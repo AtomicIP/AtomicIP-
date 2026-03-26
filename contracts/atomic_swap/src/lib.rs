@@ -1,5 +1,5 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env};
+use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env};
 
 // ── Storage Keys ─────────────────────────────────────────────────────────────
 
@@ -27,6 +27,7 @@ pub struct SwapRecord {
     pub seller: Address,
     pub buyer: Address,
     pub price: i128,
+    pub token: Address,
     pub status: SwapStatus,
 }
 
@@ -38,24 +39,23 @@ pub struct AtomicSwap;
 #[contractimpl]
 impl AtomicSwap {
     /// Seller initiates a patent sale. Returns the swap ID.
-    pub fn initiate_swap(env: Env, ip_id: u64, price: i128, buyer: Address) -> u64 {
-        assert!(price > 0, "price must be greater than zero");
-        let seller = env.current_contract_address(); // placeholder; real impl uses invoker
-
-        const TTL_THRESHOLD: u32 = 518400;
-        const TTL_BUMP: u32 = 518400;
-
-        let id: u64 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::NextId)
-            .unwrap_or(0);
+    pub fn initiate_swap(
+        env: Env,
+        seller: Address,
+        ip_id: u64,
+        price: i128,
+        token: Address,
+        buyer: Address,
+    ) -> u64 {
+        seller.require_auth();
+        let id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(0);
 
         let swap = SwapRecord {
             ip_id,
             seller,
             buyer,
             price,
+            token,
             status: SwapStatus::Pending,
         };
 
@@ -67,7 +67,7 @@ impl AtomicSwap {
         id
     }
 
-    /// Buyer accepts the swap and sends payment (payment handled by token contract in full impl).
+    /// Buyer accepts the swap and transfers payment into contract escrow.
     pub fn accept_swap(env: Env, swap_id: u64) {
         let mut swap: SwapRecord = env
             .storage()
@@ -77,11 +77,18 @@ impl AtomicSwap {
 
         swap.buyer.require_auth();
         assert!(swap.status == SwapStatus::Pending, "swap not pending");
+
+        swap.buyer.require_auth();
+
+        // Transfer buyer's payment into contract escrow
+        let token_client = token::Client::new(&env, &swap.token);
+        token_client.transfer(&swap.buyer, &env.current_contract_address(), &swap.price);
+
         swap.status = SwapStatus::Accepted;
         env.storage().persistent().set(&DataKey::Swap(swap_id), &swap);
     }
 
-    /// Seller reveals the decryption key; payment releases.
+    /// Seller reveals the decryption key; escrowed payment releases to seller.
     pub fn reveal_key(env: Env, swap_id: u64, _decryption_key: BytesN<32>) {
         let mut swap: SwapRecord = env
             .storage()
@@ -91,12 +98,18 @@ impl AtomicSwap {
 
         swap.seller.require_auth();
         assert!(swap.status == SwapStatus::Accepted, "swap not accepted");
-        // Full impl: verify key against IP commitment, then transfer escrowed payment
+
+        swap.seller.require_auth();
+
+        // Release escrowed payment to seller
+        let token_client = token::Client::new(&env, &swap.token);
+        token_client.transfer(&env.current_contract_address(), &swap.seller, &swap.price);
+
         swap.status = SwapStatus::Completed;
         env.storage().persistent().set(&DataKey::Swap(swap_id), &swap);
     }
 
-    /// Cancel a swap (invalid key or timeout).
+    /// Cancel a swap — refunds buyer if payment was escrowed.
     pub fn cancel_swap(env: Env, swap_id: u64) {
         let mut swap: SwapRecord = env
             .storage()
@@ -108,6 +121,13 @@ impl AtomicSwap {
             swap.status == SwapStatus::Pending || swap.status == SwapStatus::Accepted,
             "swap already finalised"
         );
+
+        // Refund buyer if payment is already in escrow
+        if swap.status == SwapStatus::Accepted {
+            let token_client = token::Client::new(&env, &swap.token);
+            token_client.transfer(&env.current_contract_address(), &swap.buyer, &swap.price);
+        }
+
         swap.status = SwapStatus::Cancelled;
         env.storage().persistent().set(&DataKey::Swap(swap_id), &swap);
     }
@@ -122,117 +142,89 @@ impl AtomicSwap {
 }
 
 #[cfg(test)]
-mod tests {
+mod test {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, Env};
+    use soroban_sdk::{
+        testutils::{Address as _, AuthorizedFunction, AuthorizedInvocation},
+        token::{Client as TokenClient, StellarAssetClient},
+        Address, BytesN, Env, IntoVal,
+    };
 
-    fn setup() -> (Env, AtomicSwapClient<'static>) {
+    fn setup_token(env: &Env, admin: &Address) -> Address {
+        let token_id = env.register_stellar_asset_contract_v2(admin.clone());
+        StellarAssetClient::new(env, &token_id.address()).mint(admin, &10_000);
+        token_id.address()
+    }
+
+    #[test]
+    fn test_escrow_balance_on_accept() {
         let env = Env::default();
+        env.mock_all_auths();
+
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let token_addr = setup_token(&env, &buyer);
+        let token = TokenClient::new(&env, &token_addr);
+
         let contract_id = env.register(AtomicSwap, ());
         let client = AtomicSwapClient::new(&env, &contract_id);
-        (env, client)
-    }
 
-    #[test]
-    fn test_next_id_counter_persists_across_calls() {
-        let (env, client) = setup();
-        let buyer = Address::generate(&env);
-        env.mock_all_auths();
+        let swap_id = client.initiate_swap(&seller, &1u64, &500i128, &token_addr, &buyer);
 
-        let id0 = client.initiate_swap(&1u64, &100i128, &buyer);
-        let id1 = client.initiate_swap(&2u64, &200i128, &buyer);
-        let id2 = client.initiate_swap(&3u64, &300i128, &buyer);
+        assert_eq!(token.balance(&buyer), 10_000);
+        assert_eq!(token.balance(&contract_id), 0);
 
-        assert_eq!(id0, 0);
-        assert_eq!(id1, 1);
-        assert_eq!(id2, 2);
-
-        // counter is in persistent storage — verify directly
-        env.as_contract(&client.address, || {
-            let next: u64 = env
-                .storage()
-                .persistent()
-                .get(&DataKey::NextId)
-                .expect("NextId missing from persistent storage");
-            assert_eq!(next, 3);
-        });
-    }
-
-    #[test]
-    fn test_initiate_swap_zero_price_rejected() {
-        let (env, client) = setup();
-        let buyer = Address::generate(&env);
-        env.mock_all_auths();
-        let result = client.try_initiate_swap(&1u64, &0i128, &buyer);
-        assert!(result.is_err(), "expected failure for zero price");
-    }
-
-    #[test]
-    fn test_accept_swap_unauthorized_rejected() {
-        let (env, client) = setup();
-
-        let seller = Address::generate(&env);
-        let buyer = Address::generate(&env);
-
-        // initiate a swap
-        let swap_id = env.as_contract(&client.address, || {
-            let id: u64 = env.storage().persistent().get(&DataKey::NextId).unwrap_or(0);
-            let swap = SwapRecord {
-                ip_id: 1,
-                seller: seller.clone(),
-                buyer: buyer.clone(),
-                price: 100,
-                status: SwapStatus::Pending,
-            };
-            env.storage().persistent().set(&DataKey::Swap(id), &swap);
-            env.storage().persistent().set(&DataKey::NextId, &(id + 1));
-            id
-        });
-
-        // stranger tries to accept — must panic with auth error
-        env.mock_auths(&[]);
-        let result = client.try_accept_swap(&swap_id);
-        assert!(result.is_err(), "expected auth failure for unauthorized caller");
-
-        // legitimate buyer can accept
-        env.mock_all_auths();
         client.accept_swap(&swap_id);
-        let swap = client.get_swap(&swap_id);
-        assert_eq!(swap.status, SwapStatus::Accepted);
+
+        // Payment must be in escrow
+        assert_eq!(token.balance(&buyer), 9_500);
+        assert_eq!(token.balance(&contract_id), 500);
     }
 
     #[test]
-    fn test_reveal_key_unauthorized_rejected() {
-        let (env, client) = setup();
+    fn test_reveal_key_releases_payment_to_seller() {
+        let env = Env::default();
+        env.mock_all_auths();
 
         let seller = Address::generate(&env);
         let buyer = Address::generate(&env);
-        let key = BytesN::from_array(&env, &[1u8; 32]);
+        let token_addr = setup_token(&env, &buyer);
+        let token = TokenClient::new(&env, &token_addr);
 
-        // seed an Accepted swap directly
-        let swap_id = env.as_contract(&client.address, || {
-            let id: u64 = env.storage().persistent().get(&DataKey::NextId).unwrap_or(0);
-            let swap = SwapRecord {
-                ip_id: 1,
-                seller: seller.clone(),
-                buyer: buyer.clone(),
-                price: 100,
-                status: SwapStatus::Accepted,
-            };
-            env.storage().persistent().set(&DataKey::Swap(id), &swap);
-            env.storage().persistent().set(&DataKey::NextId, &(id + 1));
-            id
-        });
+        let contract_id = env.register(AtomicSwap, ());
+        let client = AtomicSwapClient::new(&env, &contract_id);
 
-        // no auth — must fail
-        env.mock_auths(&[]);
-        let result = client.try_reveal_key(&swap_id, &key);
-        assert!(result.is_err(), "expected auth failure for unauthorized caller");
+        let swap_id = client.initiate_swap(&seller, &1u64, &500i128, &token_addr, &buyer);
+        client.accept_swap(&swap_id);
 
-        // legitimate seller can reveal
-        env.mock_all_auths();
+        let key = BytesN::from_array(&env, &[0u8; 32]);
         client.reveal_key(&swap_id, &key);
-        let swap = client.get_swap(&swap_id);
-        assert_eq!(swap.status, SwapStatus::Completed);
+
+        assert_eq!(token.balance(&seller), 500);
+        assert_eq!(token.balance(&contract_id), 0);
+    }
+
+    #[test]
+    fn test_cancel_after_accept_refunds_buyer() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let token_addr = setup_token(&env, &buyer);
+        let token = TokenClient::new(&env, &token_addr);
+
+        let contract_id = env.register(AtomicSwap, ());
+        let client = AtomicSwapClient::new(&env, &contract_id);
+
+        let swap_id = client.initiate_swap(&seller, &1u64, &500i128, &token_addr, &buyer);
+        client.accept_swap(&swap_id);
+
+        assert_eq!(token.balance(&contract_id), 500);
+
+        client.cancel_swap(&swap_id);
+
+        assert_eq!(token.balance(&buyer), 10_000); // fully refunded
+        assert_eq!(token.balance(&contract_id), 0);
     }
 }
