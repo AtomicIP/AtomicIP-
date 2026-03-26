@@ -1,5 +1,5 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env, Vec};
 
 // ── Storage Keys ────────────────────────────────────────────────────────────
 
@@ -62,10 +62,13 @@ impl IpRegistry {
         ids.push_back(id);
         env.storage().persistent().set(&DataKey::OwnerIps(owner), &ids);
 
-        env.storage().persistent().set(&DataKey::NextId, &(id + 1));
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::NextId, TTL_THRESHOLD, TTL_BUMP);
+        env.storage().instance().set(&DataKey::NextId, &(id + 1));
+
+        env.events().publish(
+            (symbol_short!("ip_commit"), owner),
+            (id, record.timestamp),
+        );
+
         id
     }
 
@@ -154,6 +157,27 @@ impl IpRegistry {
 mod tests {
     use super::*;
     use soroban_sdk::{testutils::Address as _, Env};
+
+    #[test]
+    fn commit_ip_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[0xabu8; 32]);
+        let id = client.commit_ip(&owner, &hash);
+
+        let events = env.events().all();
+        assert_eq!(events.len(), 1);
+        let (_, topics, data): (_, soroban_sdk::Vec<soroban_sdk::Val>, soroban_sdk::Val) =
+            events.get(0).unwrap();
+        // topic[1] is the owner address; data is (ip_id, timestamp)
+        let (emitted_id, _timestamp): (u64, u64) =
+            soroban_sdk::FromVal::from_val(&env, &data);
+        assert_eq!(emitted_id, id);
+    }
 
     #[test]
     fn unknown_owner_returns_none() {
