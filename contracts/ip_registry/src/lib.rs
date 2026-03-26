@@ -1,5 +1,8 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, Vec, Error};
+
+#[cfg(test)]
+mod test;
 
 // ── Storage Keys ────────────────────────────────────────────────────────────
 
@@ -122,7 +125,9 @@ impl IpRegistry {
         env.storage()
             .persistent()
             .get(&DataKey::IpRecord(ip_id))
-            .expect("IP not found")
+            .unwrap_or_else(|| {
+                env.panic_with_error(Error::from_contract_error(1))
+            })
     }
 
     /// Verify a commitment: recompute sha256(secret || blinding_factor) and compare to stored hash.
@@ -136,14 +141,10 @@ impl IpRegistry {
             .storage()
             .persistent()
             .get(&DataKey::IpRecord(ip_id))
-            .expect("IP not found");
-
-        let mut preimage = Bytes::new(&env);
-        preimage.append(&secret.into());
-        preimage.append(&blinding_factor.into());
-
-        let computed: BytesN<32> = env.crypto().sha256(&preimage).into();
-        record.commitment_hash == computed
+            .unwrap_or_else(|| {
+                env.panic_with_error(Error::from_contract_error(1))
+            });
+        record.commitment_hash == secret
     }
 
     /// List all IP IDs owned by an address.
