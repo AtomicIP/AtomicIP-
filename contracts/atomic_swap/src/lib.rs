@@ -12,7 +12,7 @@ pub enum DataKey {
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 #[contracttype]
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 pub enum SwapStatus {
     Pending,
     Accepted,
@@ -60,7 +60,10 @@ impl AtomicSwap {
         };
 
         env.storage().persistent().set(&DataKey::Swap(id), &swap);
-        env.storage().instance().set(&DataKey::NextId, &(id + 1));
+        env.storage().persistent().set(&DataKey::NextId, &(id + 1));
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::NextId, TTL_THRESHOLD, TTL_BUMP);
         id
     }
 
@@ -72,6 +75,7 @@ impl AtomicSwap {
             .get(&DataKey::Swap(swap_id))
             .expect("swap not found");
 
+        swap.buyer.require_auth();
         assert!(swap.status == SwapStatus::Pending, "swap not pending");
 
         swap.buyer.require_auth();
@@ -92,6 +96,7 @@ impl AtomicSwap {
             .get(&DataKey::Swap(swap_id))
             .expect("swap not found");
 
+        swap.seller.require_auth();
         assert!(swap.status == SwapStatus::Accepted, "swap not accepted");
 
         swap.seller.require_auth();

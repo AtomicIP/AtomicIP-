@@ -31,7 +31,14 @@ impl IpRegistry {
     pub fn commit_ip(env: Env, owner: Address, commitment_hash: BytesN<32>) -> u64 {
         owner.require_auth();
 
-        let id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(0);
+        const TTL_THRESHOLD: u32 = 518400;
+        const TTL_BUMP: u32 = 518400;
+
+        let id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NextId)
+            .unwrap_or(0);
 
         let record = IpRecord {
             owner: owner.clone(),
@@ -50,7 +57,10 @@ impl IpRegistry {
         ids.push_back(id);
         env.storage().persistent().set(&DataKey::OwnerIps(owner), &ids);
 
-        env.storage().instance().set(&DataKey::NextId, &(id + 1));
+        env.storage().persistent().set(&DataKey::NextId, &(id + 1));
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::NextId, TTL_THRESHOLD, TTL_BUMP);
         id
     }
 
@@ -78,5 +88,40 @@ impl IpRegistry {
             .persistent()
             .get(&DataKey::OwnerIps(owner))
             .unwrap_or(Vec::new(&env))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::{testutils::Address as _, Env};
+
+    #[test]
+    fn test_next_id_counter_persists_across_calls() {
+        let env = Env::default();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[0u8; 32]);
+
+        env.mock_all_auths();
+        let id0 = client.commit_ip(&owner, &hash);
+        let id1 = client.commit_ip(&owner, &hash);
+        let id2 = client.commit_ip(&owner, &hash);
+
+        assert_eq!(id0, 0);
+        assert_eq!(id1, 1);
+        assert_eq!(id2, 2);
+
+        // counter is in persistent storage — verify directly
+        env.as_contract(&contract_id, || {
+            let next: u64 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::NextId)
+                .expect("NextId missing from persistent storage");
+            assert_eq!(next, 3);
+        });
     }
 }
