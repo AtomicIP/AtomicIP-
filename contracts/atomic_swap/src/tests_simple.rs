@@ -29,6 +29,7 @@ mod tests {
         
         let ip_id = 1;
         let price = 1000;
+        let seller = Address::generate(&env);
         let buyer = Address::generate(&env);
         let decryption_key = BytesN::from_array(&env, &[0; 32]);
 
@@ -40,8 +41,8 @@ mod tests {
         let swap = AtomicSwap::get_swap(env.clone(), swap_id);
         assert_eq!(swap.status, crate::SwapStatus::Accepted);
         
-        // Complete swap
-        super::AtomicSwap::reveal_key(env.clone(), swap_id, decryption_key);
+        // Complete swap — caller must be the seller
+        super::AtomicSwap::reveal_key(env.clone(), swap_id, seller.clone(), decryption_key);
         let swap = AtomicSwap::get_swap(env.clone(), swap_id);
         assert_eq!(swap.status, crate::SwapStatus::Completed);
     }

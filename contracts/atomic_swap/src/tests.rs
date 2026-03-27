@@ -70,12 +70,13 @@ mod tests {
         let ip_id = 1;
         let price = 1000;
         let buyer = Address::random(&env);
+        let seller = Address::random(&env);
         let decryption_key = BytesN::from_array(&env, &[0; 32]);
 
         // Complete swap lifecycle
         let swap_id = client.initiate_swap(&ip_id, &price, &buyer);
         client.accept_swap(&swap_id);
-        client.reveal_key(&swap_id, &decryption_key);
+        client.reveal_key(&swap_id, &seller, &decryption_key);
 
         // Check TTL after completion
         let ttl = env.storage().persistent().get_ttl(&DataKey::Swap(swap_id)).unwrap();
@@ -123,6 +124,7 @@ mod tests {
 
         let ip_id = 1;
         let price = 1000;
+        let seller = Address::random(&env);
         let buyer = Address::random(&env);
         let decryption_key = BytesN::from_array(&env, &[0; 32]);
 
@@ -135,7 +137,7 @@ mod tests {
         let ttl_after_accept = env.storage().persistent().get_ttl(&DataKey::Swap(swap_id)).unwrap();
 
         env.jump(100);
-        client.reveal_key(&swap_id, &decryption_key);
+        client.reveal_key(&swap_id, &seller, &decryption_key);
         let ttl_after_complete = env.storage().persistent().get_ttl(&DataKey::Swap(swap_id)).unwrap();
 
         // All TTLs should be positive
