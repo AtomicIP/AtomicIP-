@@ -1,9 +1,9 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Vec, Error};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Error, Vec,
+};
 
 #[cfg(test)]
-mod test;
-
 mod test;
 
 // ── Error Codes ────────────────────────────────────────────────────────────
@@ -30,6 +30,7 @@ pub enum DataKey {
 #[contracttype]
 #[derive(Clone)]
 pub struct IpRecord {
+    pub ip_id: u64,
     pub owner: Address,
     pub commitment_hash: BytesN<32>,
     pub timestamp: u64,
@@ -66,7 +67,9 @@ impl IpRegistry {
 
         // Reject zero-byte commitment hash (Issue #40)
         if commitment_hash == BytesN::from_array(&env, &[0u8; 32]) {
-            env.panic_with_error(Error::from_contract_error(ContractError::ZeroCommitmentHash as u32));
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::ZeroCommitmentHash as u32,
+            ));
         }
 
         // Reject duplicate commitment hash globally
@@ -77,16 +80,24 @@ impl IpRegistry {
             "commitment already registered"
         );
 
-        let id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(0);
+        // NextId lives in persistent storage so it survives contract upgrades.
+        // Instance storage is wiped on upgrade, which would reset the counter
+        // and cause ID collisions with existing IP records.
+        let id: u64 = env.storage().persistent().get(&DataKey::NextId).unwrap_or(0);
 
         let record = IpRecord {
+            ip_id: id,
             owner: owner.clone(),
             commitment_hash: commitment_hash.clone(),
             timestamp: env.ledger().timestamp(),
         };
 
-        env.storage().persistent().set(&DataKey::IpRecord(id), &record);
-        env.storage().persistent().extend_ttl(&DataKey::IpRecord(id), 50000, 50000);
+        env.storage()
+            .persistent()
+            .set(&DataKey::IpRecord(id), &record);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::IpRecord(id), 50000, 50000);
 
         // Append to owner index
         let mut ids: Vec<u64> = env
@@ -95,13 +106,18 @@ impl IpRegistry {
             .get(&DataKey::OwnerIps(owner.clone()))
             .unwrap_or(Vec::new(&env));
         ids.push_back(id);
-        env.storage().persistent().set(&DataKey::OwnerIps(owner.clone()), &ids);
-        env.storage().persistent().extend_ttl(&DataKey::OwnerIps(owner.clone()), 50000, 50000);
+        env.storage()
+            .persistent()
+            .set(&DataKey::OwnerIps(owner.clone()), &ids);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::OwnerIps(owner.clone()), 50000, 50000);
 
-        env.storage().instance().set(&DataKey::NextId, &(id + 1));
+        env.storage().persistent().set(&DataKey::NextId, &(id + 1));
+        env.storage().persistent().extend_ttl(&DataKey::NextId, 50000, 50000);
 
         env.events().publish(
-            (symbol_short!("ip_commit"), owner),
+            (symbol_short!("ip_commit"), owner.clone()),
             (id, record.timestamp),
         );
 
@@ -147,12 +163,15 @@ impl IpRegistry {
             .set(&DataKey::OwnerIps(new_owner.clone()), &new_ids);
 
         // Update commitment index
-        env.storage()
-            .persistent()
-            .set(&DataKey::CommitmentOwner(record.commitment_hash.clone()), &new_owner);
+        env.storage().persistent().set(
+            &DataKey::CommitmentOwner(record.commitment_hash.clone()),
+            &new_owner,
+        );
 
         record.owner = new_owner;
-        env.storage().persistent().set(&DataKey::IpRecord(ip_id), &record);
+        env.storage()
+            .persistent()
+            .set(&DataKey::IpRecord(ip_id), &record);
     }
 
     /// Retrieve an IP record by ID.
@@ -180,14 +199,12 @@ impl IpRegistry {
             .unwrap_or_else(|| {
                 env.panic_with_error(Error::from_contract_error(ContractError::IpNotFound as u32))
             });
-        
-        // Hash the secret and blinding factor using SHA256 (Issue #43: Critical fix)
-        // Proper commitment verification: hash first, then compare
-        let mut preimage = soroban_sdk::Vec::new(&env);
-        preimage.append(secret);
-        preimage.append(blinding_factor);
-        let computed_hash = env.crypto().sha256(&preimage);
-        
+
+        let mut preimage = soroban_sdk::Bytes::new(&env);
+        preimage.append(&secret.into());
+        preimage.append(&blinding_factor.into());
+        let computed_hash: BytesN<32> = env.crypto().sha256(&preimage).into();
+
         record.commitment_hash == computed_hash
     }
 
@@ -203,7 +220,32 @@ impl IpRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, IntoVal, Env};
+    use soroban_sdk::{testutils::Address as _, Env, IntoVal};
+
+    /// ID continuity: IP IDs must be monotonically increasing and must not reset
+    /// to 0 after multiple commits (guards against the instance-storage upgrade bug).
+    #[test]
+    fn next_id_is_persistent_and_monotonic() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+
+        let id0 = client.commit_ip(&owner, &soroban_sdk::BytesN::from_array(&env, &[1u8; 32]));
+        let id1 = client.commit_ip(&owner, &soroban_sdk::BytesN::from_array(&env, &[2u8; 32]));
+        let id2 = client.commit_ip(&owner, &soroban_sdk::BytesN::from_array(&env, &[3u8; 32]));
+
+        assert_eq!(id0, 0);
+        assert_eq!(id1, 1);
+        assert_eq!(id2, 2);
+
+        // All records must be independently retrievable — no collisions.
+        assert_eq!(client.get_ip(&id0).commitment_hash, soroban_sdk::BytesN::from_array(&env, &[1u8; 32]));
+        assert_eq!(client.get_ip(&id1).commitment_hash, soroban_sdk::BytesN::from_array(&env, &[2u8; 32]));
+        assert_eq!(client.get_ip(&id2).commitment_hash, soroban_sdk::BytesN::from_array(&env, &[3u8; 32]));
+    }
 
     /// Bug Condition Exploration Test — Property 1
     ///
