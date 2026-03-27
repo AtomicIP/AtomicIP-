@@ -99,6 +99,7 @@ Follow the step-by-step guide in `demo/demo-script.md`
 - [Commitment Scheme](docs/commitment-scheme.md)
 - [Atomic Swap Flow](docs/atomic-swap.md)
 - [Threat Model & Security](docs/threat-model.md)
+- [Security Policy](SECURITY.md)
 - [Roadmap](docs/roadmap.md)
 
 ## 🎓 Smart Contract API

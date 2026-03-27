@@ -8,6 +8,17 @@ use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, 
 pub enum ContractError {
     SwapNotFound = 1,
     InvalidKey = 2,
+    PriceMustBeGreaterThanZero = 3,
+    SellerIsNotTheIPOwner = 4,
+    ActiveSwapAlreadyExistsForThisIpId = 5,
+    SwapNotPending = 6,
+    OnlyTheSellerCanRevealTheKey = 7,
+    SwapNotAccepted = 8,
+    OnlyTheSellerOrBuyerCanCancel = 9,
+    OnlyPendingSwapsCanBeCancelledThisWay = 10,
+    SwapNotInAcceptedState = 11,
+    OnlyTheBuyerCanCancelAnExpiredSwap = 12,
+    SwapHasNotExpiredYet = 13,
 }
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
@@ -74,6 +85,33 @@ pub struct AtomicSwap;
 #[contractimpl]
 impl AtomicSwap {
     /// Seller initiates a patent sale. Returns the swap ID.
+    ///
+    /// This function creates a new atomic swap record, allowing a seller to list
+    /// their IP for sale. The seller must be the registered owner of the IP.
+    /// The swap starts in Pending status and can be accepted by the buyer.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `ip_registry_id` - The address of the IP registry contract
+    /// * `token` - The address of the token contract used for payment
+    /// * `ip_id` - The unique identifier of the IP being sold
+    /// * `seller` - The address of the seller (must be the IP owner)
+    /// * `price` - The price in token units (must be positive)
+    /// * `buyer` - The address of the potential buyer
+    ///
+    /// # Returns
+    ///
+    /// The unique swap ID assigned to this swap. IDs are monotonically increasing.
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// * The seller does not authorize the transaction (auth error)
+    /// * The price is not positive (price_must_be_greater_than_zero error)
+    /// * The seller is not the registered IP owner (seller_is_not_the_IP_owner error)
+    /// * An active swap already exists for this IP (active_swap_already_exists_for_this_ip_id error)
+    /// * The IP does not exist in the registry (IpNotFound error from registry)
     pub fn initiate_swap(
         env: Env,
         ip_registry_id: Address,
@@ -86,7 +124,11 @@ impl AtomicSwap {
         seller.require_auth();
 
         // 2. Guard: price must be positive.
-        assert!(price > 0, "price must be greater than zero");
+        if price <= 0 {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::PriceMustBeGreaterThanZero as u32,
+            ));
+        }
 
         // 3. Cross-contract ownership check — SECURITY FIX.
         //    Fetches the IP record from the registry and asserts the caller is
@@ -94,17 +136,19 @@ impl AtomicSwap {
         //    swap for an IP they do not own.
         let registry = IpRegistryClient::new(&env, &ip_registry_id);
         let record = registry.get_ip(&ip_id);
-        assert!(record.owner == seller, "seller is not the IP owner");
+        if record.owner != seller {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::SellerIsNotTheIPOwner as u32,
+            ));
+        }
 
-        assert!(
-            !env.storage().persistent().has(&DataKey::ActiveSwap(ip_id)),
-            "active swap already exists for this ip_id"
-        );
+        if env.storage().persistent().has(&DataKey::ActiveSwap(ip_id)) {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::ActiveSwapAlreadyExistsForThisIpId as u32,
+            ));
+        }
 
         let id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(0);
-
-        // Default expiry: 7 days (604800 seconds) from now
-        let expiry = env.ledger().timestamp() + 604800u64;
 
         let swap = SwapRecord {
             ip_id,
@@ -114,7 +158,7 @@ impl AtomicSwap {
             price,
             token,
             status: SwapStatus::Pending,
-            expiry: env.ledger().timestamp() + 86400,
+            expiry: env.ledger().timestamp() + 604800u64,
         };
 
         env.storage().persistent().set(&DataKey::Swap(id), &swap);
@@ -129,6 +173,25 @@ impl AtomicSwap {
     }
 
     /// Buyer accepts the swap.
+    ///
+    /// This function allows the buyer to accept a pending swap by transferring
+    /// the payment into escrow. The swap status changes from Pending to Accepted.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `swap_id` - The unique identifier of the swap to accept
+    ///
+    /// # Returns
+    ///
+    /// This function does not return a value.
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// * The swap does not exist (SwapNotFound error)
+    /// * The buyer does not authorize the transaction (auth error)
+    /// * The swap is not in Pending status (swap_not_pending error)
     pub fn accept_swap(env: Env, swap_id: u64) {
         let mut swap: SwapRecord = env
             .storage()
@@ -141,7 +204,11 @@ impl AtomicSwap {
             });
 
         swap.buyer.require_auth();
-        assert!(swap.status == SwapStatus::Pending, "swap not pending");
+        if swap.status != SwapStatus::Pending {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::SwapNotPending as u32,
+            ));
+        }
 
         // Transfer payment from buyer into contract escrow.
         // buyer.require_auth() above satisfies the token's auth requirement via
@@ -162,6 +229,35 @@ impl AtomicSwap {
     }
 
     /// Seller reveals the decryption key; payment releases only if the key is valid.
+    ///
+    /// This function allows the seller to reveal the secret that was used to create
+    /// the IP commitment. The key is verified against the stored commitment hash
+    /// before the swap is marked as Completed. If the key is invalid, the transaction
+    /// fails and the payment remains in escrow.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `swap_id` - The unique identifier of the swap
+    /// * `caller` - The address of the caller (must be the seller)
+    /// * `secret` - The 32-byte secret that was used to create the IP commitment
+    /// * `blinding_factor` - The 32-byte blinding factor used to create the commitment
+    ///
+    /// # Returns
+    ///
+    /// This function does not return a value.
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// * The swap does not exist (SwapNotFound error)
+    /// * The caller is not the seller (only_the_seller_can_reveal_the_key error)
+    /// * The caller does not authorize the transaction (auth error)
+    /// * The swap is not in Accepted status (swap_not_accepted error)
+    /// * The revealed key is invalid (InvalidKey error)
+    ///
+    /// # Security
+    ///
     /// SECURITY: caller must be the seller — verified by identity check + require_auth.
     /// SECURITY: key is verified against the IP commitment before marking Completed.
     pub fn reveal_key(
@@ -181,9 +277,17 @@ impl AtomicSwap {
                 ))
             });
 
-        assert!(caller == swap.seller, "only the seller can reveal the key");
+        if caller != swap.seller {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::OnlyTheSellerCanRevealTheKey as u32,
+            ));
+        }
         caller.require_auth();
-        assert!(swap.status == SwapStatus::Accepted, "swap not accepted");
+        if swap.status != SwapStatus::Accepted {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::SwapNotAccepted as u32,
+            ));
+        }
 
         let registry = IpRegistryClient::new(&env, &swap.ip_registry_id);
         let valid = registry.verify_commitment(&swap.ip_id, &secret, &blinding_factor);
@@ -200,7 +304,7 @@ impl AtomicSwap {
             .extend_ttl(&DataKey::Swap(swap_id), 50000, 50000);
 
         env.events().publish(
-            (soroban_sdk::symbol_short!("key_reveal"),),
+            (soroban_sdk::symbol_short!("key_rev"),),
             KeyRevealedEvent {
                 swap_id,
                 decryption_key: secret,
@@ -209,6 +313,27 @@ impl AtomicSwap {
     }
 
     /// Cancel a pending swap. Only the seller or buyer may cancel.
+    ///
+    /// This function allows either the seller or buyer to cancel a pending swap.
+    /// When cancelled, the IP lock is released and a new swap can be created for the same IP.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `swap_id` - The unique identifier of the swap to cancel
+    /// * `canceller` - The address of the person cancelling (must be seller or buyer)
+    ///
+    /// # Returns
+    ///
+    /// This function does not return a value.
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// * The swap does not exist (SwapNotFound error)
+    /// * The canceller is not the seller or buyer (only_the_seller_or_buyer_can_cancel error)
+    /// * The canceller does not authorize the transaction (auth error)
+    /// * The swap is not in Pending status (only_pending_swaps_can_be_cancelled_this_way error)
     pub fn cancel_swap(env: Env, swap_id: u64, canceller: Address) {
         let mut swap: SwapRecord = env
             .storage()
@@ -220,16 +345,18 @@ impl AtomicSwap {
                 ))
             });
 
-        assert!(
-            canceller == swap.seller || canceller == swap.buyer,
-            "only the seller or buyer can cancel"
-        );
+        if canceller != swap.seller && canceller != swap.buyer {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::OnlyTheSellerOrBuyerCanCancel as u32,
+            ));
+        }
         canceller.require_auth();
 
-        assert!(
-            swap.status == SwapStatus::Pending,
-            "only pending swaps can be cancelled this way"
-        );
+        if swap.status != SwapStatus::Pending {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::OnlyPendingSwapsCanBeCancelledThisWay as u32,
+            ));
+        }
         swap.status = SwapStatus::Cancelled;
         env.storage()
             .persistent()
@@ -244,6 +371,28 @@ impl AtomicSwap {
     }
 
     /// Buyer cancels an Accepted swap after expiry.
+    ///
+    /// This function allows the buyer to cancel an accepted swap after the expiry
+    /// time has passed. This protects buyers from sellers who fail to reveal the
+    /// key within the expected timeframe.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `swap_id` - The unique identifier of the swap to cancel
+    /// * `caller` - The address of the caller (must be the buyer)
+    ///
+    /// # Returns
+    ///
+    /// This function does not return a value.
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// * The swap does not exist (SwapNotFound error)
+    /// * The swap is not in Accepted status (swap_not_in_Accepted_state error)
+    /// * The caller is not the buyer (only_the_buyer_can_cancel_an_expired_swap error)
+    /// * The swap has not expired yet (swap_has_not_expired_yet error)
     pub fn cancel_expired_swap(env: Env, swap_id: u64, caller: Address) {
         let mut swap: SwapRecord = env
             .storage()
@@ -255,18 +404,21 @@ impl AtomicSwap {
                 ))
             });
 
-        assert!(
-            swap.status == SwapStatus::Accepted,
-            "swap not in Accepted state"
-        );
-        assert!(
-            caller == swap.buyer,
-            "only the buyer can cancel an expired swap"
-        );
-        assert!(
-            env.ledger().timestamp() > swap.expiry,
-            "swap has not expired yet"
-        );
+        if swap.status != SwapStatus::Accepted {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::SwapNotInAcceptedState as u32,
+            ));
+        }
+        if caller != swap.buyer {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::OnlyTheBuyerCanCancelAnExpiredSwap as u32,
+            ));
+        }
+        if env.ledger().timestamp() <= swap.expiry {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::SwapHasNotExpiredYet as u32,
+            ));
+        }
 
         swap.status = SwapStatus::Cancelled;
         env.storage()
@@ -278,6 +430,32 @@ impl AtomicSwap {
     }
 
     /// Read a swap record. Returns `None` if the swap_id does not exist.
+    ///
+    /// Returns the complete swap record including IP details, parties, price,
+    /// status, and expiry time.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `swap_id` - The unique identifier of the swap to retrieve
+    ///
+    /// # Returns
+    ///
+    /// `Some(SwapRecord)` containing:
+    /// * `ip_id` - The unique identifier of the IP being sold
+    /// * `ip_registry_id` - The address of the IP registry contract
+    /// * `seller` - The address of the seller
+    /// * `buyer` - The address of the buyer
+    /// * `price` - The price in token units
+    /// * `token` - The address of the token contract
+    /// * `status` - The current swap status (Pending, Accepted, Completed, or Cancelled)
+    /// * `expiry` - The ledger timestamp after which the buyer may cancel
+    ///
+    /// `None` if the swap does not exist.
+    ///
+    /// # Panics
+    ///
+    /// This function does not panic.
     pub fn get_swap(env: Env, swap_id: u64) -> Option<SwapRecord> {
         env.storage().persistent().get(&DataKey::Swap(swap_id))
     }

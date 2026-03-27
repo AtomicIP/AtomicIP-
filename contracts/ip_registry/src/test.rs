@@ -3,7 +3,7 @@ mod tests {
     use crate::IpRecord;
     use soroban_sdk::contractclient;
     use soroban_sdk::testutils::Address as TestAddress;
-    use soroban_sdk::{Address, BytesN, Env, Vec};
+    use soroban_sdk::{symbol_short, Address, BytesN, Env, TryFromVal, Vec};
 
     #[contractclient(name = "IpRegistryClient")]
     #[allow(dead_code)]

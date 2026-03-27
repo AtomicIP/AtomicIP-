@@ -12,6 +12,7 @@ mod test;
 pub enum ContractError {
     IpNotFound = 1,
     ZeroCommitmentHash = 2,
+    CommitmentAlreadyRegistered = 3,
 }
 
 // ── Storage Keys ────────────────────────────────────────────────────────────
@@ -45,6 +46,29 @@ pub struct IpRegistry;
 impl IpRegistry {
     /// Timestamp a new IP commitment. Returns the assigned IP ID.
     ///
+    /// This function creates a new IP record with a cryptographic commitment hash,
+    /// establishing a verifiable timestamp on the blockchain. The commitment hash
+    /// should be constructed using the Pedersen commitment scheme: sha256(secret || blinding_factor).
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `owner` - The address that owns the IP. This address must authorize the transaction.
+    /// * `commitment_hash` - A 32-byte cryptographic hash of the IP secret and blinding factor.
+    ///   Must not be all zeros and must be unique across all registered IPs.
+    ///
+    /// # Returns
+    ///
+    /// The unique IP ID assigned to this commitment. IDs are monotonically increasing
+    /// and persist across contract upgrades.
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// * The `owner` does not authorize the transaction (auth error)
+    /// * The `commitment_hash` is all zeros (ZeroCommitmentHash error)
+    /// * The `commitment_hash` is already registered (duplicate commitment error)
+    ///
     /// # Auth Model
     ///
     /// `owner.require_auth()` is the correct Soroban idiom for "only this address
@@ -73,12 +97,14 @@ impl IpRegistry {
         }
 
         // Reject duplicate commitment hash globally
-        assert!(
-            !env.storage()
-                .persistent()
-                .has(&DataKey::CommitmentOwner(commitment_hash.clone())),
-            "commitment already registered"
-        );
+        if env.storage()
+            .persistent()
+            .has(&DataKey::CommitmentOwner(commitment_hash.clone()))
+        {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::CommitmentAlreadyRegistered as u32,
+            ));
+        }
 
         // NextId lives in persistent storage so it survives contract upgrades.
         // Instance storage is wiped on upgrade, which would reset the counter
@@ -125,6 +151,25 @@ impl IpRegistry {
     }
 
     /// Transfer IP ownership to a new address.
+    ///
+    /// This function transfers ownership of an IP record from the current owner
+    /// to a new owner. The current owner must authorize the transaction.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `ip_id` - The unique identifier of the IP to transfer
+    /// * `new_owner` - The address that will become the new owner of the IP
+    ///
+    /// # Returns
+    ///
+    /// This function does not return a value.
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// * The IP record does not exist (IpNotFound error)
+    /// * The current owner does not authorize the transaction (auth error)
     pub fn transfer_ip(env: Env, ip_id: u64, new_owner: Address) {
         let mut record: IpRecord = env
             .storage()
@@ -175,6 +220,25 @@ impl IpRegistry {
     }
 
     /// Retrieve an IP record by ID.
+    ///
+    /// Returns the complete IP record including owner, commitment hash, and timestamp.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `ip_id` - The unique identifier of the IP to retrieve
+    ///
+    /// # Returns
+    ///
+    /// The `IpRecord` containing:
+    /// * `ip_id` - The unique identifier
+    /// * `owner` - The current owner's address
+    /// * `commitment_hash` - The cryptographic commitment hash
+    /// * `timestamp` - The ledger timestamp when the IP was committed
+    ///
+    /// # Panics
+    ///
+    /// Panics if the IP record does not exist (IpNotFound error).
     pub fn get_ip(env: Env, ip_id: u64) -> IpRecord {
         env.storage()
             .persistent()
@@ -185,7 +249,31 @@ impl IpRegistry {
     }
 
     /// Verify a commitment: hash the secret and blinding factor, then compare to stored commitment hash.
-    /// Implements Pedersen commitment verification: sha256(secret || blinding_factor) == commitment_hash
+    ///
+    /// This function implements Pedersen commitment verification by computing
+    /// sha256(secret || blinding_factor) and comparing it to the stored commitment hash.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `ip_id` - The unique identifier of the IP to verify
+    /// * `secret` - The 32-byte secret that was used to create the commitment
+    /// * `blinding_factor` - The 32-byte blinding factor used to create the commitment
+    ///
+    /// # Returns
+    ///
+    /// `true` if the computed hash matches the stored commitment hash, `false` otherwise.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the IP record does not exist (IpNotFound error).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // To verify a commitment, you need the original secret and blinding factor
+    /// let is_valid = registry.verify_commitment(&ip_id, &secret, &blinding_factor);
+    /// ```
     pub fn verify_commitment(
         env: Env,
         ip_id: u64,
@@ -210,7 +298,23 @@ impl IpRegistry {
     }
 
     /// List all IP IDs owned by an address.
+    ///
+    /// Returns a vector of all IP IDs owned by the specified address.
     /// Returns `None` if the address has never committed any IP.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `owner` - The address to list IPs for
+    ///
+    /// # Returns
+    ///
+    /// `Some(Vec<u64>)` containing all IP IDs owned by the address,
+    /// or `None` if the address has no IP records.
+    ///
+    /// # Panics
+    ///
+    /// This function does not panic.
     pub fn list_ip_by_owner(env: Env, owner: Address) -> Option<Vec<u64>> {
         env.storage().persistent().get(&DataKey::OwnerIps(owner))
     }
