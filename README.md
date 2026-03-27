@@ -1,4 +1,6 @@
 # Atomic Patent — The Instant IP Ledger
+
+[![CI](https://github.com/AtomicIP/AtomicIP-/actions/workflows/ci.yml/badge.svg)](https://github.com/AtomicIP/AtomicIP-/actions/workflows/ci.yml)
 A decentralized Intellectual Property registry built on Stellar Soroban smart contracts using Pedersen Commitments and Atomic Swaps.
 
 In engineering, proving "Prior Art" across borders is expensive, slow, and lawyer-dependent. Atomic Patent lets you claim an idea instantly — without revealing it to competitors — and sell it globally without intermediaries.

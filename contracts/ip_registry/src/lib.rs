@@ -80,7 +80,10 @@ impl IpRegistry {
             "commitment already registered"
         );
 
-        let id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(0);
+        // NextId lives in persistent storage so it survives contract upgrades.
+        // Instance storage is wiped on upgrade, which would reset the counter
+        // and cause ID collisions with existing IP records.
+        let id: u64 = env.storage().persistent().get(&DataKey::NextId).unwrap_or(0);
 
         let record = IpRecord {
             ip_id: id,
@@ -110,7 +113,8 @@ impl IpRegistry {
             .persistent()
             .extend_ttl(&DataKey::OwnerIps(owner.clone()), 50000, 50000);
 
-        env.storage().instance().set(&DataKey::NextId, &(id + 1));
+        env.storage().persistent().set(&DataKey::NextId, &(id + 1));
+        env.storage().persistent().extend_ttl(&DataKey::NextId, 50000, 50000);
 
         env.events().publish(
             (symbol_short!("ip_commit"), owner.clone()),
@@ -196,6 +200,7 @@ impl IpRegistry {
                 env.panic_with_error(Error::from_contract_error(ContractError::IpNotFound as u32))
             });
 
+        // Concatenate secret || blinding_factor into Bytes, then SHA256
         let mut preimage = soroban_sdk::Bytes::new(&env);
         preimage.append(&secret.into());
         preimage.append(&blinding_factor.into());

@@ -2,8 +2,8 @@
 mod tests {
     use crate::IpRecord;
     use soroban_sdk::contractclient;
-    use soroban_sdk::testutils::{Address as TestAddress, Events as _};
-    use soroban_sdk::{symbol_short, Address, BytesN, Env, IntoVal, TryFromVal, Vec};
+    use soroban_sdk::testutils::Address as TestAddress;
+    use soroban_sdk::{Address, BytesN, Env, Vec};
 
     #[contractclient(name = "IpRegistryClient")]
     #[allow(dead_code)]
@@ -54,12 +54,8 @@ mod tests {
         assert_eq!(record3.commitment_hash, commitment3);
 
         // Verify owner index is correct
-        let owner1_ips = client
-            .list_ip_by_owner(&owner1)
-            .expect("owner1 should have committed IPs");
-        let owner2_ips = client
-            .list_ip_by_owner(&owner2)
-            .expect("owner2 should have committed IPs");
+        let owner1_ips = client.list_ip_by_owner(&owner1);
+        let owner2_ips = client.list_ip_by_owner(&owner2);
 
         assert_eq!(owner1_ips.len(), 2);
         assert_eq!(owner2_ips.len(), 1);

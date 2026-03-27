@@ -1,0 +1,43 @@
+name: Validate OpenAPI Spec
+
+on:
+  push:
+    paths:
+      - 'api-server/**'
+  pull_request:
+    paths:
+      - 'api-server/**'
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            api-server/target
+          key: ${{ runner.os }}-cargo-api-${{ hashFiles('api-server/Cargo.lock') }}
+
+      - name: Build api-server
+        working-directory: api-server
+        run: cargo build --release
+
+      - name: Start api-server and export spec
+        run: |
+          ./api-server/target/release/api-server &
+          sleep 2
+          curl -sf http://localhost:8080/openapi.json -o openapi.json
+
+      - name: Install swagger-cli
+        run: npm install -g @apidevtools/swagger-cli
+
+      - name: Validate OpenAPI spec
+        run: swagger-cli validate openapi.json

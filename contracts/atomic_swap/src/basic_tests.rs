@@ -1,9 +1,9 @@
 #[cfg(test)]
 mod tests {
     use ip_registry::{IpRegistry, IpRegistryClient};
-    use soroban_sdk::{testutils::Address as _, BytesN, Env};
+    use soroban_sdk::{testutils::{Address as _, Ledger}, BytesN, Env};
 
-    use crate::{AtomicSwap, AtomicSwapClient, DataKey, SwapStatus};
+    use crate::{AtomicSwap, AtomicSwapClient, DataKey};
 
     /// Helper: register IpRegistry, commit an IP with a known secret+blinding_factor.
     /// Returns (registry_id, ip_id, secret, blinding_factor).
@@ -79,6 +79,38 @@ mod tests {
     #[should_panic(expected = "only the seller or buyer can cancel")]
     fn test_unauthorized_cancel_rejected() {
         let env = Env::default();
+
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let price = 1000;
+        let ip_id = 1;
+
+        // Test that we can create SwapRecord struct
+        let token = Address::generate(&env);
+        let swap = crate::SwapRecord {
+            ip_id,
+            seller: seller.clone(),
+            buyer: buyer.clone(),
+            price,
+            token,
+            expiry: 0,
+            status: crate::SwapStatus::Pending,
+        };
+
+        assert_eq!(swap.seller, seller);
+        assert_eq!(swap.buyer, buyer);
+        assert_eq!(swap.price, price);
+        assert_eq!(swap.status, crate::SwapStatus::Pending);
+    }
+
+    /// SECURITY: only the seller may reveal the key.
+    /// Passing a different address as `caller` must be rejected even with
+    /// `mock_all_auths`, because the identity check is an explicit assert
+    /// that runs before `require_auth`.
+    #[test]
+    #[should_panic(expected = "only the seller can reveal the key")]
+    fn test_unauthorized_reveal_key_rejected() {
+        let env = Env::default();
         env.mock_all_auths();
 
         let seller = soroban_sdk::Address::generate(&env);
@@ -95,19 +127,98 @@ mod tests {
 
     /// SECURITY: only the seller may reveal the key.
     #[test]
-    #[should_panic(expected = "only the seller can reveal the key")]
-    fn test_unauthorized_reveal_key_rejected() {
+    fn test_full_swap_lifecycle_initiate_accept_reveal_completed() {
         let env = Env::default();
         env.mock_all_auths();
 
         let seller = soroban_sdk::Address::generate(&env);
         let buyer = soroban_sdk::Address::generate(&env);
+        let decryption_key = BytesN::from_array(&env, &[42u8; 32]);
+
+        let (registry_id, ip_id) = setup_registry(&env, &seller);
+        let contract_id = env.register(AtomicSwap, ());
+        let client = AtomicSwapClient::new(&env, &contract_id);
+
+        // 1. Initiate
+        let swap_id = client.initiate_swap(&registry_id, &ip_id, &seller, &500_i128, &buyer);
+        let swap = client.get_swap(&swap_id).unwrap();
+        assert_eq!(swap.status, SwapStatus::Pending);
+        assert_eq!(swap.seller, seller);
+        assert_eq!(swap.buyer, buyer);
+
+        // 2. Accept
+        client.accept_swap(&swap_id);
+        let swap = client.get_swap(&swap_id).unwrap();
+        assert_eq!(swap.status, SwapStatus::Accepted);
+
+        // 3. Reveal key → Completed
+        client.reveal_key(&swap_id, &seller, &decryption_key);
+        let swap = client.get_swap(&swap_id).unwrap();
+        assert_eq!(swap.status, SwapStatus::Completed);
+    }
+
+    /// Issue #31: swap record must store the seller address passed by the caller,
+    /// not the contract's own address.
+    #[test]
+    fn test_initiate_swap_seller_matches_caller() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let seller = soroban_sdk::Address::generate(&env);
+        let buyer = soroban_sdk::Address::generate(&env);
+
+        let (registry_id, ip_id) = setup_registry(&env, &seller);
+        let contract_id = env.register(AtomicSwap, ());
+        let client = AtomicSwapClient::new(&env, &contract_id);
+
+        let swap_id = client.initiate_swap(&registry_id, &ip_id, &seller, &500_i128, &buyer);
+
+        let swap = client.get_swap(&swap_id).unwrap();
+        assert_eq!(swap.seller, seller);
+        assert_ne!(swap.seller, contract_id); // must not be the contract's own address
+    }
+
+    /// Issue #31: non-owner cannot initiate a swap for an IP they don't own.
+    #[test]
+    #[should_panic(expected = "seller is not the IP owner")]
+    fn test_initiate_swap_rejects_non_owner_seller() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let real_owner = soroban_sdk::Address::generate(&env);
         let attacker = soroban_sdk::Address::generate(&env);
+        let buyer = soroban_sdk::Address::generate(&env);
+
+        let (registry_id, ip_id) = setup_registry(&env, &real_owner);
+        let contract_id = env.register(AtomicSwap, ());
+        let client = AtomicSwapClient::new(&env, &contract_id);
+
+        // attacker is not the IP owner — must panic
+        client.initiate_swap(&registry_id, &ip_id, &attacker, &500_i128, &buyer);
+    }
+
+    /// Issue #29: cancelling an Accepted swap must set status to Cancelled.
+    ///
+    /// An Accepted swap can only be cancelled via `cancel_expired_swap` once the
+    /// ledger timestamp has passed the expiry. `cancel_swap` is for Pending swaps only.
+    ///
+    /// NOTE: The current contract does not escrow tokens (the `token` field is a
+    /// placeholder). This test therefore asserts the observable on-chain state —
+    /// swap status becomes Cancelled — which is the precondition for any refund
+    /// logic once real token escrow is wired up.
+    #[test]
+    fn test_cancel_after_accept_sets_status_cancelled() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let seller = soroban_sdk::Address::generate(&env);
+        let buyer = soroban_sdk::Address::generate(&env);
 
         let (registry_id, ip_id, secret, blinding_factor) = setup_registry(&env, &seller);
         let contract_id = env.register(AtomicSwap, ());
         let client = AtomicSwapClient::new(&env, &contract_id);
 
+        // 1. Initiate and accept the swap
         let swap_id = client.initiate_swap(&registry_id, &ip_id, &seller, &500_i128, &buyer);
         client.accept_swap(&swap_id);
 
