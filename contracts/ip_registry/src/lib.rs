@@ -1,5 +1,7 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Vec, Error};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Error, Vec,
+};
 
 #[cfg(test)]
 mod test;
@@ -70,8 +72,12 @@ impl IpRegistry {
             timestamp: env.ledger().timestamp(),
         };
 
-        env.storage().persistent().set(&DataKey::IpRecord(id), &record);
-        env.storage().persistent().extend_ttl(&DataKey::IpRecord(id), 50000, 50000);
+        env.storage()
+            .persistent()
+            .set(&DataKey::IpRecord(id), &record);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::IpRecord(id), 50000, 50000);
 
         // Append to owner index
         let mut ids: Vec<u64> = env
@@ -80,8 +86,12 @@ impl IpRegistry {
             .get(&DataKey::OwnerIps(owner.clone()))
             .unwrap_or(Vec::new(&env));
         ids.push_back(id);
-        env.storage().persistent().set(&DataKey::OwnerIps(owner.clone()), &ids);
-        env.storage().persistent().extend_ttl(&DataKey::OwnerIps(owner.clone()), 50000, 50000);
+        env.storage()
+            .persistent()
+            .set(&DataKey::OwnerIps(owner.clone()), &ids);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::OwnerIps(owner.clone()), 50000, 50000);
 
         env.storage().instance().set(&DataKey::NextId, &(id + 1));
 
@@ -130,12 +140,15 @@ impl IpRegistry {
             .set(&DataKey::OwnerIps(new_owner.clone()), &new_ids);
 
         // Update commitment index
-        env.storage()
-            .persistent()
-            .set(&DataKey::CommitmentOwner(record.commitment_hash.clone()), &new_owner);
+        env.storage().persistent().set(
+            &DataKey::CommitmentOwner(record.commitment_hash.clone()),
+            &new_owner,
+        );
 
         record.owner = new_owner;
-        env.storage().persistent().set(&DataKey::IpRecord(ip_id), &record);
+        env.storage()
+            .persistent()
+            .set(&DataKey::IpRecord(ip_id), &record);
     }
 
     /// Retrieve an IP record by ID.
@@ -143,9 +156,7 @@ impl IpRegistry {
         env.storage()
             .persistent()
             .get(&DataKey::IpRecord(ip_id))
-            .unwrap_or_else(|| {
-                env.panic_with_error(Error::from_contract_error(1))
-            })
+            .unwrap_or_else(|| env.panic_with_error(Error::from_contract_error(1)))
     }
 
     /// Verify a commitment: recompute sha256(secret || blinding_factor) and compare to stored hash.
@@ -159,9 +170,7 @@ impl IpRegistry {
             .storage()
             .persistent()
             .get(&DataKey::IpRecord(ip_id))
-            .unwrap_or_else(|| {
-                env.panic_with_error(Error::from_contract_error(1))
-            });
+            .unwrap_or_else(|| env.panic_with_error(Error::from_contract_error(1)));
         record.commitment_hash == secret
     }
 
@@ -177,7 +186,7 @@ impl IpRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, IntoVal, Env};
+    use soroban_sdk::{testutils::Address as _, Env, IntoVal};
 
     /// Bug Condition Exploration Test — Property 1
     ///
