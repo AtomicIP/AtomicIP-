@@ -1,5 +1,5 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, Vec, Error};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Vec, Error};
 
 #[cfg(test)]
 mod test;
@@ -96,7 +96,7 @@ impl IpRegistry {
             .unwrap_or(Vec::new(&env));
         ids.push_back(id);
         env.storage().persistent().set(&DataKey::OwnerIps(owner.clone()), &ids);
-        env.storage().persistent().extend_ttl(&DataKey::OwnerIps(owner), 50000, 50000);
+        env.storage().persistent().extend_ttl(&DataKey::OwnerIps(owner.clone()), 50000, 50000);
 
         env.storage().instance().set(&DataKey::NextId, &(id + 1));
 

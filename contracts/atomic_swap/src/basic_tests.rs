@@ -42,11 +42,14 @@ mod tests {
         let ip_id = 1;
         
         // Test that we can create SwapRecord struct
+        let token = Address::generate(&env);
         let swap = crate::SwapRecord {
             ip_id,
             seller: seller.clone(),
             buyer: buyer.clone(),
             price,
+            token,
+            expiry: 0,
             status: crate::SwapStatus::Pending,
         };
         
