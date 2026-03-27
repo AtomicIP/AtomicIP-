@@ -1,4 +1,4 @@
-use crate::{IpRecord, IpRegistry};
+use crate::IpRecord;
 use soroban_sdk::{Address, BytesN, Env, Vec};
 
 #[cfg(test)]
@@ -8,6 +8,7 @@ mod tests {
     use soroban_sdk::testutils::Address as TestAddress;
 
     #[contractclient(name = "IpRegistryClient")]
+    #[allow(dead_code)]
     pub trait IpRegistry {
         fn commit_ip(env: Env, owner: Address, commitment_hash: BytesN<32>) -> u64;
         fn get_ip(env: Env, ip_id: u64) -> IpRecord;
@@ -17,7 +18,7 @@ mod tests {
     #[test]
     fn test_commit_ip_sequential_ids() {
         let env = Env::default();
-        let contract_id = env.register_contract(None, IpRegistry);
+        let contract_id = env.register(crate::IpRegistry, ());
         let client = IpRegistryClient::new(&env, &contract_id);
 
         // Create test addresses using the test environment
