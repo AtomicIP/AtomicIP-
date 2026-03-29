@@ -1,6 +1,6 @@
 #![no_std]
 use ip_registry::IpRegistryClient;
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env, Error, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Bytes, Env, Error, Vec};
 
 // ── Error Codes ────────────────────────────────────────────────────────────
 
@@ -20,6 +20,12 @@ pub enum ContractError {
     OnlyTheBuyerCanCancelAnExpiredSwap = 12,
     SwapHasNotExpiredYet = 13,
     IpIsRevoked = 14,
+    UnauthorizedUpgrade = 15,
+    InvalidFeeBps = 16,
+    DisputeWindowExpired = 17,
+    OnlyBuyerCanDispute = 18,
+    SwapNotDisputed = 19,
+    OnlyAdminCanResolve = 20,
 }
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
@@ -36,6 +42,8 @@ pub enum DataKey {
     SellerSwaps(Address),
     /// Maps buyer address → Vec<u64> of all swap IDs they are party to.
     BuyerSwaps(Address),
+    Admin,
+    ProtocolConfig,
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -46,6 +54,7 @@ pub enum SwapStatus {
     Pending,
     Accepted,
     Completed,
+    Disputed,
     Cancelled,
 }
 
@@ -62,9 +71,29 @@ pub struct SwapRecord {
     /// Ledger timestamp after which the buyer may cancel an Accepted swap
     /// if reveal_key has not been called. Set at initiation time.
     pub expiry: u64,
+    pub accept_timestamp: u64,
 }
 
 // ── Events ────────────────────────────────────────────────────────────────────
+
+/// Payload published when a swap is successfully initiated.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SwapInitiatedEvent {
+    pub swap_id: u64,
+    pub ip_id: u64,
+    pub seller: Address,
+    pub buyer: Address,
+    pub price: i128,
+}
+
+/// Payload published when a swap is successfully accepted.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SwapAcceptedEvent {
+    pub swap_id: u64,
+    pub buyer: Address,
+}
 
 /// Payload published when a swap is successfully cancelled.
 #[contracttype]
@@ -79,7 +108,36 @@ pub struct SwapCancelledEvent {
 #[derive(Clone, Debug, PartialEq)]
 pub struct KeyRevealedEvent {
     pub swap_id: u64,
-    pub decryption_key: BytesN<32>,
+}
+
+/// Payload published when protocol fee is deducted on swap completion.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProtocolFeeEvent {
+    pub swap_id: u64,
+    pub fee_amount: i128,
+    pub treasury: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DisputeRaisedEvent {
+    pub swap_id: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DisputeResolvedEvent {
+    pub swap_id: u64,
+    pub refunded: bool,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct ProtocolConfig {
+    pub protocol_fee_bps: u32,  // 0-10000 (0.00% - 100.00%)
+    pub treasury: Address,
+    pub dispute_window_seconds: u64,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -126,7 +184,26 @@ impl AtomicSwap {
         price: i128,
         buyer: Address,
     ) -> u64 {
+        // Guard: reject new swaps when the contract is paused.
+        if env
+            .storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::ContractPaused as u32,
+            ));
+        }
+
         seller.require_auth();
+
+        // Initialize admin on first call if not set
+        if !env.storage().persistent().has(&DataKey::Admin) {
+            let admin = env.deployer();
+            env.storage().persistent().set(&DataKey::Admin, &admin);
+            env.storage().persistent().extend_ttl(&DataKey::Admin, 50000, 50000);
+        }
 
         // 2. Guard: price must be positive.
         if price <= 0 {
@@ -158,7 +235,7 @@ impl AtomicSwap {
             ));
         }
 
-        let id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(0);
+        let id: u64 = env.storage().persistent().get(&DataKey::NextId).unwrap_or(0);
 
         let swap = SwapRecord {
             ip_id,
@@ -169,7 +246,9 @@ impl AtomicSwap {
             token,
             status: SwapStatus::Pending,
             expiry: env.ledger().timestamp() + 604800u64,
+            accept_timestamp: 0,
         };
+
 
         env.storage().persistent().set(&DataKey::Swap(id), &swap);
         env.storage()
@@ -207,7 +286,33 @@ impl AtomicSwap {
             .persistent()
             .extend_ttl(&DataKey::BuyerSwaps(swap.buyer.clone()), 50000, 50000);
 
+        // Append to ip-swaps index
+        let mut ip_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IpSwaps(ip_id))
+            .unwrap_or(Vec::new(&env));
+        ip_ids.push_back(id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::IpSwaps(ip_id), &ip_ids);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::IpSwaps(ip_id), 50000, 50000);
+
         env.storage().instance().set(&DataKey::NextId, &(id + 1));
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("swap_init"),),
+            SwapInitiatedEvent {
+                swap_id: id,
+                ip_id,
+                seller,
+                buyer,
+                price,
+            },
+        );
+
         id
     }
 
@@ -232,6 +337,18 @@ impl AtomicSwap {
     /// * The buyer does not authorize the transaction (auth error)
     /// * The swap is not in Pending status (swap_not_pending error)
     pub fn accept_swap(env: Env, swap_id: u64) {
+        // Guard: reject new acceptances when the contract is paused.
+        if env
+            .storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::ContractPaused as u32,
+            ));
+        }
+
         let mut swap: SwapRecord = env
             .storage()
             .persistent()
@@ -258,13 +375,23 @@ impl AtomicSwap {
             &swap.price,
         );
 
+        swap.accept_timestamp = env.ledger().timestamp();
         swap.status = SwapStatus::Accepted;
+
         env.storage()
             .persistent()
             .set(&DataKey::Swap(swap_id), &swap);
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::Swap(swap_id), 50000, 50000);
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("swap_acpt"),),
+            SwapAcceptedEvent {
+                swap_id,
+                buyer: swap.buyer,
+            },
+        );
     }
 
     /// Seller reveals the decryption key; payment releases only if the key is valid.
@@ -342,19 +469,41 @@ impl AtomicSwap {
             .persistent()
             .extend_ttl(&DataKey::Swap(swap_id), 50000, 50000);
 
-        // Transfer escrowed payment to seller (Issue #34)
-        token::Client::new(&env, &swap.token).transfer(
-            &env.current_contract_address(),
-            &swap.seller,
-            &swap.price,
-        );
+        // Protocol fee deduction
+        let token_client = token::Client::new(&env, &swap.token);
+        let config: ProtocolConfig = if env.storage().persistent().has(&DataKey::ProtocolConfig) {
+            env.storage().persistent().get(&DataKey::ProtocolConfig).unwrap()
+        } else {
+            ProtocolConfig {
+                protocol_fee_bps: 0,
+                treasury: env.deployer(),
+                dispute_window_seconds: 86400u64,
+            }
+        };
+        let fee_bps = config.protocol_fee_bps as i128;
+        let fee_amount = if fee_bps > 0 && swap.price > 0 {
+            ((swap.price * fee_bps) / 10000)
+        } else {
+            0
+        };
+        let seller_amount = swap.price - fee_amount;
+        if fee_amount > 0 {
+            token_client.transfer(&env.current_contract_address(), &config.treasury, &fee_amount);
+            env.events().publish(
+                (soroban_sdk::symbol_short!("protocol_fee"),),
+                ProtocolFeeEvent {
+                    swap_id,
+                    fee_amount,
+                    treasury: config.treasury.clone(),
+                },
+            );
+        }
+        // Transfer net payment to seller
+        token_client.transfer(&env.current_contract_address(), &swap.seller, &seller_amount);
 
         env.events().publish(
             (soroban_sdk::symbol_short!("key_rev"),),
-            KeyRevealedEvent {
-                swap_id,
-                decryption_key: secret,
-            },
+            KeyRevealedEvent { swap_id },
         );
     }
 
@@ -480,10 +629,17 @@ impl AtomicSwap {
             &swap.buyer,
             &swap.price,
         );
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("swap_cancel"),),
+            SwapCancelledEvent {
+                swap_id,
+                canceller: caller,
+            },
+        );
     }
 
-    /// List all swap IDs initiated by a seller. Returns `None` if the seller has no swaps.
-    pub fn get_swaps_by_seller(env: Env, seller: Address) -> Option<Vec<u64>> {
+    /// Admin-only contract upgrade.\n    ///\n    /// # Panics\n    ///\n    /// Panics if caller is not admin or admin not initialized.\n    pub fn upgrade(env: Env, new_wasm_hash: Bytes) {\n        let admin_opt = env.storage().persistent().get(&DataKey::Admin);\n        if admin_opt.is_none() {\n            env.panic_with_error(Error::from_contract_error(ContractError::UnauthorizedUpgrade as u32));\n        }\n        let admin = admin_opt.unwrap();\n        let invoker = env.invoker();\n        if invoker != admin {\n            env.panic_with_error(Error::from_contract_error(ContractError::UnauthorizedUpgrade as u32));\n        }\n        admin.require_auth();\n        env.deployer().update_current_contract_wasm(new_wasm_hash);\n    }\n\n    /// List all swap IDs initiated by a seller. Returns `None` if the seller has no swaps.\n    pub fn get_swaps_by_seller(env: Env, seller: Address) -> Option<Vec<u64>> {
         env.storage()
             .persistent()
             .get(&DataKey::SellerSwaps(seller))
@@ -494,6 +650,70 @@ impl AtomicSwap {
         env.storage()
             .persistent()
             .get(&DataKey::BuyerSwaps(buyer))
+    }
+
+    /// List all swap IDs ever created for a given IP. Returns `None` if none exist.
+    pub fn get_swaps_by_ip(env: Env, ip_id: u64) -> Option<Vec<u64>> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::IpSwaps(ip_id))
+    }
+
+    /// Set the admin address. Can only be called once (bootstraps the admin).
+    /// After the admin is set, only the current admin can call pause/unpause.
+    pub fn set_admin(env: Env, new_admin: Address) {
+        new_admin.require_auth();
+        if env.storage().instance().has(&DataKey::Admin) {
+            // Only the existing admin may rotate the admin key.
+            let current: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+            if current != new_admin {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::Unauthorized as u32,
+                ));
+            }
+        }
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+    }
+
+    /// Pause the contract. Only the admin may call this.
+    /// Blocks initiate_swap and accept_swap; cancel_swap and reveal_key remain available.
+    pub fn pause(env: Env, caller: Address) {
+        caller.require_auth();
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::Unauthorized as u32,
+                ))
+            });
+        if caller != admin {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::Unauthorized as u32,
+            ));
+        }
+        env.storage().instance().set(&DataKey::Paused, &true);
+    }
+
+    /// Unpause the contract. Only the admin may call this.
+    pub fn unpause(env: Env, caller: Address) {
+        caller.require_auth();
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::Unauthorized as u32,
+                ))
+            });
+        if caller != admin {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::Unauthorized as u32,
+            ));
+        }
+        env.storage().instance().set(&DataKey::Paused, &false);
     }
 
     /// Read a swap record. Returns `None` if the swap_id does not exist.
@@ -1066,6 +1286,78 @@ mod tests {
         assert_eq!(a_ids.get(0).unwrap(), swap_a);
         assert_eq!(b_ids.len(), 1);
         assert_eq!(b_ids.get(0).unwrap(), swap_b);
+    }
+
+    #[test]
+    fn initiate_swap_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (registry_id, ip_id) = setup_registry_with_ip(&env, &seller);
+        let token_id = setup_token(&env, &admin, &buyer, 1000);
+
+        let client = AtomicSwapClient::new(&env, &setup_swap(&env));
+        let swap_id = client.initiate_swap(&registry_id, &token_id, &ip_id, &seller, &100_i128, &buyer);
+
+        let events = env.events().all();
+        let event = events.last().unwrap();
+        assert_eq!(event.0.get_unchecked(0), soroban_sdk::symbol_short!("swap_init"));
+    }
+
+    #[test]
+    fn accept_swap_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (registry_id, ip_id) = setup_registry_with_ip(&env, &seller);
+        let token_id = setup_token(&env, &admin, &buyer, 1000);
+
+        let client = AtomicSwapClient::new(&env, &setup_swap(&env));
+        let swap_id = client.initiate_swap(&registry_id, &token_id, &ip_id, &seller, &100_i128, &buyer);
+        client.accept_swap(&swap_id);
+
+        let events = env.events().all();
+        let event = events.last().unwrap();
+        assert_eq!(event.0.get_unchecked(0), soroban_sdk::symbol_short!("swap_acpt"));
+    }
+
+    #[test]
+    fn reveal_key_emits_event_without_secret() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let admin = Address::generate(&env);
+
+        let secret = BytesN::from_array(&env, &[7u8; 32]);
+        let blinding_factor = BytesN::from_array(&env, &[8u8; 32]);
+        let mut preimage = soroban_sdk::Bytes::new(&env);
+        preimage.append(&soroban_sdk::Bytes::from(secret.clone()));
+        preimage.append(&soroban_sdk::Bytes::from(blinding_factor.clone()));
+        let commitment_hash: BytesN<32> = env.crypto().sha256(&preimage).into();
+
+        let registry_id = env.register(IpRegistry, ());
+        let registry = IpRegistryClient::new(&env, &registry_id);
+        let ip_id = registry.commit_ip(&seller, &commitment_hash);
+
+        let token_id = setup_token(&env, &admin, &buyer, 1000);
+        let swap_contract = setup_swap(&env);
+        let client = AtomicSwapClient::new(&env, &swap_contract);
+
+        let swap_id = client.initiate_swap(&registry_id, &token_id, &ip_id, &seller, &1000_i128, &buyer);
+        client.accept_swap(&swap_id);
+        client.reveal_key(&swap_id, &seller, &secret, &blinding_factor);
+
+        let events = env.events().all();
+        let event = events.last().unwrap();
+        assert_eq!(event.0.get_unchecked(0), soroban_sdk::symbol_short!("key_rev"));
     }
 }
 

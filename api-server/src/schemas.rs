@@ -15,6 +15,8 @@ pub struct IpRecord {
     pub owner: String,
     pub commitment_hash: String,
     pub timestamp: u64,
+    /// Whether the IP record has been revoked
+    pub revoked: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -40,7 +42,7 @@ pub struct VerifyCommitmentResponse {
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ListIpByOwnerResponse {
-    pub ip_ids: Option<Vec<u64>>,
+    pub ip_ids: Vec<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -55,6 +57,7 @@ pub enum SwapStatus {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct SwapRecord {
     pub ip_id: u64,
+    pub ip_registry_id: String,
     pub seller: String,
     pub buyer: String,
     /// Price in stroops (1 XLM = 10_000_000 stroops)
@@ -72,6 +75,8 @@ pub struct InitiateSwapRequest {
     pub seller: String,
     pub price: i128,
     pub buyer: String,
+    /// Stellar asset contract address for the payment token
+    pub token: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -82,8 +87,10 @@ pub struct AcceptSwapRequest {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct RevealKeyRequest {
     pub caller: String,
-    /// 32-byte decryption key, hex-encoded
-    pub decryption_key: String,
+    /// 32-byte secret, hex-encoded
+    pub secret: String,
+    /// 32-byte blinding factor, hex-encoded
+    pub blinding_factor: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
