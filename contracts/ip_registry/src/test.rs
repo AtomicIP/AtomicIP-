@@ -11,7 +11,7 @@ mod tests {
         fn commit_ip(env: Env, owner: Address, commitment_hash: BytesN<32>) -> u64;
         fn get_ip(env: Env, ip_id: u64) -> IpRecord;
         fn verify_commitment(env: Env, ip_id: u64, secret: BytesN<32>, blinding_factor: BytesN<32>) -> bool;
-        fn list_ip_by_owner(env: Env, owner: Address) -> Option<Vec<u64>>;
+        fn list_ip_by_owner(env: Env, owner: Address) -> Vec<u64>;
         fn transfer_ip(env: Env, ip_id: u64, new_owner: Address);
         fn revoke_ip(env: Env, ip_id: u64);
     }
@@ -144,11 +144,11 @@ mod tests {
         assert_eq!(record.owner, bob);
 
         // Old owner index no longer contains ip_id
-        let alice_ips = client.list_ip_by_owner(&alice).unwrap_or(Vec::new(&env));
+        let alice_ips = client.list_ip_by_owner(&alice);
         assert!(!alice_ips.iter().any(|x| x == ip_id));
 
         // New owner index contains ip_id
-        let bob_ips = client.list_ip_by_owner(&bob).expect("bob should have IPs");
+        let bob_ips = client.list_ip_by_owner(&bob);
         assert!(bob_ips.iter().any(|x| x == ip_id));
     }
 
@@ -192,7 +192,7 @@ mod tests {
     }
 
     #[test]
-    fn test_list_ip_by_owner_unknown_returns_none() {
+    fn test_list_ip_by_owner_unknown_returns_empty() {
         let env = Env::default();
         let contract_id = env.register(crate::IpRegistry, ());
         let client = IpRegistryClient::new(&env, &contract_id);
@@ -205,13 +205,11 @@ mod tests {
         let commitment = BytesN::from_array(&env, &[1u8; 32]);
         let ip_id = client.commit_ip(&owner, &commitment);
 
-        // Unknown owner returns None; known owner returns Some(Vec).
+        // Unknown owner returns empty Vec; known owner returns Vec with IPs.
         let unknown_ips = client.list_ip_by_owner(&unknown_owner);
-        assert_eq!(unknown_ips, None);
+        assert_eq!(unknown_ips.len(), 0);
 
-        let owner_ips = client
-            .list_ip_by_owner(&owner)
-            .expect("owner should have committed IPs");
+        let owner_ips = client.list_ip_by_owner(&owner);
         assert_eq!(owner_ips.len(), 1);
         assert_eq!(owner_ips.get(0).unwrap(), ip_id);
     }
@@ -305,7 +303,7 @@ mod tests {
         let id1 = client.commit_ip(&owner, &BytesN::from_array(&env, &[5u8; 32]));
         let id2 = client.commit_ip(&owner, &BytesN::from_array(&env, &[6u8; 32]));
 
-        let ids = client.list_ip_by_owner(&owner).expect("owner should have IPs");
+        let ids = client.list_ip_by_owner(&owner);
         assert_eq!(ids.len(), 3);
         assert_eq!(ids.get(0).unwrap(), id0);
         assert_eq!(ids.get(1).unwrap(), id1);
