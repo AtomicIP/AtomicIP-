@@ -2,7 +2,7 @@
 mod tests {
     use crate::IpRecord;
     use soroban_sdk::contractclient;
-    use soroban_sdk::testutils::Address as TestAddress;
+    use soroban_sdk::testutils::{Address as TestAddress, Events};
     use soroban_sdk::{symbol_short, Address, BytesN, Env, IntoVal, TryFromVal, Vec};
 
     #[contractclient(name = "IpRegistryClient")]
@@ -14,6 +14,7 @@ mod tests {
         fn list_ip_by_owner(env: Env, owner: Address) -> Option<Vec<u64>>;
         fn transfer_ip(env: Env, ip_id: u64, new_owner: Address);
         fn revoke_ip(env: Env, ip_id: u64);
+        fn ip_count(env: Env) -> u64;
     }
 
     #[test]
@@ -57,8 +58,8 @@ mod tests {
         assert_eq!(record3.commitment_hash, commitment3);
 
         // Verify owner index is correct
-        let owner1_ips = client.list_ip_by_owner(&owner1);
-        let owner2_ips = client.list_ip_by_owner(&owner2);
+        let owner1_ips = client.list_ip_by_owner(&owner1).expect("owner1 should have IPs");
+        let owner2_ips = client.list_ip_by_owner(&owner2).expect("owner2 should have IPs");
 
         assert_eq!(owner1_ips.len(), 2);
         assert_eq!(owner2_ips.len(), 1);
@@ -81,25 +82,25 @@ mod tests {
         // Call commit_ip which should emit an event
         let ip_id = client.commit_ip(&owner, &commitment);
 
-        // Verify the event payload and topic.
-        let record = client.get_ip(&ip_id);
-
+        // Check events immediately after commit_ip, before any other calls.
         let all_events = env.events().all();
         assert_eq!(all_events.len(), 1);
         let event = all_events.get(0).unwrap();
         let expected_topics = (symbol_short!("ip_commit"), owner.clone()).into_val(&env);
-        let expected_data = (ip_id, record.timestamp);
         assert_eq!(event.1, expected_topics);
         let observed_data: (u64, u64) = TryFromVal::try_from_val(&env, &event.2).unwrap();
-        assert_eq!(observed_data, expected_data);
+        assert_eq!(observed_data.0, ip_id);
 
+        // Verify the record separately.
+        let record = client.get_ip(&ip_id);
         assert_eq!(record.owner, owner);
         assert_eq!(record.commitment_hash, commitment);
         assert_eq!(record.ip_id, ip_id);
+        assert_eq!(observed_data.1, record.timestamp);
     }
 
     #[test]
-    #[should_panic(expected = "ContractError(2)")]
+    #[should_panic(expected = "Error(Contract, #2)")]
     fn test_commit_ip_zero_hash_rejected() {
         let env = Env::default();
         let contract_id = env.register(crate::IpRegistry, ());
@@ -114,7 +115,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "ContractError(1)")]
+    #[should_panic(expected = "Error(Contract, #1)")]
     fn test_get_ip_nonexistent_returns_structured_error() {
         let env = Env::default();
         let contract_id = env.register(crate::IpRegistry, ());
@@ -180,7 +181,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "ContractError(1)")]
+    #[should_panic(expected = "Error(Contract, #1)")]
     fn test_transfer_ip_nonexistent_panics() {
         let env = Env::default();
         let contract_id = env.register(crate::IpRegistry, ());
@@ -234,7 +235,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "ContractError(4)")]
+    #[should_panic(expected = "Error(Contract, #4)")]
     fn test_revoke_ip_twice_panics() {
         let env = Env::default();
         let contract_id = env.register(crate::IpRegistry, ());
@@ -335,5 +336,20 @@ mod tests {
             },
         }]);
         client.revoke_ip(&ip_id);
+    }
+
+    #[test]
+    fn test_ip_count_reflects_total_commits() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = <Address as TestAddress>::generate(&env);
+
+        assert_eq!(client.ip_count(), 0);
+        client.commit_ip(&owner, &BytesN::from_array(&env, &[1u8; 32]));
+        assert_eq!(client.ip_count(), 1);
+        client.commit_ip(&owner, &BytesN::from_array(&env, &[2u8; 32]));
+        assert_eq!(client.ip_count(), 2);
     }
 }

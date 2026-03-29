@@ -1,85 +1,119 @@
 #[cfg(test)]
 mod tests {
-    use soroban_sdk::{BytesN, Env, Address};
-    use soroban_sdk::testutils::Address as _;
-    use crate::AtomicSwap;
+    use ip_registry::{IpRegistry, IpRegistryClient};
+    use soroban_sdk::{
+        testutils::Address as _,
+        token::StellarAssetClient,
+        Address, BytesN, Env,
+    };
 
-    #[test]
-    fn test_ttl_extension_after_swap_initiation() {
-        let env = Env::default();
-        
-        let ip_id = 1;
-        let price = 1000;
-        let buyer = Address::generate(&env);
+    use crate::{AtomicSwap, AtomicSwapClient, SwapStatus};
 
-        // Test that we can initiate a swap (this includes TTL extension)
-        let swap_id = AtomicSwap::initiate_swap(env.clone(), ip_id, price, buyer.clone());
-        
-        // Verify the swap exists and is accessible
-        let swap = AtomicSwap::get_swap(env.clone(), swap_id);
-        assert_eq!(swap.ip_id, ip_id);
-        assert_eq!(swap.price, price);
-        assert_eq!(swap.buyer, buyer);
-        assert_eq!(swap.status, crate::SwapStatus::Pending);
+    fn setup_registry(env: &Env, owner: &Address) -> (Address, u64, BytesN<32>, BytesN<32>) {
+        let registry_id = env.register(IpRegistry, ());
+        let registry = IpRegistryClient::new(env, &registry_id);
+
+        let secret = BytesN::from_array(env, &[2u8; 32]);
+        let blinding = BytesN::from_array(env, &[3u8; 32]);
+
+        let mut preimage = soroban_sdk::Bytes::new(env);
+        preimage.append(&soroban_sdk::Bytes::from(secret.clone()));
+        preimage.append(&soroban_sdk::Bytes::from(blinding.clone()));
+        let commitment_hash: BytesN<32> = env.crypto().sha256(&preimage).into();
+
+        let ip_id = registry.commit_ip(owner, &commitment_hash);
+        (registry_id, ip_id, secret, blinding)
+    }
+
+    fn setup_token(env: &Env, admin: &Address, recipient: &Address, amount: i128) -> Address {
+        let token_id = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        StellarAssetClient::new(env, &token_id).mint(recipient, &amount);
+        token_id
     }
 
     #[test]
     fn test_swap_lifecycle() {
         let env = Env::default();
-        
-        let ip_id = 1;
-        let price = 1000;
+        env.mock_all_auths();
+
         let seller = Address::generate(&env);
         let buyer = Address::generate(&env);
-        let decryption_key = BytesN::from_array(&env, &[0; 32]);
+        let admin = Address::generate(&env);
+        let (registry_id, ip_id, secret, blinding) = setup_registry(&env, &seller);
+        let token_id = setup_token(&env, &admin, &buyer, 1000);
 
-        // Complete swap lifecycle
-        let swap_id = AtomicSwap::initiate_swap(env.clone(), ip_id, price, buyer.clone());
-        
-        // Accept swap
-        super::AtomicSwap::accept_swap(env.clone(), swap_id);
-        let swap = AtomicSwap::get_swap(env.clone(), swap_id);
-        assert_eq!(swap.status, crate::SwapStatus::Accepted);
-        
-        // Complete swap — caller must be the seller
-        super::AtomicSwap::reveal_key(env.clone(), swap_id, seller.clone(), decryption_key.clone(), decryption_key);
-        let swap = AtomicSwap::get_swap(env.clone(), swap_id);
-        assert_eq!(swap.status, crate::SwapStatus::Completed);
+        let client = AtomicSwapClient::new(&env, &env.register(AtomicSwap, ()));
+
+        let swap_id = client.initiate_swap(&registry_id, &token_id, &ip_id, &seller, &1000_i128, &buyer);
+        assert_eq!(client.get_swap(&swap_id).unwrap().status, SwapStatus::Pending);
+
+        client.accept_swap(&swap_id);
+        assert_eq!(client.get_swap(&swap_id).unwrap().status, SwapStatus::Accepted);
+
+        client.reveal_key(&swap_id, &seller, &secret, &blinding);
+        assert_eq!(client.get_swap(&swap_id).unwrap().status, SwapStatus::Completed);
     }
 
     #[test]
     fn test_swap_cancellation() {
         let env = Env::default();
-        
-        let ip_id = 1;
-        let price = 1000;
-        let buyer = Address::generate(&env);
+        env.mock_all_auths();
 
-        // Initiate and cancel swap
-        let swap_id = AtomicSwap::initiate_swap(env.clone(), ip_id, price, buyer);
-        super::AtomicSwap::cancel_swap(env.clone(), swap_id);
-        
-        // Verify swap is cancelled
-        let swap = AtomicSwap::get_swap(env.clone(), swap_id);
-        assert_eq!(swap.status, crate::SwapStatus::Cancelled);
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (registry_id, ip_id, _, _) = setup_registry(&env, &seller);
+        let token_id = setup_token(&env, &admin, &buyer, 1000);
+
+        let client = AtomicSwapClient::new(&env, &env.register(AtomicSwap, ()));
+
+        let swap_id = client.initiate_swap(&registry_id, &token_id, &ip_id, &seller, &500_i128, &buyer);
+        client.cancel_swap(&swap_id, &seller);
+
+        assert_eq!(client.get_swap(&swap_id).unwrap().status, SwapStatus::Cancelled);
     }
 
     #[test]
     fn test_multiple_swaps() {
         let env = Env::default();
-        
-        let buyer = Address::generate(&env);
+        env.mock_all_auths();
 
-        // Create multiple swaps
-        let swap_id1 = AtomicSwap::initiate_swap(env.clone(), 1, 1000, buyer.clone());
-        let swap_id2 = AtomicSwap::initiate_swap(env.clone(), 2, 2000, buyer.clone());
-        
-        // Verify both swaps exist
-        let swap1 = AtomicSwap::get_swap(env.clone(), swap_id1);
-        let swap2 = AtomicSwap::get_swap(env.clone(), swap_id2);
-        assert_eq!(swap1.ip_id, 1);
-        assert_eq!(swap2.ip_id, 2);
-        assert_eq!(swap1.buyer, buyer);
-        assert_eq!(swap2.buyer, buyer);
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let admin = Address::generate(&env);
+
+        let registry_id = env.register(IpRegistry, ());
+        let registry = IpRegistryClient::new(&env, &registry_id);
+        let ip_id_0 = registry.commit_ip(&seller, &BytesN::from_array(&env, &[10u8; 32]));
+        let ip_id_1 = registry.commit_ip(&seller, &BytesN::from_array(&env, &[11u8; 32]));
+
+        let token_id = setup_token(&env, &admin, &buyer, 2000);
+        let client = AtomicSwapClient::new(&env, &env.register(AtomicSwap, ()));
+
+        let swap_id_0 = client.initiate_swap(&registry_id, &token_id, &ip_id_0, &seller, &1000_i128, &buyer);
+        let swap_id_1 = client.initiate_swap(&registry_id, &token_id, &ip_id_1, &seller, &1000_i128, &buyer);
+
+        assert_eq!(client.get_swap(&swap_id_0).unwrap().ip_id, ip_id_0);
+        assert_eq!(client.get_swap(&swap_id_1).unwrap().ip_id, ip_id_1);
+        assert_ne!(swap_id_0, swap_id_1);
+    }
+
+    #[test]
+    fn test_ttl_extension_after_swap_initiation() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (registry_id, ip_id, _, _) = setup_registry(&env, &seller);
+        let token_id = setup_token(&env, &admin, &buyer, 1000);
+
+        let client = AtomicSwapClient::new(&env, &env.register(AtomicSwap, ()));
+        let swap_id = client.initiate_swap(&registry_id, &token_id, &ip_id, &seller, &500_i128, &buyer);
+
+        assert_eq!(client.get_swap(&swap_id).unwrap().status, SwapStatus::Pending);
     }
 }

@@ -272,6 +272,11 @@ impl IpRegistry {
     /// # Panics
     ///
     /// Panics if the IP record does not exist (IpNotFound error).
+    /// Returns the total number of IP commitments ever registered.
+    pub fn ip_count(env: Env) -> u64 {
+        env.storage().persistent().get(&DataKey::NextId).unwrap_or(0)
+    }
+
     pub fn get_ip(env: Env, ip_id: u64) -> IpRecord {
         env.storage()
             .persistent()
