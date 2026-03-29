@@ -354,7 +354,7 @@ impl IpRegistry {
     /// List all IP IDs owned by an address.
     ///
     /// Returns a vector of all IP IDs owned by the specified address.
-    /// Returns `None` if the address has never committed any IP.
+    /// Returns an empty vector if the address has never committed any IP.
     ///
     /// # Arguments
     ///
@@ -363,14 +363,17 @@ impl IpRegistry {
     ///
     /// # Returns
     ///
-    /// `Some(Vec<u64>)` containing all IP IDs owned by the address,
-    /// or `None` if the address has no IP records.
+    /// `Vec<u64>` containing all IP IDs owned by the address,
+    /// or an empty vector if the address has no IP records.
     ///
     /// # Panics
     ///
     /// This function does not panic.
-    pub fn list_ip_by_owner(env: Env, owner: Address) -> Option<Vec<u64>> {
-        env.storage().persistent().get(&DataKey::OwnerIps(owner))
+    pub fn list_ip_by_owner(env: Env, owner: Address) -> Vec<u64> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::OwnerIps(owner))
+            .unwrap_or(Vec::new(&env))
     }
 
     /// Check if an address owns a specific IP.

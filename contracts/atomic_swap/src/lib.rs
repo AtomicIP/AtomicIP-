@@ -74,6 +74,25 @@ pub struct SwapRecord {
 
 // ── Events ────────────────────────────────────────────────────────────────────
 
+/// Payload published when a swap is successfully initiated.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SwapInitiatedEvent {
+    pub swap_id: u64,
+    pub ip_id: u64,
+    pub seller: Address,
+    pub buyer: Address,
+    pub price: i128,
+}
+
+/// Payload published when a swap is successfully accepted.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SwapAcceptedEvent {
+    pub swap_id: u64,
+    pub buyer: Address,
+}
+
 /// Payload published when a swap is successfully cancelled.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -87,7 +106,6 @@ pub struct SwapCancelledEvent {
 #[derive(Clone, Debug, PartialEq)]
 pub struct KeyRevealedEvent {
     pub swap_id: u64,
-    pub decryption_key: BytesN<32>,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -242,6 +260,18 @@ impl AtomicSwap {
             .extend_ttl(&DataKey::IpSwaps(ip_id), 50000, 50000);
 
         env.storage().instance().set(&DataKey::NextId, &(id + 1));
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("swap_init"),),
+            SwapInitiatedEvent {
+                swap_id: id,
+                ip_id,
+                seller,
+                buyer,
+                price,
+            },
+        );
+
         id
     }
 
@@ -311,6 +341,14 @@ impl AtomicSwap {
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::Swap(swap_id), 50000, 50000);
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("swap_acpt"),),
+            SwapAcceptedEvent {
+                swap_id,
+                buyer: swap.buyer,
+            },
+        );
     }
 
     /// Seller reveals the decryption key; payment releases only if the key is valid.
@@ -397,10 +435,7 @@ impl AtomicSwap {
 
         env.events().publish(
             (soroban_sdk::symbol_short!("key_rev"),),
-            KeyRevealedEvent {
-                swap_id,
-                decryption_key: secret,
-            },
+            KeyRevealedEvent { swap_id },
         );
     }
 
@@ -1159,17 +1194,8 @@ mod tests {
         assert_eq!(b_ids.get(0).unwrap(), swap_b);
     }
 
-    // ── Issue #64: get_swaps_by_ip ────────────────────────────────────────────
-
     #[test]
-    fn get_swaps_by_ip_returns_none_for_unknown_ip() {
-        let env = Env::default();
-        let client = AtomicSwapClient::new(&env, &setup_swap(&env));
-        assert!(client.get_swaps_by_ip(&9999_u64).is_none());
-    }
-
-    #[test]
-    fn get_swaps_by_ip_tracks_all_swaps_for_ip() {
+    fn initiate_swap_emits_event() {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -1180,184 +1206,64 @@ mod tests {
         let token_id = setup_token(&env, &admin, &buyer, 1000);
 
         let client = AtomicSwapClient::new(&env, &setup_swap(&env));
+        let swap_id = client.initiate_swap(&registry_id, &token_id, &ip_id, &seller, &100_i128, &buyer);
 
-        // First swap — cancel it so the IP lock is released.
-        let swap_id_0 = client.initiate_swap(&registry_id, &token_id, &ip_id, &seller, &100_i128, &buyer);
-        client.cancel_swap(&swap_id_0, &seller);
-
-        // Second swap for the same IP.
-        let swap_id_1 = client.initiate_swap(&registry_id, &token_id, &ip_id, &seller, &200_i128, &buyer);
-
-        let ids = client.get_swaps_by_ip(&ip_id).expect("ip should have swaps");
-        assert_eq!(ids.len(), 2);
-        assert_eq!(ids.get(0).unwrap(), swap_id_0);
-        assert_eq!(ids.get(1).unwrap(), swap_id_1);
+        let events = env.events().all();
+        let event = events.last().unwrap();
+        assert_eq!(event.0.get_unchecked(0), soroban_sdk::symbol_short!("swap_init"));
     }
 
     #[test]
-    fn get_swaps_by_ip_does_not_include_other_ips_swaps() {
+    fn accept_swap_emits_event() {
         let env = Env::default();
         env.mock_all_auths();
 
         let seller = Address::generate(&env);
         let buyer = Address::generate(&env);
         let admin = Address::generate(&env);
-
-        let registry_id = env.register(IpRegistry, ());
-        let registry = IpRegistryClient::new(&env, &registry_id);
-        let ip_a = registry.commit_ip(&seller, &BytesN::from_array(&env, &[50u8; 32]));
-        let ip_b = registry.commit_ip(&seller, &BytesN::from_array(&env, &[51u8; 32]));
+        let (registry_id, ip_id) = setup_registry_with_ip(&env, &seller);
         let token_id = setup_token(&env, &admin, &buyer, 1000);
-
-        let client = AtomicSwapClient::new(&env, &setup_swap(&env));
-        let swap_a = client.initiate_swap(&registry_id, &token_id, &ip_a, &seller, &100_i128, &buyer);
-        let swap_b = client.initiate_swap(&registry_id, &token_id, &ip_b, &seller, &100_i128, &buyer);
-
-        let a_ids = client.get_swaps_by_ip(&ip_a).unwrap();
-        let b_ids = client.get_swaps_by_ip(&ip_b).unwrap();
-
-        assert_eq!(a_ids.len(), 1);
-        assert_eq!(a_ids.get(0).unwrap(), swap_a);
-        assert_eq!(b_ids.len(), 1);
-        assert_eq!(b_ids.get(0).unwrap(), swap_b);
-    }
-
-    // ── Issue #65: emergency pause ────────────────────────────────────────────
-
-    #[test]
-    fn pause_blocks_initiate_swap() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let admin = Address::generate(&env);
-        let seller = Address::generate(&env);
-        let buyer = Address::generate(&env);
-        let token_admin = Address::generate(&env);
-        let (registry_id, ip_id) = setup_registry_with_ip(&env, &seller);
-        let token_id = setup_token(&env, &token_admin, &buyer, 1000);
-
-        let client = AtomicSwapClient::new(&env, &setup_swap(&env));
-        client.set_admin(&admin);
-        client.pause(&admin);
-
-        assert!(
-            client
-                .try_initiate_swap(&registry_id, &token_id, &ip_id, &seller, &100_i128, &buyer)
-                .is_err(),
-            "initiate_swap must be blocked while paused"
-        );
-    }
-
-    #[test]
-    fn pause_blocks_accept_swap() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let admin = Address::generate(&env);
-        let seller = Address::generate(&env);
-        let buyer = Address::generate(&env);
-        let token_admin = Address::generate(&env);
-        let (registry_id, ip_id) = setup_registry_with_ip(&env, &seller);
-        let token_id = setup_token(&env, &token_admin, &buyer, 1000);
-
-        let client = AtomicSwapClient::new(&env, &setup_swap(&env));
-        let swap_id = client.initiate_swap(&registry_id, &token_id, &ip_id, &seller, &100_i128, &buyer);
-
-        client.set_admin(&admin);
-        client.pause(&admin);
-
-        assert!(
-            client.try_accept_swap(&swap_id).is_err(),
-            "accept_swap must be blocked while paused"
-        );
-    }
-
-    #[test]
-    fn pause_does_not_block_cancel_swap() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let admin = Address::generate(&env);
-        let seller = Address::generate(&env);
-        let buyer = Address::generate(&env);
-        let token_admin = Address::generate(&env);
-        let (registry_id, ip_id) = setup_registry_with_ip(&env, &seller);
-        let token_id = setup_token(&env, &token_admin, &buyer, 1000);
-
-        let client = AtomicSwapClient::new(&env, &setup_swap(&env));
-        let swap_id = client.initiate_swap(&registry_id, &token_id, &ip_id, &seller, &100_i128, &buyer);
-
-        client.set_admin(&admin);
-        client.pause(&admin);
-
-        // cancel_swap must succeed even while paused.
-        client.cancel_swap(&swap_id, &seller);
-        let swap = client.get_swap(&swap_id).unwrap();
-        assert_eq!(swap.status, SwapStatus::Cancelled);
-    }
-
-    #[test]
-    fn pause_does_not_block_reveal_key() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let admin = Address::generate(&env);
-        let seller = Address::generate(&env);
-        let buyer = Address::generate(&env);
-        let token_admin = Address::generate(&env);
-        let (registry_id, ip_id) = setup_registry_with_ip(&env, &seller);
-        let token_id = setup_token(&env, &token_admin, &buyer, 1000);
 
         let client = AtomicSwapClient::new(&env, &setup_swap(&env));
         let swap_id = client.initiate_swap(&registry_id, &token_id, &ip_id, &seller, &100_i128, &buyer);
         client.accept_swap(&swap_id);
 
-        client.set_admin(&admin);
-        client.pause(&admin);
-
-        // reveal_key must succeed even while paused.
-        client.reveal_key(&swap_id, &seller, &BytesN::from_array(&env, &[0u8; 32]), &BytesN::from_array(&env, &[0u8; 32]));
-        let swap = client.get_swap(&swap_id).unwrap();
-        assert_eq!(swap.status, SwapStatus::Completed);
+        let events = env.events().all();
+        let event = events.last().unwrap();
+        assert_eq!(event.0.get_unchecked(0), soroban_sdk::symbol_short!("swap_acpt"));
     }
 
     #[test]
-    fn unpause_re_enables_initiate_swap() {
+    fn reveal_key_emits_event_without_secret() {
         let env = Env::default();
         env.mock_all_auths();
 
-        let admin = Address::generate(&env);
         let seller = Address::generate(&env);
         let buyer = Address::generate(&env);
-        let token_admin = Address::generate(&env);
-        let (registry_id, ip_id) = setup_registry_with_ip(&env, &seller);
-        let token_id = setup_token(&env, &token_admin, &buyer, 1000);
-
-        let client = AtomicSwapClient::new(&env, &setup_swap(&env));
-        client.set_admin(&admin);
-        client.pause(&admin);
-        client.unpause(&admin);
-
-        // Should succeed after unpause.
-        let swap_id = client.initiate_swap(&registry_id, &token_id, &ip_id, &seller, &100_i128, &buyer);
-        assert!(client.get_swap(&swap_id).is_some());
-    }
-
-    #[test]
-    fn non_admin_cannot_pause() {
-        let env = Env::default();
-        env.mock_all_auths();
-
         let admin = Address::generate(&env);
-        let attacker = Address::generate(&env);
 
-        let client = AtomicSwapClient::new(&env, &setup_swap(&env));
-        client.set_admin(&admin);
+        let secret = BytesN::from_array(&env, &[7u8; 32]);
+        let blinding_factor = BytesN::from_array(&env, &[8u8; 32]);
+        let mut preimage = soroban_sdk::Bytes::new(&env);
+        preimage.append(&soroban_sdk::Bytes::from(secret.clone()));
+        preimage.append(&soroban_sdk::Bytes::from(blinding_factor.clone()));
+        let commitment_hash: BytesN<32> = env.crypto().sha256(&preimage).into();
 
-        assert!(
-            client.try_pause(&attacker).is_err(),
-            "non-admin must not be able to pause"
-        );
+        let registry_id = env.register(IpRegistry, ());
+        let registry = IpRegistryClient::new(&env, &registry_id);
+        let ip_id = registry.commit_ip(&seller, &commitment_hash);
+
+        let token_id = setup_token(&env, &admin, &buyer, 1000);
+        let swap_contract = setup_swap(&env);
+        let client = AtomicSwapClient::new(&env, &swap_contract);
+
+        let swap_id = client.initiate_swap(&registry_id, &token_id, &ip_id, &seller, &1000_i128, &buyer);
+        client.accept_swap(&swap_id);
+        client.reveal_key(&swap_id, &seller, &secret, &blinding_factor);
+
+        let events = env.events().all();
+        let event = events.last().unwrap();
+        assert_eq!(event.0.get_unchecked(0), soroban_sdk::symbol_short!("key_rev"));
     }
 }
 

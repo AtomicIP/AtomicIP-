@@ -42,7 +42,7 @@ pub struct VerifyCommitmentResponse {
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ListIpByOwnerResponse {
-    pub ip_ids: Option<Vec<u64>>,
+    pub ip_ids: Vec<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
