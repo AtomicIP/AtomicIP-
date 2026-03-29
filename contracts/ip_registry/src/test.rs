@@ -3,6 +3,7 @@ mod tests {
     use crate::IpRecord;
     use soroban_sdk::contractclient;
     use soroban_sdk::testutils::Address as TestAddress;
+    use soroban_sdk::testutils::Events;
     use soroban_sdk::{symbol_short, Address, BytesN, Env, IntoVal, TryFromVal, Vec};
 
     #[contractclient(name = "IpRegistryClient")]
@@ -13,6 +14,7 @@ mod tests {
         fn list_ip_by_owner(env: Env, owner: Address) -> Option<Vec<u64>>;
         fn transfer_ip(env: Env, ip_id: u64, new_owner: Address);
         fn revoke_ip(env: Env, ip_id: u64);
+        fn is_ip_owner(env: Env, ip_id: u64, address: Address) -> bool;
     }
 
     #[test]
@@ -56,8 +58,8 @@ mod tests {
         assert_eq!(record3.commitment_hash, commitment3);
 
         // Verify owner index is correct
-        let owner1_ips = client.list_ip_by_owner(&owner1);
-        let owner2_ips = client.list_ip_by_owner(&owner2);
+        let owner1_ips = client.list_ip_by_owner(&owner1).unwrap();
+        let owner2_ips = client.list_ip_by_owner(&owner2).unwrap();
 
         assert_eq!(owner1_ips.len(), 2);
         assert_eq!(owner2_ips.len(), 1);
@@ -269,5 +271,28 @@ mod tests {
             },
         }]);
         client.revoke_ip(&ip_id);
+    }
+
+    #[test]
+    fn test_is_ip_owner() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let alice = <Address as TestAddress>::generate(&env);
+        let bob = <Address as TestAddress>::generate(&env);
+        let commitment = BytesN::from_array(&env, &[10u8; 32]);
+
+        env.mock_all_auths();
+        let ip_id = client.commit_ip(&alice, &commitment);
+
+        // Alice should be the owner
+        assert!(client.is_ip_owner(&ip_id, &alice));
+
+        // Bob should not be the owner
+        assert!(!client.is_ip_owner(&ip_id, &bob));
+
+        // Non-existent IP should return false
+        assert!(!client.is_ip_owner(&999u64, &alice));
     }
 }

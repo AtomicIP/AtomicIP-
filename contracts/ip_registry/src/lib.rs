@@ -351,6 +351,32 @@ impl IpRegistry {
     pub fn list_ip_by_owner(env: Env, owner: Address) -> Option<Vec<u64>> {
         env.storage().persistent().get(&DataKey::OwnerIps(owner))
     }
+
+    /// Check if an address owns a specific IP.
+    ///
+    /// Returns `true` if the given address is the owner of the IP with the given ID,
+    /// `false` otherwise. Returns `false` if the IP does not exist.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `ip_id` - The unique identifier of the IP to check
+    /// * `address` - The address to check for ownership
+    ///
+    /// # Returns
+    ///
+    /// `true` if the address owns the IP, `false` otherwise.
+    ///
+    /// # Panics
+    ///
+    /// This function does not panic.
+    pub fn is_ip_owner(env: Env, ip_id: u64, address: Address) -> bool {
+        if let Some(record) = env.storage().persistent().get::<DataKey, IpRecord>(&DataKey::IpRecord(ip_id)) {
+            record.owner == address
+        } else {
+            false
+        }
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
