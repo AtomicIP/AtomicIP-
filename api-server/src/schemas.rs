@@ -74,6 +74,8 @@ pub struct InitiateSwapRequest {
     pub seller: String,
     pub price: i128,
     pub buyer: String,
+    /// Stellar asset contract address for the payment token
+    pub token: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
