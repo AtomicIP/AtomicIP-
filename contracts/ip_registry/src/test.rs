@@ -12,10 +12,7 @@ mod tests {
         fn get_ip(env: Env, ip_id: u64) -> IpRecord;
         fn list_ip_by_owner(env: Env, owner: Address) -> Option<Vec<u64>>;
         fn transfer_ip(env: Env, ip_id: u64, new_owner: Address);
-        fn revoke_ip(env: Env, ip_id: u64);
-    }
-
-    #[test]
+        fn revoke_ip(env: Env, ip_id: u64);\n        fn batch_commit_ip(env: Env, owner: Address, hashes: Vec<BytesN<32>>) -> Vec<u64>;\n    }\n\n    #[test]
     fn test_commit_ip_sequential_ids() {
         let env = Env::default();
         let contract_id = env.register(crate::IpRegistry, ());
