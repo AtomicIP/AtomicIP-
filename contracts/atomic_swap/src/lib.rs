@@ -555,6 +555,14 @@ impl AtomicSwap {
         env.storage()
             .persistent()
             .remove(&DataKey::ActiveSwap(swap.ip_id));
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("swap_cncl"),),
+            SwapCancelledEvent {
+                swap_id,
+                canceller,
+            },
+        );
     }
 
     /// Buyer cancels an Accepted swap after expiry.
