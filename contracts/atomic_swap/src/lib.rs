@@ -21,6 +21,7 @@ pub enum ContractError {
     SwapHasNotExpiredYet = 13,
     IpIsRevoked = 14,
     UnauthorizedUpgrade = 15,
+    InvalidFeeBps = 16,
 }
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
@@ -38,6 +39,7 @@ pub enum DataKey {
     /// Maps buyer address → Vec<u64> of all swap IDs they are party to.
     BuyerSwaps(Address),
     Admin,
+    ProtocolConfig,
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -82,6 +84,22 @@ pub struct SwapCancelledEvent {
 pub struct KeyRevealedEvent {
     pub swap_id: u64,
     pub decryption_key: BytesN<32>,
+}
+
+/// Payload published when protocol fee is deducted on swap completion.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProtocolFeeEvent {
+    pub swap_id: u64,
+    pub fee_amount: i128,
+    pub treasury: Address,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct ProtocolConfig {
+    pub protocol_fee_bps: u32,  // 0-10000 (0.00% - 100.00%)
+    pub treasury: Address,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -351,12 +369,36 @@ impl AtomicSwap {
             .persistent()
             .extend_ttl(&DataKey::Swap(swap_id), 50000, 50000);
 
-        // Transfer escrowed payment to seller (Issue #34)
-        token::Client::new(&env, &swap.token).transfer(
-            &env.current_contract_address(),
-            &swap.seller,
-            &swap.price,
-        );
+        // Protocol fee deduction
+        let token_client = token::Client::new(&env, &swap.token);
+        let config: ProtocolConfig = if env.storage().persistent().has(&DataKey::ProtocolConfig) {
+            env.storage().persistent().get(&DataKey::ProtocolConfig).unwrap()
+        } else {
+            ProtocolConfig {
+                protocol_fee_bps: 0,
+                treasury: env.deployer(),
+            }
+        };
+        let fee_bps = config.protocol_fee_bps as i128;
+        let fee_amount = if fee_bps > 0 && swap.price > 0 {
+            ((swap.price * fee_bps) / 10000)
+        } else {
+            0
+        };
+        let seller_amount = swap.price - fee_amount;
+        if fee_amount > 0 {
+            token_client.transfer(&env.current_contract_address(), &config.treasury, &fee_amount);
+            env.events().publish(
+                (soroban_sdk::symbol_short!("protocol_fee"),),
+                ProtocolFeeEvent {
+                    swap_id,
+                    fee_amount,
+                    treasury: config.treasury.clone(),
+                },
+            );
+        }
+        // Transfer net payment to seller
+        token_client.transfer(&env.current_contract_address(), &swap.seller, &seller_amount);
 
         env.events().publish(
             (soroban_sdk::symbol_short!("key_rev"),),
