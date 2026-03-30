@@ -11,7 +11,12 @@ mod tests {
     pub trait IpRegistry {
         fn commit_ip(env: Env, owner: Address, commitment_hash: BytesN<32>) -> u64;
         fn get_ip(env: Env, ip_id: u64) -> IpRecord;
-        fn verify_commitment(env: Env, ip_id: u64, secret: BytesN<32>, blinding_factor: BytesN<32>) -> bool;
+        fn verify_commitment(
+            env: Env,
+            ip_id: u64,
+            secret: BytesN<32>,
+            blinding_factor: BytesN<32>,
+        ) -> bool;
         fn list_ip_by_owner(env: Env, owner: Address) -> Vec<u64>;
         fn transfer_ip(env: Env, ip_id: u64, new_owner: Address);
         fn revoke_ip(env: Env, ip_id: u64);
@@ -59,8 +64,8 @@ mod tests {
         assert_eq!(record3.commitment_hash, commitment3);
 
         // Verify owner index is correct
-        let owner1_ips = client.list_ip_by_owner(&owner1).unwrap();
-        let owner2_ips = client.list_ip_by_owner(&owner2).unwrap();
+        let owner1_ips = client.list_ip_by_owner(&owner1);
+        let owner2_ips = client.list_ip_by_owner(&owner2);
 
         assert_eq!(owner1_ips.len(), 2);
         assert_eq!(owner2_ips.len(), 1);
@@ -265,9 +270,9 @@ mod tests {
         assert_eq!(id2, 3);
     }
 
-    /// Issue: verify_commitment returns false for a wrong secret.
+    /// Issue #196: verification must fail when called with the wrong secret.
     #[test]
-    fn test_wrong_secret_returns_false() {
+    fn test_verify_commitment_with_invalid_secret_fails() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(crate::IpRegistry, ());
@@ -277,7 +282,7 @@ mod tests {
         let secret = BytesN::from_array(&env, &[10u8; 32]);
         let blinding = BytesN::from_array(&env, &[20u8; 32]);
 
-        // Build commitment_hash = sha256(secret || blinding)
+        // Create an IP commitment from the valid secret + blinding pair.
         let mut preimage = soroban_sdk::Bytes::new(&env);
         preimage.append(&soroban_sdk::Bytes::from(secret.clone()));
         preimage.append(&soroban_sdk::Bytes::from(blinding.clone()));
@@ -285,10 +290,11 @@ mod tests {
 
         let ip_id = client.commit_ip(&owner, &commitment_hash);
 
-        // Wrong secret — must return false
+        // Attempt verification with the wrong secret and assert the check fails.
         let wrong_secret = BytesN::from_array(&env, &[99u8; 32]);
         assert!(!client.verify_commitment(&ip_id, &wrong_secret, &blinding));
-        // Correct secret — must return true
+
+        // Sanity check: the original secret still verifies successfully.
         assert!(client.verify_commitment(&ip_id, &secret, &blinding));
     }
 
