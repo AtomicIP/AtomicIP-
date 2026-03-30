@@ -1,5 +1,10 @@
 #![no_std]
-use soroban_sdk::{\n    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Bytes, Env, Error, Vec,\n};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Bytes, Env, Error, Vec,
+};
+
+mod validation;
+use validation::*;
 
 #[cfg(test)]
 mod test;
@@ -95,22 +100,20 @@ impl IpRegistry {
     pub fn commit_ip(env: Env, owner: Address, commitment_hash: BytesN<32>) -> u64 {
         // Enforced by the Soroban host: panics if the transaction does not carry
         // a valid authorization for `owner`. This is the correct auth pattern.
-        owner.require_auth();\n\n        // Initialize admin on first call if not set\n        if !env.storage().persistent().has(&DataKey::Admin) {\n            let admin = env.deployer();\n            env.storage().persistent().set(&DataKey::Admin, &admin);\n            env.storage().persistent().extend_ttl(&DataKey::Admin, 50000, 50000);\n        }\n\n        // Reject zero-byte commitment hash (Issue #40)
-        if commitment_hash == BytesN::from_array(&env, &[0u8; 32]) {
-            env.panic_with_error(Error::from_contract_error(
-                ContractError::ZeroCommitmentHash as u32,
-            ));
+        owner.require_auth();
+
+        // Initialize admin on first call if not set
+        if !env.storage().persistent().has(&DataKey::Admin) {
+            let admin = env.deployer();
+            env.storage().persistent().set(&DataKey::Admin, &admin);
+            env.storage().persistent().extend_ttl(&DataKey::Admin, 50000, 50000);
         }
 
+        // Reject zero-byte commitment hash (Issue #40)
+        require_non_zero_commitment(&env, &commitment_hash);
+
         // Reject duplicate commitment hash globally
-        if env.storage()
-            .persistent()
-            .has(&DataKey::CommitmentOwner(commitment_hash.clone()))
-        {
-            env.panic_with_error(Error::from_contract_error(
-                ContractError::CommitmentAlreadyRegistered as u32,
-            ));
-        }
+        require_unique_commitment(&env, &commitment_hash);
 
         // NextId lives in persistent storage so it survives contract upgrades.
         // Instance storage is wiped on upgrade, which would reset the counter
@@ -175,7 +178,93 @@ impl IpRegistry {
         );
 
         id
-    }\n\n    /// Batch commit multiple IP hashes from the same owner in a single transaction.\n    /// Reduces gas fees compared to sequential commit_ip calls.\n    ///\n    /// All hashes must be unique and non-zero. Sequential IDs assigned.\n    ///\n    /// # Arguments\n    ///\n    /// * `env` - Soroban environment\n    /// * `owner` - Owner address (requires auth)\n    /// * `hashes` - Vec of BytesN<32> commitment hashes\n    ///\n    /// # Returns\n    ///\n    /// Vec<u64> of assigned sequential IP IDs\n    ///\n    /// # Panics\n    ///\n    /// * ZeroCommitmentHash(2) if any hash is zero\n    /// * CommitmentAlreadyRegistered(3) if any hash already exists globally\n    pub fn batch_commit_ip(env: Env, owner: Address, hashes: Vec<BytesN<32>>) -> Vec<u64> {\n        owner.require_auth();\n\n        // Admin init\n        if !env.storage().persistent().has(&amp;DataKey::Admin) {\n            let admin = env.deployer();\n            env.storage().persistent().set(&amp;DataKey::Admin, &amp;admin);\n            env.storage().persistent().extend_ttl(&amp;DataKey::Admin, 50000, 50000);\n        }\n\n        let mut next_id: u64 = env.storage().persistent().get(&amp;DataKey::NextId).unwrap_or(0);\n        let mut ids = Vec::new(&amp;env);\n\n        for hash in hashes.iter() {\n            let commitment_hash = hash.clone();\n\n            // Zero hash check\n            if commitment_hash == BytesN::from_array(&amp;env, &amp;[0u8; 32]) {\n                env.panic_with_error(Error::from_contract_error(ContractError::ZeroCommitmentHash as u32));\n            }\n\n            // Duplicate commitment check\n            if env.storage().persistent().has(&amp;DataKey::CommitmentOwner(commitment_hash.clone())) {\n                env.panic_with_error(Error::from_contract_error(ContractError::CommitmentAlreadyRegistered as u32));\n            }\n\n            let record = IpRecord {\n                ip_id: next_id,\n                owner: owner.clone(),\n                commitment_hash: commitment_hash.clone(),\n                timestamp: env.ledger().timestamp(),\n                revoked: false,\n            };\n\n            env.storage().persistent().set(&amp;DataKey::IpRecord(next_id), &amp;record);\n            env.storage().persistent().extend_ttl(&amp;DataKey::IpRecord(next_id), 50000, 50000);\n\n            env.storage().persistent().set(&amp;DataKey::CommitmentOwner(commitment_hash.clone()), &amp;owner);\n\n            ids.push_back(next_id);\n\n            // Emit event per IP\n            env.events().publish(\n                (symbol_short!("ip_commit"), owner.clone()),\n                (next_id, record.timestamp),\n            );\n\n            next_id += 1;\n        }\n\n        // Update owner index\n        let mut owner_ids: Vec<u64> = env\n            .storage()\n            .persistent()\n            .get(&amp;DataKey::OwnerIps(owner.clone()))\n            .unwrap_or_else(|| Vec::new(&amp;env));\n        for &amp;id in ids.iter() {\n            owner_ids.push_back(id);\n        }\n        env.storage().persistent().set(&amp;DataKey::OwnerIps(owner.clone()), &amp;owner_ids);\n        env.storage().persistent().extend_ttl(&amp;DataKey::OwnerIps(owner.clone()), 50000, 50000);\n\n        // Update NextId once\n        env.storage().persistent().set(&amp;DataKey::NextId, &amp;next_id);\n        env.storage().persistent().extend_ttl(&amp;DataKey::NextId, 50000, 50000);\n\n        ids\n    }\n\n    /// Transfer IP ownership to a new address.
+    }
+
+    /// Batch commit multiple IP hashes from the same owner in a single transaction.
+    /// Reduces gas fees compared to sequential commit_ip calls.
+    ///
+    /// All hashes must be unique and non-zero. Sequential IDs assigned.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - Soroban environment
+    /// * `owner` - Owner address (requires auth)
+    /// * `hashes` - Vec of BytesN<32> commitment hashes
+    ///
+    /// # Returns
+    ///
+    /// Vec<u64> of assigned sequential IP IDs
+    ///
+    /// # Panics
+    ///
+    /// * ZeroCommitmentHash(2) if any hash is zero
+    /// * CommitmentAlreadyRegistered(3) if any hash already exists globally
+    pub fn batch_commit_ip(env: Env, owner: Address, hashes: Vec<BytesN<32>>) -> Vec<u64> {
+        owner.require_auth();
+
+        // Admin init
+        if !env.storage().persistent().has(&DataKey::Admin) {
+            let admin = env.deployer();
+            env.storage().persistent().set(&DataKey::Admin, &admin);
+            env.storage().persistent().extend_ttl(&DataKey::Admin, 50000, 50000);
+        }
+
+        let mut next_id: u64 = env.storage().persistent().get(&DataKey::NextId).unwrap_or(0);
+        let mut ids = Vec::new(&env);
+
+        for hash in hashes.iter() {
+            let commitment_hash = hash.clone();
+
+            // Zero hash check
+            require_non_zero_commitment(&env, &commitment_hash);
+
+            // Duplicate commitment check
+            require_unique_commitment(&env, &commitment_hash);
+
+            let record = IpRecord {
+                ip_id: next_id,
+                owner: owner.clone(),
+                commitment_hash: commitment_hash.clone(),
+                timestamp: env.ledger().timestamp(),
+                revoked: false,
+            };
+
+            env.storage().persistent().set(&DataKey::IpRecord(next_id), &record);
+            env.storage().persistent().extend_ttl(&DataKey::IpRecord(next_id), 50000, 50000);
+
+            env.storage().persistent().set(&DataKey::CommitmentOwner(commitment_hash.clone()), &owner);
+
+            ids.push_back(next_id);
+
+            // Emit event per IP
+            env.events().publish(
+                (symbol_short!("ip_commit"), owner.clone()),
+                (next_id, record.timestamp),
+            );
+
+            next_id += 1;
+        }
+
+        // Update owner index
+        let mut owner_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OwnerIps(owner.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        for &id in ids.iter() {
+            owner_ids.push_back(id);
+        }
+        env.storage().persistent().set(&DataKey::OwnerIps(owner.clone()), &owner_ids);
+        env.storage().persistent().extend_ttl(&DataKey::OwnerIps(owner.clone()), 50000, 50000);
+
+        // Update NextId once
+        env.storage().persistent().set(&DataKey::NextId, &next_id);
+        env.storage().persistent().extend_ttl(&DataKey::NextId, 50000, 50000);
+
+        ids
+    }
+
+    /// Transfer IP ownership to a new address.
     ///
     /// This function transfers ownership of an IP record from the current owner
     /// to a new owner. The current owner must authorize the transaction.
@@ -196,13 +285,7 @@ impl IpRegistry {
     /// * The IP record does not exist (IpNotFound error)
     /// * The current owner does not authorize the transaction (auth error)
     pub fn transfer_ip(env: Env, ip_id: u64, new_owner: Address) {
-        let mut record: IpRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::IpRecord(ip_id))
-            .unwrap_or_else(|| {
-                env.panic_with_error(Error::from_contract_error(ContractError::IpNotFound as u32))
-            });
+        let mut record = require_ip_exists(&env, ip_id);
 
         record.owner.require_auth();
 
@@ -266,21 +349,11 @@ impl IpRegistry {
     ///
     /// Panics if the IP does not exist, the owner does not authorize, or the IP is already revoked.
     pub fn revoke_ip(env: Env, ip_id: u64) {
-        let mut record: IpRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::IpRecord(ip_id))
-            .unwrap_or_else(|| {
-                env.panic_with_error(Error::from_contract_error(ContractError::IpNotFound as u32))
-            });
+        let mut record = require_ip_exists(&env, ip_id);
 
         record.owner.require_auth();
 
-        if record.revoked {
-            env.panic_with_error(Error::from_contract_error(
-                ContractError::IpAlreadyRevoked as u32,
-            ));
-        }
+        require_not_revoked(&env, &record);
 
         record.revoked = true;
         env.storage()
@@ -291,13 +364,47 @@ impl IpRegistry {
             .extend_ttl(&DataKey::IpRecord(ip_id), 50000, 50000);
     }
 
-    /// Admin-only contract upgrade.\n    ///\n    /// # Panics\n    ///\n    /// Panics if caller is not admin or admin not initialized.\n    pub fn upgrade(env: Env, new_wasm_hash: Bytes) {\n        let admin_opt = env.storage().persistent().get(&DataKey::Admin);\n        if admin_opt.is_none() {\n            env.panic_with_error(Error::from_contract_error(ContractError::UnauthorizedUpgrade as u32));\n        }\n        let admin = admin_opt.unwrap();\n        let invoker = env.invoker();\n        if invoker != admin {\n            env.panic_with_error(Error::from_contract_error(ContractError::UnauthorizedUpgrade as u32));\n        }\n        admin.require_auth();\n        env.deployer().update_current_contract_wasm(new_wasm_hash);\n    }\n\n    /// Retrieve an IP record by ID.\n    ///\n    /// Returns the complete IP record including owner, commitment hash, and timestamp.\n    ///\n    /// # Arguments\n    ///\n    /// * `env` - The Soroban environment\n    /// * `ip_id` - The unique identifier of the IP to retrieve\n    ///\n    /// # Returns\n    ///\n    /// The `IpRecord` containing:\n    /// * `ip_id` - The unique identifier\n    /// * `owner` - The current owner's address\n    /// * `commitment_hash` - The cryptographic commitment hash\n    /// * `timestamp` - The ledger timestamp when the IP was committed\n    ///\n    /// # Panics\n    ///\n    /// Panics if the IP record does not exist (IpNotFound error).\n    pub fn get_ip(env: Env, ip_id: u64) -> IpRecord {
-        env.storage()
-            .persistent()
-            .get(&DataKey::IpRecord(ip_id))
-            .unwrap_or_else(|| {
-                env.panic_with_error(Error::from_contract_error(ContractError::IpNotFound as u32))
-            })
+    /// Admin-only contract upgrade.
+    ///
+    /// # Panics
+    ///
+    /// Panics if caller is not admin or admin not initialized.
+    pub fn upgrade(env: Env, new_wasm_hash: Bytes) {
+        let admin_opt = env.storage().persistent().get(&DataKey::Admin);
+        if admin_opt.is_none() {
+            env.panic_with_error(Error::from_contract_error(ContractError::UnauthorizedUpgrade as u32));
+        }
+        let admin = admin_opt.unwrap();
+        let invoker = env.invoker();
+        if invoker != admin {
+            env.panic_with_error(Error::from_contract_error(ContractError::UnauthorizedUpgrade as u32));
+        }
+        admin.require_auth();
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+    }
+
+    /// Retrieve an IP record by ID.
+    ///
+    /// Returns the complete IP record including owner, commitment hash, and timestamp.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `ip_id` - The unique identifier of the IP to retrieve
+    ///
+    /// # Returns
+    ///
+    /// The `IpRecord` containing:
+    /// * `ip_id` - The unique identifier
+    /// * `owner` - The current owner's address
+    /// * `commitment_hash` - The cryptographic commitment hash
+    /// * `timestamp` - The ledger timestamp when the IP was committed
+    ///
+    /// # Panics
+    ///
+    /// Panics if the IP record does not exist (IpNotFound error).
+    pub fn get_ip(env: Env, ip_id: u64) -> IpRecord {
+        require_ip_exists(&env, ip_id)
     }
 
     /// Verify a commitment: hash the secret and blinding factor, then compare to stored commitment hash.
@@ -332,13 +439,7 @@ impl IpRegistry {
         secret: BytesN<32>,
         blinding_factor: BytesN<32>,
     ) -> bool {
-        let record: IpRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::IpRecord(ip_id))
-            .unwrap_or_else(|| {
-                env.panic_with_error(Error::from_contract_error(ContractError::IpNotFound as u32))
-            });
+        let record = require_ip_exists(&env, ip_id);
 
         // Concatenate secret || blinding_factor into Bytes, then SHA256
         let mut preimage = soroban_sdk::Bytes::new(&env);
