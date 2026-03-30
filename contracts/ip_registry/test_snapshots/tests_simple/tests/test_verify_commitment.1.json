@@ -1,6 +1,6 @@
 {
   "generators": {
-    "address": 3,
+    "address": 2,
     "nonce": 0
   },
   "auth": [
@@ -18,7 +18,7 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
                 },
                 {
-                  "bytes": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"
+                  "bytes": "90f885b78d7745ea4ee85c12508e193187f01eb4e0a364d5878efe51b5abcba8"
                 }
               ]
             }
@@ -27,7 +27,6 @@
         }
       ]
     ],
-    [],
     [],
     []
   ],
@@ -51,7 +50,7 @@
                   "symbol": "CommitmentOwner"
                 },
                 {
-                  "bytes": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"
+                  "bytes": "90f885b78d7745ea4ee85c12508e193187f01eb4e0a364d5878efe51b5abcba8"
                 }
               ]
             },
@@ -71,7 +70,7 @@
                       "symbol": "CommitmentOwner"
                     },
                     {
-                      "bytes": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"
+                      "bytes": "90f885b78d7745ea4ee85c12508e193187f01eb4e0a364d5878efe51b5abcba8"
                     }
                   ]
                 },
@@ -128,7 +127,7 @@
                         "symbol": "commitment_hash"
                       },
                       "val": {
-                        "bytes": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"
+                        "bytes": "90f885b78d7745ea4ee85c12508e193187f01eb4e0a364d5878efe51b5abcba8"
                       }
                     },
                     {
