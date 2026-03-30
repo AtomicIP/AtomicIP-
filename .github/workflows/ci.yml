@@ -31,5 +31,21 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Security audit
+        run: |
+          cargo install cargo-audit
+          cargo audit
+
       - name: Test
         run: cargo test --workspace
+
+      - name: Code coverage
+        run: |
+          cargo install cargo-tarpaulin
+          cargo tarpaulin --workspace --out Xml --output-dir coverage
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./coverage/cobertura.xml
+          fail_ci_if_error: true
