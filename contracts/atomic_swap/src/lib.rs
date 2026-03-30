@@ -146,7 +146,7 @@ pub struct DisputeResolvedEvent {
 }
 
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ProtocolConfig {
     pub protocol_fee_bps: u32,  // 0-10000 (0.00% - 100.00%)
     pub treasury: Address,
@@ -374,15 +374,7 @@ impl AtomicSwap {
 
         // Protocol fee deduction
         let token_client = token::Client::new(&env, &swap.token);
-        let config: ProtocolConfig = if env.storage().persistent().has(&DataKey::ProtocolConfig) {
-            env.storage().persistent().get(&DataKey::ProtocolConfig).unwrap()
-        } else {
-            ProtocolConfig {
-                protocol_fee_bps: 0,
-                treasury: env.deployer(),
-                dispute_window_seconds: 86400u64,
-            }
-        };
+        let config = Self::protocol_config(&env);
         let fee_bps = config.protocol_fee_bps as i128;
         let fee_amount = if fee_bps > 0 && swap.price > 0 {
             ((swap.price * fee_bps) / 10000)
@@ -505,6 +497,52 @@ impl AtomicSwap {
                 canceller: caller,
             },
         );
+    }
+
+    /// Updates the protocol config and refreshes the instance cache in the same transaction.
+    pub fn admin_set_protocol_config(
+        env: Env,
+        protocol_fee_bps: u32,
+        treasury: Address,
+        dispute_window_seconds: u64,
+    ) {
+        if protocol_fee_bps > 10_000 {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::InvalidFeeBps as u32,
+            ));
+        }
+
+        let invoker = env.invoker();
+        let admin: Address = if let Some(admin) = env.storage().persistent().get(&DataKey::Admin) {
+            admin
+        } else {
+            invoker.require_auth();
+            env.storage().persistent().set(&DataKey::Admin, &invoker);
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::Admin, LEDGER_BUMP, LEDGER_BUMP);
+            invoker.clone()
+        };
+
+        if invoker != admin {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::UnauthorizedUpgrade as u32,
+            ));
+        }
+
+        admin.require_auth();
+        Self::store_protocol_config(
+            &env,
+            &ProtocolConfig {
+                protocol_fee_bps,
+                treasury,
+                dispute_window_seconds,
+            },
+        );
+    }
+
+    pub fn get_protocol_config(env: Env) -> ProtocolConfig {
+        Self::protocol_config(&env)
     }
 
     /// Admin-only contract upgrade.\n    ///\n    /// # Panics\n    ///\n    /// Panics if caller is not admin or admin not initialized.\n    pub fn upgrade(env: Env, new_wasm_hash: Bytes) {\n        let admin_opt = env.storage().persistent().get(&DataKey::Admin);\n        if admin_opt.is_none() {\n            env.panic_with_error(Error::from_contract_error(ContractError::UnauthorizedUpgrade as u32));\n        }\n        let admin = admin_opt.unwrap();\n        let invoker = env.invoker();\n        if invoker != admin {\n            env.panic_with_error(Error::from_contract_error(ContractError::UnauthorizedUpgrade as u32));\n        }\n        admin.require_auth();\n        env.deployer().update_current_contract_wasm(new_wasm_hash);\n    }\n\n    /// List all swap IDs initiated by a seller. Returns `None` if the seller has no swaps.\n    pub fn get_swaps_by_seller(env: Env, seller: Address) -> Option<Vec<u64>> {
