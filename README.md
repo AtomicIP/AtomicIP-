@@ -1,6 +1,9 @@
 # Atomic Patent — The Instant IP Ledger
 
 [![CI](https://github.com/AtomicIP/AtomicIP-/actions/workflows/ci.yml/badge.svg)](https://github.com/AtomicIP/AtomicIP-/actions/workflows/ci.yml)
+[![Security Audit](https://github.com/AtomicIP/AtomicIP-/actions/workflows/ci.yml/badge.svg)](https://github.com/AtomicIP/AtomicIP-/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/AtomicIP/AtomicIP-/branch/main/graph/badge.svg)](https://codecov.io/gh/AtomicIP/AtomicIP-)
+
 A decentralized Intellectual Property registry built on Stellar Soroban smart contracts using Pedersen Commitments and Atomic Swaps.
 
 In engineering, proving "Prior Art" across borders is expensive, slow, and lawyer-dependent. Atomic Patent lets you claim an idea instantly — without revealing it to competitors — and sell it globally without intermediaries.
@@ -93,14 +96,28 @@ stellar keys generate deployer --network testnet
 
 Follow the step-by-step guide in `demo/demo-script.md`
 
+## 🌐 Testnet Deployment Status
+
+[![Deploy to Testnet](https://github.com/AtomicIP/AtomicIP-/actions/workflows/deploy-testnet.yml/badge.svg)](https://github.com/AtomicIP/AtomicIP-/actions/workflows/deploy-testnet.yml)
+
+Latest testnet deployment addresses are published in GitHub Actions deployment summaries. Deployments are triggered automatically on release tags (`v*`).
+
 ## 📖 Documentation
 
 - [Architecture Overview](docs/architecture.md)
 - [Commitment Scheme](docs/commitment-scheme.md)
+- [Changelog Format](docs/changelog-format.md)
 - [Atomic Swap Flow](docs/atomic-swap.md)
 - [Threat Model & Security](docs/threat-model.md)
+- [Integration Guide for Wallet Providers](docs/integration-guide.md)
 - [Security Policy](SECURITY.md)
 - [Roadmap](docs/roadmap.md)
+
+## 📦 Release Notes and Changelog
+
+- Release notes are generated automatically from commit messages and PR metadata.
+- Push a tag in the format `v*` (for example, `v1.2.0`) to trigger the release workflow.
+- The release workflow uses `git-cliff` with configuration in `cliff.toml`.
 
 ## 🎓 Smart Contract API
 

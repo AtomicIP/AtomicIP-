@@ -7,7 +7,7 @@ mod tests {
         Address, BytesN, Env,
     };
 
-    use crate::{AtomicSwap, AtomicSwapClient, DataKey, SwapStatus};
+    use crate::{AtomicSwap, AtomicSwapClient, DataKey, ProtocolConfig, SwapStatus};
 
     fn setup_registry(env: &Env, owner: &Address) -> (Address, u64, BytesN<32>, BytesN<32>) {
         let registry_id = env.register(IpRegistry, ());
@@ -175,5 +175,60 @@ mod tests {
         assert!(ttl_accept > 0);
         assert!(ttl_complete > 0);
         assert_eq!(client.get_swap(&swap_id).unwrap().status, SwapStatus::Completed);
+    }
+
+    #[test]
+    fn test_protocol_config_is_cached_in_instance_storage() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let seller = Address::generate(&env);
+        let contract_id = setup_swap(&env, &setup_registry(&env, &seller).0);
+        let client = AtomicSwapClient::new(&env, &contract_id);
+        let treasury = Address::generate(&env);
+
+        client.admin_set_protocol_config(&250u32, &treasury, &3_600u64);
+
+        let cached = env
+            .storage()
+            .instance()
+            .get::<DataKey, ProtocolConfig>(&DataKey::ProtocolConfig)
+            .unwrap();
+
+        assert_eq!(cached.protocol_fee_bps, 250);
+        assert_eq!(cached.treasury, treasury);
+        assert_eq!(cached.dispute_window_seconds, 3_600);
+    }
+
+    #[test]
+    fn test_protocol_config_update_invalidates_cache() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let seller = Address::generate(&env);
+        let contract_id = setup_swap(&env, &setup_registry(&env, &seller).0);
+        let client = AtomicSwapClient::new(&env, &contract_id);
+        let treasury_a = Address::generate(&env);
+        let treasury_b = Address::generate(&env);
+
+        client.admin_set_protocol_config(&100u32, &treasury_a, &900u64);
+        client.admin_set_protocol_config(&500u32, &treasury_b, &7_200u64);
+
+        let cached = env
+            .storage()
+            .instance()
+            .get::<DataKey, ProtocolConfig>(&DataKey::ProtocolConfig)
+            .unwrap();
+        let persisted = env
+            .storage()
+            .persistent()
+            .get::<DataKey, ProtocolConfig>(&DataKey::ProtocolConfig)
+            .unwrap();
+
+        assert_eq!(cached.protocol_fee_bps, 500);
+        assert_eq!(cached.treasury, treasury_b);
+        assert_eq!(cached.dispute_window_seconds, 7_200);
+        assert_eq!(persisted, cached);
+        assert_eq!(client.get_protocol_config(), cached);
     }
 }

@@ -1,0 +1,1 @@
+Note: Clippy linting (#210) was already configured in CI with -D warnings flag

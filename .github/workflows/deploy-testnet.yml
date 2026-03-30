@@ -1,0 +1,69 @@
+name: Deploy to Testnet
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: testnet
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Install Stellar CLI
+        run: cargo install stellar-cli --locked
+
+      - name: Build contracts
+        run: ./scripts/build.sh
+
+      - name: Import deployer identity
+        env:
+          DEPLOYER_SECRET_KEY: ${{ secrets.DEPLOYER_SECRET_KEY }}
+        run: stellar keys add deployer --secret-key "$DEPLOYER_SECRET_KEY"
+
+      - name: Deploy ip_registry
+        id: deploy_registry
+        run: |
+          CONTRACT_ID=$(stellar contract deploy \
+            --wasm target/wasm32-unknown-unknown/release/ip_registry.wasm \
+            --source deployer \
+            --network testnet)
+          echo "ip_registry=$CONTRACT_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy atomic_swap
+        id: deploy_swap
+        run: |
+          CONTRACT_ID=$(stellar contract deploy \
+            --wasm target/wasm32-unknown-unknown/release/atomic_swap.wasm \
+            --source deployer \
+            --network testnet)
+          echo "atomic_swap=$CONTRACT_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Print deployed contract addresses
+        run: |
+          echo "ip_registry:  ${{ steps.deploy_registry.outputs.ip_registry }}"
+          echo "atomic_swap:  ${{ steps.deploy_swap.outputs.atomic_swap }}"
+
+      - name: Create deployment summary
+        run: |
+          echo "## Testnet Deployment — ${{ github.ref_name }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Contract | Address |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| ip_registry | \`${{ steps.deploy_registry.outputs.ip_registry }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| atomic_swap | \`${{ steps.deploy_swap.outputs.atomic_swap }}\` |" >> "$GITHUB_STEP_SUMMARY"
