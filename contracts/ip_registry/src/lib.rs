@@ -119,7 +119,11 @@ impl IpRegistry {
         // Instance storage is wiped on upgrade, which would reset the counter
         // and cause ID collisions with existing IP records.
         // Initialize to 1 so the first IP ID is 1, not 0 (0 is ambiguous with "not found").
-        let id: u64 = env.storage().persistent().get(&DataKey::NextId).unwrap_or(1);
+        let id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NextId)
+            .unwrap_or(1);
 
         let record = IpRecord {
             ip_id: id,
@@ -146,26 +150,31 @@ impl IpRegistry {
         env.storage()
             .persistent()
             .set(&DataKey::OwnerIps(owner.clone()), &ids);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::OwnerIps(owner.clone()), LEDGER_BUMP, LEDGER_BUMP);
+        env.storage().persistent().extend_ttl(
+            &DataKey::OwnerIps(owner.clone()),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
 
         // Track commitment hash ownership and extend TTL
         env.storage()
             .persistent()
             .set(&DataKey::CommitmentOwner(commitment_hash.clone()), &owner);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::CommitmentOwner(commitment_hash.clone()), 50000, 50000);
+        env.storage().persistent().extend_ttl(
+            &DataKey::CommitmentOwner(commitment_hash.clone()),
+            50000,
+            50000,
+        );
 
         env.storage().persistent().set(&DataKey::NextId, &(id + 1));
-        env.storage().persistent().extend_ttl(&DataKey::NextId, LEDGER_BUMP, LEDGER_BUMP);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::NextId, LEDGER_BUMP, LEDGER_BUMP);
 
         // Track commitment → owner mapping (for duplicate detection and transfer)
-        env.storage().persistent().set(
-            &DataKey::CommitmentOwner(commitment_hash.clone()),
-            &owner,
-        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::CommitmentOwner(commitment_hash.clone()), &owner);
         env.storage().persistent().extend_ttl(
             &DataKey::CommitmentOwner(commitment_hash.clone()),
             LEDGER_BUMP,
@@ -500,7 +509,11 @@ impl IpRegistry {
     ///
     /// This function does not panic.
     pub fn is_ip_owner(env: Env, ip_id: u64, address: Address) -> bool {
-        if let Some(record) = env.storage().persistent().get::<DataKey, IpRecord>(&DataKey::IpRecord(ip_id)) {
+        if let Some(record) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, IpRecord>(&DataKey::IpRecord(ip_id))
+        {
             record.owner == address
         } else {
             false
