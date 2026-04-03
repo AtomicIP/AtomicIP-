@@ -2,7 +2,7 @@
 mod tests {
     use ip_registry::{IpRegistry, IpRegistryClient};
     use soroban_sdk::{
-        testutils::{Address as _, Ledger},
+        testutils::{Address as _, Ledger, storage::Persistent},
         token::StellarAssetClient,
         Address, BytesN, Env,
     };

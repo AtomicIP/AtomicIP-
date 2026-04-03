@@ -1,6 +1,6 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Bytes, Env, Error, Vec,
+    contract, contractimpl, contracttype, contracterror, symbol_short, Address, BytesN, Bytes, Env, Error, Vec,
 };
 
 mod validation;
@@ -20,6 +20,7 @@ pub enum ContractError {
     CommitmentAlreadyRegistered = 3,
     IpAlreadyRevoked = 4,
     UnauthorizedUpgrade = 5,
+    Unauthorized = 6,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -99,14 +100,14 @@ impl IpRegistry {
     /// Therefore: a caller cannot forge `owner` in production. They can only
     /// commit IP under an address for which they hold a valid private key or
     /// delegated authorization.
-    pub fn commit_ip(env: Env, owner: Address, commitment_hash: BytesN<32>) -> Result<u64, ContractError> {
+    pub fn commit_ip(env: Env, owner: Address, commitment_hash: BytesN<32>) -> u64 {
         // Enforced by the Soroban host: panics if the transaction does not carry
         // a valid authorization for `owner`. This is the correct auth pattern.
         owner.require_auth();
 
         // Initialize admin on first call if not set
         if !env.storage().persistent().has(&DataKey::Admin) {
-            let admin = env.deployer();
+            let admin = env.current_contract_address();
             env.storage().persistent().set(&DataKey::Admin, &admin);
             env.storage().persistent().extend_ttl(&DataKey::Admin, 50000, 50000);
         }
@@ -191,90 +192,6 @@ impl IpRegistry {
         id
     }
 
-    /// Batch commit multiple IP hashes from the same owner in a single transaction.
-    /// Reduces gas fees compared to sequential commit_ip calls.
-    ///
-    /// All hashes must be unique and non-zero. Sequential IDs assigned.
-    ///
-    /// # Arguments
-    ///
-    /// * `env` - Soroban environment
-    /// * `owner` - Owner address (requires auth)
-    /// * `hashes` - Vec of BytesN<32> commitment hashes
-    ///
-    /// # Returns
-    ///
-    /// Vec<u64> of assigned sequential IP IDs
-    ///
-    /// # Panics
-    ///
-    /// * ZeroCommitmentHash(2) if any hash is zero
-    /// * CommitmentAlreadyRegistered(3) if any hash already exists globally
-    pub fn batch_commit_ip(env: Env, owner: Address, hashes: Vec<BytesN<32>>) -> Vec<u64> {
-        owner.require_auth();
-
-        // Admin init
-        if !env.storage().persistent().has(&DataKey::Admin) {
-            let admin = env.deployer();
-            env.storage().persistent().set(&DataKey::Admin, &admin);
-            env.storage().persistent().extend_ttl(&DataKey::Admin, 50000, 50000);
-        }
-
-        let mut next_id: u64 = env.storage().persistent().get(&DataKey::NextId).unwrap_or(0);
-        let mut ids = Vec::new(&env);
-
-        for hash in hashes.iter() {
-            let commitment_hash = hash.clone();
-
-            // Zero hash check
-            require_non_zero_commitment(&env, &commitment_hash);
-
-            // Duplicate commitment check
-            require_unique_commitment(&env, &commitment_hash);
-
-            let record = IpRecord {
-                ip_id: next_id,
-                owner: owner.clone(),
-                commitment_hash: commitment_hash.clone(),
-                timestamp: env.ledger().timestamp(),
-                revoked: false,
-            };
-
-            env.storage().persistent().set(&DataKey::IpRecord(next_id), &record);
-            env.storage().persistent().extend_ttl(&DataKey::IpRecord(next_id), 50000, 50000);
-
-            env.storage().persistent().set(&DataKey::CommitmentOwner(commitment_hash.clone()), &owner);
-
-            ids.push_back(next_id);
-
-            // Emit event per IP
-            env.events().publish(
-                (symbol_short!("ip_commit"), owner.clone()),
-                (next_id, record.timestamp),
-            );
-
-            next_id += 1;
-        }
-
-        // Update owner index
-        let mut owner_ids: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::OwnerIps(owner.clone()))
-            .unwrap_or_else(|| Vec::new(&env));
-        for &id in ids.iter() {
-            owner_ids.push_back(id);
-        }
-        env.storage().persistent().set(&DataKey::OwnerIps(owner.clone()), &owner_ids);
-        env.storage().persistent().extend_ttl(&DataKey::OwnerIps(owner.clone()), 50000, 50000);
-
-        // Update NextId once
-        env.storage().persistent().set(&DataKey::NextId, &next_id);
-        env.storage().persistent().extend_ttl(&DataKey::NextId, 50000, 50000);
-
-        ids
-    }
-
     /// Transfer IP ownership to a new address.
     ///
     /// This function transfers ownership of an IP record from the current owner
@@ -350,8 +267,6 @@ impl IpRegistry {
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::IpRecord(ip_id), 50000, 50000);
-        
-        Ok(())
     }
 
     /// Revoke an IP record, marking it as invalid.
@@ -375,7 +290,6 @@ impl IpRegistry {
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::IpRecord(ip_id), 50000, 50000);
-        Ok(())
     }
 
     /// Admin-only contract upgrade.
@@ -383,33 +297,13 @@ impl IpRegistry {
     /// # Panics
     ///
     /// Panics if caller is not admin or admin not initialized.
-    pub fn upgrade(env: Env, new_wasm_hash: Bytes) -> Result<(), ContractError> {
-        let admin_opt = env.storage().persistent().get(&DataKey::Admin);
-        if admin_opt.is_none() {
-            return Err(ContractError::UnauthorizedUpgrade);
-        }
-        let admin = admin_opt.unwrap();
-        let invoker = env.invoker();
-        if invoker != admin {
-            return Err(ContractError::UnauthorizedUpgrade);
-        }
-        admin.require_auth();
-        env.deployer().update_current_contract_wasm(new_wasm_hash);
-        Ok(())
-    }
-
-    /// Admin-only contract upgrade.
-    ///
-    /// # Panics
-    ///
-    /// Panics if caller is not admin or admin not initialized.
-    pub fn upgrade(env: Env, new_wasm_hash: Bytes) {
-        let admin_opt = env.storage().persistent().get(&DataKey::Admin);
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
+        let admin_opt: Option<Address> = env.storage().persistent().get(&DataKey::Admin);
         if admin_opt.is_none() {
             env.panic_with_error(Error::from_contract_error(ContractError::UnauthorizedUpgrade as u32));
         }
         let admin = admin_opt.unwrap();
-        let invoker = env.invoker();
+        let invoker = env.current_contract_address();
         if invoker != admin {
             env.panic_with_error(Error::from_contract_error(ContractError::UnauthorizedUpgrade as u32));
         }
@@ -481,7 +375,7 @@ impl IpRegistry {
         preimage.append(&blinding_factor.into());
         let computed_hash: BytesN<32> = env.crypto().sha256(&preimage).into();
 
-        Ok(record.commitment_hash == computed_hash)
+        record.commitment_hash == computed_hash
     }
 
     /// List all IP IDs owned by an address.
