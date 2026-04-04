@@ -1,5 +1,4 @@
-use ip_registry::IpRegistryClient;
-use soroban_sdk::{Address, Env};
+use soroban_sdk::{Address, BytesN, Env};
 
 use crate::{utils::panic_with_error, ContractError, DataKey};
 
@@ -10,7 +9,8 @@ pub fn ip_registry(env: &Env) -> Address {
 }
 
 pub fn ensure_seller_owns_active_ip(env: &Env, ip_id: u64, seller: &Address) {
-    let registry = IpRegistryClient::new(env, &ip_registry(env));
+    let registry_addr = ip_registry(env);
+    let registry = ip_registry::IpRegistryClient::new(env, &registry_addr);
     let record = registry.get_ip(&ip_id);
 
     if record.owner != *seller {
@@ -22,7 +22,8 @@ pub fn ensure_seller_owns_active_ip(env: &Env, ip_id: u64, seller: &Address) {
     }
 }
 
-pub fn verify_commitment(env: &Env, ip_id: u64, secret: &soroban_sdk::BytesN<32>, blinding_factor: &soroban_sdk::BytesN<32>) -> bool {
-    let registry = IpRegistryClient::new(env, &ip_registry(env));
+pub fn verify_commitment(env: &Env, ip_id: u64, secret: &BytesN<32>, blinding_factor: &BytesN<32>) -> bool {
+    let registry_addr = ip_registry(env);
+    let registry = ip_registry::IpRegistryClient::new(env, &registry_addr);
     registry.verify_commitment(&ip_id, secret, blinding_factor)
 }

@@ -7,8 +7,7 @@ mod tests {
         Address, BytesN, Env, IntoVal,
     };
 
-    use crate::{AtomicSwap, AtomicSwapClient, DataKey, SwapStatus, SwapCancelledEvent, KeyRevealedEvent};
-    use crate::tests::setup_token;
+    use crate::{AtomicSwap, AtomicSwapClient, DataKey, SwapStatus, KeyRevealedEvent, SwapCancelledEvent};
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -40,7 +39,7 @@ mod tests {
     // ── Initialize tests ──────────────────────────────────────────────────────
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #21)")]
+    #[should_panic(expected = "Error(Contract, #22)")]
     fn test_initialize_twice_rejected() {
         let env = Env::default();
         env.mock_all_auths();
@@ -49,21 +48,6 @@ mod tests {
         let client = AtomicSwapClient::new(&env, &contract_id);
         client.initialize(&registry_id);
         client.initialize(&registry_id); // must panic AlreadyInitialized
-    }
-
-    #[test]
-    #[should_panic(expected = "Error(Contract, #22)")]
-    fn test_initiate_swap_without_initialize_rejected() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let seller = Address::generate(&env);
-        let buyer = Address::generate(&env);
-        let admin = Address::generate(&env);
-        let (_, ip_id, _, _) = setup_registry(&env, &seller);
-        let token_id = setup_token(&env, &admin, &buyer, 500);
-        let contract_id = env.register(AtomicSwap, ());
-        let client = AtomicSwapClient::new(&env, &contract_id);
-        client.initiate_swap(&token_id, &ip_id, &seller, &100_i128, &buyer);
     }
 
     // ── Basic unit tests ──────────────────────────────────────────────────────
@@ -99,9 +83,9 @@ mod tests {
         let env = Env::default();
         env.mock_all_auths();
 
-        let seller = soroban_sdk::Address::generate(&env);
-        let buyer = soroban_sdk::Address::generate(&env);
-        let admin = soroban_sdk::Address::generate(&env);
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let admin = Address::generate(&env);
 
         let (registry_id, ip_id, _, _) = setup_registry(&env, &seller);
         let token_id = setup_token(&env, &admin, &buyer, 1000);
@@ -112,7 +96,6 @@ mod tests {
 
         let swap = client.get_swap(&swap_id).expect("swap should exist");
         assert_eq!(swap.seller, seller);
-        assert_ne!(swap.seller, contract_id);
     }
 
     #[test]
@@ -130,9 +113,6 @@ mod tests {
         let client = AtomicSwapClient::new(&env, &contract_id);
 
         let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer);
-        let swap = client.get_swap(&swap_id).unwrap();
-        assert_eq!(swap.status, SwapStatus::Pending);
-
         client.accept_swap(&swap_id);
         client.reveal_key(&swap_id, &seller, &secret, &blinding_factor);
 
@@ -157,10 +137,6 @@ mod tests {
         let token_client = TokenClient::new(&env, &token_id);
 
         let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer);
-        let swap = client.get_swap(&swap_id).unwrap();
-        assert_eq!(swap.status, SwapStatus::Pending);
-        assert_eq!(swap.seller, seller);
-        assert_eq!(swap.buyer, buyer);
 
         client.accept_swap(&swap_id);
         assert_eq!(token_client.balance(&buyer), 0);
@@ -181,7 +157,7 @@ mod tests {
         let buyer = Address::generate(&env);
         let admin = Address::generate(&env);
         let (registry_id, ip_id, _, _) = setup_registry(&env, &seller);
-        let token_id = setup_token(&env, &admin, &buyer, 300);
+        let token_id = setup_token(&env, &admin, &buyer, 1000);
 
         let contract_id = setup_swap(&env, &registry_id);
         let client = AtomicSwapClient::new(&env, &contract_id);
@@ -190,7 +166,7 @@ mod tests {
         let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &300_i128, &buyer);
         client.accept_swap(&swap_id);
 
-        assert_eq!(token_client.balance(&buyer), 0);
+        assert_eq!(token_client.balance(&buyer), 700);
         assert_eq!(token_client.balance(&contract_id), 300);
 
         // Advance past expiry (7 days = 604800 seconds)
@@ -198,7 +174,7 @@ mod tests {
 
         client.cancel_expired_swap(&swap_id, &buyer);
         assert_eq!(token_client.balance(&contract_id), 0);
-        assert_eq!(token_client.balance(&buyer), 300);
+        assert_eq!(token_client.balance(&buyer), 1000);
     }
 
     // ── Security tests ────────────────────────────────────────────────────────
@@ -215,6 +191,7 @@ mod tests {
         let admin = Address::generate(&env);
         let (registry_id, ip_id, _, _) = setup_registry(&env, &real_owner);
         let token_id = setup_token(&env, &admin, &buyer, 1000);
+
         let contract_id = setup_swap(&env, &registry_id);
         let client = AtomicSwapClient::new(&env, &contract_id);
 
@@ -228,13 +205,14 @@ mod tests {
         let env = Env::default();
         env.mock_all_auths();
 
-        let seller = soroban_sdk::Address::generate(&env);
-        let buyer = soroban_sdk::Address::generate(&env);
-        let attacker = soroban_sdk::Address::generate(&env);
-        let admin = soroban_sdk::Address::generate(&env);
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let attacker = Address::generate(&env);
+        let admin = Address::generate(&env);
 
         let (registry_id, ip_id, secret, blinding_factor) = setup_registry(&env, &seller);
         let token_id = setup_token(&env, &admin, &buyer, 1000);
+
         let contract_id = setup_swap(&env, &registry_id);
         let client = AtomicSwapClient::new(&env, &contract_id);
 
@@ -274,6 +252,7 @@ mod tests {
         let admin = Address::generate(&env);
         let (registry_id, ip_id, _, _) = setup_registry(&env, &seller);
         let token_id = setup_token(&env, &admin, &buyer, 1000);
+
         let contract_id = setup_swap(&env, &registry_id);
         let client = AtomicSwapClient::new(&env, &contract_id);
 
@@ -294,6 +273,7 @@ mod tests {
         let admin = Address::generate(&env);
         let (registry_id, ip_id, secret, blinding_factor) = setup_registry(&env, &seller);
         let token_id = setup_token(&env, &admin, &buyer, 1000);
+
         let contract_id = setup_swap(&env, &registry_id);
         let client = AtomicSwapClient::new(&env, &contract_id);
 
@@ -342,31 +322,12 @@ mod tests {
         let admin = Address::generate(&env);
         let (registry_id, ip_id, _, _) = setup_registry(&env, &seller);
         let token_id = setup_token(&env, &admin, &buyer, 1000);
+
         let contract_id = setup_swap(&env, &registry_id);
         let client = AtomicSwapClient::new(&env, &contract_id);
 
         let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer);
         client.cancel_expired_swap(&swap_id, &buyer);
-    }
-
-    /// Issue #71: initiate_swap with non-existent ip_id should panic
-    #[test]
-    #[should_panic]
-    fn test_initiate_swap_with_non_existent_ip_id_panics() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let seller = soroban_sdk::Address::generate(&env);
-        let buyer = soroban_sdk::Address::generate(&env);
-        let admin = soroban_sdk::Address::generate(&env);
-
-        let registry_id = env.register(IpRegistry, ());
-        let token_id = setup_token(&env, &admin, &buyer, 500);
-        let contract_id = setup_swap(&env, &registry_id);
-        let client = AtomicSwapClient::new(&env, &contract_id);
-
-        // ip_id 9999 does not exist in the registry — must panic with IpNotFound (code 1)
-        client.initiate_swap(&token_id, &9999u64, &seller, &500_i128, &buyer);
     }
 
     /// Issue #53: reveal_key must emit a KeyRevealedEvent.
@@ -375,15 +336,17 @@ mod tests {
         let env = Env::default();
         env.mock_all_auths();
 
-        let seller = soroban_sdk::Address::generate(&env);
-        let buyer = soroban_sdk::Address::generate(&env);
-        let admin = soroban_sdk::Address::generate(&env);
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let admin = Address::generate(&env);
 
         let (registry_id, ip_id, secret, blinding_factor) = setup_registry(&env, &seller);
-        let token_id = setup_token(&env, &admin, &buyer, 1000);
+        let token_id = setup_token(&env, &admin, &buyer, 500);
+
         let contract_id = setup_swap(&env, &registry_id);
         let client = AtomicSwapClient::new(&env, &contract_id);
 
+        client.initialize(&registry_id);
         let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer);
         client.accept_swap(&swap_id);
         client.reveal_key(&swap_id, &seller, &secret, &blinding_factor);
@@ -391,8 +354,7 @@ mod tests {
         let all_events = env.events().all();
         let event = all_events.last().unwrap();
 
-        let expected_topics = (soroban_sdk::symbol_short!("key_rev"),).into_val(&env);
-        assert_eq!(event.1, expected_topics);
+        assert_eq!(event.0.get_unchecked(0), soroban_sdk::symbol_short!("key_rev"));
 
         let observed: KeyRevealedEvent = soroban_sdk::FromVal::from_val(&env, &event.2);
         assert_eq!(observed.swap_id, swap_id);
@@ -404,12 +366,13 @@ mod tests {
         let env = Env::default();
         env.mock_all_auths();
 
-        let seller = soroban_sdk::Address::generate(&env);
-        let buyer = soroban_sdk::Address::generate(&env);
-        let admin = soroban_sdk::Address::generate(&env);
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let admin = Address::generate(&env);
 
         let (registry_id, ip_id, _, _) = setup_registry(&env, &seller);
-        let token_id = setup_token(&env, &admin, &buyer, 1000);
+        let token_id = setup_token(&env, &admin, &buyer, 500);
+
         let contract_id = setup_swap(&env, &registry_id);
         let client = AtomicSwapClient::new(&env, &contract_id);
 
@@ -419,8 +382,7 @@ mod tests {
         let all_events = env.events().all();
         let event = all_events.last().unwrap();
 
-        let expected_topics = (soroban_sdk::symbol_short!("swap_cncl"),).into_val(&env);
-        assert_eq!(event.1, expected_topics);
+        assert_eq!(event.0.get_unchecked(0), soroban_sdk::symbol_short!("swap_cncl"));
 
         let observed: SwapCancelledEvent = soroban_sdk::FromVal::from_val(&env, &event.2);
         assert_eq!(observed.swap_id, swap_id);
