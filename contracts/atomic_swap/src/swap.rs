@@ -2,6 +2,7 @@ use soroban_sdk::{Address, Env, Vec};
 
 use crate::{utils::panic_with_error, ContractError, DataKey, SwapRecord, LEDGER_BUMP};
 
+#[allow(dead_code)]
 pub fn load_swap(env: &Env, swap_id: u64) -> SwapRecord {
     env.storage()
         .persistent()
@@ -10,7 +11,9 @@ pub fn load_swap(env: &Env, swap_id: u64) -> SwapRecord {
 }
 
 pub fn save_swap(env: &Env, swap_id: u64, swap: &SwapRecord) {
-    env.storage().persistent().set(&DataKey::Swap(swap_id), swap);
+    env.storage()
+        .persistent()
+        .set(&DataKey::Swap(swap_id), swap);
     env.storage()
         .persistent()
         .extend_ttl(&DataKey::Swap(swap_id), LEDGER_BUMP, LEDGER_BUMP);

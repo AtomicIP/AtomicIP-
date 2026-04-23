@@ -1,7 +1,7 @@
 {
   "generators": {
     "address": 3,
-    "nonce": 0
+    "nonce": 1
   },
   "auth": [
     [],
@@ -18,7 +18,7 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
                 },
                 {
-                  "bytes": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"
+                  "bytes": "6949d8f4b9e525930b71ee1e4b602ebc89adeb6e7803f6c1dabd9f643fb40059"
                 }
               ]
             }
@@ -27,7 +27,6 @@
         }
       ]
     ],
-    [],
     [],
     []
   ],
@@ -90,7 +89,7 @@
                   "symbol": "CommitmentOwner"
                 },
                 {
-                  "bytes": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"
+                  "bytes": "6949d8f4b9e525930b71ee1e4b602ebc89adeb6e7803f6c1dabd9f643fb40059"
                 }
               ]
             },
@@ -110,7 +109,7 @@
                       "symbol": "CommitmentOwner"
                     },
                     {
-                      "bytes": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"
+                      "bytes": "6949d8f4b9e525930b71ee1e4b602ebc89adeb6e7803f6c1dabd9f643fb40059"
                     }
                   ]
                 },
@@ -167,7 +166,7 @@
                         "symbol": "commitment_hash"
                       },
                       "val": {
-                        "bytes": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"
+                        "bytes": "6949d8f4b9e525930b71ee1e4b602ebc89adeb6e7803f6c1dabd9f643fb40059"
                       }
                     },
                     {
@@ -362,6 +361,38 @@
             "ext": "v0"
           },
           6311999
+        ]
+      ],
+      [
+        {
+          "contract_data": {
+            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M",
+            "key": "ledger_key_contract_instance",
+            "durability": "persistent"
+          }
+        },
+        [
+          {
+            "last_modified_ledger_seq": 0,
+            "data": {
+              "contract_data": {
+                "ext": "v0",
+                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M",
+                "key": "ledger_key_contract_instance",
+                "durability": "persistent",
+                "val": {
+                  "contract_instance": {
+                    "executable": {
+                      "wasm": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                    },
+                    "storage": null
+                  }
+                }
+              }
+            },
+            "ext": "v0"
+          },
+          4095
         ]
       ],
       [

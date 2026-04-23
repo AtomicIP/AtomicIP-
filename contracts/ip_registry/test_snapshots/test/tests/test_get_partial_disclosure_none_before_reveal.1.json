@@ -1,6 +1,6 @@
 {
   "generators": {
-    "address": 3,
+    "address": 2,
     "nonce": 0
   },
   "auth": [
@@ -18,7 +18,7 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
                 },
                 {
-                  "bytes": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"
+                  "bytes": "9999999999999999999999999999999999999999999999999999999999999999"
                 }
               ]
             }
@@ -27,8 +27,6 @@
         }
       ]
     ],
-    [],
-    [],
     []
   ],
   "ledger": {
@@ -90,7 +88,7 @@
                   "symbol": "CommitmentOwner"
                 },
                 {
-                  "bytes": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"
+                  "bytes": "9999999999999999999999999999999999999999999999999999999999999999"
                 }
               ]
             },
@@ -110,7 +108,7 @@
                       "symbol": "CommitmentOwner"
                     },
                     {
-                      "bytes": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"
+                      "bytes": "9999999999999999999999999999999999999999999999999999999999999999"
                     }
                   ]
                 },
@@ -167,7 +165,7 @@
                         "symbol": "commitment_hash"
                       },
                       "val": {
-                        "bytes": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"
+                        "bytes": "9999999999999999999999999999999999999999999999999999999999999999"
                       }
                     },
                     {

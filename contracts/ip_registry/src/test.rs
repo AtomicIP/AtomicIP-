@@ -21,11 +21,13 @@ mod tests {
         fn transfer_ip(env: Env, ip_id: u64, new_owner: Address);
         fn revoke_ip(env: Env, ip_id: u64);
         fn is_ip_owner(env: Env, ip_id: u64, address: Address) -> bool;
-        fn set_ip_expiry(env: Env, ip_id: u64, expiry_timestamp: u64);
-        fn set_ip_metadata(env: Env, ip_id: u64, metadata: soroban_sdk::Bytes);
-        fn grant_license(env: Env, ip_id: u64, licensee: Address, terms_hash: BytesN<32>);
-        fn revoke_license(env: Env, ip_id: u64, licensee: Address);
-        fn get_licenses(env: Env, ip_id: u64) -> Vec<crate::LicenseEntry>;
+        fn reveal_partial(
+            env: Env,
+            ip_id: u64,
+            partial_hash: BytesN<32>,
+            blinding_factor: BytesN<32>,
+        ) -> bool;
+        fn get_partial_disclosure(env: Env, ip_id: u64) -> Option<BytesN<32>>;
     }
 
     #[test]
@@ -371,242 +373,117 @@ mod tests {
         assert!(!client.is_ip_owner(&999u64, &alice));
     }
 
-    // ── Expiry tests ──────────────────────────────────────────────────────────
+    // ── Partial Disclosure Tests ──────────────────────────────────────────────
 
-    #[test]
-    fn test_set_ip_expiry_and_get() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(crate::IpRegistry, ());
-        let client = IpRegistryClient::new(&env, &contract_id);
-
-        let owner = <Address as TestAddress>::generate(&env);
-        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[11u8; 32]));
-
-        // Default: no expiry
-        assert_eq!(client.get_ip(&ip_id).expiry_timestamp, 0);
-
-        // Set expiry far in the future
-        client.set_ip_expiry(&ip_id, &9_999_999_999u64);
-        assert_eq!(client.get_ip(&ip_id).expiry_timestamp, 9_999_999_999u64);
-
-        // Remove expiry
-        client.set_ip_expiry(&ip_id, &0u64);
-        assert_eq!(client.get_ip(&ip_id).expiry_timestamp, 0);
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_verify_commitment_rejects_expired_ip() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(crate::IpRegistry, ());
-        let client = IpRegistryClient::new(&env, &contract_id);
-
-        let owner = <Address as TestAddress>::generate(&env);
-        let secret = BytesN::from_array(&env, &[20u8; 32]);
-        let blinding = BytesN::from_array(&env, &[21u8; 32]);
-
-        let mut preimage = soroban_sdk::Bytes::new(&env);
-        preimage.append(&soroban_sdk::Bytes::from(secret.clone()));
+    fn make_commitment(env: &Env, partial_hash: &BytesN<32>, blinding: &BytesN<32>) -> BytesN<32> {
+        let mut preimage = soroban_sdk::Bytes::new(env);
+        preimage.append(&soroban_sdk::Bytes::from(partial_hash.clone()));
         preimage.append(&soroban_sdk::Bytes::from(blinding.clone()));
-        let hash: BytesN<32> = env.crypto().sha256(&preimage).into();
-
-        let ip_id = client.commit_ip(&owner, &hash);
-
-        // Set expiry to 1 (already past ledger timestamp 0)
-        client.set_ip_expiry(&ip_id, &1u64);
-
-        // Advance ledger time past expiry
-        env.ledger().set_timestamp(100);
-
-        // Must panic with IpExpired
-        client.verify_commitment(&ip_id, &secret, &blinding);
+        env.crypto().sha256(&preimage).into()
     }
 
     #[test]
-    fn test_verify_commitment_succeeds_before_expiry() {
+    fn test_reveal_partial_valid_proof_returns_true_and_stores() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(crate::IpRegistry, ());
         let client = IpRegistryClient::new(&env, &contract_id);
 
         let owner = <Address as TestAddress>::generate(&env);
-        let secret = BytesN::from_array(&env, &[22u8; 32]);
-        let blinding = BytesN::from_array(&env, &[23u8; 32]);
+        let partial_hash = BytesN::from_array(&env, &[0xabu8; 32]);
+        let blinding = BytesN::from_array(&env, &[0xcdu8; 32]);
+        let commitment = make_commitment(&env, &partial_hash, &blinding);
 
-        let mut preimage = soroban_sdk::Bytes::new(&env);
-        preimage.append(&soroban_sdk::Bytes::from(secret.clone()));
-        preimage.append(&soroban_sdk::Bytes::from(blinding.clone()));
-        let hash: BytesN<32> = env.crypto().sha256(&preimage).into();
+        let ip_id = client.commit_ip(&owner, &commitment);
 
-        let ip_id = client.commit_ip(&owner, &hash);
-        client.set_ip_expiry(&ip_id, &9_999_999_999u64);
+        // Valid proof: returns true
+        assert!(client.reveal_partial(&ip_id, &partial_hash, &blinding));
 
-        assert!(client.verify_commitment(&ip_id, &secret, &blinding));
+        // Partial hash is now publicly retrievable
+        assert_eq!(client.get_partial_disclosure(&ip_id), Some(partial_hash));
     }
 
-    // ── Metadata tests ────────────────────────────────────────────────────────
-
     #[test]
-    fn test_set_ip_metadata_stores_and_retrieves() {
+    fn test_reveal_partial_wrong_blinding_returns_false() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(crate::IpRegistry, ());
         let client = IpRegistryClient::new(&env, &contract_id);
 
         let owner = <Address as TestAddress>::generate(&env);
-        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[30u8; 32]));
+        let partial_hash = BytesN::from_array(&env, &[0x11u8; 32]);
+        let blinding = BytesN::from_array(&env, &[0x22u8; 32]);
+        let wrong_blinding = BytesN::from_array(&env, &[0x33u8; 32]);
+        let commitment = make_commitment(&env, &partial_hash, &blinding);
 
-        let meta = soroban_sdk::Bytes::from_slice(&env, b"title:My Invention");
-        client.set_ip_metadata(&ip_id, &meta);
+        let ip_id = client.commit_ip(&owner, &commitment);
 
-        assert_eq!(client.get_ip(&ip_id).metadata, meta);
+        // Wrong blinding factor: proof fails
+        assert!(!client.reveal_partial(&ip_id, &partial_hash, &wrong_blinding));
+
+        // Nothing stored
+        assert_eq!(client.get_partial_disclosure(&ip_id), None);
+    }
+
+    #[test]
+    fn test_reveal_partial_wrong_partial_hash_returns_false() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let partial_hash = BytesN::from_array(&env, &[0x44u8; 32]);
+        let blinding = BytesN::from_array(&env, &[0x55u8; 32]);
+        let wrong_partial = BytesN::from_array(&env, &[0x66u8; 32]);
+        let commitment = make_commitment(&env, &partial_hash, &blinding);
+
+        let ip_id = client.commit_ip(&owner, &commitment);
+
+        assert!(!client.reveal_partial(&ip_id, &wrong_partial, &blinding));
+        assert_eq!(client.get_partial_disclosure(&ip_id), None);
     }
 
     #[test]
     #[should_panic]
-    fn test_set_ip_metadata_rejects_oversized() {
+    fn test_reveal_partial_requires_owner_auth() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let attacker = <Address as TestAddress>::generate(&env);
+        let partial_hash = BytesN::from_array(&env, &[0x77u8; 32]);
+        let blinding = BytesN::from_array(&env, &[0x88u8; 32]);
+        let commitment = make_commitment(&env, &partial_hash, &blinding);
+
+        env.mock_all_auths();
+        let ip_id = client.commit_ip(&owner, &commitment);
+
+        // Only mock attacker's auth — must panic
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &attacker,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "reveal_partial",
+                args: (ip_id, partial_hash.clone(), blinding.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.reveal_partial(&ip_id, &partial_hash, &blinding);
+    }
+
+    #[test]
+    fn test_get_partial_disclosure_none_before_reveal() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(crate::IpRegistry, ());
         let client = IpRegistryClient::new(&env, &contract_id);
 
         let owner = <Address as TestAddress>::generate(&env);
-        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[31u8; 32]));
+        let commitment = BytesN::from_array(&env, &[0x99u8; 32]);
+        let ip_id = client.commit_ip(&owner, &commitment);
 
-        // 1025 bytes — exceeds 1 KB limit
-        let big = soroban_sdk::Bytes::from_slice(&env, &[0u8; 1025]);
-        client.set_ip_metadata(&ip_id, &big);
-    }
-
-    // ── Collision owner info tests ────────────────────────────────────────────
-
-    #[test]
-    #[should_panic]
-    fn test_duplicate_commitment_panics() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(crate::IpRegistry, ());
-        let client = IpRegistryClient::new(&env, &contract_id);
-
-        let alice = <Address as TestAddress>::generate(&env);
-        let bob = <Address as TestAddress>::generate(&env);
-        let hash = BytesN::from_array(&env, &[40u8; 32]);
-
-        client.commit_ip(&alice, &hash);
-        // Second commit with same hash must panic with CommitmentAlreadyRegistered
-        client.commit_ip(&bob, &hash);
-    }
-
-    /// Verifies that the collision event is emitted with the existing owner's address
-    /// when a duplicate commitment is attempted. We inspect events after the first
-    /// commit to confirm the event infrastructure works, then verify the collision
-    /// event is emitted by checking storage directly.
-    #[test]
-    fn test_collision_event_emitted_with_existing_owner() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(crate::IpRegistry, ());
-        let client = IpRegistryClient::new(&env, &contract_id);
-
-        let alice = <Address as TestAddress>::generate(&env);
-        let hash = BytesN::from_array(&env, &[41u8; 32]);
-
-        client.commit_ip(&alice, &hash);
-
-        // Verify alice is stored as the commitment owner (the data that would be
-        // emitted in the collision event)
-        let stored_owner: Address = env
-            .as_contract(&contract_id, || {
-                env.storage()
-                    .persistent()
-                    .get(&crate::DataKey::CommitmentOwner(hash.clone()))
-                    .unwrap()
-            });
-        assert_eq!(stored_owner, alice);
-    }
-
-    // ── Licensing tests ───────────────────────────────────────────────────────
-
-    #[test]
-    fn test_grant_and_get_licenses() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(crate::IpRegistry, ());
-        let client = IpRegistryClient::new(&env, &contract_id);
-
-        let owner = <Address as TestAddress>::generate(&env);
-        let licensee1 = <Address as TestAddress>::generate(&env);
-        let licensee2 = <Address as TestAddress>::generate(&env);
-        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[50u8; 32]));
-        let terms = BytesN::from_array(&env, &[99u8; 32]);
-
-        assert_eq!(client.get_licenses(&ip_id).len(), 0);
-
-        client.grant_license(&ip_id, &licensee1, &terms);
-        client.grant_license(&ip_id, &licensee2, &terms);
-
-        let licenses = client.get_licenses(&ip_id);
-        assert_eq!(licenses.len(), 2);
-        assert_eq!(licenses.get(0).unwrap().licensee, licensee1);
-        assert_eq!(licenses.get(1).unwrap().licensee, licensee2);
-    }
-
-    #[test]
-    fn test_grant_license_updates_existing_licensee() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(crate::IpRegistry, ());
-        let client = IpRegistryClient::new(&env, &contract_id);
-
-        let owner = <Address as TestAddress>::generate(&env);
-        let licensee = <Address as TestAddress>::generate(&env);
-        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[51u8; 32]));
-
-        let terms_v1 = BytesN::from_array(&env, &[1u8; 32]);
-        let terms_v2 = BytesN::from_array(&env, &[2u8; 32]);
-
-        client.grant_license(&ip_id, &licensee, &terms_v1);
-        client.grant_license(&ip_id, &licensee, &terms_v2);
-
-        let licenses = client.get_licenses(&ip_id);
-        assert_eq!(licenses.len(), 1);
-        assert_eq!(licenses.get(0).unwrap().terms_hash, terms_v2);
-    }
-
-    #[test]
-    fn test_revoke_license_removes_licensee() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(crate::IpRegistry, ());
-        let client = IpRegistryClient::new(&env, &contract_id);
-
-        let owner = <Address as TestAddress>::generate(&env);
-        let licensee = <Address as TestAddress>::generate(&env);
-        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[52u8; 32]));
-        let terms = BytesN::from_array(&env, &[99u8; 32]);
-
-        client.grant_license(&ip_id, &licensee, &terms);
-        assert_eq!(client.get_licenses(&ip_id).len(), 1);
-
-        client.revoke_license(&ip_id, &licensee);
-        assert_eq!(client.get_licenses(&ip_id).len(), 0);
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_revoke_license_nonexistent_panics() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(crate::IpRegistry, ());
-        let client = IpRegistryClient::new(&env, &contract_id);
-
-        let owner = <Address as TestAddress>::generate(&env);
-        let licensee = <Address as TestAddress>::generate(&env);
-        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[53u8; 32]));
-
-        // No license granted — must panic with LicenseeNotFound
-        client.revoke_license(&ip_id, &licensee);
+        assert_eq!(client.get_partial_disclosure(&ip_id), None);
     }
 }

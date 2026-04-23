@@ -1,8 +1,9 @@
 #[cfg(test)]
+#[allow(clippy::module_inception)]
 mod tests {
     use ip_registry::{IpRegistry, IpRegistryClient};
     use soroban_sdk::{
-        testutils::{Address as _, Ledger, storage::Persistent},
+        testutils::{storage::Persistent, Address as _},
         token::StellarAssetClient,
         Address, BytesN, Env,
     };
@@ -55,12 +56,12 @@ mod tests {
 
         let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer);
 
-        let ttl = env
-            .storage()
-            .persistent()
-            .get_ttl(&DataKey::Swap(swap_id));
+        let ttl = env.storage().persistent().get_ttl(&DataKey::Swap(swap_id));
         assert!(ttl > 0, "TTL should be set after swap initiation");
-        assert_eq!(client.get_swap(&swap_id).unwrap().status, SwapStatus::Pending);
+        assert_eq!(
+            client.get_swap(&swap_id).unwrap().status,
+            SwapStatus::Pending
+        );
     }
 
     #[test]
@@ -80,12 +81,12 @@ mod tests {
         let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer);
         client.accept_swap(&swap_id);
 
-        let ttl = env
-            .storage()
-            .persistent()
-            .get_ttl(&DataKey::Swap(swap_id));
+        let ttl = env.storage().persistent().get_ttl(&DataKey::Swap(swap_id));
         assert!(ttl > 0, "TTL should be extended after swap acceptance");
-        assert_eq!(client.get_swap(&swap_id).unwrap().status, SwapStatus::Accepted);
+        assert_eq!(
+            client.get_swap(&swap_id).unwrap().status,
+            SwapStatus::Accepted
+        );
     }
 
     #[test]
@@ -106,12 +107,12 @@ mod tests {
         client.accept_swap(&swap_id);
         client.reveal_key(&swap_id, &seller, &secret, &blinding);
 
-        let ttl = env
-            .storage()
-            .persistent()
-            .get_ttl(&DataKey::Swap(swap_id));
+        let ttl = env.storage().persistent().get_ttl(&DataKey::Swap(swap_id));
         assert!(ttl > 0, "TTL should be extended after swap completion");
-        assert_eq!(client.get_swap(&swap_id).unwrap().status, SwapStatus::Completed);
+        assert_eq!(
+            client.get_swap(&swap_id).unwrap().status,
+            SwapStatus::Completed
+        );
     }
 
     #[test]
@@ -131,12 +132,12 @@ mod tests {
         let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer);
         client.cancel_swap(&swap_id, &seller);
 
-        let ttl = env
-            .storage()
-            .persistent()
-            .get_ttl(&DataKey::Swap(swap_id));
+        let ttl = env.storage().persistent().get_ttl(&DataKey::Swap(swap_id));
         assert!(ttl > 0, "TTL should be extended after swap cancellation");
-        assert_eq!(client.get_swap(&swap_id).unwrap().status, SwapStatus::Cancelled);
+        assert_eq!(
+            client.get_swap(&swap_id).unwrap().status,
+            SwapStatus::Cancelled
+        );
     }
 
     #[test]
@@ -154,27 +155,21 @@ mod tests {
         let client = AtomicSwapClient::new(&env, &contract_id);
 
         let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer);
-        let ttl_init = env
-            .storage()
-            .persistent()
-            .get_ttl(&DataKey::Swap(swap_id));
+        let ttl_init = env.storage().persistent().get_ttl(&DataKey::Swap(swap_id));
 
         client.accept_swap(&swap_id);
-        let ttl_accept = env
-            .storage()
-            .persistent()
-            .get_ttl(&DataKey::Swap(swap_id));
+        let ttl_accept = env.storage().persistent().get_ttl(&DataKey::Swap(swap_id));
 
         client.reveal_key(&swap_id, &seller, &secret, &blinding);
-        let ttl_complete = env
-            .storage()
-            .persistent()
-            .get_ttl(&DataKey::Swap(swap_id));
+        let ttl_complete = env.storage().persistent().get_ttl(&DataKey::Swap(swap_id));
 
         assert!(ttl_init > 0);
         assert!(ttl_accept > 0);
         assert!(ttl_complete > 0);
-        assert_eq!(client.get_swap(&swap_id).unwrap().status, SwapStatus::Completed);
+        assert_eq!(
+            client.get_swap(&swap_id).unwrap().status,
+            SwapStatus::Completed
+        );
     }
 
     #[test]

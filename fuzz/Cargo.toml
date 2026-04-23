@@ -1,0 +1,27 @@
+[package]
+name = "ip_registry-fuzz"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+soroban-sdk = { version = "22.0.0", features = ["alloc"] }
+ip_registry = { path = "../contracts/ip_registry" }
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1.0", features = ["derive"] }
+
+[dependencies.soroban-sdk]
+version = "22.0.0"
+features = ["testutils"]
+
+[[bin]]
+name = "fuzz_verify_commitment"
+path = "fuzz_targets/fuzz_verify_commitment.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_batch_commitments"
+path = "fuzz_targets/fuzz_batch_commitments.rs"
+test = false
+doc = false

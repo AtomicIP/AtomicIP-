@@ -3,8 +3,8 @@
 //! This module provides reusable validation functions to reduce code duplication
 //! and ensure consistent error handling across the contract.
 
-use soroban_sdk::{Address, Env, Error};
 use crate::{ContractError, DataKey, SwapRecord, SwapStatus};
+use soroban_sdk::{Address, Env, Error};
 
 /// Validates that the contract is not paused.
 ///
@@ -269,7 +269,12 @@ mod tests {
             accept_timestamp: 0,
         };
         // Should not panic
-        require_swap_status(&env, &swap, SwapStatus::Pending, ContractError::SwapNotPending);
+        require_swap_status(
+            &env,
+            &swap,
+            SwapStatus::Pending,
+            ContractError::SwapNotPending,
+        );
     }
 
     #[test]
@@ -286,7 +291,12 @@ mod tests {
             expiry: 0,
             accept_timestamp: 0,
         };
-        require_swap_status(&env, &swap, SwapStatus::Pending, ContractError::SwapNotPending);
+        require_swap_status(
+            &env,
+            &swap,
+            SwapStatus::Pending,
+            ContractError::SwapNotPending,
+        );
     }
 
     #[test]
@@ -464,7 +474,9 @@ mod tests {
     #[should_panic(expected = "ActiveSwapAlreadyExistsForThisIpId")]
     fn test_require_no_active_swap_panics_when_active_swap_exists() {
         let env = Env::default();
-        env.storage().persistent().set(&DataKey::ActiveSwap(1), &0u64);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ActiveSwap(1), &0u64);
         require_no_active_swap(&env, 1);
     }
 }

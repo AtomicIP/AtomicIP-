@@ -3,8 +3,8 @@
 //! This module provides reusable validation functions to reduce code duplication
 //! and ensure consistent error handling across the contract.
 
-use soroban_sdk::{symbol_short, Address, BytesN, Env, Error};
 use crate::{ContractError, DataKey, IpRecord};
+use soroban_sdk::{Address, BytesN, Env, Error};
 
 /// Retrieves an IP record by ID, panicking if not found.
 ///
@@ -25,9 +25,7 @@ pub fn require_ip_exists(env: &Env, ip_id: u64) -> IpRecord {
         .persistent()
         .get(&DataKey::IpRecord(ip_id))
         .unwrap_or_else(|| {
-            env.panic_with_error(Error::from_contract_error(
-                ContractError::IpNotFound as u32,
-            ))
+            env.panic_with_error(Error::from_contract_error(ContractError::IpNotFound as u32))
         })
 }
 
@@ -107,6 +105,7 @@ pub fn require_not_revoked(env: &Env, record: &IpRecord) {
 /// # Panics
 ///
 /// Panics with an auth error if caller is not the owner.
+#[allow(dead_code)]
 pub fn require_owner(env: &Env, caller: &Address, record: &IpRecord) {
     if caller != &record.owner {
         env.panic_with_error(Error::from_contract_error(
@@ -125,6 +124,7 @@ pub fn require_owner(env: &Env, caller: &Address, record: &IpRecord) {
 /// # Panics
 ///
 /// Panics with `UnauthorizedUpgrade` error if caller is not the admin or admin is not initialized.
+#[allow(dead_code)]
 pub fn require_admin(env: &Env, caller: &Address) {
     let admin: Address = env
         .storage()

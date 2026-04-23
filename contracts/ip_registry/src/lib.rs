@@ -1,6 +1,7 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, contracterror, symbol_short, Address, BytesN, Bytes, Env, Error, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env,
+    Error, Vec,
 };
 
 mod validation;
@@ -45,7 +46,7 @@ pub enum DataKey {
     NextId,
     CommitmentOwner(BytesN<32>), // tracks which owner already holds a commitment hash
     Admin,
-    IpLicenses(u64),             // Vec<LicenseEntry> for an IP
+    PartialDisclosure(u64), // stores partial_hash for a given ip_id after reveal
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -125,7 +126,9 @@ impl IpRegistry {
         if !env.storage().persistent().has(&DataKey::Admin) {
             let admin = env.current_contract_address();
             env.storage().persistent().set(&DataKey::Admin, &admin);
-            env.storage().persistent().extend_ttl(&DataKey::Admin, 50000, 50000);
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::Admin, 50000, 50000);
         }
 
         // Reject zero-byte commitment hash (Issue #40)
@@ -318,12 +321,16 @@ impl IpRegistry {
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
         let admin_opt: Option<Address> = env.storage().persistent().get(&DataKey::Admin);
         if admin_opt.is_none() {
-            env.panic_with_error(Error::from_contract_error(ContractError::UnauthorizedUpgrade as u32));
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::UnauthorizedUpgrade as u32,
+            ));
         }
         let admin = admin_opt.unwrap();
         let invoker = env.current_contract_address();
         if invoker != admin {
-            env.panic_with_error(Error::from_contract_error(ContractError::UnauthorizedUpgrade as u32));
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::UnauthorizedUpgrade as u32,
+            ));
         }
         admin.require_auth();
         env.deployer().update_current_contract_wasm(new_wasm_hash);
@@ -430,6 +437,78 @@ impl IpRegistry {
             .persistent()
             .get(&DataKey::OwnerIps(owner))
             .unwrap_or(Vec::new(&env))
+    }
+
+    /// Partially disclose an IP commitment by revealing a hash of the design
+    /// without exposing the full secret.
+    ///
+    /// # Proof Scheme
+    ///
+    /// The original commitment is `commitment_hash = sha256(partial_hash || blinding_factor)`.
+    /// The caller proves knowledge of `partial_hash` (e.g. sha256 of source code) and
+    /// `blinding_factor` by providing both. On-chain verification recomputes
+    /// `sha256(partial_hash || blinding_factor)` and checks it equals the stored
+    /// `commitment_hash`. The `partial_hash` is then stored publicly so third parties
+    /// can verify prior art without learning the full design.
+    ///
+    /// # Arguments
+    ///
+    /// * `ip_id` - The IP to partially disclose
+    /// * `partial_hash` - sha256 of the design artifact (e.g. sha256(source_code))
+    /// * `blinding_factor` - The blinding factor used when committing
+    ///
+    /// # Returns
+    ///
+    /// `true` if the proof is valid and the partial hash is stored; `false` otherwise.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the IP does not exist or the caller is not the owner.
+    pub fn reveal_partial(
+        env: Env,
+        ip_id: u64,
+        partial_hash: BytesN<32>,
+        blinding_factor: BytesN<32>,
+    ) -> bool {
+        let record = require_ip_exists(&env, ip_id);
+        record.owner.require_auth();
+
+        // Recompute commitment: sha256(partial_hash || blinding_factor)
+        let mut preimage = Bytes::new(&env);
+        preimage.append(&partial_hash.clone().into());
+        preimage.append(&blinding_factor.into());
+        let computed: BytesN<32> = env.crypto().sha256(&preimage).into();
+
+        if computed != record.commitment_hash {
+            return false;
+        }
+
+        // Store the partial hash publicly for third-party verification
+        env.storage()
+            .persistent()
+            .set(&DataKey::PartialDisclosure(ip_id), &partial_hash);
+        env.storage().persistent().extend_ttl(
+            &DataKey::PartialDisclosure(ip_id),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        env.events().publish(
+            (symbol_short!("partial"), record.owner),
+            (ip_id, partial_hash),
+        );
+
+        true
+    }
+
+    /// Retrieve the publicly disclosed partial hash for an IP, if any.
+    ///
+    /// Returns `Some(partial_hash)` if `reveal_partial` was successfully called,
+    /// `None` if no partial disclosure has been made.
+    pub fn get_partial_disclosure(env: Env, ip_id: u64) -> Option<BytesN<32>> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PartialDisclosure(ip_id))
     }
 
     /// Check if an address owns a specific IP.
