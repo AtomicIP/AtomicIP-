@@ -1,4 +1,5 @@
 use axum::{extract::Path, http::StatusCode, Json};
+use tracing::instrument;
 use crate::schemas::*;
 
 /// Timestamp a new IP commitment. Returns the assigned IP ID.
@@ -12,6 +13,7 @@ use crate::schemas::*;
         (status = 400, description = "Invalid request (zero hash, duplicate hash)", body = ErrorResponse),
     )
 )]
+#[instrument(skip(body))]
 pub async fn commit_ip(Json(body): Json<CommitIpRequest>) -> Result<Json<u64>, (StatusCode, Json<ErrorResponse>)> {
     // TODO: Call Soroban RPC to invoke ip_registry.commit_ip
     // For now, return a stub response
@@ -34,6 +36,7 @@ pub async fn commit_ip(Json(body): Json<CommitIpRequest>) -> Result<Json<u64>, (
         (status = 404, description = "IP record not found", body = ErrorResponse),
     )
 )]
+#[instrument]
 pub async fn get_ip(Path(ip_id): Path<u64>) -> Result<Json<IpRecord>, (StatusCode, Json<ErrorResponse>)> {
     // TODO: Call Soroban RPC to invoke ip_registry.get_ip
     // For now, return a stub response
@@ -56,6 +59,7 @@ pub async fn get_ip(Path(ip_id): Path<u64>) -> Result<Json<IpRecord>, (StatusCod
         (status = 404, description = "IP record not found", body = ErrorResponse),
     )
 )]
+#[instrument(skip(body))]
 pub async fn transfer_ip(Json(body): Json<TransferIpRequest>) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     // TODO: Call Soroban RPC to invoke ip_registry.transfer_ip
     Err((
@@ -77,6 +81,7 @@ pub async fn transfer_ip(Json(body): Json<TransferIpRequest>) -> Result<StatusCo
         (status = 404, description = "IP record not found", body = ErrorResponse),
     )
 )]
+#[instrument(skip(body))]
 pub async fn verify_commitment(Json(body): Json<VerifyCommitmentRequest>) -> Result<Json<VerifyCommitmentResponse>, (StatusCode, Json<ErrorResponse>)> {
     // TODO: Call Soroban RPC to invoke ip_registry.verify_commitment
     Err((
@@ -97,6 +102,7 @@ pub async fn verify_commitment(Json(body): Json<VerifyCommitmentRequest>) -> Res
         (status = 200, description = "List of IP IDs (null if none)", body = ListIpByOwnerResponse),
     )
 )]
+#[instrument]
 pub async fn list_ip_by_owner(Path(owner): Path<String>) -> Json<ListIpByOwnerResponse> {
     // TODO: Call Soroban RPC to invoke ip_registry.list_ip_by_owner
     Json(ListIpByOwnerResponse { ip_ids: None })
@@ -113,6 +119,7 @@ pub async fn list_ip_by_owner(Path(owner): Path<String>) -> Json<ListIpByOwnerRe
         (status = 400, description = "Seller is not IP owner or active swap exists", body = ErrorResponse),
     )
 )]
+#[instrument(skip(body))]
 pub async fn initiate_swap(Json(body): Json<InitiateSwapRequest>) -> Result<Json<u64>, (StatusCode, Json<ErrorResponse>)> {
     // TODO: Call Soroban RPC to invoke atomic_swap.initiate_swap
     Err((
@@ -136,6 +143,7 @@ pub async fn initiate_swap(Json(body): Json<InitiateSwapRequest>) -> Result<Json
         (status = 404, description = "Swap not found", body = ErrorResponse),
     )
 )]
+#[instrument(skip(body))]
 pub async fn accept_swap(Path(swap_id): Path<u64>, Json(body): Json<AcceptSwapRequest>) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     // TODO: Call Soroban RPC to invoke atomic_swap.accept_swap
     Err((
@@ -159,6 +167,7 @@ pub async fn accept_swap(Path(swap_id): Path<u64>, Json(body): Json<AcceptSwapRe
         (status = 404, description = "Swap not found", body = ErrorResponse),
     )
 )]
+#[instrument(skip(body))]
 pub async fn reveal_key(Path(swap_id): Path<u64>, Json(body): Json<RevealKeyRequest>) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     // TODO: Call Soroban RPC to invoke atomic_swap.reveal_key
     Err((
@@ -182,6 +191,7 @@ pub async fn reveal_key(Path(swap_id): Path<u64>, Json(body): Json<RevealKeyRequ
         (status = 404, description = "Swap not found", body = ErrorResponse),
     )
 )]
+#[instrument(skip(body))]
 pub async fn cancel_swap(Path(swap_id): Path<u64>, Json(body): Json<CancelSwapRequest>) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     // TODO: Call Soroban RPC to invoke atomic_swap.cancel_swap
     Err((
@@ -205,6 +215,7 @@ pub async fn cancel_swap(Path(swap_id): Path<u64>, Json(body): Json<CancelSwapRe
         (status = 404, description = "Swap not found", body = ErrorResponse),
     )
 )]
+#[instrument(skip(body))]
 pub async fn cancel_expired_swap(Path(swap_id): Path<u64>, Json(body): Json<CancelExpiredSwapRequest>) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     // TODO: Call Soroban RPC to invoke atomic_swap.cancel_expired_swap
     Err((
@@ -226,6 +237,7 @@ pub async fn cancel_expired_swap(Path(swap_id): Path<u64>, Json(body): Json<Canc
         (status = 404, description = "Swap not found", body = ErrorResponse),
     )
 )]
+#[instrument]
 pub async fn get_swap(Path(swap_id): Path<u64>) -> Result<Json<SwapRecord>, (StatusCode, Json<ErrorResponse>)> {
     // TODO: Call Soroban RPC to invoke atomic_swap.get_swap
     Err((

@@ -1,8 +1,10 @@
 use axum::{routing::get, routing::post, Router};
+use axum::middleware;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
 mod handlers;
+mod metrics;
 mod schemas;
 
 #[derive(OpenApi)]
@@ -50,8 +52,11 @@ pub struct ApiDoc;
 
 #[tokio::main]
 async fn main() {
+    metrics::init();
+
     let app = Router::new()
         .merge(SwaggerUi::new("/docs").url("/openapi.json", ApiDoc::openapi()))
+        .route("/metrics", get(metrics::metrics_handler))
         .route("/ip/commit", post(handlers::commit_ip))
         .route("/ip/{ip_id}", get(handlers::get_ip))
         .route("/ip/transfer", post(handlers::transfer_ip))
@@ -62,10 +67,12 @@ async fn main() {
         .route("/swap/{swap_id}/reveal", post(handlers::reveal_key))
         .route("/swap/{swap_id}/cancel", post(handlers::cancel_swap))
         .route("/swap/{swap_id}/cancel-expired", post(handlers::cancel_expired_swap))
-        .route("/swap/{swap_id}", get(handlers::get_swap));
+        .route("/swap/{swap_id}", get(handlers::get_swap))
+        .layer(middleware::from_fn(metrics::track));
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
     println!("Swagger UI   -> http://localhost:8080/docs");
     println!("OpenAPI JSON -> http://localhost:8080/openapi.json");
+    println!("Metrics      -> http://localhost:8080/metrics");
     axum::serve(listener, app).await.unwrap();
 }
