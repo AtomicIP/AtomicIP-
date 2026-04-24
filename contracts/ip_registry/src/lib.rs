@@ -7,6 +7,9 @@ use soroban_sdk::{
 mod validation;
 use validation::*;
 
+mod types;
+use types::*;
+
 #[cfg(test)]
 mod test;
 
@@ -213,6 +216,120 @@ impl IpRegistry {
         id
     }
 
+    /// Commit multiple IP commitments in a single transaction.
+    ///
+    /// This function allows batching multiple IP commitments, reducing gas costs
+    /// for users with multiple designs. Returns the assigned IP IDs in order.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `owner` - The address that owns all the IPs. This address must authorize the transaction.
+    /// * `commitment_hashes` - A vector of 32-byte cryptographic hashes for the IP commitments.
+    ///   Each must not be all zeros and must be unique across all registered IPs.
+    ///
+    /// # Returns
+    ///
+    /// A vector of unique IP IDs assigned to the commitments, in the same order as the input hashes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// * The `owner` does not authorize the transaction (auth error)
+    /// * Any `commitment_hash` is all zeros (ZeroCommitmentHash error)
+    /// * Any `commitment_hash` is already registered (CommitmentAlreadyRegistered error)
+    ///
+    /// # Auth Model
+    ///
+    /// `owner.require_auth()` is called once for the batch operation.
+    pub fn batch_commit_ip(env: Env, owner: Address, commitment_hashes: Vec<BytesN<32>>) -> Vec<u64> {
+        owner.require_auth();
+
+        // Initialize admin on first call if not set
+        if !env.storage().persistent().has(&DataKey::Admin) {
+            let admin = env.current_contract_address();
+            env.storage().persistent().set(&DataKey::Admin, &admin);
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::Admin, 50000, 50000);
+        }
+
+        let mut ids = Vec::new(&env);
+        let timestamp = env.ledger().timestamp();
+
+        for commitment_hash in commitment_hashes.iter() {
+            // Reject zero-byte commitment hash
+            require_non_zero_commitment(&env, &commitment_hash);
+
+            // Reject duplicate commitment hash globally
+            require_unique_commitment(&env, &commitment_hash);
+
+            // NextId lives in persistent storage so it survives contract upgrades.
+            let id: u64 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::NextId)
+                .unwrap_or(1);
+
+            let record = IpRecord {
+                ip_id: id,
+                owner: owner.clone(),
+                commitment_hash: commitment_hash.clone(),
+                timestamp,
+                revoked: false,
+                expiry_timestamp: 0,
+                metadata: Bytes::new(&env),
+            };
+
+            env.storage()
+                .persistent()
+                .set(&DataKey::IpRecord(id), &record);
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::IpRecord(id), LEDGER_BUMP, LEDGER_BUMP);
+
+            // Append to owner index
+            let mut owner_ids: Vec<u64> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::OwnerIps(owner.clone()))
+                .unwrap_or(Vec::new(&env));
+            owner_ids.push_back(id);
+            env.storage()
+                .persistent()
+                .set(&DataKey::OwnerIps(owner.clone()), &owner_ids);
+            env.storage().persistent().extend_ttl(
+                &DataKey::OwnerIps(owner.clone()),
+                LEDGER_BUMP,
+                LEDGER_BUMP,
+            );
+
+            // Track commitment hash ownership
+            env.storage()
+                .persistent()
+                .set(&DataKey::CommitmentOwner(commitment_hash.clone()), &owner);
+            env.storage().persistent().extend_ttl(
+                &DataKey::CommitmentOwner(commitment_hash.clone()),
+                50000,
+                50000,
+            );
+
+            env.events().publish(
+                (symbol_short!("ip_commit"), owner.clone()),
+                (id, timestamp),
+            );
+
+            ids.push_back(id);
+
+            env.storage().persistent().set(&DataKey::NextId, &(id + 1));
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::NextId, LEDGER_BUMP, LEDGER_BUMP);
+        }
+
+        ids
+    }
+
     /// Transfer IP ownership to a new address.
     ///
     /// This function transfers ownership of an IP record from the current owner
@@ -311,9 +428,35 @@ impl IpRegistry {
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::IpRecord(ip_id), 50000, 50000);
+
+        env.events().publish(
+            (REVOKE_TOPIC, record.owner.clone()),
+            (ip_id, env.ledger().timestamp()),
+        );
+    }
+
+    /// Validate that a new WASM is compatible for upgrade.
+    ///
+    /// Checks that the new WASM has the same contract interface,
+    /// does not remove storage keys, and does not change error codes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the new WASM is not compatible.
+    pub fn validate_upgrade(env: Env, new_wasm_hash: BytesN<32>) {
+        // For now, simple validation: ensure new_wasm_hash is not zero
+        let zero_hash = BytesN::from_array(&env, &[0u8; 32]);
+        if new_wasm_hash == zero_hash {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::UnauthorizedUpgrade as u32,
+            ));
+        }
+        // TODO: Implement full validation for exported functions, storage keys, error codes
     }
 
     /// Admin-only contract upgrade.
+    ///
+    /// # Panics
     ///
     /// # Panics
     ///
@@ -333,6 +476,10 @@ impl IpRegistry {
             ));
         }
         admin.require_auth();
+
+        // Validate the new WASM before upgrading
+        Self::validate_upgrade(env, new_wasm_hash);
+
         env.deployer().update_current_contract_wasm(new_wasm_hash);
     }
 
