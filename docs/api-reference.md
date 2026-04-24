@@ -38,7 +38,7 @@ pub fn commit_ip(env: Env, owner: Address, commitment_hash: BytesN<32>) -> u64
 
 Requires `owner.require_auth()` — the transaction must be signed by the owner's private key.
 
-### Example
+### Example (Rust SDK)
 
 ```rust
 let owner = Address::from_string("GABC...");
@@ -51,6 +51,23 @@ preimage.append(&blinding_factor.into());
 let commitment_hash: BytesN<32> = env.crypto().sha256(&preimage).into();
 
 let ip_id = registry.commit_ip(&owner, &commitment_hash);
+```
+
+### Example (REST API)
+
+**POST** `/ip/commit`
+
+**Request Body:**
+```json
+{
+  "owner": "GABC...",
+  "commitment_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+}
+```
+
+**Response (200 OK):**
+```json
+1
 ```
 
 ---
@@ -81,12 +98,32 @@ pub fn batch_commit_ip(env: Env, owner: Address, hashes: Vec<BytesN<32>>) -> Vec
 
 Same as `commit_ip` — panics if any hash is zero or already registered.
 
-### Example
+### Example (Rust SDK)
 
 ```rust
 let hashes = Vec::from_array(&env, [hash1, hash2, hash3]);
 let ip_ids = registry.batch_commit_ip(&owner, &hashes);
 // ip_ids = [1, 2, 3]
+```
+
+### Example (REST API)
+
+**POST** `/ip/batch`
+
+**Request Body:**
+```json
+{
+  "owner": "GABC...",
+  "hashes": [
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9"
+  ]
+}
+```
+
+**Response (200 OK):**
+```json
+[1, 2]
 ```
 
 ---
@@ -136,12 +173,27 @@ pub struct IpRecord {
 |---|---|---|
 | `IpNotFound` | 1 | IP record does not exist |
 
-### Example
+### Example (Rust SDK)
 
 ```rust
 let record = registry.get_ip(&ip_id);
 println!("Owner: {}", record.owner);
 println!("Timestamp: {}", record.timestamp);
+```
+
+### Example (REST API)
+
+**GET** `/ip/1`
+
+**Response (200 OK):**
+```json
+{
+  "ip_id": 1,
+  "owner": "GABC...",
+  "commitment_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "timestamp": 1713994200,
+  "revoked": false
+}
 ```
 
 ---
@@ -180,12 +232,32 @@ pub fn verify_commitment(
 |---|---|---|
 | `IpNotFound` | 1 | IP record does not exist |
 
-### Example
+### Example (Rust SDK)
 
 ```rust
 let is_valid = registry.verify_commitment(&ip_id, &secret, &blinding_factor);
 if is_valid {
     println!("Commitment verified!");
+}
+```
+
+### Example (REST API)
+
+**POST** `/ip/verify`
+
+**Request Body:**
+```json
+{
+  "ip_id": 1,
+  "secret": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "blinding_factor": "5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9"
+}
+```
+
+**Response (200 OK):**
+```json
+{
+  "valid": true
 }
 ```
 
@@ -216,13 +288,24 @@ pub fn list_ip_by_owner(env: Env, owner: Address) -> Vec<u64>
 
 This function does not panic.
 
-### Example
+### Example (Rust SDK)
 
 ```rust
 let ip_ids = registry.list_ip_by_owner(&owner);
 for ip_id in ip_ids.iter() {
     let record = registry.get_ip(&ip_id);
     println!("IP {}: {}", ip_id, record.commitment_hash);
+}
+```
+
+### Example (REST API)
+
+**GET** `/ip/owner/GABC...`
+
+**Response (200 OK):**
+```json
+{
+  "ip_ids": [1, 2, 5]
 }
 ```
 
@@ -261,10 +344,27 @@ This function does not return a value.
 
 Requires `record.owner.require_auth()` — the current owner must sign the transaction.
 
-### Example
+### Example (Rust SDK)
 
 ```rust
 registry.transfer_ip(&ip_id, &new_owner);
+```
+
+### Example (REST API)
+
+**POST** `/ip/transfer`
+
+**Request Body:**
+```json
+{
+  "ip_id": 1,
+  "new_owner": "GDEF..."
+}
+```
+
+**Response (200 OK):**
+```json
+{}
 ```
 
 ---
@@ -302,10 +402,26 @@ This function does not return a value.
 
 Requires `record.owner.require_auth()` — only the current owner can revoke.
 
-### Example
+### Example (Rust SDK)
 
 ```rust
 registry.revoke_ip(&ip_id);
+```
+
+### Example (REST API)
+
+**POST** `/ip/revoke` (Note: Custom endpoint for revocation)
+
+**Request Body:**
+```json
+{
+  "ip_id": 1
+}
+```
+
+**Response (200 OK):**
+```json
+{}
 ```
 
 ---

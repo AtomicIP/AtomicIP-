@@ -325,9 +325,11 @@ components:
         owner:
           type: string
           description: Stellar address of the IP owner (must sign the transaction)
+          example: "GABC..."
         commitment_hash:
           type: string
           description: 32-byte Pedersen commitment hash, hex-encoded
+          example: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
     IpRecord:
       type: object
@@ -336,16 +338,21 @@ components:
         ip_id:
           type: integer
           format: int64
+          example: 1
         owner:
           type: string
+          example: "GABC..."
         commitment_hash:
           type: string
+          example: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         timestamp:
           type: integer
           format: int64
+          example: 1713994200
         revoked:
           type: boolean
           description: Whether the IP record has been revoked
+          example: false
 
     TransferIpRequest:
       type: object
@@ -425,19 +432,26 @@ components:
       properties:
         ip_registry_id:
           type: string
+          example: "CDEF..."
         ip_id:
           type: integer
           format: int64
+          example: 1
         seller:
           type: string
+          example: "GABC..."
         price:
           type: integer
           format: int64
+          description: Price in stroops (1 XLM = 10_000_000 stroops)
+          example: 100000000
         buyer:
           type: string
+          example: "GXYZ..."
         token:
           type: string
           description: Stellar asset contract address for the payment token
+          example: "CASD..."
 
     AcceptSwapRequest:
       type: object
