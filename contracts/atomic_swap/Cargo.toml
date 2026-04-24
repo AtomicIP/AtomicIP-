@@ -13,3 +13,4 @@ ip_registry = { path = "../ip_registry" }
 [dev-dependencies]
 soroban-sdk = { version = "22.0.0", features = ["testutils"] }
 ip_registry = { path = "../ip_registry", features = ["testutils"] }
+proptest = { version = "1", default-features = false, features = ["std"] }
