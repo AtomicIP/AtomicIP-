@@ -3,6 +3,7 @@ use axum::middleware;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
+mod auth;
 mod handlers;
 mod metrics;
 mod schemas;
