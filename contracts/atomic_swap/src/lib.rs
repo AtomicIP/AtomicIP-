@@ -1,12 +1,16 @@
 #![no_std]
 mod registry;
 mod swap;
+mod upgrade;
 mod utils;
 mod multi_currency;
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, Bytes, BytesN, Env, Error, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token,
+    Address, Bytes, BytesN, Env, Error, String, Vec,
 };
+
+pub use upgrade::{build_v1_schema, ContractSchema, ErrorEntry, FunctionEntry};
 
 mod validation;
 use validation::*;
@@ -50,6 +54,20 @@ pub enum ContractError {
     InsufficientApprovals = 27,
     /// #254: Approver has already approved this swap.
     AlreadyApproved = 28,
+
+    // ── Upgrade-validation errors (29-34) ─────────────────────────────────────
+    /// New schema version must be strictly greater than the current one.
+    UpgradeSchemaVersionNotGreater = 29,
+    /// A function present in the current schema is missing from the new schema.
+    UpgradeMissingFunction = 30,
+    /// A function's signature changed between the current and new schema.
+    UpgradeFunctionSignatureChanged = 31,
+    /// An error entry present in the current schema is missing from the new schema.
+    UpgradeMissingErrorCode = 32,
+    /// An error's numeric discriminant changed between schemas.
+    UpgradeErrorCodeChanged = 33,
+    /// A storage key present in the current schema is missing from the new schema.
+    UpgradeMissingStorageKey = 34,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -82,6 +100,14 @@ pub enum DataKey {
     SwapHistory(u64),
     /// #254: Maps swap_id → Vec<Address> of collected approvals.
     SwapApprovals(u64),
+    /// Maps cancellation reason bytes for a swap_id.
+    CancelReason(u64),
+    /// Multi-currency configuration.
+    MultiCurrencyConfig,
+    /// List of supported token addresses.
+    SupportedTokens,
+    /// On-chain interface manifest used by validate_upgrade.
+    ContractSchema,
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -111,6 +137,8 @@ pub struct SwapRecord {
     pub accept_timestamp: u64,
     /// #254: Number of approvals required before accept_swap is allowed.
     pub required_approvals: u32,
+    /// Ledger timestamp when a dispute was raised. Zero if no dispute.
+    pub dispute_timestamp: u64,
 }
 
 // ── Events ────────────────────────────────────────────────────────────────────
@@ -229,6 +257,11 @@ impl AtomicSwap {
         env.storage()
             .instance()
             .set(&DataKey::IpRegistry, &ip_registry);
+
+        // Seed the on-chain interface manifest so future upgrades can validate
+        // backward compatibility against the v1 schema.
+        let schema = upgrade::build_v1_schema(&env);
+        upgrade::store_schema(&env, &schema);
     }
 
     /// Seller initiates a patent sale. Returns the swap ID.
@@ -274,6 +307,7 @@ impl AtomicSwap {
             expiry: env.ledger().timestamp() + 604800u64,
             accept_timestamp: 0,
             required_approvals,
+            dispute_timestamp: 0,
         };
 
         env.storage().persistent().set(&DataKey::Swap(id), &swap);
@@ -525,7 +559,7 @@ impl AtomicSwap {
         let elapsed = env.ledger().timestamp().saturating_sub(swap.dispute_timestamp);
         if elapsed < config.dispute_resolution_timeout_seconds {
             env.panic_with_error(Error::from_contract_error(
-                ContractError::DisputeResolutionTimeout as u32,
+                ContractError::SwapHasNotExpiredYet as u32,
             ));
         }
 
@@ -628,6 +662,41 @@ impl AtomicSwap {
         let admin: Address = admin_opt.unwrap();
         admin.require_auth();
         env.deployer().update_current_contract_wasm(new_wasm_hash);
+    }
+
+    /// Admin-only upgrade with backward-compatibility validation.
+    ///
+    /// Validates that `new_schema` is a strict superset of the currently stored
+    /// interface manifest before swapping the WASM.  The admin must supply the
+    /// manifest of the candidate WASM alongside its hash.
+    ///
+    /// # Upgrade safety requirements
+    ///
+    /// The following must NOT change across upgrades:
+    /// - Exported function names and their full signatures.
+    /// - Error code numeric discriminants (names and numbers must be stable).
+    /// - Storage key variant names (existing keys must remain readable).
+    ///
+    /// Additions (new functions, new error codes, new storage keys) are allowed.
+    /// The schema version must be strictly greater than the current version.
+    pub fn validate_upgrade(
+        env: Env,
+        new_wasm_hash: BytesN<32>,
+        new_schema: ContractSchema,
+    ) -> Result<(), ContractError> {
+        // Only the admin may trigger an upgrade.
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::UnauthorizedUpgrade as u32,
+                ))
+            });
+        admin.require_auth();
+
+        upgrade::validate_upgrade(&env, new_wasm_hash, new_schema)
     }
 
     /// Updates the protocol config.
@@ -779,13 +848,22 @@ impl AtomicSwap {
 
     /// Check if a token is supported
     pub fn is_token_supported(env: Env, token: SupportedToken) -> Result<bool, ContractError> {
-        let config = Self::get_multi_currency_config(env)?;
+        let config: MultiCurrencyConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MultiCurrencyConfig)
+            .ok_or(ContractError::SwapNotFound)?;
         Ok(config.is_token_supported(&token))
     }
 
     /// Get token metadata by symbol
     pub fn get_token_metadata(env: Env, symbol: String) -> Result<TokenMetadata, ContractError> {
-        let config = Self::get_multi_currency_config(env)?;
+        let config: MultiCurrencyConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MultiCurrencyConfig)
+            .ok_or(ContractError::SwapNotFound)?;
+        // Convert soroban String to a fixed-size byte comparison via the module helper
         config.get_token_by_symbol(&env, &symbol).ok_or(ContractError::SwapNotFound)
     }
 
@@ -799,24 +877,29 @@ impl AtomicSwap {
         caller.require_auth();
         require_admin(&env, &caller);
 
-        let mut config = Self::get_multi_currency_config(env)?;
-        
+        let mut config: MultiCurrencyConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MultiCurrencyConfig)
+            .ok_or(ContractError::SwapNotFound)?;
+
         if !config.enabled_tokens.contains(token.clone()) {
+            let token_addr = metadata.address.clone();
             config.enabled_tokens.push_back(token.clone());
             config.token_metadata.push_back(metadata);
-            
+
             env.storage().persistent().set(&DataKey::MultiCurrencyConfig, &config);
             env.storage().persistent().set(&DataKey::SupportedTokens, &config.enabled_tokens);
-            
+
             env.events().publish(
                 (symbol_short!("token_add"),),
                 multi_currency::TokenAddedEvent {
                     token,
-                    address: metadata.address,
+                    address: token_addr,
                 },
             );
         }
-        
+
         Ok(())
     }
 
@@ -829,16 +912,18 @@ impl AtomicSwap {
         caller.require_auth();
         require_admin(&env, &caller);
 
-        let mut config = Self::get_multi_currency_config(env)?;
-        
-        // Cannot remove default token
+        let config: MultiCurrencyConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MultiCurrencyConfig)
+            .ok_or(ContractError::SwapNotFound)?;
+
+        // Cannot remove the default token.
         if config.default_token == token {
-            return Err(ContractError::UnauthorizedUpgrade); // Reusing error
+            return Err(ContractError::UnauthorizedUpgrade);
         }
 
-        // Remove from lists (simplified - in production would need proper removal)
-        // For now, just mark as removed in a future enhancement
-        
+        // Removal of non-default tokens is a future enhancement.
         Ok(())
     }
 

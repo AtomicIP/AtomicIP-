@@ -219,6 +219,22 @@ mod tests {
     use super::*;
     use soroban_sdk::{testutils::Address as _, Env};
 
+    /// Convenience constructor so every test doesn't repeat all fields.
+    fn make_swap(env: &Env, status: SwapStatus, expiry: u64) -> SwapRecord {
+        SwapRecord {
+            ip_id: 1,
+            seller: Address::generate(env),
+            buyer: Address::generate(env),
+            price: 100,
+            token: Address::generate(env),
+            status,
+            expiry,
+            accept_timestamp: 0,
+            required_approvals: 0,
+            dispute_timestamp: 0,
+        }
+    }
+
     #[test]
     fn test_require_not_paused_succeeds_when_not_paused() {
         let env = Env::default();
@@ -258,47 +274,17 @@ mod tests {
     #[test]
     fn test_require_swap_status_succeeds_when_matching() {
         let env = Env::default();
-        let swap = SwapRecord {
-            ip_id: 1,
-            seller: Address::generate(&env),
-            buyer: Address::generate(&env),
-            price: 100,
-            token: Address::generate(&env),
-            status: SwapStatus::Pending,
-            expiry: 0,
-            accept_timestamp: 0,
-            dispute_timestamp: 0,
-        };
+        let swap = make_swap(&env, SwapStatus::Pending, 0);
         // Should not panic
-        require_swap_status(
-            &env,
-            &swap,
-            SwapStatus::Pending,
-            ContractError::SwapNotPending,
-        );
+        require_swap_status(&env, &swap, SwapStatus::Pending, ContractError::SwapNotPending);
     }
 
     #[test]
     #[should_panic(expected = "SwapNotPending")]
     fn test_require_swap_status_panics_when_not_matching() {
         let env = Env::default();
-        let swap = SwapRecord {
-            ip_id: 1,
-            seller: Address::generate(&env),
-            buyer: Address::generate(&env),
-            price: 100,
-            token: Address::generate(&env),
-            status: SwapStatus::Accepted,
-            expiry: 0,
-            accept_timestamp: 0,
-            dispute_timestamp: 0,
-        };
-        require_swap_status(
-            &env,
-            &swap,
-            SwapStatus::Pending,
-            ContractError::SwapNotPending,
-        );
+        let swap = make_swap(&env, SwapStatus::Accepted, 0);
+        require_swap_status(&env, &swap, SwapStatus::Pending, ContractError::SwapNotPending);
     }
 
     #[test]
@@ -314,6 +300,7 @@ mod tests {
             status: SwapStatus::Pending,
             expiry: 0,
             accept_timestamp: 0,
+            required_approvals: 0,
             dispute_timestamp: 0,
         };
         // Should not panic
@@ -335,6 +322,7 @@ mod tests {
             status: SwapStatus::Pending,
             expiry: 0,
             accept_timestamp: 0,
+            required_approvals: 0,
             dispute_timestamp: 0,
         };
         require_seller(&env, &not_seller, &swap);
@@ -353,6 +341,7 @@ mod tests {
             status: SwapStatus::Pending,
             expiry: 0,
             accept_timestamp: 0,
+            required_approvals: 0,
             dispute_timestamp: 0,
         };
         // Should not panic
@@ -374,6 +363,7 @@ mod tests {
             status: SwapStatus::Pending,
             expiry: 0,
             accept_timestamp: 0,
+            required_approvals: 0,
             dispute_timestamp: 0,
         };
         require_buyer(&env, &not_buyer, &swap);
@@ -392,6 +382,7 @@ mod tests {
             status: SwapStatus::Pending,
             expiry: 0,
             accept_timestamp: 0,
+            required_approvals: 0,
             dispute_timestamp: 0,
         };
         // Should not panic
@@ -411,6 +402,7 @@ mod tests {
             status: SwapStatus::Pending,
             expiry: 0,
             accept_timestamp: 0,
+            required_approvals: 0,
             dispute_timestamp: 0,
         };
         // Should not panic
@@ -433,6 +425,7 @@ mod tests {
             status: SwapStatus::Pending,
             expiry: 0,
             accept_timestamp: 0,
+            required_approvals: 0,
             dispute_timestamp: 0,
         };
         require_seller_or_buyer(&env, &neither, &swap);
@@ -441,18 +434,14 @@ mod tests {
     #[test]
     fn test_require_swap_expired_succeeds_when_expired() {
         let env = Env::default();
-        let swap = SwapRecord {
-            ip_id: 1,
-            seller: Address::generate(&env),
-            buyer: Address::generate(&env),
-            price: 100,
-            token: Address::generate(&env),
-            status: SwapStatus::Accepted,
-            expiry: 0, // Expired (timestamp is > 0)
-            accept_timestamp: 0,
-            dispute_timestamp: 0,
-        };
-        // Should not panic
+        // expiry=0, ledger timestamp starts at 0 but require_swap_expired checks <=
+        // so we need expiry strictly less than current timestamp.
+        // In the default test env, timestamp is 0; set expiry to 0 means 0 <= 0 → not expired.
+        // Use a swap with expiry in the past relative to a bumped ledger.
+        let swap = make_swap(&env, SwapStatus::Accepted, 0);
+        // Ledger timestamp is 0 and expiry is 0: 0 <= 0 is true so it would panic.
+        // Advance ledger time past expiry.
+        env.ledger().with_mut(|l| l.timestamp = 1);
         require_swap_expired(&env, &swap);
     }
 
@@ -460,17 +449,7 @@ mod tests {
     #[should_panic(expected = "SwapHasNotExpiredYet")]
     fn test_require_swap_expired_panics_when_not_expired() {
         let env = Env::default();
-        let swap = SwapRecord {
-            ip_id: 1,
-            seller: Address::generate(&env),
-            buyer: Address::generate(&env),
-            price: 100,
-            token: Address::generate(&env),
-            status: SwapStatus::Accepted,
-            expiry: u64::MAX, // Far in the future
-            accept_timestamp: 0,
-            dispute_timestamp: 0,
-        };
+        let swap = make_swap(&env, SwapStatus::Accepted, u64::MAX);
         require_swap_expired(&env, &swap);
     }
 
@@ -491,3 +470,4 @@ mod tests {
         require_no_active_swap(&env, 1);
     }
 }
+
