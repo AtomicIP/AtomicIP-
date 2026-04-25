@@ -159,6 +159,7 @@ impl IpRegistry {
             revoked: false,
             expiry_timestamp: 0,
             metadata: Bytes::new(&env),
+            co_owners: Vec::new(&env),
         };
 
         env.storage()
@@ -280,6 +281,7 @@ impl IpRegistry {
                 revoked: false,
                 expiry_timestamp: 0,
                 metadata: Bytes::new(&env),
+                co_owners: Vec::new(&env),
             };
 
             env.storage()
@@ -767,6 +769,47 @@ impl IpRegistry {
             .persistent()
             .get(&DataKey::IpLicenses(ip_id))
             .unwrap_or(Vec::new(&env))
+    }
+
+    /// Add a co-owner to an IP. Owner-only.
+    /// Co-owners can verify commitments but cannot transfer or revoke the IP.
+    pub fn add_co_owner(env: Env, ip_id: u64, co_owner: Address) {
+        let mut record = require_ip_exists(&env, ip_id);
+        record.owner.require_auth();
+
+        // Check if already a co-owner
+        for existing in record.co_owners.iter() {
+            if existing == co_owner {
+                return; // Already a co-owner, no-op
+            }
+        }
+
+        record.co_owners.push_back(co_owner.clone());
+        env.storage().persistent().set(&DataKey::IpRecord(ip_id), &record);
+        env.storage().persistent().extend_ttl(&DataKey::IpRecord(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish(
+            (symbol_short!("co_add"), record.owner),
+            (ip_id, co_owner),
+        );
+    }
+
+    /// Remove a co-owner from an IP. Owner-only.
+    pub fn remove_co_owner(env: Env, ip_id: u64, co_owner: Address) {
+        let mut record = require_ip_exists(&env, ip_id);
+        record.owner.require_auth();
+
+        // Find and remove the co-owner
+        if let Some(pos) = record.co_owners.iter().position(|addr| addr == co_owner) {
+            record.co_owners.remove(pos as u32);
+            env.storage().persistent().set(&DataKey::IpRecord(ip_id), &record);
+            env.storage().persistent().extend_ttl(&DataKey::IpRecord(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+
+            env.events().publish(
+                (symbol_short!("co_rem"), record.owner),
+                (ip_id, co_owner),
+            );
+        }
     }
 }
 

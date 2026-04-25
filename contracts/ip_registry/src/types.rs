@@ -38,4 +38,5 @@ pub struct IpRecord {
     pub commitment_hash: BytesN<32>,
     pub timestamp: u64,
     pub revoked: bool,
+    pub co_owners: soroban_sdk::Vec<Address>,
 }
