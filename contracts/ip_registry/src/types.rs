@@ -38,5 +38,5 @@ pub struct IpRecord {
     pub commitment_hash: BytesN<32>,
     pub timestamp: u64,
     pub revoked: bool,
-    pub priority: u8, // 0-10 scale, 0 = no priority, 10 = highest
+    pub co_owners: soroban_sdk::Vec<Address>,
 }

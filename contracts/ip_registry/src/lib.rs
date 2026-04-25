@@ -160,7 +160,7 @@ impl IpRegistry {
             revoked: false,
             expiry_timestamp: 0,
             metadata: Bytes::new(&env),
-            priority: 0,
+            co_owners: Vec::new(&env),
         };
 
         env.storage()
@@ -282,7 +282,7 @@ impl IpRegistry {
                 revoked: false,
                 expiry_timestamp: 0,
                 metadata: Bytes::new(&env),
-                priority: 0,
+                co_owners: Vec::new(&env),
             };
 
             env.storage()
@@ -772,61 +772,45 @@ impl IpRegistry {
             .unwrap_or(Vec::new(&env))
     }
 
-    /// Set the priority level for an IP (0-10 scale). Owner-only.
-    /// 0 = no priority, 10 = highest priority (e.g., urgent filing deadline)
-    pub fn set_ip_priority(env: Env, ip_id: u64, priority: u8) {
-        if priority > 10 {
-            env.panic_with_error(Error::from_contract_error(ContractError::Unauthorized as u32));
-        }
+    /// Add a co-owner to an IP. Owner-only.
+    /// Co-owners can verify commitments but cannot transfer or revoke the IP.
+    pub fn add_co_owner(env: Env, ip_id: u64, co_owner: Address) {
         let mut record = require_ip_exists(&env, ip_id);
         record.owner.require_auth();
-        record.priority = priority;
+
+        // Check if already a co-owner
+        for existing in record.co_owners.iter() {
+            if existing == co_owner {
+                return; // Already a co-owner, no-op
+            }
+        }
+
+        record.co_owners.push_back(co_owner.clone());
         env.storage().persistent().set(&DataKey::IpRecord(ip_id), &record);
         env.storage().persistent().extend_ttl(&DataKey::IpRecord(ip_id), LEDGER_BUMP, LEDGER_BUMP);
 
         env.events().publish(
-            (symbol_short!("priority"), record.owner),
-            (ip_id, priority),
+            (symbol_short!("co_add"), record.owner),
+            (ip_id, co_owner),
         );
     }
 
-    /// List all IP IDs owned by an address with priority >= min_priority.
-    /// Returns IPs sorted by priority (highest first).
-    pub fn list_ip_by_priority(env: Env, owner: Address, min_priority: u8) -> Vec<u64> {
-        let all_ids: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::OwnerIps(owner))
-            .unwrap_or(Vec::new(&env));
+    /// Remove a co-owner from an IP. Owner-only.
+    pub fn remove_co_owner(env: Env, ip_id: u64, co_owner: Address) {
+        let mut record = require_ip_exists(&env, ip_id);
+        record.owner.require_auth();
 
-        let mut filtered = Vec::new(&env);
-        for ip_id in all_ids.iter() {
-            if let Some(record) = env
-                .storage()
-                .persistent()
-                .get::<DataKey, IpRecord>(&DataKey::IpRecord(ip_id))
-            {
-                if record.priority >= min_priority {
-                    filtered.push_back(ip_id);
-                }
-            }
+        // Find and remove the co-owner
+        if let Some(pos) = record.co_owners.iter().position(|addr| addr == co_owner) {
+            record.co_owners.remove(pos as u32);
+            env.storage().persistent().set(&DataKey::IpRecord(ip_id), &record);
+            env.storage().persistent().extend_ttl(&DataKey::IpRecord(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+
+            env.events().publish(
+                (symbol_short!("co_rem"), record.owner),
+                (ip_id, co_owner),
+            );
         }
-
-        // Sort by priority (highest first) - simple bubble sort for small lists
-        for i in 0..filtered.len() {
-            for j in (i + 1)..filtered.len() {
-                let id_i = filtered.get(i).unwrap();
-                let id_j = filtered.get(j).unwrap();
-                let rec_i: IpRecord = env.storage().persistent().get(&DataKey::IpRecord(id_i)).unwrap();
-                let rec_j: IpRecord = env.storage().persistent().get(&DataKey::IpRecord(id_j)).unwrap();
-                if rec_j.priority > rec_i.priority {
-                    filtered.set(i, id_j);
-                    filtered.set(j, id_i);
-                }
-            }
-        }
-
-        filtered
     }
 }
 
