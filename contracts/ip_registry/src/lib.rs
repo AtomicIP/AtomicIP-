@@ -65,6 +65,7 @@ pub struct IpRecord {
     pub revoked: bool,
     pub expiry_timestamp: u64,   // 0 = no expiry
     pub metadata: Bytes,         // max 1 KB; empty = no metadata
+    pub priority: u8,            // 0-10 scale, 0 = no priority, 10 = highest
 }
 
 #[contracttype]
@@ -159,6 +160,7 @@ impl IpRegistry {
             revoked: false,
             expiry_timestamp: 0,
             metadata: Bytes::new(&env),
+            priority: 0,
         };
 
         env.storage()
@@ -280,6 +282,7 @@ impl IpRegistry {
                 revoked: false,
                 expiry_timestamp: 0,
                 metadata: Bytes::new(&env),
+                priority: 0,
             };
 
             env.storage()
@@ -767,6 +770,63 @@ impl IpRegistry {
             .persistent()
             .get(&DataKey::IpLicenses(ip_id))
             .unwrap_or(Vec::new(&env))
+    }
+
+    /// Set the priority level for an IP (0-10 scale). Owner-only.
+    /// 0 = no priority, 10 = highest priority (e.g., urgent filing deadline)
+    pub fn set_ip_priority(env: Env, ip_id: u64, priority: u8) {
+        if priority > 10 {
+            env.panic_with_error(Error::from_contract_error(ContractError::Unauthorized as u32));
+        }
+        let mut record = require_ip_exists(&env, ip_id);
+        record.owner.require_auth();
+        record.priority = priority;
+        env.storage().persistent().set(&DataKey::IpRecord(ip_id), &record);
+        env.storage().persistent().extend_ttl(&DataKey::IpRecord(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish(
+            (symbol_short!("priority"), record.owner),
+            (ip_id, priority),
+        );
+    }
+
+    /// List all IP IDs owned by an address with priority >= min_priority.
+    /// Returns IPs sorted by priority (highest first).
+    pub fn list_ip_by_priority(env: Env, owner: Address, min_priority: u8) -> Vec<u64> {
+        let all_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OwnerIps(owner))
+            .unwrap_or(Vec::new(&env));
+
+        let mut filtered = Vec::new(&env);
+        for ip_id in all_ids.iter() {
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, IpRecord>(&DataKey::IpRecord(ip_id))
+            {
+                if record.priority >= min_priority {
+                    filtered.push_back(ip_id);
+                }
+            }
+        }
+
+        // Sort by priority (highest first) - simple bubble sort for small lists
+        for i in 0..filtered.len() {
+            for j in (i + 1)..filtered.len() {
+                let id_i = filtered.get(i).unwrap();
+                let id_j = filtered.get(j).unwrap();
+                let rec_i: IpRecord = env.storage().persistent().get(&DataKey::IpRecord(id_i)).unwrap();
+                let rec_j: IpRecord = env.storage().persistent().get(&DataKey::IpRecord(id_j)).unwrap();
+                if rec_j.priority > rec_i.priority {
+                    filtered.set(i, id_j);
+                    filtered.set(j, id_i);
+                }
+            }
+        }
+
+        filtered
     }
 }
 
