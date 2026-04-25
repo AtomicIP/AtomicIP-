@@ -51,6 +51,7 @@ pub enum DataKey {
     Admin,
     PartialDisclosure(u64), // stores partial_hash for a given ip_id after reveal
     IpLicenses(u64),        // stores license entries for a given ip_id
+    CategoryIps(BytesN<32>), // maps category hash -> Vec<u64> of IP IDs
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -65,6 +66,7 @@ pub struct IpRecord {
     pub revoked: bool,
     pub expiry_timestamp: u64,   // 0 = no expiry
     pub metadata: Bytes,         // max 1 KB; empty = no metadata
+    pub category: Bytes,         // IP category (e.g., "software", "hardware", "design")
 }
 
 #[contracttype]
@@ -159,6 +161,7 @@ impl IpRegistry {
             revoked: false,
             expiry_timestamp: 0,
             metadata: Bytes::new(&env),
+            category: Bytes::new(&env),
         };
 
         env.storage()
@@ -280,6 +283,7 @@ impl IpRegistry {
                 revoked: false,
                 expiry_timestamp: 0,
                 metadata: Bytes::new(&env),
+                category: Bytes::new(&env),
             };
 
             env.storage()
@@ -766,6 +770,56 @@ impl IpRegistry {
         env.storage()
             .persistent()
             .get(&DataKey::IpLicenses(ip_id))
+            .unwrap_or(Vec::new(&env))
+    }
+
+    /// Set or update the category for an IP. Owner-only.
+    /// Category examples: "software", "hardware", "design", "patent", etc.
+    pub fn set_ip_category(env: Env, ip_id: u64, category: Bytes) {
+        let mut record = require_ip_exists(&env, ip_id);
+        record.owner.require_auth();
+
+        // Remove from old category index if it had one
+        if !record.category.is_empty() {
+            let old_cat_hash: BytesN<32> = env.crypto().sha256(&record.category).into();
+            let mut old_cat_ips: Vec<u64> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::CategoryIps(old_cat_hash.clone()))
+                .unwrap_or(Vec::new(&env));
+            if let Some(pos) = old_cat_ips.iter().position(|id| id == ip_id) {
+                old_cat_ips.remove(pos as u32);
+                env.storage().persistent().set(&DataKey::CategoryIps(old_cat_hash.clone()), &old_cat_ips);
+                env.storage().persistent().extend_ttl(&DataKey::CategoryIps(old_cat_hash), LEDGER_BUMP, LEDGER_BUMP);
+            }
+        }
+
+        // Add to new category index
+        if !category.is_empty() {
+            let cat_hash: BytesN<32> = env.crypto().sha256(&category).into();
+            let mut cat_ips: Vec<u64> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::CategoryIps(cat_hash.clone()))
+                .unwrap_or(Vec::new(&env));
+            if !cat_ips.iter().any(|id| id == ip_id) {
+                cat_ips.push_back(ip_id);
+            }
+            env.storage().persistent().set(&DataKey::CategoryIps(cat_hash.clone()), &cat_ips);
+            env.storage().persistent().extend_ttl(&DataKey::CategoryIps(cat_hash), LEDGER_BUMP, LEDGER_BUMP);
+        }
+
+        record.category = category;
+        env.storage().persistent().set(&DataKey::IpRecord(ip_id), &record);
+        env.storage().persistent().extend_ttl(&DataKey::IpRecord(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+    }
+
+    /// List all IP IDs in a specific category.
+    pub fn list_ip_by_category(env: Env, category: Bytes) -> Vec<u64> {
+        let cat_hash: BytesN<32> = env.crypto().sha256(&category).into();
+        env.storage()
+            .persistent()
+            .get(&DataKey::CategoryIps(cat_hash))
             .unwrap_or(Vec::new(&env))
     }
 }

@@ -26,6 +26,7 @@ pub enum DataKey {
     NextId,
     CommitmentOwner(BytesN<32>), // tracks which owner already holds a commitment hash
     Admin,
+    CategoryIps(BytesN<32>), // maps category hash -> Vec<u64> of IP IDs
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -38,4 +39,5 @@ pub struct IpRecord {
     pub commitment_hash: BytesN<32>,
     pub timestamp: u64,
     pub revoked: bool,
+    pub category: soroban_sdk::Bytes,
 }
