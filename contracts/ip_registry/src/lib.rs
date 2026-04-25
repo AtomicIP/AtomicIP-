@@ -51,6 +51,7 @@ pub enum DataKey {
     Admin,
     PartialDisclosure(u64), // stores partial_hash for a given ip_id after reveal
     IpLicenses(u64),        // stores license entries for a given ip_id
+    PublicIps,              // stores list of public IP IDs
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -65,6 +66,14 @@ pub struct IpRecord {
     pub revoked: bool,
     pub expiry_timestamp: u64,   // 0 = no expiry
     pub metadata: Bytes,         // max 1 KB; empty = no metadata
+    pub visibility: Visibility,  // Private or Public
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum Visibility {
+    Private,
+    Public,
 }
 
 #[contracttype]
@@ -159,6 +168,7 @@ impl IpRegistry {
             revoked: false,
             expiry_timestamp: 0,
             metadata: Bytes::new(&env),
+            visibility: Visibility::Private,
         };
 
         env.storage()
@@ -280,6 +290,7 @@ impl IpRegistry {
                 revoked: false,
                 expiry_timestamp: 0,
                 metadata: Bytes::new(&env),
+                visibility: Visibility::Private,
             };
 
             env.storage()
@@ -766,6 +777,74 @@ impl IpRegistry {
         env.storage()
             .persistent()
             .get(&DataKey::IpLicenses(ip_id))
+            .unwrap_or(Vec::new(&env))
+    }
+
+    /// Set IP visibility (Private or Public). Owner-only.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `ip_id` - The unique identifier of the IP
+    /// * `visibility` - The visibility setting (Private or Public)
+    ///
+    /// # Panics
+    ///
+    /// Panics if the IP does not exist or the caller is not the owner.
+    pub fn set_ip_visibility(env: Env, ip_id: u64, visibility: Visibility) {
+        let mut record = require_ip_exists(&env, ip_id);
+        record.owner.require_auth();
+
+        let old_visibility = record.visibility.clone();
+        record.visibility = visibility.clone();
+
+        env.storage().persistent().set(&DataKey::IpRecord(ip_id), &record);
+        env.storage().persistent().extend_ttl(&DataKey::IpRecord(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        // Update public IPs list
+        let mut public_ips: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PublicIps)
+            .unwrap_or(Vec::new(&env));
+
+        match (&old_visibility, &visibility) {
+            (Visibility::Private, Visibility::Public) => {
+                // Add to public list
+                if !public_ips.iter().any(|id| id == ip_id) {
+                    public_ips.push_back(ip_id);
+                }
+            }
+            (Visibility::Public, Visibility::Private) => {
+                // Remove from public list
+                if let Some(pos) = public_ips.iter().position(|id| id == ip_id) {
+                    public_ips.remove(pos as u32);
+                }
+            }
+            _ => {}
+        }
+
+        env.storage().persistent().set(&DataKey::PublicIps, &public_ips);
+        env.storage().persistent().extend_ttl(&DataKey::PublicIps, LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish(
+            (symbol_short!("vis_set"), record.owner),
+            (ip_id, visibility),
+        );
+    }
+
+    /// List all public IPs.
+    ///
+    /// Returns a vector of all IP IDs that are marked as public.
+    /// Anyone can call this function to discover public IPs.
+    ///
+    /// # Returns
+    ///
+    /// `Vec<u64>` containing all public IP IDs, or an empty vector if no public IPs exist.
+    pub fn list_public_ips(env: Env) -> Vec<u64> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PublicIps)
             .unwrap_or(Vec::new(&env))
     }
 }

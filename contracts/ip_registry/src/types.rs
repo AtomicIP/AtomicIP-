@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, BytesN, Symbol};
+use soroban_sdk::{contracttype, Address, BytesN, Symbol, Vec, Env};
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
 
@@ -26,10 +26,13 @@ pub enum DataKey {
     NextId,
     CommitmentOwner(BytesN<32>), // tracks which owner already holds a commitment hash
     Admin,
+    PublicIps, // stores list of public IP IDs
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
+#[contracttype]
+#[derive(Clone)]
 #[contracttype]
 #[derive(Clone)]
 pub struct IpRecord {
@@ -38,4 +41,12 @@ pub struct IpRecord {
     pub commitment_hash: BytesN<32>,
     pub timestamp: u64,
     pub revoked: bool,
+    pub visibility: Visibility,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum Visibility {
+    Private,
+    Public,
 }
