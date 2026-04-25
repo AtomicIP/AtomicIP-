@@ -1,92 +1,112 @@
 #![no_main]
-use libfuzzer_sys::fuzz_target;
-use soroban_sdk::{Env, BytesN, Bytes, Vec};
 use arbitrary::Arbitrary;
+use libfuzzer_sys::fuzz_target;
+use soroban_sdk::testutils::Address as _;
+use soroban_sdk::{Address, Bytes, BytesN, Env};
 
+// Task 4.1 — input struct and setup
+// Requirements: 3.1, 3.2
 #[derive(Arbitrary, Debug)]
-struct BatchFuzzInput {
-    /// Number of commitments to create (0-100 to avoid excessive memory)
+struct BatchInput {
+    /// Number of commitments to create (capped to 100 in harness)
     commitment_count: u8,
     /// Seeds for generating unique commitment hashes
-    seeds: Vec<[u8; 32]>,
+    seeds: std::vec::Vec<[u8; 32]>,
 }
 
-fuzz_target!(|input: BatchFuzzInput| {
-    // Create a test environment
+fuzz_target!(|input: BatchInput| {
+    // Task 4.1 — construct environment and mock auth
     let env = Env::default();
-
-    // Initialize test addresses
-    let owner = soroban_sdk::Address::from_contract_id(&env, &soroban_sdk::BytesN::<32>::from_array(&env, &[2u8; 32]));
     env.mock_all_auths();
 
-    let count = std::cmp::min(input.commitment_count as usize, 100);
-    let mut created_ids = Vec::new(&env);
+    let owner = Address::generate(&env);
 
-    // Create multiple commitments with varying sizes and seeds
+    // Task 4.1 — cap iteration count at 100
+    // Requirements: 3.2
+    let count = (input.commitment_count as usize).min(100);
+
+    let mut success_count: usize = 0;
+    let mut created_ids: std::vec::Vec<u64> = std::vec::Vec::new();
+
+    // Task 4.2 — commit loop with duplicate-hash handling
+    // Requirements: 3.7
     for i in 0..count {
-        let seed = if i < input.seeds.len() {
+        let seed: [u8; 32] = if i < input.seeds.len() {
             input.seeds[i]
         } else {
-            // Generate a deterministic seed from the index
-            let mut seed = [0u8; 32];
-            seed[0] = (i as u8).wrapping_add(3);
-            seed[1] = (i as u8).wrapping_add(5);
-            seed
+            // Deterministic fallback seed from index
+            let mut s = [0u8; 32];
+            s[0] = (i as u8).wrapping_add(3);
+            s[1] = (i as u8).wrapping_add(5);
+            s
         };
 
-        // Create a commitment hash using the seed
+        // Compute commitment_hash = sha256(seed || seed)
         let mut preimage = Bytes::new(&env);
-        preimage.append(&BytesN::<32>::from_array(&env, &seed));
-        preimage.append(&BytesN::<32>::from_array(&env, &seed));
+        preimage.append(&BytesN::<32>::from_array(&env, &seed).into());
+        preimage.append(&BytesN::<32>::from_array(&env, &seed).into());
         let commitment_hash: BytesN<32> = env.crypto().sha256(&preimage).into();
 
-        // Skip zero-value commitments
+        // Skip all-zero hashes without counting them
         if commitment_hash == BytesN::<32>::from_array(&env, &[0u8; 32]) {
             continue;
         }
 
-        // Attempt to create the commitment
-        if let Ok(ip_id) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            ip_registry::IpRegistry::commit_ip(&env, owner.clone(), commitment_hash.clone())
-        })) {
-            created_ids.push_back(ip_id);
-        }
-    }
+        // Wrap commit_ip in catch_unwind to handle CommitmentAlreadyRegistered
+        // without crashing the fuzzer
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ip_registry::IpRegistry::commit_ip(
+                env.clone(),
+                owner.clone(),
+                commitment_hash.clone(),
+            )
+        }));
 
-    // Verify that all created commitments can be retrieved and verified
-    let created_count = created_ids.len();
-
-    for i in 0..created_count {
-        if let Ok(ip_id) = created_ids.get(i as u32) {
-            // Verify we can retrieve the record
-            if let Ok(_record) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                ip_registry::IpRegistry::get_ip(&env, ip_id)
-            })) {
-                // Successfully retrieved the record
+        if let Ok(ip_id) = result {
+            // Task 4.3 — Property 3: Batch IP IDs Are Strictly Monotonically Increasing
+            // Feature: fuzz-testing-commitment-scheme, Property 3: Batch IP IDs Are Strictly Monotonically Increasing
+            // Requirements: 3.3, 3.4
+            if let Some(&prev_id) = created_ids.last() {
+                assert!(
+                    prev_id < ip_id,
+                    "IP IDs must be strictly monotonically increasing: prev={} curr={}",
+                    prev_id,
+                    ip_id
+                );
             }
+
+            created_ids.push(ip_id);
+            success_count += 1;
         }
+        // Duplicate-hash panics are silently swallowed; not counted toward success_count
     }
 
-    // Test batch retrieval by owner
-    if let Ok(_owner_ips) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        ip_registry::IpRegistry::get_ips_by_owner(&env, owner.clone())
-    })) {
-        // Successfully retrieved owner's IP list
+    // Task 4.5 — Property 4: Committed IP Is Always Retrievable
+    // Feature: fuzz-testing-commitment-scheme, Property 4: Committed IP Is Always Retrievable
+    // Requirements: 3.5
+    for &ip_id in &created_ids {
+        let record = ip_registry::IpRegistry::get_ip(env.clone(), ip_id);
+        assert_eq!(
+            record.ip_id, ip_id,
+            "get_ip must return a record whose ip_id equals the queried ID"
+        );
     }
 
-    // Verify monotonicity: IDs should be strictly increasing
-    for i in 1..created_ids.len() {
-        if let (Ok(prev_id), Ok(curr_id)) = (created_ids.get((i - 1) as u32), created_ids.get(i as u32)) {
-            assert!(prev_id < curr_id, "IP IDs should be monotonically increasing");
-        }
-    }
+    // Task 4.7 — Property 5: Owner IP List Count Matches Successful Commits
+    // Feature: fuzz-testing-commitment-scheme, Property 5: Owner IP List Count Matches Successful Commits
+    // Requirements: 3.6
+    let owner_ips = ip_registry::IpRegistry::list_ip_by_owner(env.clone(), owner.clone());
+    assert_eq!(
+        owner_ips.len() as usize,
+        success_count,
+        "list_ip_by_owner length must equal the number of successful commits"
+    );
 
-    // Verify uniqueness: all created IDs should be distinct
-    for i in 0..created_ids.len() {
-        for j in (i + 1)..created_ids.len() {
-            if let (Ok(id_i), Ok(id_j)) = (created_ids.get(i as u32), created_ids.get(j as u32)) {
-                assert!(id_i != id_j, "All IP IDs should be unique");
-            }
-        }
-    }
+    // Task 4.9 — Property 10: Batch Cap Is Enforced
+    // Feature: fuzz-testing-commitment-scheme, Property 10: Batch Cap Is Enforced
+    // Requirements: 3.2
+    assert!(
+        created_ids.len() <= 100,
+        "created_ids must never exceed the batch cap of 100"
+    );
 });

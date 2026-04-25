@@ -1,65 +1,68 @@
 #![no_main]
-use libfuzzer_sys::fuzz_target;
-use soroban_sdk::{Env, BytesN, Bytes};
-use ip_registry::IpRegistry;
 use arbitrary::Arbitrary;
+use libfuzzer_sys::fuzz_target;
+use soroban_sdk::testutils::Address as _;
+use soroban_sdk::{Address, Bytes, BytesN, Env};
 
 #[derive(Arbitrary, Debug)]
-struct FuzzInput {
+struct VerifyInput {
     secret: [u8; 32],
     blinding_factor: [u8; 32],
 }
 
-fuzz_target!(|input: FuzzInput| {
-    // Create a test environment
+fuzz_target!(|input: VerifyInput| {
     let env = Env::default();
-
-    // Initialize admin and owner
-    let admin = soroban_sdk::Address::from_contract_id(&env, &env.contract_id());
-    let owner = soroban_sdk::Address::from_contract_id(&env, &soroban_sdk::BytesN::<32>::from_array(&env, &[1u8; 32]));
-
-    // Mock authentication for testing
     env.mock_all_auths();
 
-    // Create a commitment hash from the fuzzed input
+    let owner = Address::generate(&env);
+
+    // Compute commitment_hash = sha256(secret || blinding_factor)
     let mut preimage = Bytes::new(&env);
-    preimage.append(&BytesN::<32>::from_array(&env, &input.secret));
-    preimage.append(&BytesN::<32>::from_array(&env, &input.blinding_factor));
+    preimage.append(&BytesN::<32>::from_array(&env, &input.secret).into());
+    preimage.append(&BytesN::<32>::from_array(&env, &input.blinding_factor).into());
     let commitment_hash: BytesN<32> = env.crypto().sha256(&preimage).into();
 
-    // Skip if commitment hash is all zeros (invalid)
+    // Skip if commitment hash is all-zero bytes (IpRegistry rejects zero-value hashes)
     if commitment_hash == BytesN::<32>::from_array(&env, &[0u8; 32]) {
         return;
     }
 
-    // Attempt to commit the IP (may fail if constraints are violated)
-    let contract = IpRegistry;
-    if let Ok(ip_id) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        ip_registry::IpRegistry::commit_ip(&env, owner.clone(), commitment_hash.clone())
+    // Wrap commit_ip in catch_unwind to handle any unexpected contract panics
+    // without crashing the fuzzer
+    let ip_id = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ip_registry::IpRegistry::commit_ip(env.clone(), owner.clone(), commitment_hash.clone())
     })) {
-        // If commitment succeeded, verify it works
-        let secret_bytes = BytesN::<32>::from_array(&env, &input.secret);
-        let blinding_bytes = BytesN::<32>::from_array(&env, &input.blinding_factor);
+        Ok(id) => id,
+        Err(_) => return,
+    };
 
-        if let Ok(is_valid) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            ip_registry::IpRegistry::verify_commitment(&env, ip_id, secret_bytes.clone(), blinding_bytes.clone())
-        })) {
-            // Verification should always succeed with the correct inputs
-            assert!(is_valid, "Verification should succeed with correct inputs");
-        }
+    let secret_bytes = BytesN::<32>::from_array(&env, &input.secret);
+    let blinding_bytes = BytesN::<32>::from_array(&env, &input.blinding_factor);
 
-        // Also verify that wrong inputs fail
-        let wrong_secret = BytesN::<32>::from_array(&env, &{
-            let mut arr = input.secret;
-            arr[0] = arr[0].wrapping_add(1);
-            arr
-        });
+    // Feature: fuzz-testing-commitment-scheme, Property 1: Commitment Verification Round-Trip
+    let is_valid = ip_registry::IpRegistry::verify_commitment(
+        env.clone(),
+        ip_id,
+        secret_bytes.clone(),
+        blinding_bytes.clone(),
+    );
+    assert!(
+        is_valid,
+        "verify_commitment must return true for correct secret and blinding_factor"
+    );
 
-        if let Ok(is_invalid) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            ip_registry::IpRegistry::verify_commitment(&env, ip_id, wrong_secret, blinding_bytes.clone())
-        })) {
-            // Wrong secret should not verify
-            assert!(!is_invalid, "Verification should fail with wrong secret");
-        }
-    }
+    // Construct wrong_secret by flipping the first byte of secret (XOR with 0x01;
+    // if secret[0] == 0x01 use 0x02 instead)
+    let flip_byte = if input.secret[0] == 0x01 { 0x02u8 } else { 0x01u8 };
+    let mut wrong_arr = input.secret;
+    wrong_arr[0] ^= flip_byte;
+    let wrong_secret = BytesN::<32>::from_array(&env, &wrong_arr);
+
+    // Feature: fuzz-testing-commitment-scheme, Property 2: Wrong Secret Fails Verification
+    let is_invalid =
+        ip_registry::IpRegistry::verify_commitment(env.clone(), ip_id, wrong_secret, blinding_bytes);
+    assert!(
+        !is_invalid,
+        "verify_commitment must return false for a secret that differs by at least one byte"
+    );
 });

@@ -50,6 +50,7 @@ pub enum DataKey {
     CommitmentOwner(BytesN<32>), // tracks which owner already holds a commitment hash
     Admin,
     PartialDisclosure(u64), // stores partial_hash for a given ip_id after reveal
+    IpLicenses(u64),        // stores license entries for a given ip_id
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────

@@ -4,7 +4,7 @@
 //! and ensure consistent error handling across the contract.
 
 use crate::{ContractError, DataKey, IpRecord};
-use soroban_sdk::{Address, BytesN, Env, Error};
+use soroban_sdk::{symbol_short, Address, BytesN, Env, Error};
 
 /// Retrieves an IP record by ID, panicking if not found.
 ///
