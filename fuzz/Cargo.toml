@@ -4,15 +4,16 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
-[dependencies]
-soroban-sdk = { version = "22.0.0", features = ["alloc"] }
-ip_registry = { path = "../contracts/ip_registry" }
-libfuzzer-sys = "0.4"
-arbitrary = { version = "1.0", features = ["derive"] }
+[package.metadata]
+cargo-fuzz = true
 
-[dependencies.soroban-sdk]
-version = "22.0.0"
-features = ["testutils"]
+[workspace]
+
+[dependencies]
+ip_registry = { path = "../contracts/ip_registry", features = ["testutils"] }
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+soroban-sdk = { version = "22.0.0", features = ["testutils"] }
 
 [[bin]]
 name = "fuzz_verify_commitment"
@@ -23,5 +24,11 @@ doc = false
 [[bin]]
 name = "fuzz_batch_commitments"
 path = "fuzz_targets/fuzz_batch_commitments.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_reveal_partial"
+path = "fuzz_targets/fuzz_reveal_partial.rs"
 test = false
 doc = false

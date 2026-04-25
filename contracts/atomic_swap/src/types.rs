@@ -32,6 +32,14 @@ pub enum DataKey {
     SwapHistory(u64),
     /// #254: Maps swap_id → Vec<Address> of collected approvals.
     SwapApprovals(u64),
+    /// Maps cancellation reason bytes for a swap_id.
+    CancelReason(u64),
+    /// Multi-currency configuration.
+    MultiCurrencyConfig,
+    /// List of supported token addresses.
+    SupportedTokens,
+    /// On-chain interface manifest used by validate_upgrade.
+    ContractSchema,
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -61,6 +69,8 @@ pub struct SwapRecord {
     pub accept_timestamp: u64,
     /// #254: Number of approvals required before accept_swap is allowed.
     pub required_approvals: u32,
+    /// Ledger timestamp when a dispute was raised. Zero if no dispute.
+    pub dispute_timestamp: u64,
 }
 
 // ── Events ────────────────────────────────────────────────────────────────────

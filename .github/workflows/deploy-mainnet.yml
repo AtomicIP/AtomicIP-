@@ -1,0 +1,57 @@
+name: Deploy to Mainnet
+
+on:
+  push:
+    tags:
+      - 'v*-mainnet'
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: mainnet
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Install Stellar CLI
+        run: cargo install stellar-cli --locked
+
+      - name: Build contracts
+        run: ./scripts/build.sh
+
+      - name: Import deployer identity
+        env:
+          DEPLOYER_SECRET_KEY: ${{ secrets.DEPLOYER_SECRET_KEY }}
+        run: stellar keys add deployer --secret-key "$DEPLOYER_SECRET_KEY"
+
+      - name: Deploy to Mainnet
+        env:
+          NETWORK: mainnet
+        run: |
+          ./scripts/deploy.sh --network mainnet --skip-build
+
+      - name: Create deployment summary
+        run: |
+          echo "## Mainnet Deployment — ${{ github.ref_name }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Contracts deployed successfully to Stellar mainnet." >> "$GITHUB_STEP_SUMMARY"
+          source .env.mainnet
+          echo "| Contract | Address |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| ip_registry | \`${CONTRACT_IP_REGISTRY}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| atomic_swap | \`${CONTRACT_ATOMIC_SWAP}\` |" >> "$GITHUB_STEP_SUMMARY"
