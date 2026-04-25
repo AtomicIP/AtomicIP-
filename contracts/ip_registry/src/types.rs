@@ -1,4 +1,14 @@
-use soroban_sdk::{contracttype, Address, BytesN};
+use soroban_sdk::{contracttype, Address, BytesN, Symbol};
+
+// ── TTL ───────────────────────────────────────────────────────────────────────
+
+/// Minimum ledger TTL bump applied to every persistent storage write.
+/// ~1 year at ~5s per ledger: 365 * 24 * 3600 / 5 ≈ 6_307_200 ledgers.
+pub const LEDGER_BUMP: u32 = 6_307_200;
+
+// ── Event Topics ────────────────────────────────────────────────────────────
+
+pub const REVOKE_TOPIC: Symbol = soroban_sdk::symbol_short!("revoke");
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
 

@@ -6,10 +6,13 @@ mod tests {
     use soroban_sdk::testutils::Events;
     use soroban_sdk::{symbol_short, Address, BytesN, Env, IntoVal, TryFromVal, Vec};
 
+    use crate::types::REVOKE_TOPIC;
+
     #[contractclient(name = "IpRegistryClient")]
     #[allow(dead_code)]
     pub trait IpRegistry {
         fn commit_ip(env: Env, owner: Address, commitment_hash: BytesN<32>) -> u64;
+        fn batch_commit_ip(env: Env, owner: Address, commitment_hashes: Vec<BytesN<32>>) -> Vec<u64>;
         fn get_ip(env: Env, ip_id: u64) -> IpRecord;
         fn verify_commitment(
             env: Env,
@@ -28,6 +31,8 @@ mod tests {
             blinding_factor: BytesN<32>,
         ) -> bool;
         fn get_partial_disclosure(env: Env, ip_id: u64) -> Option<BytesN<32>>;
+        fn validate_upgrade(env: Env, new_wasm_hash: BytesN<32>);
+        fn upgrade(env: Env, new_wasm_hash: BytesN<32>);
     }
 
     #[test]
@@ -243,6 +248,33 @@ mod tests {
         assert!(!client.get_ip(&ip_id).revoked);
         client.revoke_ip(&ip_id);
         assert!(client.get_ip(&ip_id).revoked);
+    }
+
+    #[test]
+    fn test_revoke_ip_emits_event() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let commitment = BytesN::from_array(&env, &[9u8; 32]);
+
+        env.mock_all_auths();
+        let ip_id = client.commit_ip(&owner, &commitment);
+
+        // Clear previous events (from commit_ip)
+        env.events().clear();
+
+        client.revoke_ip(&ip_id);
+
+        let all_events = env.events().all();
+        assert_eq!(all_events.len(), 1);
+        let event = all_events.get(0).unwrap();
+        let expected_topics = (REVOKE_TOPIC, owner.clone()).into_val(&env);
+        assert_eq!(event.1, expected_topics);
+        let observed_data: (u64, u64) = TryFromVal::try_from_val(&env, &event.2).unwrap();
+        assert_eq!(observed_data.0, ip_id);
+        assert_eq!(observed_data.1, env.ledger().timestamp());
     }
 
     #[test]
@@ -485,5 +517,115 @@ mod tests {
         let ip_id = client.commit_ip(&owner, &commitment);
 
         assert_eq!(client.get_partial_disclosure(&ip_id), None);
+    }
+
+    #[test]
+    fn test_batch_commit_ip_single() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let commitments = Vec::from_array(&env, [BytesN::from_array(&env, &[1u8; 32])]);
+
+        let ids = client.batch_commit_ip(&owner, &commitments);
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids.get(0).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_batch_commit_ip_five() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let commitments = Vec::from_array(&env, [
+            BytesN::from_array(&env, &[1u8; 32]),
+            BytesN::from_array(&env, &[2u8; 32]),
+            BytesN::from_array(&env, &[3u8; 32]),
+            BytesN::from_array(&env, &[4u8; 32]),
+            BytesN::from_array(&env, &[5u8; 32]),
+        ]);
+
+        let ids = client.batch_commit_ip(&owner, &commitments);
+        assert_eq!(ids.len(), 5);
+        for i in 0..5 {
+            assert_eq!(ids.get(i).unwrap(), (i + 1) as u64);
+        }
+    }
+
+    #[test]
+    fn test_batch_commit_ip_hundred() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let mut commitments = Vec::new(&env);
+        for i in 0..100 {
+            commitments.push_back(BytesN::from_array(&env, &[i as u8; 32]));
+        }
+
+        let ids = client.batch_commit_ip(&owner, &commitments);
+        assert_eq!(ids.len(), 100);
+        for i in 0..100 {
+            assert_eq!(ids.get(i).unwrap(), (i + 1) as u64);
+        }
+    }
+
+    #[test]
+    fn test_batch_commit_ip_sequential_with_single() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+
+        // Single commit
+        let id1 = client.commit_ip(&owner, &BytesN::from_array(&env, &[10u8; 32]));
+        assert_eq!(id1, 1);
+
+        // Batch commit 3
+        let commitments = Vec::from_array(&env, [
+            BytesN::from_array(&env, &[11u8; 32]),
+            BytesN::from_array(&env, &[12u8; 32]),
+            BytesN::from_array(&env, &[13u8; 32]),
+        ]);
+        let ids = client.batch_commit_ip(&owner, &commitments);
+        assert_eq!(ids.len(), 3);
+        assert_eq!(ids.get(0).unwrap(), 2);
+        assert_eq!(ids.get(1).unwrap(), 3);
+        assert_eq!(ids.get(2).unwrap(), 4);
+
+        // Another single
+        let id5 = client.commit_ip(&owner, &BytesN::from_array(&env, &[14u8; 32]));
+        assert_eq!(id5, 5);
+    }
+
+    #[test]
+    fn test_validate_upgrade_accepts_non_zero_hash() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let valid_hash = BytesN::from_array(&env, &[1u8; 32]);
+        // Should not panic
+        client.validate_upgrade(&valid_hash);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_validate_upgrade_rejects_zero_hash() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let zero_hash = BytesN::from_array(&env, &[0u8; 32]);
+        client.validate_upgrade(&zero_hash);
     }
 }
