@@ -161,3 +161,43 @@ pub struct WebhookResponse {
     pub events: Vec<String>,
     pub created_at: u64,
 }
+
+/// #321: Bulk commit IP request
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct BulkCommitIpRequest {
+    pub owner: String,
+    pub commitment_hashes: Vec<String>,
+}
+
+/// #321: Bulk commit IP response with individual results
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct BulkCommitIpResponse {
+    pub results: Vec<BulkOperationResult<u64>>,
+}
+
+/// #321: Bulk initiate swap request
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct BulkInitiateSwapRequest {
+    pub ip_registry_id: String,
+    pub ip_ids: Vec<u64>,
+    pub seller: String,
+    pub prices: Vec<i128>,
+    pub buyer: String,
+    pub token: String,
+    pub referrer: Option<String>,
+}
+
+/// #321: Bulk initiate swap response with individual results
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct BulkInitiateSwapResponse {
+    pub results: Vec<BulkOperationResult<u64>>,
+}
+
+/// #321: Individual operation result in bulk response
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct BulkOperationResult<T> {
+    pub index: usize,
+    pub success: bool,
+    pub data: Option<T>,
+    pub error: Option<String>,
+}
