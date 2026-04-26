@@ -166,6 +166,9 @@ impl IpRegistry {
             revoked: false,
             expiry_timestamp: 0,
             metadata: Bytes::new(&env),
+            priority: 0,
+            category: Bytes::new(&env),
+            commitment_strength: calculate_commitment_strength(32, pow_difficulty),
             co_owners: Vec::new(&env),
         };
 
@@ -288,6 +291,9 @@ impl IpRegistry {
                 revoked: false,
                 expiry_timestamp: 0,
                 metadata: Bytes::new(&env),
+                priority: 0,
+                category: Bytes::new(&env),
+                commitment_strength: calculate_commitment_strength(32, 0),
                 co_owners: Vec::new(&env),
             };
 
@@ -845,7 +851,256 @@ impl IpRegistry {
             );
         }
     }
-}
+
+    // ── Issue #335: IP Commitment Strength Scoring ──────────────────────────────
+
+    /// Get the commitment strength score for an IP (0-100 scale).
+    pub fn get_ip_strength(env: Env, ip_id: u64) -> u8 {
+        let record = require_ip_exists(&env, ip_id);
+        record.commitment_strength
+    }
+
+    // ── Issue #336: IP Compartmentalization by Category ────────────────────────
+
+    /// List all IP IDs in a specific category.
+    pub fn list_ip_by_category(env: Env, category: Bytes) -> Vec<u64> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CategoryIps(category))
+            .unwrap_or(Vec::new(&env))
+    }
+
+    /// Update the category for an IP. Owner-only.
+    pub fn update_ip_category(env: Env, ip_id: u64, new_category: Bytes) {
+        let mut record = require_ip_exists(&env, ip_id);
+        record.owner.require_auth();
+
+        // Remove from old category index
+        if !record.category.is_empty() {
+            let mut old_ids: Vec<u64> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::CategoryIps(record.category.clone()))
+                .unwrap_or(Vec::new(&env));
+            if let Some(pos) = old_ids.iter().position(|x| x == ip_id) {
+                old_ids.remove(pos as u32);
+            }
+            env.storage()
+                .persistent()
+                .set(&DataKey::CategoryIps(record.category.clone()), &old_ids);
+            env.storage().persistent().extend_ttl(
+                &DataKey::CategoryIps(record.category.clone()),
+                LEDGER_BUMP,
+                LEDGER_BUMP,
+            );
+        }
+
+        // Add to new category index
+        let mut new_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CategoryIps(new_category.clone()))
+            .unwrap_or(Vec::new(&env));
+        new_ids.push_back(ip_id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::CategoryIps(new_category.clone()), &new_ids);
+        env.storage().persistent().extend_ttl(
+            &DataKey::CategoryIps(new_category.clone()),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        record.category = new_category;
+        env.storage()
+            .persistent()
+            .set(&DataKey::IpRecord(ip_id), &record);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::IpRecord(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish(
+            (symbol_short!("cat_upd"), record.owner),
+            (ip_id, record.category.clone()),
+        );
+    }
+
+    // ── Issue #338: IP Commitment Delegation ────────────────────────────────────
+
+    /// Delegate commitment authority to a trusted agent. Owner-only.
+    pub fn delegate_commitment_authority(env: Env, owner: Address, delegate_address: Address) {
+        owner.require_auth();
+
+        let mut delegates: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IpDelegates(owner.clone()))
+            .unwrap_or(Vec::new(&env));
+
+        // Check if already a delegate
+        for existing in delegates.iter() {
+            if existing == delegate_address {
+                return; // Already a delegate, no-op
+            }
+        }
+
+        delegates.push_back(delegate_address.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::IpDelegates(owner.clone()), &delegates);
+        env.storage().persistent().extend_ttl(
+            &DataKey::IpDelegates(owner.clone()),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        env.events().publish(
+            (symbol_short!("del_add"), owner),
+            delegate_address,
+        );
+    }
+
+    /// Revoke delegation authority from an agent. Owner-only.
+    pub fn revoke_delegation(env: Env, owner: Address, delegate_address: Address) {
+        owner.require_auth();
+
+        let mut delegates: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IpDelegates(owner.clone()))
+            .unwrap_or(Vec::new(&env));
+
+        if let Some(pos) = delegates.iter().position(|addr| addr == delegate_address) {
+            delegates.remove(pos as u32);
+            env.storage()
+                .persistent()
+                .set(&DataKey::IpDelegates(owner.clone()), &delegates);
+            env.storage().persistent().extend_ttl(
+                &DataKey::IpDelegates(owner.clone()),
+                LEDGER_BUMP,
+                LEDGER_BUMP,
+            );
+
+            env.events().publish(
+                (symbol_short!("del_rem"), owner),
+                delegate_address,
+            );
+        }
+    }
+
+    /// Check if an address is a delegate for an owner.
+    pub fn is_delegate(env: Env, owner: Address, delegate_address: Address) -> bool {
+        let delegates: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IpDelegates(owner))
+            .unwrap_or(Vec::new(&env));
+
+        for delegate in delegates.iter() {
+            if delegate == delegate_address {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Commit IP on behalf of an owner (delegate-only).
+    pub fn commit_ip_delegated(
+        env: Env,
+        owner: Address,
+        commitment_hash: BytesN<32>,
+        pow_difficulty: u32,
+    ) -> u64 {
+        let caller = env.invoker();
+
+        // Verify caller is a delegate of owner
+        if !Self::is_delegate(env.clone(), owner.clone(), caller.clone()) {
+            env.panic_with_error(Error::from_contract_error(ContractError::Unauthorized as u32));
+        }
+
+        // Initialize admin on first call if not set
+        if !env.storage().persistent().has(&DataKey::Admin) {
+            let admin = env.current_contract_address();
+            env.storage().persistent().set(&DataKey::Admin, &admin);
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::Admin, 50000, 50000);
+        }
+
+        // Reject zero-byte commitment hash
+        require_non_zero_commitment(&env, &commitment_hash);
+
+        // Reject duplicate commitment hash globally
+        require_unique_commitment(&env, &commitment_hash);
+
+        // Validate proof-of-work
+        require_pow(&env, &commitment_hash, pow_difficulty);
+
+        let id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NextId)
+            .unwrap_or(1);
+
+        let record = IpRecord {
+            ip_id: id,
+            owner: owner.clone(),
+            commitment_hash: commitment_hash.clone(),
+            timestamp: env.ledger().timestamp(),
+            revoked: false,
+            expiry_timestamp: 0,
+            metadata: Bytes::new(&env),
+            priority: 0,
+            category: Bytes::new(&env),
+            commitment_strength: calculate_commitment_strength(32, pow_difficulty),
+            co_owners: Vec::new(&env),
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::IpRecord(id), &record);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::IpRecord(id), LEDGER_BUMP, LEDGER_BUMP);
+
+        // Append to owner index
+        let mut ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OwnerIps(owner.clone()))
+            .unwrap_or(Vec::new(&env));
+        ids.push_back(id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::OwnerIps(owner.clone()), &ids);
+        env.storage().persistent().extend_ttl(
+            &DataKey::OwnerIps(owner.clone()),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        // Track commitment hash ownership
+        env.storage()
+            .persistent()
+            .set(&DataKey::CommitmentOwner(commitment_hash.clone()), &owner);
+        env.storage().persistent().extend_ttl(
+            &DataKey::CommitmentOwner(commitment_hash.clone()),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        env.storage().persistent().set(&DataKey::NextId, &(id + 1));
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::NextId, LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish(
+            (symbol_short!("ip_commit"), owner.clone()),
+            (id, record.timestamp),
+        );
+
+        id
+    }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 

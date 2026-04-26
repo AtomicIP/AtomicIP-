@@ -169,6 +169,17 @@ pub fn require_pow(env: &Env, commitment_hash: &BytesN<32>, difficulty: u32) {
     }
 }
 
+/// Calculate commitment strength (0-100 scale) based on secret length and PoW difficulty.
+/// Strength = min(100, (secret_length * 2) + (pow_difficulty * 3))
+pub fn calculate_commitment_strength(secret_length: u32, pow_difficulty: u32) -> u8 {
+    let strength = (secret_length * 2).saturating_add(pow_difficulty * 3);
+    if strength > 100 {
+        100u8
+    } else {
+        strength as u8
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
