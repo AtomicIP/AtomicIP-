@@ -56,6 +56,12 @@ pub enum DataKey {
     PaymentsMade(u64),
     /// #350: Maps swap_id → collateral amount held in escrow.
     SwapCollateral(u64),
+    /// #359: Maps Address → (completed_swaps: u32, rating: u32) for user reputation.
+    UserReputation(Address),
+    /// #360: Maps swap_id → contingency_condition: Bytes for conditional completion.
+    SwapContingency(u64),
+    /// #361: Maps swap_id → Vec<Bytes> of evidence hashes for disputes.
+    SwapDisputeEvidence(u64),
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -91,6 +97,8 @@ pub struct SwapRecord {
     pub referrer: Option<Address>,
     /// #350: Collateral amount required from buyer. Zero if no collateral.
     pub collateral_amount: i128,
+    /// #360: Optional contingency condition for delayed finalization.
+    pub contingency_condition: Option<Vec<u8>>,
 }
 
 // ── Events ────────────────────────────────────────────────────────────────────
@@ -316,4 +324,32 @@ pub struct CollateralRefundedEvent {
     pub swap_id: u64,
     pub buyer: Address,
     pub collateral_amount: i128,
+}
+
+// ── #359: User Reputation Types ───────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct UserReputation {
+    pub completed_swaps: u32,
+    pub rating: u32,
+}
+
+// ── #360: Contingent Completion Types ─────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SwapContingentCompletedEvent {
+    pub swap_id: u64,
+    pub seller: Address,
+}
+
+// ── #361: Dispute Evidence Types ──────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DisputeEvidenceStoredEvent {
+    pub swap_id: u64,
+    pub submitter: Address,
+    pub evidence_hash: BytesN<32>,
 }
