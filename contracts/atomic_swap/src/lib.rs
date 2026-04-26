@@ -2622,6 +2622,69 @@ impl AtomicSwap {
             },
         );
     }
+
+    // ── #358: Swap Timeout Escalation ─────────────────────────────────────────
+
+    /// Request timeout escalation. Buyer-only. Extends deadline if timeout imminent.
+    pub fn escalate_swap_timeout(
+        env: Env,
+        swap_id: u64,
+        buyer: Address,
+        new_expiry: u64,
+    ) {
+        let mut swap = require_swap_exists(&env, swap_id);
+        buyer.require_auth();
+
+        if swap.buyer != buyer {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::Unauthorized as u32,
+            ));
+        }
+
+        require_swap_status(
+            &env,
+            &swap,
+            SwapStatus::Accepted,
+            ContractError::SwapNotAccepted,
+        );
+
+        let current_time = env.ledger().timestamp();
+        let time_until_expiry = swap.expiry.saturating_sub(current_time);
+
+        // Require timeout to be imminent (within 1 hour = 3600 seconds)
+        if time_until_expiry > 3600 {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::SwapHasNotExpiredYet as u32,
+            ));
+        }
+
+        // New expiry must be greater than current expiry
+        if new_expiry <= swap.expiry {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::NewExpiryNotGreater as u32,
+            ));
+        }
+
+        let old_expiry = swap.expiry;
+        swap.expiry = new_expiry;
+        swap::save_swap(&env, swap_id, &swap);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::TimeoutExtension(swap_id), &new_expiry);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::TimeoutExtension(swap_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("timeout_esc"),),
+            TimeoutEscalationRequestedEvent {
+                swap_id,
+                buyer,
+                new_expiry,
+            },
+        );
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
