@@ -10,6 +10,15 @@ pub const LEDGER_BUMP: u32 = 6_307_200;
 
 pub const REVOKE_TOPIC: Symbol = soroban_sdk::symbol_short!("revoke");
 
+// ── Access Control ────────────────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone)]
+pub struct IpAccessGrant {
+    pub grantee: Address,
+    pub access_level: u8, // 0 = none, 1 = read-only, 2 = read-write
+}
+
 // ── Storage Keys ────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -23,6 +32,9 @@ pub enum DataKey {
     CategoryIps(BytesN<32>), // maps category hash -> Vec<u64> of IP IDs
     IpLineage(u64), // stores parent_ip_id for versioning
     IpVersions(u64), // stores Vec<u64> of all version IDs for a given IP
+    IpCommitmentChecksum, // Issue #346: stores hash of all commitments for rollback protection
+    IpAccessGrants(u64), // Issue #344: stores Vec of (grantee, access_level) for tiered access
+    NotarySignature(u64), // Issue #345: stores notary signature for timestamp notarization
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -37,4 +49,5 @@ pub struct IpRecord {
     pub revoked: bool,
     pub co_owners: soroban_sdk::Vec<Address>,
     pub parent_ip_id: Option<u64>, // parent IP ID for versioning
+    pub notary_signature: Option<Bytes>, // Issue #345: notary signature for timestamp notarization
 }
