@@ -2,6 +2,7 @@
 members = [
     "contracts/ip_registry",
     "contracts/atomic_swap",
+    "api-server",
 ]
 resolver = "2"
 

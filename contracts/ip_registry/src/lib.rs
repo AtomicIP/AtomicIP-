@@ -56,8 +56,8 @@ pub enum DataKey {
     IpLicenses(u64),        // stores license entries for a given ip_id
     CategoryIps(BytesN<32>), // maps category hash -> Vec<u64> of IP IDs
     PowDifficulty,          // stores the current PoW difficulty (leading zero bits required)
-    IpDisputes(u64),        // stores dispute records for a given ip_id
-    IpAnonymous(u64),       // stores anonymity flag for a given ip_id
+    IpVersions(u64),        // stores Vec<u64> of all version IDs for a given IP
+    SuggestedPrice(u64),    // stores suggested price for an IP
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -73,6 +73,7 @@ pub struct IpRecord {
     pub expiry_timestamp: u64,   // 0 = no expiry
     pub metadata: Bytes,         // max 1 KB; empty = no metadata
     pub priority: u8,            // 0-10 scale, 0 = no priority, 10 = highest
+    pub parent_ip_id: Option<u64>, // parent IP ID for versioning
 }
 
 #[contracttype]
@@ -180,7 +181,8 @@ impl IpRegistry {
             revoked: false,
             expiry_timestamp: 0,
             metadata: Bytes::new(&env),
-            co_owners: Vec::new(&env),
+            priority: 0,
+            parent_ip_id: None,
         };
 
         env.storage()
@@ -302,7 +304,8 @@ impl IpRegistry {
                 revoked: false,
                 expiry_timestamp: 0,
                 metadata: Bytes::new(&env),
-                co_owners: Vec::new(&env),
+                priority: 0,
+                parent_ip_id: None,
             };
 
             env.storage()
@@ -860,174 +863,172 @@ impl IpRegistry {
         }
     }
 
-    /// Renew an IP commitment by extending its expiry timestamp. Owner-only.
-    /// The new expiry must be greater than the current expiry.
-    pub fn renew_ip_commitment(env: Env, ip_id: u64, new_expiry_timestamp: u64) {
-        let mut record = require_ip_exists(&env, ip_id);
-        record.owner.require_auth();
+    /// Create a new version of an existing IP commitment.
+    /// 
+    /// This function allows an IP owner to create a new version of their IP
+    /// while maintaining a link to the original for prior art proof.
+    /// The new version is a separate IP record with its own ID.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `parent_ip_id` - The ID of the original IP to version from
+    /// * `new_commitment_hash` - The new commitment hash for this version
+    ///
+    /// # Returns
+    ///
+    /// The new IP ID assigned to this version.
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// * The parent IP does not exist (IpNotFound error)
+    /// * The caller is not the owner of the parent IP (Unauthorized error)
+    /// * The new commitment hash is all zeros (ZeroCommitmentHash error)
+    /// * The new commitment hash is already registered (CommitmentAlreadyRegistered error)
+    pub fn create_ip_version(env: Env, parent_ip_id: u64, new_commitment_hash: BytesN<32>) -> u64 {
+        let parent_record = require_ip_exists(&env, parent_ip_id);
+        parent_record.owner.require_auth();
 
-        if new_expiry_timestamp <= record.expiry_timestamp {
-            env.panic_with_error(Error::from_contract_error(ContractError::InvalidExpiry as u32));
-        }
-
-        let old_expiry = record.expiry_timestamp;
-        record.expiry_timestamp = new_expiry_timestamp;
-        env.storage().persistent().set(&DataKey::IpRecord(ip_id), &record);
-        env.storage().persistent().extend_ttl(&DataKey::IpRecord(ip_id), LEDGER_BUMP, LEDGER_BUMP);
-
-        env.events().publish(
-            (symbol_short!("renew"), record.owner),
-            (ip_id, old_expiry, new_expiry_timestamp),
-        );
-    }
-
-    /// Verify multiple commitments in a single call. Returns a vector of verification results.
-    pub fn batch_verify_commitments(
-        env: Env,
-        ip_ids: Vec<u64>,
-        secrets: Vec<BytesN<32>>,
-        blinding_factors: Vec<BytesN<32>>,
-    ) -> Vec<bool> {
-        let mut results = Vec::new(&env);
-
-        for i in 0..ip_ids.len() {
-            let ip_id = ip_ids.get(i).unwrap();
-            let secret = secrets.get(i).unwrap();
-            let blinding_factor = blinding_factors.get(i).unwrap();
-
-            let result = Self::verify_commitment(env.clone(), ip_id, secret, blinding_factor);
-            results.push_back(result);
-        }
-
-        results
-    }
-
-    /// Raise a dispute for an IP. Anyone can raise a dispute.
-    pub fn raise_ip_dispute(env: Env, ip_id: u64, claimant_address: Address, evidence_hash: BytesN<32>) {
-        let record = require_ip_exists(&env, ip_id);
-
-        let dispute = IpDispute {
-            ip_id,
-            claimant: claimant_address,
-            evidence_hash,
-            timestamp: env.ledger().timestamp(),
-            resolved: false,
-        };
-
-        env.storage().persistent().set(&DataKey::IpDisputes(ip_id), &dispute);
-        env.storage().persistent().extend_ttl(&DataKey::IpDisputes(ip_id), LEDGER_BUMP, LEDGER_BUMP);
-
-        env.events().publish(
-            (symbol_short!("dispute"), record.owner),
-            (ip_id, dispute.claimant, dispute.timestamp),
-        );
-    }
-
-    /// Resolve an IP dispute. Admin-only.
-    pub fn resolve_ip_dispute(env: Env, ip_id: u64, winner_address: Address) {
-        let admin_opt: Option<Address> = env.storage().persistent().get(&DataKey::Admin);
-        if admin_opt.is_none() {
-            env.panic_with_error(Error::from_contract_error(ContractError::Unauthorized as u32));
-        }
-        let admin = admin_opt.unwrap();
-        admin.require_auth();
-
-        let record = require_ip_exists(&env, ip_id);
-
-        // Update dispute as resolved
-        if let Some(mut dispute) = env.storage().persistent().get::<DataKey, IpDispute>(&DataKey::IpDisputes(ip_id)) {
-            dispute.resolved = true;
-            env.storage().persistent().set(&DataKey::IpDisputes(ip_id), &dispute);
-            env.storage().persistent().extend_ttl(&DataKey::IpDisputes(ip_id), LEDGER_BUMP, LEDGER_BUMP);
-        }
-
-        env.events().publish(
-            (symbol_short!("resolved"), record.owner),
-            (ip_id, winner_address),
-        );
-    }
-
-    /// Commit an IP anonymously using a zero-knowledge proof.
-    pub fn commit_ip_anonymous(env: Env, commitment_hash: BytesN<32>, zk_proof: Bytes) -> u64 {
         // Reject zero-byte commitment hash
-        require_non_zero_commitment(&env, &commitment_hash);
+        require_non_zero_commitment(&env, &new_commitment_hash);
 
         // Reject duplicate commitment hash globally
-        require_unique_commitment(&env, &commitment_hash);
+        require_unique_commitment(&env, &new_commitment_hash);
 
-        // Verify ZK proof (simplified: just check it's not empty)
-        if zk_proof.len() == 0 {
-            env.panic_with_error(Error::from_contract_error(ContractError::Unauthorized as u32));
-        }
-
-        // Initialize admin on first call if not set
-        if !env.storage().persistent().has(&DataKey::Admin) {
-            let admin = env.current_contract_address();
-            env.storage().persistent().set(&DataKey::Admin, &admin);
-            env.storage().persistent().extend_ttl(&DataKey::Admin, 50000, 50000);
-        }
-
+        // Get next ID
         let id: u64 = env
             .storage()
             .persistent()
             .get(&DataKey::NextId)
             .unwrap_or(1);
 
-        // Use contract address as owner for anonymous commitments
-        let owner = env.current_contract_address();
-
-        let record = IpRecord {
+        // Create new version record with parent_ip_id set
+        let mut version_record = IpRecord {
             ip_id: id,
-            owner: owner.clone(),
-            commitment_hash: commitment_hash.clone(),
+            owner: parent_record.owner.clone(),
+            commitment_hash: new_commitment_hash.clone(),
             timestamp: env.ledger().timestamp(),
             revoked: false,
-            expiry_timestamp: 0,
-            metadata: Bytes::new(&env),
-            priority: 0,
+            co_owners: Vec::new(&env),
+            parent_ip_id: Some(parent_ip_id),
         };
 
-        env.storage().persistent().set(&DataKey::IpRecord(id), &record);
-        env.storage().persistent().extend_ttl(&DataKey::IpRecord(id), LEDGER_BUMP, LEDGER_BUMP);
+        // Store the new version
+        env.storage()
+            .persistent()
+            .set(&DataKey::IpRecord(id), &version_record);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::IpRecord(id), LEDGER_BUMP, LEDGER_BUMP);
 
-        // Mark as anonymous
-        env.storage().persistent().set(&DataKey::IpAnonymous(id), &true);
-        env.storage().persistent().extend_ttl(&DataKey::IpAnonymous(id), LEDGER_BUMP, LEDGER_BUMP);
-
-        // Track commitment hash ownership
-        env.storage().persistent().set(&DataKey::CommitmentOwner(commitment_hash.clone()), &owner);
+        // Add to owner's IP list
+        let mut owner_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OwnerIps(parent_record.owner.clone()))
+            .unwrap_or(Vec::new(&env));
+        owner_ids.push_back(id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::OwnerIps(parent_record.owner.clone()), &owner_ids);
         env.storage().persistent().extend_ttl(
-            &DataKey::CommitmentOwner(commitment_hash.clone()),
+            &DataKey::OwnerIps(parent_record.owner.clone()),
             LEDGER_BUMP,
             LEDGER_BUMP,
         );
 
+        // Track commitment hash ownership
+        env.storage()
+            .persistent()
+            .set(&DataKey::CommitmentOwner(new_commitment_hash.clone()), &parent_record.owner);
+        env.storage().persistent().extend_ttl(
+            &DataKey::CommitmentOwner(new_commitment_hash.clone()),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        // Add to version lineage
+        let mut versions: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IpVersions(parent_ip_id))
+            .unwrap_or(Vec::new(&env));
+        versions.push_back(id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::IpVersions(parent_ip_id), &versions);
+        env.storage().persistent().extend_ttl(
+            &DataKey::IpVersions(parent_ip_id),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        // Increment next ID
         env.storage().persistent().set(&DataKey::NextId, &(id + 1));
-        env.storage().persistent().extend_ttl(&DataKey::NextId, LEDGER_BUMP, LEDGER_BUMP);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::NextId, LEDGER_BUMP, LEDGER_BUMP);
 
         env.events().publish(
-            (symbol_short!("anon_commit"), owner),
-            (id, record.timestamp),
+            (symbol_short!("version"), parent_record.owner.clone()),
+            (parent_ip_id, id),
         );
 
         id
     }
 
-    /// Check if an IP is in dispute.
-    pub fn is_ip_in_dispute(env: Env, ip_id: u64) -> bool {
-        if let Some(dispute) = env.storage().persistent().get::<DataKey, IpDispute>(&DataKey::IpDisputes(ip_id)) {
-            !dispute.resolved
-        } else {
-            false
-        }
-    }
+    /// Retrieve all versions of an IP (including the original).
+    ///
+    /// Returns a vector of all IP IDs that are part of the same version lineage,
+    /// starting from the original IP and including all subsequent versions.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `ip_id` - The IP ID to get the lineage for (can be original or any version)
+    ///
+    /// # Returns
+    ///
+    /// A vector of IP IDs in the lineage, with the original first.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the IP record does not exist (IpNotFound error).
+    pub fn get_ip_lineage(env: Env, ip_id: u64) -> Vec<u64> {
+        let record = require_ip_exists(&env, ip_id);
 
-    /// Check if an IP is anonymous.
-    pub fn is_ip_anonymous(env: Env, ip_id: u64) -> bool {
-        env.storage()
+        // Find the root IP (the one with no parent)
+        let mut root_id = ip_id;
+        let mut current_id = ip_id;
+
+        // Walk up the chain to find the root
+        loop {
+            let current_record = require_ip_exists(&env, current_id);
+            if let Some(parent_id) = current_record.parent_ip_id {
+                current_id = parent_id;
+            } else {
+                root_id = current_id;
+                break;
+            }
+        }
+
+        // Build lineage starting from root
+        let mut lineage = Vec::new(&env);
+        lineage.push_back(root_id);
+
+        // Get all versions of the root
+        let versions: Vec<u64> = env
+            .storage()
             .persistent()
-            .get::<DataKey, bool>(&DataKey::IpAnonymous(ip_id))
-            .unwrap_or(false)
+            .get(&DataKey::IpVersions(root_id))
+            .unwrap_or(Vec::new(&env));
+
+        for version_id in versions.iter() {
+            lineage.push_back(version_id);
+        }
+
+        lineage
     }
 }
 

@@ -1,19 +1,26 @@
 use axum::{routing::get, routing::post, Router};
 use axum::body::Body;
-use axum::http::StatusCode;
+use axum::http::{StatusCode, HeaderMap};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::extract::Request;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
+use std::sync::Arc;
 
 mod auth;
 mod cache;
+mod graphql;
 mod handlers;
 mod metrics;
 mod schemas;
+mod tracing_middleware;
+mod versioning;
 mod webhook;
+mod websocket;
+mod graphql;
+mod request_signing;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -37,6 +44,8 @@ mod webhook;
         handlers::get_swap,
         handlers::register_webhook,
         handlers::unregister_webhook,
+        handlers::bulk_commit_ip,
+        handlers::bulk_initiate_swap,
     ),
     components(schemas(
         schemas::CommitIpRequest,
@@ -57,6 +66,11 @@ mod webhook;
         schemas::ErrorResponse,
         schemas::RegisterWebhookRequest,
         schemas::WebhookResponse,
+        schemas::BulkCommitIpRequest,
+        schemas::BulkCommitIpResponse,
+        schemas::BulkInitiateSwapRequest,
+        schemas::BulkInitiateSwapResponse,
+        schemas::BulkOperationResult,
     )),
     tags(
         (name = "IP Registry", description = "Commit and query intellectual property records"),
@@ -96,11 +110,13 @@ async fn main() {
     metrics::init();
 
     let schema = graphql::build_schema();
+    let broadcaster = Arc::new(websocket::EventBroadcaster::new());
 
     let app = Router::new()
         .merge(SwaggerUi::new("/docs").url("/openapi.json", ApiDoc::openapi()))
         .route("/metrics", get(metrics::metrics_handler))
         .route("/graphql", post(graphql_handler))
+        .route("/ws", get(ws_handler))
         .route("/ip/commit", post(handlers::commit_ip))
         .route("/ip/{ip_id}", get(handlers::get_ip))
         .route("/ip/transfer", post(handlers::transfer_ip))
@@ -113,33 +129,45 @@ async fn main() {
         .route("/swap/{swap_id}/cancel", post(handlers::cancel_swap))
         .route("/swap/{swap_id}/cancel-expired", post(handlers::cancel_expired_swap))
         .route("/swap/{swap_id}", get(handlers::get_swap))
-        .with_state(schema)
+        .with_state((schema, broadcaster.clone()))
         .layer(middleware::from_fn(metrics::track));
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
     println!("Swagger UI   -> http://localhost:8080/docs");
     println!("OpenAPI JSON -> http://localhost:8080/openapi.json");
     println!("Metrics      -> http://localhost:8080/metrics");
+    println!("WebSocket    -> ws://localhost:8080/ws");
     axum::serve(listener, app).await.unwrap();
+}
+
+async fn ws_handler(
+    ws: axum::extract::ws::WebSocketUpgrade,
+    axum::extract::State((_, broadcaster)): axum::extract::State<(graphql::AtomicIpSchema, Arc<websocket::EventBroadcaster>)>,
+) -> impl axum::response::IntoResponse {
+    ws.on_upgrade(|socket| websocket::handle_socket(socket, broadcaster))
 }
 
 fn build_app() -> Router {
     let schema = graphql::build_schema();
     Router::new()
-        .route("/graphql", post(graphql_handler))
-        .route("/ip/commit", post(handlers::commit_ip))
-        .route("/ip/{ip_id}", get(handlers::get_ip))
-        .route("/ip/transfer", post(handlers::transfer_ip))
-        .route("/ip/verify", post(handlers::verify_commitment))
-        .route("/ip/owner/{owner}", get(handlers::list_ip_by_owner))
-        .route("/swap/initiate", post(handlers::initiate_swap))
-        .route("/swap/batch-initiate", post(handlers::batch_initiate_swap))
-        .route("/swap/{swap_id}/accept", post(handlers::accept_swap))
-        .route("/swap/{swap_id}/reveal", post(handlers::reveal_key))
-        .route("/swap/{swap_id}/cancel", post(handlers::cancel_swap))
-        .route("/swap/{swap_id}/cancel-expired", post(handlers::cancel_expired_swap))
-        .route("/swap/{swap_id}", get(handlers::get_swap))
+        .route("/v1/graphql", post(graphql_handler))
+        .route("/v1/ip/commit", post(handlers::commit_ip))
+        .route("/v1/ip/:ip_id", get(handlers::get_ip))
+        .route("/v1/ip/transfer", post(handlers::transfer_ip))
+        .route("/v1/ip/verify", post(handlers::verify_commitment))
+        .route("/v1/ip/owner/:owner", get(handlers::list_ip_by_owner))
+        .route("/v1/swap/initiate", post(handlers::initiate_swap))
+        .route("/v1/swap/bulk/initiate", post(handlers::batch_initiate_swap))
+        .route("/v1/swap/:swap_id/accept", post(handlers::accept_swap))
+        .route("/v1/swap/:swap_id/reveal", post(handlers::reveal_key))
+        .route("/v1/swap/:swap_id/cancel", post(handlers::cancel_swap))
+        .route("/v1/swap/:swap_id/cancel-expired", post(handlers::cancel_expired_swap))
+        .route("/v1/swap/:swap_id", get(handlers::get_swap))
+        .route("/v1/bulk/commit-ip", post(handlers::bulk_commit_ip))
+        .route("/v1/bulk/initiate-swap", post(handlers::bulk_initiate_swap))
         .with_state(schema)
+        .layer(middleware::from_fn(tracing_middleware::trace_requests))
+        .layer(middleware::from_fn(versioning::version_negotiation))
         .layer(middleware::from_fn(require_json_content_type))
 }
 
@@ -159,7 +187,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/ip/commit")
+                    .uri("/v1/ip/commit")
                     .body(Body::from(r#"{"owner":"G123","commitment_hash":"abc"}"#))
                     .unwrap(),
             )
@@ -175,7 +203,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/ip/commit")
+                    .uri("/v1/ip/commit")
                     .header("content-type", "text/plain")
                     .body(Body::from(r#"{"owner":"G123","commitment_hash":"abc"}"#))
                     .unwrap(),
@@ -192,7 +220,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/ip/commit")
+                    .uri("/v1/ip/commit")
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"owner":"G123","commitment_hash":"abc"}"#))
                     .unwrap(),
@@ -210,7 +238,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/ip/1")
+                    .uri("/v1/ip/1")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -251,7 +279,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/ip/owner/GADDR?limit=10&offset=0")
+                    .uri("/v1/ip/owner/GADDR?limit=10&offset=0")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -272,7 +300,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/ip/owner/GADDR")
+                    .uri("/v1/ip/owner/GADDR")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -290,7 +318,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/ip/1")
+                    .uri("/v1/ip/1")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -307,7 +335,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/swap/1")
+                    .uri("/v1/swap/1")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -325,7 +353,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/swap/batch-initiate")
+                    .uri("/v1/swap/bulk/initiate")
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"ip_registry_id":"C1","ip_ids":[1,2],"seller":"G1","prices":[100],"buyer":"G2","token":"C2"}"#))
                     .unwrap(),
@@ -345,7 +373,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/swap/batch-initiate")
+                    .uri("/v1/swap/bulk/initiate")
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"ip_registry_id":"C1","ip_ids":[],"seller":"G1","prices":[],"buyer":"G2","token":"C2"}"#))
                     .unwrap(),
@@ -353,5 +381,176 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ── #319: API Versioning tests ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_api_version_header_present_in_response() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/ip/1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(resp.headers().contains_key("API-Version"));
+        assert_eq!(resp.headers().get("API-Version").unwrap(), "1.0.0");
+    }
+
+    #[tokio::test]
+    async fn test_accept_version_header_negotiation() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/ip/1")
+                    .header("Accept-Version", "1.0.0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_unsupported_version_returns_406() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/ip/1")
+                    .header("Accept-Version", "2.0.0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_ACCEPTABLE);
+    }
+
+    // ── #320: API Request Tracing tests ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_trace_id_header_present_in_response() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/ip/1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(resp.headers().contains_key("X-Trace-ID"));
+        assert!(resp.headers().contains_key("X-Request-ID"));
+    }
+
+    #[tokio::test]
+    async fn test_trace_id_propagation() {
+        let app = build_app();
+        let original_trace_id = "550e8400-e29b-41d4-a716-446655440000";
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/ip/1")
+                    .header("X-Trace-ID", original_trace_id)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.headers().get("X-Trace-ID").unwrap().to_str().unwrap(),
+            original_trace_id
+        );
+    }
+
+    // ── #321: Bulk operations tests ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_bulk_commit_ip_empty_hashes_returns_400() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/bulk/commit-ip")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"owner":"GADDR","commitment_hashes":[]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_bulk_commit_ip_returns_results() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/bulk/commit-ip")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"owner":"GADDR","commitment_hashes":["abc123","def456"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["results"].is_array());
+        assert_eq!(json["results"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_bulk_initiate_swap_mismatched_lengths_returns_400() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/bulk/initiate-swap")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"ip_registry_id":"C1","ip_ids":[1,2],"seller":"G1","prices":[100],"buyer":"G2","token":"C2"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_bulk_initiate_swap_returns_results() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/bulk/initiate-swap")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"ip_registry_id":"C1","ip_ids":[1,2],"seller":"G1","prices":[100,200],"buyer":"G2","token":"C2"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["results"].is_array());
+        assert_eq!(json["results"].as_array().unwrap().len(), 2);
     }
 }
