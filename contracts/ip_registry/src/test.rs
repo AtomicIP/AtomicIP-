@@ -34,6 +34,13 @@ mod tests {
         fn validate_upgrade(env: Env, new_wasm_hash: BytesN<32>);
         fn upgrade(env: Env, new_wasm_hash: BytesN<32>);
         fn get_pow_difficulty(env: Env) -> u32;
+        fn get_ip_strength(env: Env, ip_id: u64) -> u8;
+        fn list_ip_by_category(env: Env, category: soroban_sdk::Bytes) -> Vec<u64>;
+        fn update_ip_category(env: Env, ip_id: u64, new_category: soroban_sdk::Bytes);
+        fn delegate_commitment_authority(env: Env, owner: Address, delegate_address: Address);
+        fn revoke_delegation(env: Env, owner: Address, delegate_address: Address);
+        fn is_delegate(env: Env, owner: Address, delegate_address: Address) -> bool;
+        fn commit_ip_delegated(env: Env, owner: Address, commitment_hash: BytesN<32>, pow_difficulty: u32) -> u64;
     }
 
     #[test]
@@ -716,5 +723,142 @@ mod tests {
         hash_bytes[0] = 0x80;
         let hash = BytesN::from_array(&env, &hash_bytes);
         client.commit_ip(&owner, &hash, &1u32);
+    }
+
+    // ── Tests for Issue #335: IP Commitment Strength Scoring ──────────────────
+
+    #[test]
+    fn test_get_ip_strength() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        let ip_id = client.commit_ip(&owner, &hash, &4u32);
+        let strength = client.get_ip_strength(&ip_id);
+
+        // Strength should be calculated based on secret length (32) and PoW difficulty (4)
+        // Formula: min(100, (32 * 2) + (4 * 3)) = min(100, 64 + 12) = 76
+        assert_eq!(strength, 76u8);
+    }
+
+    #[test]
+    fn test_get_ip_strength_max_capped_at_100() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        let ip_id = client.commit_ip(&owner, &hash, &20u32);
+        let strength = client.get_ip_strength(&ip_id);
+
+        // Strength should be capped at 100
+        assert_eq!(strength, 100u8);
+    }
+
+    // ── Tests for Issue #336: IP Compartmentalization by Category ──────────────
+
+    #[test]
+    fn test_update_ip_category() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        let ip_id = client.commit_ip(&owner, &hash, &0u32);
+
+        // Update category
+        let category = soroban_sdk::Bytes::from_slice(&env, b"software");
+        client.update_ip_category(&ip_id, &category);
+
+        let record = client.get_ip(&ip_id);
+        assert_eq!(record.category, category);
+    }
+
+    #[test]
+    fn test_list_ip_by_category() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let hash1 = BytesN::from_array(&env, &[1u8; 32]);
+        let hash2 = BytesN::from_array(&env, &[2u8; 32]);
+
+        let ip_id1 = client.commit_ip(&owner, &hash1, &0u32);
+        let ip_id2 = client.commit_ip(&owner, &hash2, &0u32);
+
+        let category = soroban_sdk::Bytes::from_slice(&env, b"software");
+        client.update_ip_category(&ip_id1, &category);
+        client.update_ip_category(&ip_id2, &category);
+
+        let ids = client.list_ip_by_category(&category);
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids.get(0).unwrap(), ip_id1);
+        assert_eq!(ids.get(1).unwrap(), ip_id2);
+    }
+
+    // ── Tests for Issue #338: IP Commitment Delegation ────────────────────────
+
+    #[test]
+    fn test_delegate_commitment_authority() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let delegate = <Address as TestAddress>::generate(&env);
+
+        client.delegate_commitment_authority(&owner, &delegate);
+
+        let is_delegate = client.is_delegate(&owner, &delegate);
+        assert!(is_delegate);
+    }
+
+    #[test]
+    fn test_revoke_delegation() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let delegate = <Address as TestAddress>::generate(&env);
+
+        client.delegate_commitment_authority(&owner, &delegate);
+        assert!(client.is_delegate(&owner, &delegate));
+
+        client.revoke_delegation(&owner, &delegate);
+        assert!(!client.is_delegate(&owner, &delegate));
+    }
+
+    #[test]
+    fn test_commit_ip_delegated() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let delegate = <Address as TestAddress>::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.delegate_commitment_authority(&owner, &delegate);
+        let ip_id = client.commit_ip_delegated(&owner, &hash, &0u32);
+
+        let record = client.get_ip(&ip_id);
+        assert_eq!(record.owner, owner);
+        assert_eq!(record.commitment_hash, hash);
     }
 }
