@@ -28,6 +28,7 @@ pub enum ContractError {
     IpExpired = 7,
     MetadataTooLarge = 8,
     LicenseeNotFound = 9,
+    InsufficientPoW = 10,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -52,6 +53,7 @@ pub enum DataKey {
     PartialDisclosure(u64), // stores partial_hash for a given ip_id after reveal
     IpLicenses(u64),        // stores license entries for a given ip_id
     CategoryIps(BytesN<32>), // maps category hash -> Vec<u64> of IP IDs
+    PowDifficulty,          // stores the current PoW difficulty (leading zero bits required)
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -123,7 +125,7 @@ impl IpRegistry {
     /// Therefore: a caller cannot forge `owner` in production. They can only
     /// commit IP under an address for which they hold a valid private key or
     /// delegated authorization.
-    pub fn commit_ip(env: Env, owner: Address, commitment_hash: BytesN<32>) -> u64 {
+    pub fn commit_ip(env: Env, owner: Address, commitment_hash: BytesN<32>, pow_difficulty: u32) -> u64 {
         // Enforced by the Soroban host: panics if the transaction does not carry
         // a valid authorization for `owner`. This is the correct auth pattern.
         owner.require_auth();
@@ -142,6 +144,9 @@ impl IpRegistry {
 
         // Reject duplicate commitment hash globally
         require_unique_commitment(&env, &commitment_hash);
+
+        // Validate proof-of-work: commitment_hash must have `pow_difficulty` leading zero bits
+        require_pow(&env, &commitment_hash, pow_difficulty);
 
         // NextId lives in persistent storage so it survives contract upgrades.
         // Instance storage is wiped on upgrade, which would reset the counter
@@ -591,6 +596,15 @@ impl IpRegistry {
             .unwrap_or(Vec::new(&env))
     }
 
+    /// Returns the current PoW difficulty (number of leading zero bits required in commitment_hash).
+    /// Defaults to 4 if not explicitly set.
+    pub fn get_pow_difficulty(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PowDifficulty)
+            .unwrap_or(4u32)
+    }
+
     /// Partially disclose an IP commitment by revealing a hash of the design
     /// without exposing the full secret.
     ///
@@ -854,7 +868,7 @@ mod tests {
             invoke: &soroban_sdk::testutils::MockAuthInvoke {
                 contract: &contract_id,
                 fn_name: "commit_ip",
-                args: (bob.clone(), hash.clone()).into_val(&env),
+                args: (bob.clone(), hash.clone(), 0u32).into_val(&env),
                 sub_invokes: &[],
             },
         }]);
@@ -862,7 +876,7 @@ mod tests {
         // This call passes bob's address as owner but only alice's auth is mocked.
         // The SDK MUST reject this with an auth panic — confirming the bug condition
         // is correctly enforced at the protocol level.
-        client.commit_ip(&bob, &hash);
+        client.commit_ip(&bob, &hash, &0u32);
     }
 
     /// Attack Surface Documentation Test — mock_all_auths variant
@@ -891,7 +905,7 @@ mod tests {
         // This documents the attack surface: in test environments with relaxed
         // auth, a non-owner can register IP under an arbitrary address.
         // Counterexample: (invoker=alice, owner=bob) — isBugCondition is true.
-        let ip_id = client.commit_ip(&bob, &hash);
+        let ip_id = client.commit_ip(&bob, &hash, &0u32);
 
         // The record is stored under bob, not alice — confirming the forgery.
         let record = client.get_ip(&ip_id);
@@ -911,7 +925,7 @@ mod tests {
         env.mock_all_auths();
 
         let recorded_time = env.ledger().timestamp();
-        let ip_id = client.commit_ip(&owner, &commitment);
+        let ip_id = client.commit_ip(&owner, &commitment, &0u32);
         let record = client.get_ip(&ip_id);
 
         assert_eq!(record.timestamp, recorded_time);

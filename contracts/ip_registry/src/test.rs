@@ -11,7 +11,7 @@ mod tests {
     #[contractclient(name = "IpRegistryClient")]
     #[allow(dead_code)]
     pub trait IpRegistry {
-        fn commit_ip(env: Env, owner: Address, commitment_hash: BytesN<32>) -> u64;
+        fn commit_ip(env: Env, owner: Address, commitment_hash: BytesN<32>, pow_difficulty: u32) -> u64;
         fn batch_commit_ip(env: Env, owner: Address, commitment_hashes: Vec<BytesN<32>>) -> Vec<u64>;
         fn get_ip(env: Env, ip_id: u64) -> IpRecord;
         fn verify_commitment(
@@ -33,6 +33,7 @@ mod tests {
         fn get_partial_disclosure(env: Env, ip_id: u64) -> Option<BytesN<32>>;
         fn validate_upgrade(env: Env, new_wasm_hash: BytesN<32>);
         fn upgrade(env: Env, new_wasm_hash: BytesN<32>);
+        fn get_pow_difficulty(env: Env) -> u32;
     }
 
     #[test]
@@ -52,9 +53,9 @@ mod tests {
 
         // Call commit_ip three times with proper authentication
         env.mock_all_auths();
-        let id1 = client.commit_ip(&owner1, &commitment1);
-        let id2 = client.commit_ip(&owner2, &commitment2);
-        let id3 = client.commit_ip(&owner1, &commitment3);
+        let id1 = client.commit_ip(&owner1, &commitment1, &0u32);
+        let id2 = client.commit_ip(&owner2, &commitment2, &0u32);
+        let id3 = client.commit_ip(&owner1, &commitment3, &0u32);
 
         // Assert IDs are sequential: 1, 2, 3 (first ID is 1, not 0)
         assert_eq!(id1, 1, "First commit should return ID 1");
@@ -98,7 +99,7 @@ mod tests {
         env.mock_all_auths();
 
         // Call commit_ip which should emit an event
-        let ip_id = client.commit_ip(&owner, &commitment);
+        let ip_id = client.commit_ip(&owner, &commitment, &0u32);
 
         // Check events immediately after commit_ip, before any other calls.
         let all_events = env.events().all();
@@ -129,7 +130,7 @@ mod tests {
 
         // All-zero hash has no cryptographic value — must panic with ContractError::ZeroCommitmentHash (code 2)
         let zero_hash = BytesN::from_array(&env, &[0u8; 32]);
-        client.commit_ip(&owner, &zero_hash);
+        client.commit_ip(&owner, &zero_hash, &0u32);
     }
 
     #[test]
@@ -154,7 +155,7 @@ mod tests {
         let commitment = BytesN::from_array(&env, &[5u8; 32]);
 
         env.mock_all_auths();
-        let ip_id = client.commit_ip(&alice, &commitment);
+        let ip_id = client.commit_ip(&alice, &commitment, &0u32);
 
         client.transfer_ip(&ip_id, &bob);
 
@@ -183,7 +184,7 @@ mod tests {
         let commitment = BytesN::from_array(&env, &[6u8; 32]);
 
         env.mock_all_auths();
-        let ip_id = client.commit_ip(&alice, &commitment);
+        let ip_id = client.commit_ip(&alice, &commitment, &0u32);
 
         // Only mock bob's auth — alice's auth is not present, so transfer must panic
         env.mock_auths(&[soroban_sdk::testutils::MockAuth {
@@ -222,7 +223,7 @@ mod tests {
 
         // Commit an IP for owner
         let commitment = BytesN::from_array(&env, &[1u8; 32]);
-        let ip_id = client.commit_ip(&owner, &commitment);
+        let ip_id = client.commit_ip(&owner, &commitment, &0u32);
 
         // Unknown owner returns empty Vec; known owner returns Vec with IPs.
         let unknown_ips = client.list_ip_by_owner(&unknown_owner);
@@ -243,7 +244,7 @@ mod tests {
         let commitment = BytesN::from_array(&env, &[7u8; 32]);
 
         env.mock_all_auths();
-        let ip_id = client.commit_ip(&owner, &commitment);
+        let ip_id = client.commit_ip(&owner, &commitment, &0u32);
 
         assert!(!client.get_ip(&ip_id).revoked);
         client.revoke_ip(&ip_id);
@@ -260,7 +261,7 @@ mod tests {
         let commitment = BytesN::from_array(&env, &[9u8; 32]);
 
         env.mock_all_auths();
-        let ip_id = client.commit_ip(&owner, &commitment);
+        let ip_id = client.commit_ip(&owner, &commitment, &0u32);
 
         // Clear previous events (from commit_ip)
         env.events().clear();
@@ -286,7 +287,7 @@ mod tests {
 
         let owner = <Address as TestAddress>::generate(&env);
         env.mock_all_auths();
-        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[8u8; 32]));
+        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[8u8; 32]), &0u32);
         client.revoke_ip(&ip_id);
         client.revoke_ip(&ip_id); // must panic with IpAlreadyRevoked (code 4)
     }
@@ -300,9 +301,9 @@ mod tests {
         let client = IpRegistryClient::new(&env, &contract_id);
 
         let owner = <Address as TestAddress>::generate(&env);
-        let id0 = client.commit_ip(&owner, &BytesN::from_array(&env, &[1u8; 32]));
-        let id1 = client.commit_ip(&owner, &BytesN::from_array(&env, &[2u8; 32]));
-        let id2 = client.commit_ip(&owner, &BytesN::from_array(&env, &[3u8; 32]));
+        let id0 = client.commit_ip(&owner, &BytesN::from_array(&env, &[1u8; 32]), &0u32);
+        let id1 = client.commit_ip(&owner, &BytesN::from_array(&env, &[2u8; 32]), &0u32);
+        let id2 = client.commit_ip(&owner, &BytesN::from_array(&env, &[3u8; 32]), &0u32);
 
         assert_eq!(id0, 1);
         assert_eq!(id1, 2);
@@ -327,7 +328,7 @@ mod tests {
         preimage.append(&soroban_sdk::Bytes::from(blinding.clone()));
         let commitment_hash: BytesN<32> = env.crypto().sha256(&preimage).into();
 
-        let ip_id = client.commit_ip(&owner, &commitment_hash);
+        let ip_id = client.commit_ip(&owner, &commitment_hash, &0u32);
 
         // Attempt verification with the wrong secret and assert the check fails.
         let wrong_secret = BytesN::from_array(&env, &[99u8; 32]);
@@ -346,9 +347,9 @@ mod tests {
         let client = IpRegistryClient::new(&env, &contract_id);
 
         let owner = <Address as TestAddress>::generate(&env);
-        let id0 = client.commit_ip(&owner, &BytesN::from_array(&env, &[4u8; 32]));
-        let id1 = client.commit_ip(&owner, &BytesN::from_array(&env, &[5u8; 32]));
-        let id2 = client.commit_ip(&owner, &BytesN::from_array(&env, &[6u8; 32]));
+        let id0 = client.commit_ip(&owner, &BytesN::from_array(&env, &[4u8; 32]), &0u32);
+        let id1 = client.commit_ip(&owner, &BytesN::from_array(&env, &[5u8; 32]), &0u32);
+        let id2 = client.commit_ip(&owner, &BytesN::from_array(&env, &[6u8; 32]), &0u32);
 
         let ids = client.list_ip_by_owner(&owner);
         assert_eq!(ids.len(), 3);
@@ -367,7 +368,7 @@ mod tests {
         let owner = <Address as TestAddress>::generate(&env);
         let attacker = <Address as TestAddress>::generate(&env);
         env.mock_all_auths();
-        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[9u8; 32]));
+        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[9u8; 32]), &0u32);
 
         // Only mock attacker's auth — owner's auth is absent, must panic
         env.mock_auths(&[soroban_sdk::testutils::MockAuth {
@@ -393,7 +394,7 @@ mod tests {
         let commitment = BytesN::from_array(&env, &[10u8; 32]);
 
         env.mock_all_auths();
-        let ip_id = client.commit_ip(&alice, &commitment);
+        let ip_id = client.commit_ip(&alice, &commitment, &0u32);
 
         // Alice should be the owner
         assert!(client.is_ip_owner(&ip_id, &alice));
@@ -426,7 +427,7 @@ mod tests {
         let blinding = BytesN::from_array(&env, &[0xcdu8; 32]);
         let commitment = make_commitment(&env, &partial_hash, &blinding);
 
-        let ip_id = client.commit_ip(&owner, &commitment);
+        let ip_id = client.commit_ip(&owner, &commitment, &0u32);
 
         // Valid proof: returns true
         assert!(client.reveal_partial(&ip_id, &partial_hash, &blinding));
@@ -448,7 +449,7 @@ mod tests {
         let wrong_blinding = BytesN::from_array(&env, &[0x33u8; 32]);
         let commitment = make_commitment(&env, &partial_hash, &blinding);
 
-        let ip_id = client.commit_ip(&owner, &commitment);
+        let ip_id = client.commit_ip(&owner, &commitment, &0u32);
 
         // Wrong blinding factor: proof fails
         assert!(!client.reveal_partial(&ip_id, &partial_hash, &wrong_blinding));
@@ -470,7 +471,7 @@ mod tests {
         let wrong_partial = BytesN::from_array(&env, &[0x66u8; 32]);
         let commitment = make_commitment(&env, &partial_hash, &blinding);
 
-        let ip_id = client.commit_ip(&owner, &commitment);
+        let ip_id = client.commit_ip(&owner, &commitment, &0u32);
 
         assert!(!client.reveal_partial(&ip_id, &wrong_partial, &blinding));
         assert_eq!(client.get_partial_disclosure(&ip_id), None);
@@ -490,7 +491,7 @@ mod tests {
         let commitment = make_commitment(&env, &partial_hash, &blinding);
 
         env.mock_all_auths();
-        let ip_id = client.commit_ip(&owner, &commitment);
+        let ip_id = client.commit_ip(&owner, &commitment, &0u32);
 
         // Only mock attacker's auth — must panic
         env.mock_auths(&[soroban_sdk::testutils::MockAuth {
@@ -514,7 +515,7 @@ mod tests {
 
         let owner = <Address as TestAddress>::generate(&env);
         let commitment = BytesN::from_array(&env, &[0x99u8; 32]);
-        let ip_id = client.commit_ip(&owner, &commitment);
+        let ip_id = client.commit_ip(&owner, &commitment, &0u32);
 
         assert_eq!(client.get_partial_disclosure(&ip_id), None);
     }
@@ -587,7 +588,7 @@ mod tests {
         let owner = <Address as TestAddress>::generate(&env);
 
         // Single commit
-        let id1 = client.commit_ip(&owner, &BytesN::from_array(&env, &[10u8; 32]));
+        let id1 = client.commit_ip(&owner, &BytesN::from_array(&env, &[10u8; 32]), &0u32);
         assert_eq!(id1, 1);
 
         // Batch commit 3
@@ -603,7 +604,7 @@ mod tests {
         assert_eq!(ids.get(2).unwrap(), 4);
 
         // Another single
-        let id5 = client.commit_ip(&owner, &BytesN::from_array(&env, &[14u8; 32]));
+        let id5 = client.commit_ip(&owner, &BytesN::from_array(&env, &[14u8; 32]), &0u32);
         assert_eq!(id5, 5);
     }
 
@@ -627,5 +628,93 @@ mod tests {
 
         let zero_hash = BytesN::from_array(&env, &[0u8; 32]);
         client.validate_upgrade(&zero_hash);
+    }
+
+    // ── PoW Tests ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_get_pow_difficulty_returns_default_four() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        assert_eq!(client.get_pow_difficulty(), 4);
+    }
+
+    #[test]
+    fn test_commit_ip_pow_difficulty_zero_always_passes() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        // Any non-zero hash passes when difficulty is 0
+        let hash = BytesN::from_array(&env, &[0xffu8; 32]);
+        let ip_id = client.commit_ip(&owner, &hash, &0u32);
+        assert_eq!(ip_id, 1);
+    }
+
+    #[test]
+    fn test_commit_ip_pow_difficulty_eight_accepts_leading_zero_byte() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        // First byte 0x00 = 8 leading zero bits — satisfies difficulty 8
+        let mut hash_bytes = [0x01u8; 32];
+        hash_bytes[0] = 0x00;
+        let hash = BytesN::from_array(&env, &hash_bytes);
+        let ip_id = client.commit_ip(&owner, &hash, &8u32);
+        assert_eq!(ip_id, 1);
+    }
+
+    #[test]
+    fn test_commit_ip_pow_difficulty_four_accepts_half_zero_nibble() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        // 0x0f = 0000_1111 — 4 leading zero bits, satisfies difficulty 4
+        let mut hash_bytes = [0x01u8; 32];
+        hash_bytes[0] = 0x0f;
+        let hash = BytesN::from_array(&env, &hash_bytes);
+        let ip_id = client.commit_ip(&owner, &hash, &4u32);
+        assert_eq!(ip_id, 1);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_commit_ip_pow_difficulty_four_rejects_insufficient_leading_zeros() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        // 0x1f = 0001_1111 — only 3 leading zero bits, fails difficulty 4
+        let mut hash_bytes = [0x01u8; 32];
+        hash_bytes[0] = 0x1f;
+        let hash = BytesN::from_array(&env, &hash_bytes);
+        client.commit_ip(&owner, &hash, &4u32);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_commit_ip_pow_difficulty_one_rejects_high_bit_set() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        // 0x80 = 1000_0000 — high bit set, fails difficulty 1
+        let mut hash_bytes = [0x01u8; 32];
+        hash_bytes[0] = 0x80;
+        let hash = BytesN::from_array(&env, &hash_bytes);
+        client.commit_ip(&owner, &hash, &1u32);
     }
 }
