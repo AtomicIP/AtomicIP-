@@ -787,6 +787,24 @@ impl IpRegistry {
             .unwrap_or(Vec::new(&env))
     }
 
+    /// Set or update the suggested price for an IP. Owner-only. Pass 0 to clear.
+    pub fn set_ip_suggested_price(env: Env, ip_id: u64, price: i128) {
+        let record = require_ip_exists(&env, ip_id);
+        record.owner.require_auth();
+        if price == 0 {
+            env.storage().persistent().remove(&DataKey::SuggestedPrice(ip_id));
+        } else {
+            env.storage().persistent().set(&DataKey::SuggestedPrice(ip_id), &price);
+            env.storage().persistent().extend_ttl(&DataKey::SuggestedPrice(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+        }
+    }
+
+    /// Get the suggested price for an IP. Returns None if no price has been set.
+    pub fn get_ip_suggested_price(env: Env, ip_id: u64) -> Option<i128> {
+        require_ip_exists(&env, ip_id);
+        env.storage().persistent().get(&DataKey::SuggestedPrice(ip_id))
+    }
+
     /// Add a co-owner to an IP. Owner-only.
     /// Co-owners can verify commitments but cannot transfer or revoke the IP.
     pub fn add_co_owner(env: Env, ip_id: u64, co_owner: Address) {
