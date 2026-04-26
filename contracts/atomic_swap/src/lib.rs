@@ -107,6 +107,14 @@ pub enum ContractError {
     PaymentAlreadyMade = 47,
     /// Payment not yet due.
     PaymentNotYetDue = 48,
+
+    // ── #350: Collateral errors (49-51) ──────────────────────────────────────
+    /// Collateral not found for this swap.
+    CollateralNotFound = 49,
+    /// Insufficient collateral deposited.
+    InsufficientCollateral = 50,
+    /// Collateral already deposited for this swap.
+    CollateralAlreadyDeposited = 51,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -355,6 +363,7 @@ impl AtomicSwap {
         buyer: Address,
         required_approvals: u32,
         referrer: Option<Address>,
+        collateral_amount: i128,
     ) -> u64 {
         // Guard: reject new swaps when the contract is paused.
         require_not_paused(&env);
@@ -391,6 +400,7 @@ impl AtomicSwap {
             required_approvals,
             dispute_timestamp: 0,
             referrer: referrer.clone(),
+            collateral_amount,
         };
 
         env.storage().persistent().set(&DataKey::Swap(id), &swap);
@@ -470,23 +480,47 @@ impl AtomicSwap {
             }
         }
 
-        // #312: Apply tiered pricing if tiers are configured.
-        let effective_price = if swap.price_tiers.is_empty() {
-            swap.price
-        } else {
-            // Use the last tier whose min_quantity <= 1 (single-unit purchase).
-            // For quantity-based calls, callers should use accept_swap_with_quantity.
-            swap.price
-        };
+        // #350: Deposit collateral if required
+        if swap.collateral_amount > 0 {
+            // Check if collateral already deposited
+            if env.storage().persistent().has(&DataKey::SwapCollateral(swap_id)) {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::CollateralAlreadyDeposited as u32,
+                ));
+            }
+
+            // Transfer collateral from buyer to contract
+            token::Client::new(&env, &swap.token).transfer(
+                &swap.buyer,
+                &env.current_contract_address(),
+                &swap.collateral_amount,
+            );
+
+            // Store collateral amount
+            env.storage()
+                .persistent()
+                .set(&DataKey::SwapCollateral(swap_id), &swap.collateral_amount);
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::SwapCollateral(swap_id), LEDGER_BUMP, LEDGER_BUMP);
+
+            env.events().publish(
+                (soroban_sdk::symbol_short!("coll_dep"),),
+                CollateralDepositedEvent {
+                    swap_id,
+                    buyer: swap.buyer.clone(),
+                    collateral_amount: swap.collateral_amount,
+                },
+            );
+        }
 
         // Transfer payment from buyer into contract escrow.
         token::Client::new(&env, &swap.token).transfer(
             &swap.buyer,
             &env.current_contract_address(),
-            &effective_price,
+            &swap.price,
         );
 
-        swap.price = effective_price;
         swap.accept_timestamp = env.ledger().timestamp();
         swap.status = SwapStatus::Accepted;
 
@@ -602,6 +636,33 @@ impl AtomicSwap {
             &swap.seller,
             &seller_amount,
         );
+
+        // #350: Release collateral to buyer on successful completion
+        if swap.collateral_amount > 0 {
+            if let Some(collateral) = env
+                .storage()
+                .persistent()
+                .get::<_, i128>(&DataKey::SwapCollateral(swap_id))
+            {
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &swap.buyer,
+                    &collateral,
+                );
+                env.storage()
+                    .persistent()
+                    .remove(&DataKey::SwapCollateral(swap_id));
+
+                env.events().publish(
+                    (soroban_sdk::symbol_short!("coll_rel"),),
+                    CollateralReleasedEvent {
+                        swap_id,
+                        buyer: swap.buyer.clone(),
+                        collateral_amount: collateral,
+                    },
+                );
+            }
+        }
 
         env.events().publish(
             (soroban_sdk::symbol_short!("key_rev"),),
@@ -939,12 +1000,41 @@ impl AtomicSwap {
             .persistent()
             .remove(&DataKey::ActiveSwap(swap.ip_id));
 
+        let token_client = token::Client::new(&env, &swap.token);
+
         // Refund buyer's escrowed payment (Issue #35)
-        token::Client::new(&env, &swap.token).transfer(
+        token_client.transfer(
             &env.current_contract_address(),
             &swap.buyer,
             &swap.price,
         );
+
+        // #350: Refund collateral on cancellation
+        if swap.collateral_amount > 0 {
+            if let Some(collateral) = env
+                .storage()
+                .persistent()
+                .get::<_, i128>(&DataKey::SwapCollateral(swap_id))
+            {
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &swap.buyer,
+                    &collateral,
+                );
+                env.storage()
+                    .persistent()
+                    .remove(&DataKey::SwapCollateral(swap_id));
+
+                env.events().publish(
+                    (soroban_sdk::symbol_short!("coll_ref"),),
+                    CollateralRefundedEvent {
+                        swap_id,
+                        buyer: swap.buyer.clone(),
+                        collateral_amount: collateral,
+                    },
+                );
+            }
+        }
 
         // #253: Log history entry
         Self::append_history(&env, swap_id, SwapStatus::Cancelled);
@@ -1987,6 +2077,16 @@ impl AtomicSwap {
             .persistent()
             .get(&DataKey::PaymentsMade(swap_id))
             .unwrap_or(Vec::new(&env))
+    }
+
+    // ── #350: Collateral Management ───────────────────────────────────────────
+
+    /// Get collateral amount for a swap.
+    pub fn get_swap_collateral(env: Env, swap_id: u64) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SwapCollateral(swap_id))
+            .unwrap_or(0)
     }
 }
 

@@ -54,6 +54,8 @@ pub enum DataKey {
     PaymentSchedule(u64),
     /// #349: Maps swap_id → Vec<bool> tracking which payments have been made.
     PaymentsMade(u64),
+    /// #350: Maps swap_id → collateral amount held in escrow.
+    SwapCollateral(u64),
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -87,6 +89,8 @@ pub struct SwapRecord {
     pub dispute_timestamp: u64,
     /// #311: Optional referrer address for referral reward on completion.
     pub referrer: Option<Address>,
+    /// #350: Collateral amount required from buyer. Zero if no collateral.
+    pub collateral_amount: i128,
 }
 
 // ── Events ────────────────────────────────────────────────────────────────────
@@ -286,4 +290,30 @@ pub struct ScheduledPaymentMadeEvent {
     pub payment_index: u32,
     pub amount: i128,
     pub remaining_payments: u32,
+}
+
+// ── #350: Collateral Types ────────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CollateralDepositedEvent {
+    pub swap_id: u64,
+    pub buyer: Address,
+    pub collateral_amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CollateralReleasedEvent {
+    pub swap_id: u64,
+    pub buyer: Address,
+    pub collateral_amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CollateralRefundedEvent {
+    pub swap_id: u64,
+    pub buyer: Address,
+    pub collateral_amount: i128,
 }
