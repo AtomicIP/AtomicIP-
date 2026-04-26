@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, BytesN, Symbol};
+use soroban_sdk::{contracttype, Address, BytesN, Symbol, Vec, Env};
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
 
@@ -31,6 +31,8 @@ pub enum DataKey {
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
+#[contracttype]
+#[derive(Clone)]
 #[contracttype]
 #[derive(Clone)]
 pub struct IpRecord {
