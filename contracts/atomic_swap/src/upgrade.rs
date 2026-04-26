@@ -250,7 +250,8 @@ pub fn build_v1_schema(env: &Env) -> ContractSchema {
     f!("unpause",                  "unpause(caller:Address)->()");
     f!("upgrade",                  "upgrade(new_wasm_hash:BytesN<32>)->()");
     f!("validate_upgrade",         "validate_upgrade(new_wasm_hash:BytesN<32>,new_schema:ContractSchema)->Result<(),ContractError>");
-    f!("initiate_swap",            "initiate_swap(token:Address,ip_id:u64,seller:Address,price:i128,buyer:Address,required_approvals:u32)->u64");
+    f!("initiate_swap",            "initiate_swap(token:Address,ip_id:u64,seller:Address,price:i128,buyer:Address,required_approvals:u32,referrer:Option<Address>)->u64");
+    f!("batch_initiate_swap",      "batch_initiate_swap(token:Address,ip_ids:Vec<u64>,seller:Address,prices:Vec<i128>,buyer:Address,required_approvals:u32,referrer:Option<Address>)->Vec<u64>");
     f!("accept_swap",              "accept_swap(swap_id:u64)->()");
     f!("reveal_key",               "reveal_key(swap_id:u64,caller:Address,secret:BytesN<32>,blinding_factor:BytesN<32>)->()");
     f!("cancel_swap",              "cancel_swap(swap_id:u64,canceller:Address)->()");
@@ -269,7 +270,7 @@ pub fn build_v1_schema(env: &Env) -> ContractSchema {
     f!("get_swap_history",         "get_swap_history(swap_id:u64)->Vec<SwapHistoryEntry>");
     f!("get_cancellation_reason",  "get_cancellation_reason(swap_id:u64)->Option<Bytes>");
     f!("get_protocol_config",      "get_protocol_config()->ProtocolConfig");
-    f!("admin_set_protocol_config","admin_set_protocol_config(protocol_fee_bps:u32,treasury:Address,dispute_window_seconds:u64,dispute_resolution_timeout_seconds:u64)->()");
+    f!("admin_set_protocol_config","admin_set_protocol_config(protocol_fee_bps:u32,treasury:Address,dispute_window_seconds:u64,dispute_resolution_timeout_seconds:u64,referral_fee_bps:u32)->()");
 
     let mut errors: Vec<ErrorEntry> = Vec::new(env);
 

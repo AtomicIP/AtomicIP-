@@ -54,7 +54,7 @@ mod tests {
         let contract_id = setup_swap(&env, &registry_id);
         let client = AtomicSwapClient::new(&env, &contract_id);
 
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None);
 
         let ttl = env.storage().persistent().get_ttl(&DataKey::Swap(swap_id));
         assert!(ttl > 0, "TTL should be set after swap initiation");
@@ -78,7 +78,7 @@ mod tests {
         let contract_id = setup_swap(&env, &registry_id);
         let client = AtomicSwapClient::new(&env, &contract_id);
 
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None);
         client.accept_swap(&swap_id);
 
         let ttl = env.storage().persistent().get_ttl(&DataKey::Swap(swap_id));
@@ -103,7 +103,7 @@ mod tests {
         let contract_id = setup_swap(&env, &registry_id);
         let client = AtomicSwapClient::new(&env, &contract_id);
 
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None);
         client.accept_swap(&swap_id);
         client.reveal_key(&swap_id, &seller, &secret, &blinding);
 
@@ -129,7 +129,7 @@ mod tests {
         let contract_id = setup_swap(&env, &registry_id);
         let client = AtomicSwapClient::new(&env, &contract_id);
 
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None);
         client.cancel_swap(&swap_id, &seller);
 
         let ttl = env.storage().persistent().get_ttl(&DataKey::Swap(swap_id));
@@ -154,7 +154,7 @@ mod tests {
         let contract_id = setup_swap(&env, &registry_id);
         let client = AtomicSwapClient::new(&env, &contract_id);
 
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None);
         let ttl_init = env.storage().persistent().get_ttl(&DataKey::Swap(swap_id));
 
         client.accept_swap(&swap_id);
@@ -182,7 +182,7 @@ mod tests {
         let client = AtomicSwapClient::new(&env, &contract_id);
         let treasury = Address::generate(&env);
 
-        client.admin_set_protocol_config(&250u32, &treasury, &3_600u64, &2_592_000u64);
+        client.admin_set_protocol_config(&250u32, &treasury, &3_600u64, &2_592_000u64, &0_u32);
 
         let cached = env
             .storage()
@@ -206,8 +206,8 @@ mod tests {
         let treasury_a = Address::generate(&env);
         let treasury_b = Address::generate(&env);
 
-        client.admin_set_protocol_config(&100u32, &treasury_a, &900u64, &2_592_000u64);
-        client.admin_set_protocol_config(&500u32, &treasury_b, &7_200u64, &2_592_000u64);
+        client.admin_set_protocol_config(&100u32, &treasury_a, &900u64, &2_592_000u64, &0_u32);
+        client.admin_set_protocol_config(&500u32, &treasury_b, &7_200u64, &2_592_000u64, &0_u32);
 
         let cached = env
             .storage()
@@ -244,9 +244,9 @@ mod tests {
         let client = AtomicSwapClient::new(&env, &contract_id);
 
         // 250 bps = 2.5% fee
-        client.admin_set_protocol_config(&250u32, &treasury, &86400u64, &2_592_000u64);
+        client.admin_set_protocol_config(&250u32, &treasury, &86400u64, &2_592_000u64, &0_u32);
 
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &price, &buyer);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &price, &buyer, &0_u32, &None);
         client.accept_swap(&swap_id);
         client.reveal_key(&swap_id, &seller, &secret, &blinding);
 
@@ -283,9 +283,9 @@ mod tests {
         let client = AtomicSwapClient::new(&env, &contract_id);
 
         // 1-second dispute window, 100-second resolution timeout
-        client.admin_set_protocol_config(&0u32, &treasury, &1u64, &100u64);
+        client.admin_set_protocol_config(&0u32, &treasury, &1u64, &100u64, &0_u32);
 
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &price, &buyer);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &price, &buyer, &0_u32, &None);
         client.accept_swap(&swap_id);
 
         // Advance time past dispute window so buyer can raise dispute
@@ -320,9 +320,9 @@ mod tests {
         let client = AtomicSwapClient::new(&env, &contract_id);
 
         // 1-second dispute window, 1000-second resolution timeout
-        client.admin_set_protocol_config(&0u32, &treasury, &1u64, &1000u64);
+        client.admin_set_protocol_config(&0u32, &treasury, &1u64, &1000u64, &0_u32);
 
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &price, &buyer);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &price, &buyer, &0_u32, &None);
         client.accept_swap(&swap_id);
         client.raise_dispute(&swap_id);
 
@@ -343,7 +343,7 @@ mod tests {
         let contract_id = setup_swap(&env, &registry_id);
         let client = AtomicSwapClient::new(&env, &contract_id);
 
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None);
         client.cancel_swap(&swap_id, &seller);
 
         let reason = client.get_cancellation_reason(&swap_id).unwrap();
@@ -362,7 +362,7 @@ mod tests {
         let contract_id = setup_swap(&env, &registry_id);
         let client = AtomicSwapClient::new(&env, &contract_id);
 
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None);
         client.accept_swap(&swap_id);
         // Advance past expiry (initiation timestamp=0, expiry=604800)
         env.ledger().with_mut(|l| l.timestamp = 604801);
@@ -384,7 +384,7 @@ mod tests {
         let contract_id = setup_swap(&env, &registry_id);
         let client = AtomicSwapClient::new(&env, &contract_id);
 
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None);
         assert!(client.get_cancellation_reason(&swap_id).is_none());
     }
 }

@@ -91,7 +91,7 @@ mod regression_tests {
         let contract_id = setup_swap(&env, &registry_id);
         let client = AtomicSwapClient::new(&env, &contract_id);
 
-        let result = client.try_initiate_swap(&token_id, &ip_id, &attacker, &500_i128, &buyer, &0_u32);
+        let result = client.try_initiate_swap(&token_id, &ip_id, &attacker, &500_i128, &buyer, &0_u32, &None);
         assert!(
             result.is_err(),
             "non-owner must not be able to initiate a swap"
@@ -115,7 +115,7 @@ mod regression_tests {
         let contract_id = setup_swap(&env, &registry_id);
         let client = AtomicSwapClient::new(&env, &contract_id);
 
-        let result = client.try_initiate_swap(&token_id, &ip_id, &seller, &0_i128, &buyer, &0_u32);
+        let result = client.try_initiate_swap(&token_id, &ip_id, &seller, &0_i128, &buyer, &0_u32, &None);
         assert_eq!(
             result.unwrap_err().unwrap(),
             ContractError::PriceMustBeGreaterThanZero,
@@ -142,9 +142,9 @@ mod regression_tests {
         let contract_id = setup_swap(&env, &registry_id);
         let client = AtomicSwapClient::new(&env, &contract_id);
 
-        client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer1, &0_u32);
+        client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer1, &0_u32, &None);
 
-        let result = client.try_initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer2, &0_u32);
+        let result = client.try_initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer2, &0_u32, &None);
         assert_eq!(
             result.unwrap_err().unwrap(),
             ContractError::ActiveSwapAlreadyExistsForThisIpId,
@@ -174,7 +174,7 @@ mod regression_tests {
         let contract_id = setup_swap(&env, &registry_id);
         let client = AtomicSwapClient::new(&env, &contract_id);
 
-        let result = client.try_initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32);
+        let result = client.try_initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None);
         assert_eq!(
             result.unwrap_err().unwrap(),
             ContractError::IpIsRevoked,
@@ -200,7 +200,7 @@ mod regression_tests {
         let contract_id = setup_swap(&env, &registry_id);
         let client = AtomicSwapClient::new(&env, &contract_id);
 
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None);
         client.accept_swap(&swap_id, &buyer);
 
         let wrong_key = BytesN::from_array(&env, &[0xFFu8; 32]);
@@ -235,7 +235,7 @@ mod regression_tests {
         let contract_id = setup_swap(&env, &registry_id);
         let client = AtomicSwapClient::new(&env, &contract_id);
 
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None);
         client.accept_swap(&swap_id, &buyer);
 
         // Advance ledger past expiry
@@ -273,7 +273,7 @@ mod regression_tests {
         let contract_id = setup_swap(&env, &registry_id);
         let client = AtomicSwapClient::new(&env, &contract_id);
 
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None);
         client.accept_swap(&swap_id, &buyer);
 
         // Do NOT advance ledger — swap is not expired
@@ -302,7 +302,7 @@ mod regression_tests {
         let contract_id = setup_swap(&env, &registry_id);
         let client = AtomicSwapClient::new(&env, &contract_id);
 
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None);
         client.accept_swap(&swap_id, &buyer);
 
         // Build the correct preimage key: secret || blinding
@@ -320,7 +320,7 @@ mod regression_tests {
 
         // A new swap for the same IP must now be accepted
         StellarAssetClient::new(&env, &token_id).mint(&buyer, &500);
-        let result = client.try_initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32);
+        let result = client.try_initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None);
         assert!(
             result.is_ok(),
             "new swap must be allowed after previous swap completes"

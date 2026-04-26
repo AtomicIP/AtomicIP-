@@ -40,10 +40,8 @@ pub enum DataKey {
     SupportedTokens,
     /// On-chain interface manifest used by validate_upgrade.
     ContractSchema,
-    /// #314: Maps swap_id → arbitrator Address.
-    Arbitrator(u64),
-    /// #313: Maps swap_id → Vec<BytesN<32>> of evidence hashes.
-    DisputeEvidence(u64),
+    /// #311: Maps swap_id → referrer Address for referral reward tracking.
+    SwapReferrer(u64),
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -75,11 +73,8 @@ pub struct SwapRecord {
     pub required_approvals: u32,
     /// Ledger timestamp when a dispute was raised. Zero if no dispute.
     pub dispute_timestamp: u64,
-    /// #314: Optional neutral third-party arbitrator address.
-    pub arbitrator: Option<Address>,
-    /// #312: Volume discount tiers as (min_quantity, price_per_unit).
-    /// Sorted ascending by quantity. Empty means flat price.
-    pub price_tiers: Vec<(u32, i128)>,
+    /// #311: Optional referrer address for referral reward on completion.
+    pub referrer: Option<Address>,
 }
 
 // ── Events ────────────────────────────────────────────────────────────────────
@@ -149,6 +144,18 @@ pub struct ProtocolConfig {
     pub treasury: Address,
     pub dispute_window_seconds: u64,
     pub dispute_resolution_timeout_seconds: u64,
+    /// #311: Referral fee in basis points (0-10000). Deducted from seller proceeds.
+    pub referral_fee_bps: u32,
+}
+
+// ── #311: Referral Paid Event ─────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReferralPaidEvent {
+    pub swap_id: u64,
+    pub referrer: Address,
+    pub referral_amount: i128,
 }
 
 // ── #253: Swap History ────────────────────────────────────────────────────────

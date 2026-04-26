@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct CommitIpRequest {
@@ -40,9 +40,28 @@ pub struct VerifyCommitmentResponse {
     pub valid: bool,
 }
 
+/// #317: Pagination query parameters shared across list endpoints.
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct PaginationParams {
+    /// Maximum number of items to return (default: 50, max: 200).
+    #[serde(default = "default_limit")]
+    pub limit: u64,
+    /// Number of items to skip (default: 0).
+    #[serde(default)]
+    pub offset: u64,
+}
+
+fn default_limit() -> u64 {
+    50
+}
+
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ListIpByOwnerResponse {
     pub ip_ids: Vec<u64>,
+    /// #317: Total number of IPs owned (before pagination).
+    pub total_count: u64,
+    /// #317: Whether more items exist beyond this page.
+    pub has_more: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -77,6 +96,27 @@ pub struct InitiateSwapRequest {
     pub buyer: String,
     /// Stellar asset contract address for the payment token
     pub token: String,
+    /// #311: Optional referrer address for referral reward
+    pub referrer: Option<String>,
+}
+
+/// #309: Batch swap initiation request.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct BatchInitiateSwapRequest {
+    pub ip_registry_id: String,
+    pub ip_ids: Vec<u64>,
+    pub seller: String,
+    pub prices: Vec<i128>,
+    pub buyer: String,
+    pub token: String,
+    /// #311: Optional referrer address for referral reward
+    pub referrer: Option<String>,
+}
+
+/// #309: Batch swap initiation response.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct BatchInitiateSwapResponse {
+    pub swap_ids: Vec<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
