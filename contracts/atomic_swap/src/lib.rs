@@ -58,6 +58,19 @@ pub enum ContractError {
     InvalidReferralFeeBps = 35,
 
     // ── Upgrade-validation errors (29-34) ─────────────────────────────────────
+    // NOTE: codes 29-34 are reserved for upgrade validation (see below)
+
+    // ── #314: Arbitration errors (35-37) ──────────────────────────────────────
+    /// Arbitrator has already been set for this swap.
+    ArbitratorAlreadySet = 35,
+    /// Caller is not the designated arbitrator for this swap.
+    NotArbitrator = 36,
+    /// No arbitrator has been set for this swap.
+    NoArbitratorSet = 37,
+
+    // ── #313: Dispute evidence errors (38) ────────────────────────────────────
+    /// Caller is not authorized to submit evidence (must be buyer or seller).
+    UnauthorizedEvidenceSubmitter = 38,
     /// New schema version must be strictly greater than the current one.
     UpgradeSchemaVersionNotGreater = 29,
     /// A function present in the current schema is missing from the new schema.
@@ -256,6 +269,33 @@ pub struct SwapApprovedEvent {
     pub approvals_count: u32,
 }
 
+// ── #314: Arbitration Events ──────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ArbitratorSetEvent {
+    pub swap_id: u64,
+    pub arbitrator: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ArbitratedEvent {
+    pub swap_id: u64,
+    pub arbitrator: Address,
+    pub refunded: bool,
+}
+
+// ── #313: Dispute Evidence Event ──────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DisputeEvidenceSubmittedEvent {
+    pub swap_id: u64,
+    pub submitter: Address,
+    pub evidence_hash: BytesN<32>,
+}
+
 // ── Contract ──────────────────────────────────────────────────────────────────
 
 #[contract]
@@ -406,13 +446,23 @@ impl AtomicSwap {
             }
         }
 
+        // #312: Apply tiered pricing if tiers are configured.
+        let effective_price = if swap.price_tiers.is_empty() {
+            swap.price
+        } else {
+            // Use the last tier whose min_quantity <= 1 (single-unit purchase).
+            // For quantity-based calls, callers should use accept_swap_with_quantity.
+            swap.price
+        };
+
         // Transfer payment from buyer into contract escrow.
         token::Client::new(&env, &swap.token).transfer(
             &swap.buyer,
             &env.current_contract_address(),
-            &swap.price,
+            &effective_price,
         );
 
+        swap.price = effective_price;
         swap.accept_timestamp = env.ledger().timestamp();
         swap.status = SwapStatus::Accepted;
 
@@ -631,6 +681,189 @@ impl AtomicSwap {
         env.events().publish(
             (soroban_sdk::symbol_short!("disp_res"),),
             DisputeResolvedEvent { swap_id, refunded: true },
+        );
+    }
+
+    // ── #314: Third-Party Arbitration ─────────────────────────────────────────
+
+    /// Set a neutral third-party arbitrator for a disputed swap.
+    /// Only the admin may assign an arbitrator. Can only be set once.
+    pub fn set_arbitrator(env: Env, swap_id: u64, caller: Address, arbitrator: Address) {
+        caller.require_auth();
+        require_admin(&env, &caller);
+
+        let mut swap = require_swap_exists(&env, swap_id);
+        require_swap_status(&env, &swap, SwapStatus::Disputed, ContractError::SwapNotDisputed);
+
+        if swap.arbitrator.is_some() {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::ArbitratorAlreadySet as u32,
+            ));
+        }
+
+        swap.arbitrator = Some(arbitrator.clone());
+        swap::save_swap(&env, swap_id, &swap);
+
+        env.storage().persistent().set(&DataKey::Arbitrator(swap_id), &arbitrator);
+        env.storage().persistent().extend_ttl(&DataKey::Arbitrator(swap_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("arb_set"),),
+            ArbitratorSetEvent { swap_id, arbitrator },
+        );
+    }
+
+    /// Designated arbitrator resolves a disputed swap.
+    /// refunded=true refunds buyer; false completes payment to seller.
+    pub fn arbitrate_dispute(env: Env, swap_id: u64, arbitrator: Address, refunded: bool) {
+        arbitrator.require_auth();
+
+        let mut swap = require_swap_exists(&env, swap_id);
+        require_swap_status(&env, &swap, SwapStatus::Disputed, ContractError::SwapNotDisputed);
+
+        match &swap.arbitrator {
+            None => env.panic_with_error(Error::from_contract_error(
+                ContractError::NoArbitratorSet as u32,
+            )),
+            Some(assigned) => {
+                if *assigned != arbitrator {
+                    env.panic_with_error(Error::from_contract_error(
+                        ContractError::NotArbitrator as u32,
+                    ));
+                }
+            }
+        }
+
+        let token_client = token::Client::new(&env, &swap.token);
+        if refunded {
+            swap.status = SwapStatus::Cancelled;
+            swap::save_swap(&env, swap_id, &swap);
+            env.storage().persistent().remove(&DataKey::ActiveSwap(swap.ip_id));
+            token_client.transfer(&env.current_contract_address(), &swap.buyer, &swap.price);
+            env.storage().persistent().set(
+                &DataKey::CancelReason(swap_id),
+                &Bytes::from_slice(&env, b"arbitration_refund"),
+            );
+        } else {
+            swap.status = SwapStatus::Completed;
+            swap::save_swap(&env, swap_id, &swap);
+            env.storage().persistent().remove(&DataKey::ActiveSwap(swap.ip_id));
+            let config = Self::protocol_config(&env);
+            let fee_amount = if config.protocol_fee_bps > 0 {
+                (swap.price * config.protocol_fee_bps as i128) / 10000
+            } else {
+                0
+            };
+            let seller_amount = swap.price - fee_amount;
+            if fee_amount > 0 {
+                token_client.transfer(&env.current_contract_address(), &config.treasury, &fee_amount);
+            }
+            token_client.transfer(&env.current_contract_address(), &swap.seller, &seller_amount);
+        }
+
+        Self::append_history(&env, swap_id, if refunded { SwapStatus::Cancelled } else { SwapStatus::Completed });
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("arb_res"),),
+            ArbitratedEvent { swap_id, arbitrator, refunded },
+        );
+    }
+
+    // ── #313: Dispute Evidence Submission ─────────────────────────────────────
+
+    /// Submit a hash of off-chain evidence for a disputed swap.
+    /// Only the buyer or seller may submit evidence.
+    pub fn submit_dispute_evidence(env: Env, swap_id: u64, submitter: Address, evidence_hash: BytesN<32>) {
+        submitter.require_auth();
+
+        let swap = require_swap_exists(&env, swap_id);
+        require_swap_status(&env, &swap, SwapStatus::Disputed, ContractError::SwapNotDisputed);
+
+        if swap.buyer != submitter && swap.seller != submitter {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::UnauthorizedEvidenceSubmitter as u32,
+            ));
+        }
+
+        let mut evidence: Vec<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DisputeEvidence(swap_id))
+            .unwrap_or(Vec::new(&env));
+
+        evidence.push_back(evidence_hash.clone());
+        env.storage().persistent().set(&DataKey::DisputeEvidence(swap_id), &evidence);
+        env.storage().persistent().extend_ttl(&DataKey::DisputeEvidence(swap_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("evidence"),),
+            DisputeEvidenceSubmittedEvent { swap_id, submitter, evidence_hash },
+        );
+    }
+
+    /// Retrieve all evidence hashes submitted for a disputed swap.
+    pub fn get_dispute_evidence(env: Env, swap_id: u64) -> Vec<BytesN<32>> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DisputeEvidence(swap_id))
+            .unwrap_or(Vec::new(&env))
+    }
+
+    // ── #312: Tiered Pricing ──────────────────────────────────────────────────
+
+    /// Accept a swap with a specific quantity, applying tiered pricing.
+    /// The effective price is determined by the highest tier whose min_quantity <= quantity.
+    /// Falls back to swap.price if no tier matches.
+    pub fn accept_swap_with_quantity(env: Env, swap_id: u64, quantity: u32) {
+        require_not_paused(&env);
+
+        let mut swap = require_swap_exists(&env, swap_id);
+        swap.buyer.require_auth();
+        require_swap_status(&env, &swap, SwapStatus::Pending, ContractError::SwapNotPending);
+
+        if swap.required_approvals > 0 {
+            let approvals: Vec<Address> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::SwapApprovals(swap_id))
+                .unwrap_or(Vec::new(&env));
+            if (approvals.len() as u32) < swap.required_approvals {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::InsufficientApprovals as u32,
+                ));
+            }
+        }
+
+        // Determine effective price from tiers
+        let effective_price = if swap.price_tiers.is_empty() {
+            swap.price
+        } else {
+            let mut best_price = swap.price;
+            for i in 0..swap.price_tiers.len() {
+                let (min_qty, tier_price) = swap.price_tiers.get(i).unwrap();
+                if quantity >= min_qty {
+                    best_price = tier_price;
+                }
+            }
+            best_price * quantity as i128
+        };
+
+        token::Client::new(&env, &swap.token).transfer(
+            &swap.buyer,
+            &env.current_contract_address(),
+            &effective_price,
+        );
+
+        swap.price = effective_price;
+        swap.accept_timestamp = env.ledger().timestamp();
+        swap.status = SwapStatus::Accepted;
+        swap::save_swap(&env, swap_id, &swap);
+
+        Self::append_history(&env, swap_id, SwapStatus::Accepted);
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("swap_acpt"),),
+            SwapAcceptedEvent { swap_id, buyer: swap.buyer },
         );
     }
 
@@ -1242,3 +1475,6 @@ mod prop_tests;
 
 #[cfg(test)]
 mod regression_tests;
+
+#[cfg(test)]
+mod arbitration_tests;

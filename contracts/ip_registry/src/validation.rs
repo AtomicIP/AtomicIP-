@@ -142,6 +142,33 @@ pub fn require_admin(env: &Env, caller: &Address) {
     }
 }
 
+/// Validates that the commitment hash meets the proof-of-work difficulty requirement.
+/// The hash must have at least `difficulty` leading zero bits.
+///
+/// # Panics
+///
+/// Panics with `InsufficientPoW` if the hash does not meet the difficulty.
+pub fn require_pow(env: &Env, commitment_hash: &BytesN<32>, difficulty: u32) {
+    if difficulty == 0 {
+        return;
+    }
+    let bytes = commitment_hash.to_array();
+    let mut remaining = difficulty;
+    for byte in bytes.iter() {
+        if remaining == 0 {
+            break;
+        }
+        let bits = if remaining >= 8 { 8 } else { remaining };
+        let mask: u8 = !((1u8 << (8 - bits)).wrapping_sub(1));
+        if byte & mask != 0 {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::InsufficientPoW as u32,
+            ));
+        }
+        remaining = remaining.saturating_sub(8);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

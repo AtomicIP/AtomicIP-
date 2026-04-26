@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address};
+use soroban_sdk::{contracttype, Address, BytesN, Vec};
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
 
@@ -186,4 +186,31 @@ pub struct SwapApprovedEvent {
     pub swap_id: u64,
     pub approver: Address,
     pub approvals_count: u32,
+}
+
+// ── #314: Arbitration Events ──────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ArbitratorSetEvent {
+    pub swap_id: u64,
+    pub arbitrator: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ArbitratedEvent {
+    pub swap_id: u64,
+    pub arbitrator: Address,
+    pub refunded: bool,
+}
+
+// ── #313: Dispute Evidence Event ──────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DisputeEvidenceSubmittedEvent {
+    pub swap_id: u64,
+    pub submitter: Address,
+    pub evidence_hash: BytesN<32>,
 }

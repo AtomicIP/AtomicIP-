@@ -6,6 +6,7 @@ use axum::response::Response;
 use axum::extract::Request;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
+use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
 
 mod auth;
 mod cache;
@@ -65,6 +66,14 @@ mod webhook;
 )]
 pub struct ApiDoc;
 
+/// GraphQL endpoint — accepts POST requests with a GraphQL query body.
+async fn graphql_handler(
+    axum::extract::State(schema): axum::extract::State<graphql::AtomicIpSchema>,
+    req: GraphQLRequest,
+) -> GraphQLResponse {
+    schema.execute(req.into_inner()).await.into()
+}
+
 /// Middleware: reject POST/PUT/PATCH requests whose body is non-empty but lacks
 /// `Content-Type: application/json`.
 async fn require_json_content_type(req: Request<Body>, next: Next) -> Result<Response, StatusCode> {
@@ -86,9 +95,12 @@ async fn require_json_content_type(req: Request<Body>, next: Next) -> Result<Res
 async fn main() {
     metrics::init();
 
+    let schema = graphql::build_schema();
+
     let app = Router::new()
         .merge(SwaggerUi::new("/docs").url("/openapi.json", ApiDoc::openapi()))
         .route("/metrics", get(metrics::metrics_handler))
+        .route("/graphql", post(graphql_handler))
         .route("/ip/commit", post(handlers::commit_ip))
         .route("/ip/{ip_id}", get(handlers::get_ip))
         .route("/ip/transfer", post(handlers::transfer_ip))
@@ -101,6 +113,7 @@ async fn main() {
         .route("/swap/{swap_id}/cancel", post(handlers::cancel_swap))
         .route("/swap/{swap_id}/cancel-expired", post(handlers::cancel_expired_swap))
         .route("/swap/{swap_id}", get(handlers::get_swap))
+        .with_state(schema)
         .layer(middleware::from_fn(metrics::track));
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
@@ -111,7 +124,9 @@ async fn main() {
 }
 
 fn build_app() -> Router {
+    let schema = graphql::build_schema();
     Router::new()
+        .route("/graphql", post(graphql_handler))
         .route("/ip/commit", post(handlers::commit_ip))
         .route("/ip/{ip_id}", get(handlers::get_ip))
         .route("/ip/transfer", post(handlers::transfer_ip))
@@ -124,6 +139,7 @@ fn build_app() -> Router {
         .route("/swap/{swap_id}/cancel", post(handlers::cancel_swap))
         .route("/swap/{swap_id}/cancel-expired", post(handlers::cancel_expired_swap))
         .route("/swap/{swap_id}", get(handlers::get_swap))
+        .with_state(schema)
         .layer(middleware::from_fn(require_json_content_type))
 }
 
