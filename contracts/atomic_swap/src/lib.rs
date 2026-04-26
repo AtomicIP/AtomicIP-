@@ -2284,6 +2284,151 @@ impl AtomicSwap {
             },
         );
     }
+
+    // ── #356: Atomic Refund on Key Invalidity ─────────────────────────────────
+
+    /// Verify key and complete swap atomically. Seller-only.
+    /// If key is invalid, automatically refund buyer and cancel swap.
+    pub fn verify_and_complete_swap(
+        env: Env,
+        swap_id: u64,
+        caller: Address,
+        secret: BytesN<32>,
+        blinding_factor: BytesN<32>,
+    ) {
+        let mut swap = require_swap_exists(&env, swap_id);
+
+        require_seller(&env, &caller, &swap);
+        caller.require_auth();
+        require_swap_status(
+            &env,
+            &swap,
+            SwapStatus::Accepted,
+            ContractError::SwapNotAccepted,
+        );
+
+        // Verify commitment
+        let valid = registry::verify_commitment(&env, swap.ip_id, &secret, &blinding_factor);
+
+        let token_client = token::Client::new(&env, &swap.token);
+
+        if !valid {
+            // Atomic refund: invalid key triggers automatic refund
+            token_client.transfer(
+                &env.current_contract_address(),
+                &swap.buyer,
+                &swap.price,
+            );
+
+            // Refund collateral
+            if swap.collateral_amount > 0 {
+                if let Some(collateral) = env
+                    .storage()
+                    .persistent()
+                    .get::<_, i128>(&DataKey::SwapCollateral(swap_id))
+                {
+                    token_client.transfer(
+                        &env.current_contract_address(),
+                        &swap.buyer,
+                        &collateral,
+                    );
+                    env.storage()
+                        .persistent()
+                        .remove(&DataKey::SwapCollateral(swap_id));
+                }
+            }
+
+            swap.status = SwapStatus::Cancelled;
+            swap::save_swap(&env, swap_id, &swap);
+            env.storage()
+                .persistent()
+                .remove(&DataKey::ActiveSwap(swap.ip_id));
+
+            env.events().publish(
+                (soroban_sdk::symbol_short!("atom_ref"),),
+                AtomicRefundEvent {
+                    swap_id,
+                    buyer: swap.buyer.clone(),
+                    refund_amount: swap.price,
+                    reason: String::from_slice(&env, "Invalid decryption key"),
+                },
+            );
+        } else {
+            // Valid key: complete swap normally
+            swap.status = SwapStatus::Completed;
+            swap::save_swap(&env, swap_id, &swap);
+            env.storage()
+                .persistent()
+                .remove(&DataKey::ActiveSwap(swap.ip_id));
+
+            // Process payment
+            let config = Self::protocol_config(&env);
+            let fee_bps = config.protocol_fee_bps as i128;
+            let fee_amount = if fee_bps > 0 && swap.price > 0 {
+                (swap.price * fee_bps) / 10000
+            } else {
+                0
+            };
+
+            let seller_amount = swap.price - fee_amount;
+            token_client.transfer(
+                &env.current_contract_address(),
+                &swap.seller,
+                &seller_amount,
+            );
+
+            if fee_amount > 0 {
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &config.treasury,
+                    &fee_amount,
+                );
+            }
+
+            // Release collateral to seller
+            if swap.collateral_amount > 0 {
+                if let Some(collateral) = env
+                    .storage()
+                    .persistent()
+                    .get::<_, i128>(&DataKey::SwapCollateral(swap_id))
+                {
+                    token_client.transfer(
+                        &env.current_contract_address(),
+                        &swap.seller,
+                        &collateral,
+                    );
+                    env.storage()
+                        .persistent()
+                        .remove(&DataKey::SwapCollateral(swap_id));
+
+                    env.events().publish(
+                        (soroban_sdk::symbol_short!("coll_rel"),),
+                        CollateralReleasedEvent {
+                            swap_id,
+                            buyer: swap.buyer.clone(),
+                            collateral_amount: collateral,
+                        },
+                    );
+                }
+            }
+
+            env.events().publish(
+                (soroban_sdk::symbol_short!("key_rev"),),
+                KeyRevealedEvent {
+                    swap_id,
+                    seller_amount,
+                    fee_amount,
+                },
+            );
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::AtomicRefundProcessed(swap_id), &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::AtomicRefundProcessed(swap_id), LEDGER_BUMP, LEDGER_BUMP);
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
