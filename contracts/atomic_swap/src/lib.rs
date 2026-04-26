@@ -157,6 +157,28 @@ pub enum DataKey {
     ContractSchema,
     /// #311: Maps swap_id → referrer Address for referral reward tracking.
     SwapReferrer(u64),
+    /// #347: Maps auction_id → AuctionRecord for IP auctions.
+    Auction(u64),
+    /// #347: Maps ip_id → auction_id for active auction.
+    ActiveAuction(u64),
+    /// #347: Maps auction_id → Vec<(bidder, amount)> for bid history.
+    AuctionBids(u64),
+    /// #347: Next auction ID counter.
+    NextAuctionId,
+    /// #349: Maps swap_id → Vec<PaymentSchedule> for scheduled payments.
+    PaymentSchedule(u64),
+    /// #349: Maps swap_id → Vec<bool> tracking which payments have been made.
+    PaymentsMade(u64),
+    /// #350: Maps swap_id → collateral amount held in escrow.
+    SwapCollateral(u64),
+    /// #354: Maps swap_id → insurance premium amount.
+    SwapInsurance(u64),
+    /// #353: Maps swap_id → RenegotiationOffer for pending renegotiation.
+    SwapRenegotiations(u64),
+    /// #352: Maps swap_id → escrow agent address.
+    SwapEscrowAgent(u64),
+    /// #351: Maps swap_id → acceptance conditions bytes.
+    SwapConditions(u64),
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -190,6 +212,12 @@ pub struct SwapRecord {
     pub dispute_timestamp: u64,
     /// #311: Optional referrer address for referral reward on completion.
     pub referrer: Option<Address>,
+    /// #350: Collateral amount required from buyer. Zero if no collateral.
+    pub collateral_amount: i128,
+    /// #354: Insurance premium paid by buyer. Zero if no insurance.
+    pub insurance_premium: i128,
+    /// #352: Optional escrow agent address for high-value swaps.
+    pub escrow_agent: Option<Address>,
 }
 
 // ── Events ────────────────────────────────────────────────────────────────────
@@ -328,6 +356,53 @@ pub struct DisputeEvidenceSubmittedEvent {
     pub evidence_hash: BytesN<32>,
 }
 
+// ── #354: Insurance Types ─────────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct InsurancePayoutEvent {
+    pub swap_id: u64,
+    pub buyer: Address,
+    pub payout_amount: i128,
+}
+
+// ── #353: Renegotiation Types ─────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone)]
+pub struct RenegotiationOffer {
+    pub new_price: i128,
+    pub proposer: Address,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RenegotiationProposedEvent {
+    pub swap_id: u64,
+    pub new_price: i128,
+    pub proposer: Address,
+}
+
+// ── #352: Escrow Types ────────────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct EscrowReleasedEvent {
+    pub swap_id: u64,
+    pub escrow_agent: Address,
+    pub amount: i128,
+}
+
+// ── #351: Conditional Acceptance Types ────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConditionalAcceptanceEvent {
+    pub swap_id: u64,
+    pub buyer: Address,
+}
+
 // ── Contract ──────────────────────────────────────────────────────────────────
 
 #[contract]
@@ -401,6 +476,8 @@ impl AtomicSwap {
             dispute_timestamp: 0,
             referrer: referrer.clone(),
             collateral_amount,
+            insurance_premium: 0,
+            escrow_agent: None,
         };
 
         env.storage().persistent().set(&DataKey::Swap(id), &swap);
@@ -2087,6 +2164,350 @@ impl AtomicSwap {
             .persistent()
             .get(&DataKey::SwapCollateral(swap_id))
             .unwrap_or(0)
+    }
+
+    // ── #354: Swap Insurance ──────────────────────────────────────────────────
+
+    /// Buyer accepts swap with insurance protection.
+    pub fn accept_swap_with_insurance(env: Env, swap_id: u64, insurance_premium: i128) {
+        require_not_paused(&env);
+
+        let mut swap = require_swap_exists(&env, swap_id);
+        swap.buyer.require_auth();
+        require_swap_status(
+            &env,
+            &swap,
+            SwapStatus::Pending,
+            ContractError::SwapNotPending,
+        );
+
+        if insurance_premium <= 0 {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::InvalidAmount as u32,
+            ));
+        }
+
+        // Transfer insurance premium from buyer
+        token::Client::new(&env, &swap.token).transfer(
+            &swap.buyer,
+            &env.current_contract_address(),
+            &insurance_premium,
+        );
+
+        swap.insurance_premium = insurance_premium;
+
+        // Store insurance premium
+        env.storage()
+            .persistent()
+            .set(&DataKey::SwapInsurance(swap_id), &insurance_premium);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::SwapInsurance(swap_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        // Transfer payment from buyer into contract escrow
+        token::Client::new(&env, &swap.token).transfer(
+            &swap.buyer,
+            &env.current_contract_address(),
+            &swap.price,
+        );
+
+        swap.accept_timestamp = env.ledger().timestamp();
+        swap.status = SwapStatus::Accepted;
+
+        swap::save_swap(&env, swap_id, &swap);
+        Self::append_history(&env, swap_id, SwapStatus::Accepted);
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("swap_acpt"),),
+            SwapAcceptedEvent {
+                swap_id,
+                buyer: swap.buyer.clone(),
+            },
+        );
+    }
+
+    // ── #353: Swap Renegotiation ──────────────────────────────────────────────
+
+    /// Propose renegotiation of swap terms.
+    pub fn propose_renegotiation(env: Env, swap_id: u64, new_price: i128) {
+        let swap = require_swap_exists(&env, swap_id);
+        let caller = env.invoker();
+        caller.require_auth();
+
+        if new_price <= 0 {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::InvalidAmount as u32,
+            ));
+        }
+
+        if caller != swap.seller && caller != swap.buyer {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::Unauthorized as u32,
+            ));
+        }
+
+        let offer = RenegotiationOffer {
+            new_price,
+            proposer: caller.clone(),
+            timestamp: env.ledger().timestamp(),
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::SwapRenegotiations(swap_id), &offer);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::SwapRenegotiations(swap_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("reneg_prop"),),
+            RenegotiationProposedEvent {
+                swap_id,
+                new_price,
+                proposer: caller,
+            },
+        );
+    }
+
+    /// Accept renegotiation proposal.
+    pub fn accept_renegotiation(env: Env, swap_id: u64) {
+        let mut swap = require_swap_exists(&env, swap_id);
+        let caller = env.invoker();
+        caller.require_auth();
+
+        let offer: RenegotiationOffer = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SwapRenegotiations(swap_id))
+            .ok_or_else(|| Error::from_contract_error(ContractError::NotFound as u32))
+            .unwrap();
+
+        if caller == offer.proposer {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::Unauthorized as u32,
+            ));
+        }
+
+        swap.price = offer.new_price;
+        swap::save_swap(&env, swap_id, &swap);
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::SwapRenegotiations(swap_id));
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("reneg_acpt"),),
+            SwapAcceptedEvent {
+                swap_id,
+                buyer: swap.buyer,
+            },
+        );
+    }
+
+    /// Reject renegotiation proposal.
+    pub fn reject_renegotiation(env: Env, swap_id: u64) {
+        let swap = require_swap_exists(&env, swap_id);
+        let caller = env.invoker();
+        caller.require_auth();
+
+        let offer: RenegotiationOffer = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SwapRenegotiations(swap_id))
+            .ok_or_else(|| Error::from_contract_error(ContractError::NotFound as u32))
+            .unwrap();
+
+        if caller == offer.proposer {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::Unauthorized as u32,
+            ));
+        }
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::SwapRenegotiations(swap_id));
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("reneg_rej"),),
+            SwapCancelledEvent {
+                swap_id,
+                canceller: caller,
+            },
+        );
+    }
+
+    // ── #352: Swap Escrow Agent ───────────────────────────────────────────────
+
+    /// Initiate swap with escrow agent.
+    pub fn initiate_swap_with_escrow(
+        env: Env,
+        token: Address,
+        ip_id: u64,
+        seller: Address,
+        price: i128,
+        buyer: Address,
+        escrow_agent: Address,
+    ) -> u64 {
+        require_not_paused(&env);
+        seller.require_auth();
+
+        require_positive_price(&env, price);
+        registry::ensure_seller_owns_active_ip(&env, ip_id, &seller);
+        require_no_active_swap(&env, ip_id);
+
+        let id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(0);
+
+        let mut swap = SwapRecord {
+            ip_id,
+            seller: seller.clone(),
+            buyer: buyer.clone(),
+            price,
+            token: token.clone(),
+            status: SwapStatus::Pending,
+            expiry: env.ledger().timestamp() + 604800u64,
+            accept_timestamp: 0,
+            required_approvals: 0,
+            dispute_timestamp: 0,
+            referrer: None,
+            collateral_amount: 0,
+            insurance_premium: 0,
+            escrow_agent: Some(escrow_agent.clone()),
+        };
+
+        env.storage().persistent().set(&DataKey::Swap(id), &swap);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Swap(id), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::SwapEscrowAgent(id), &escrow_agent);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::SwapEscrowAgent(id), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ActiveSwap(ip_id), &id);
+        env.storage().persistent().extend_ttl(
+            &DataKey::ActiveSwap(ip_id),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        swap::append_swap_for_party(&env, &seller, &buyer, id);
+
+        let mut ip_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IpSwaps(ip_id))
+            .unwrap_or(Vec::new(&env));
+        ip_ids.push_back(id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::IpSwaps(ip_id), &ip_ids);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::IpSwaps(ip_id), 50000, 50000);
+
+        Self::append_history(&env, id, SwapStatus::Pending);
+        env.storage().instance().set(&DataKey::NextId, &(id + 1));
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("swap_init"),),
+            SwapInitiatedEvent {
+                swap_id: id,
+                ip_id,
+                seller,
+                buyer,
+                price,
+            },
+        );
+
+        id
+    }
+
+    /// Escrow agent releases funds after both parties confirm.
+    pub fn escrow_release_funds(env: Env, swap_id: u64) {
+        let swap = require_swap_exists(&env, swap_id);
+        let caller = env.invoker();
+        caller.require_auth();
+
+        let escrow_agent = swap
+            .escrow_agent
+            .clone()
+            .ok_or_else(|| Error::from_contract_error(ContractError::NotFound as u32))
+            .unwrap();
+
+        if caller != escrow_agent {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::Unauthorized as u32,
+            ));
+        }
+
+        require_swap_status(
+            &env,
+            &swap,
+            SwapStatus::Accepted,
+            ContractError::SwapNotAccepted,
+        );
+
+        let token_client = token::Client::new(&env, &swap.token);
+        token_client.transfer(&env.current_contract_address(), &swap.seller, &swap.price);
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("escrow_rel"),),
+            EscrowReleasedEvent {
+                swap_id,
+                escrow_agent,
+                amount: swap.price,
+            },
+        );
+    }
+
+    // ── #351: Conditional Acceptance ──────────────────────────────────────────
+
+    /// Accept swap with conditions.
+    pub fn accept_swap_conditional(env: Env, swap_id: u64, conditions: BytesN<32>) {
+        require_not_paused(&env);
+
+        let mut swap = require_swap_exists(&env, swap_id);
+        swap.buyer.require_auth();
+        require_swap_status(
+            &env,
+            &swap,
+            SwapStatus::Pending,
+            ContractError::SwapNotPending,
+        );
+
+        // Store conditions
+        env.storage()
+            .persistent()
+            .set(&DataKey::SwapConditions(swap_id), &conditions);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::SwapConditions(swap_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        // Transfer payment from buyer into contract escrow
+        token::Client::new(&env, &swap.token).transfer(
+            &swap.buyer,
+            &env.current_contract_address(),
+            &swap.price,
+        );
+
+        swap.accept_timestamp = env.ledger().timestamp();
+        swap.status = SwapStatus::Accepted;
+
+        swap::save_swap(&env, swap_id, &swap);
+        Self::append_history(&env, swap_id, SwapStatus::Accepted);
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("cond_acpt"),),
+            ConditionalAcceptanceEvent {
+                swap_id,
+                buyer: swap.buyer,
+            },
+        );
     }
 }
 

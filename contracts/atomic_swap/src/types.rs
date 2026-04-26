@@ -56,6 +56,14 @@ pub enum DataKey {
     PaymentsMade(u64),
     /// #350: Maps swap_id → collateral amount held in escrow.
     SwapCollateral(u64),
+    /// #354: Maps swap_id → insurance premium amount.
+    SwapInsurance(u64),
+    /// #353: Maps swap_id → RenegotiationOffer for pending renegotiation.
+    SwapRenegotiations(u64),
+    /// #352: Maps swap_id → escrow agent address.
+    SwapEscrowAgent(u64),
+    /// #351: Maps swap_id → acceptance conditions bytes.
+    SwapConditions(u64),
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -91,6 +99,10 @@ pub struct SwapRecord {
     pub referrer: Option<Address>,
     /// #350: Collateral amount required from buyer. Zero if no collateral.
     pub collateral_amount: i128,
+    /// #354: Insurance premium paid by buyer. Zero if no insurance.
+    pub insurance_premium: i128,
+    /// #352: Optional escrow agent address for high-value swaps.
+    pub escrow_agent: Option<Address>,
 }
 
 // ── Events ────────────────────────────────────────────────────────────────────
@@ -316,4 +328,51 @@ pub struct CollateralRefundedEvent {
     pub swap_id: u64,
     pub buyer: Address,
     pub collateral_amount: i128,
+}
+
+// ── #354: Insurance Types ─────────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct InsurancePayoutEvent {
+    pub swap_id: u64,
+    pub buyer: Address,
+    pub payout_amount: i128,
+}
+
+// ── #353: Renegotiation Types ─────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone)]
+pub struct RenegotiationOffer {
+    pub new_price: i128,
+    pub proposer: Address,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RenegotiationProposedEvent {
+    pub swap_id: u64,
+    pub new_price: i128,
+    pub proposer: Address,
+}
+
+// ── #352: Escrow Types ────────────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct EscrowReleasedEvent {
+    pub swap_id: u64,
+    pub escrow_agent: Address,
+    pub amount: i128,
+}
+
+// ── #351: Conditional Acceptance Types ────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConditionalAcceptanceEvent {
+    pub swap_id: u64,
+    pub buyer: Address,
 }
