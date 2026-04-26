@@ -10,12 +10,6 @@ pub const LEDGER_BUMP: u32 = 6_307_200;
 
 pub const REVOKE_TOPIC: Symbol = soroban_sdk::symbol_short!("revoke");
 
-// ── TTL ───────────────────────────────────────────────────────────────────────
-
-/// Minimum ledger TTL bump applied to every persistent storage write.
-/// ~1 year at ~5s per ledger: 365 * 24 * 3600 / 5 ≈ 6_307_200 ledgers.
-pub const LEDGER_BUMP: u32 = 6_307_200;
-
 // ── Storage Keys ────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -27,12 +21,12 @@ pub enum DataKey {
     CommitmentOwner(BytesN<32>), // tracks which owner already holds a commitment hash
     Admin,
     CategoryIps(BytesN<32>), // maps category hash -> Vec<u64> of IP IDs
+    IpLineage(u64), // stores parent_ip_id for versioning
+    IpVersions(u64), // stores Vec<u64> of all version IDs for a given IP
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
-#[contracttype]
-#[derive(Clone)]
 #[contracttype]
 #[derive(Clone)]
 pub struct IpRecord {
@@ -42,4 +36,5 @@ pub struct IpRecord {
     pub timestamp: u64,
     pub revoked: bool,
     pub co_owners: soroban_sdk::Vec<Address>,
+    pub parent_ip_id: Option<u64>, // parent IP ID for versioning
 }
