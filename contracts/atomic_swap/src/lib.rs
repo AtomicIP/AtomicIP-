@@ -83,6 +83,38 @@ pub enum ContractError {
     UpgradeErrorCodeChanged = 33,
     /// A storage key present in the current schema is missing from the new schema.
     UpgradeMissingStorageKey = 34,
+
+    // ── #347: Auction errors (39-44) ──────────────────────────────────────────
+    /// Auction not found.
+    AuctionNotFound = 39,
+    /// Active auction already exists for this IP.
+    ActiveAuctionAlreadyExists = 40,
+    /// Bid amount must be greater than or equal to minimum bid.
+    BidBelowMinimum = 41,
+    /// Bid amount must be greater than current highest bid.
+    BidNotHigherThanCurrent = 42,
+    /// Auction has not ended yet.
+    AuctionNotEnded = 43,
+    /// Auction has already been finalized.
+    AuctionAlreadyFinalized = 44,
+
+    // ── #349: Payment schedule errors (45-48) ────────────────────────────────
+    /// Payment schedule not found for this swap.
+    PaymentScheduleNotFound = 45,
+    /// Payment index out of bounds.
+    PaymentIndexOutOfBounds = 46,
+    /// Payment already made for this index.
+    PaymentAlreadyMade = 47,
+    /// Payment not yet due.
+    PaymentNotYetDue = 48,
+
+    // ── #350: Collateral errors (49-51) ──────────────────────────────────────
+    /// Collateral not found for this swap.
+    CollateralNotFound = 49,
+    /// Insufficient collateral deposited.
+    InsufficientCollateral = 50,
+    /// Collateral already deposited for this swap.
+    CollateralAlreadyDeposited = 51,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -331,6 +363,7 @@ impl AtomicSwap {
         buyer: Address,
         required_approvals: u32,
         referrer: Option<Address>,
+        collateral_amount: i128,
     ) -> u64 {
         // Guard: reject new swaps when the contract is paused.
         require_not_paused(&env);
@@ -367,6 +400,7 @@ impl AtomicSwap {
             required_approvals,
             dispute_timestamp: 0,
             referrer: referrer.clone(),
+            collateral_amount,
         };
 
         env.storage().persistent().set(&DataKey::Swap(id), &swap);
@@ -446,23 +480,47 @@ impl AtomicSwap {
             }
         }
 
-        // #312: Apply tiered pricing if tiers are configured.
-        let effective_price = if swap.price_tiers.is_empty() {
-            swap.price
-        } else {
-            // Use the last tier whose min_quantity <= 1 (single-unit purchase).
-            // For quantity-based calls, callers should use accept_swap_with_quantity.
-            swap.price
-        };
+        // #350: Deposit collateral if required
+        if swap.collateral_amount > 0 {
+            // Check if collateral already deposited
+            if env.storage().persistent().has(&DataKey::SwapCollateral(swap_id)) {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::CollateralAlreadyDeposited as u32,
+                ));
+            }
+
+            // Transfer collateral from buyer to contract
+            token::Client::new(&env, &swap.token).transfer(
+                &swap.buyer,
+                &env.current_contract_address(),
+                &swap.collateral_amount,
+            );
+
+            // Store collateral amount
+            env.storage()
+                .persistent()
+                .set(&DataKey::SwapCollateral(swap_id), &swap.collateral_amount);
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::SwapCollateral(swap_id), LEDGER_BUMP, LEDGER_BUMP);
+
+            env.events().publish(
+                (soroban_sdk::symbol_short!("coll_dep"),),
+                CollateralDepositedEvent {
+                    swap_id,
+                    buyer: swap.buyer.clone(),
+                    collateral_amount: swap.collateral_amount,
+                },
+            );
+        }
 
         // Transfer payment from buyer into contract escrow.
         token::Client::new(&env, &swap.token).transfer(
             &swap.buyer,
             &env.current_contract_address(),
-            &effective_price,
+            &swap.price,
         );
 
-        swap.price = effective_price;
         swap.accept_timestamp = env.ledger().timestamp();
         swap.status = SwapStatus::Accepted;
 
@@ -578,6 +636,33 @@ impl AtomicSwap {
             &swap.seller,
             &seller_amount,
         );
+
+        // #350: Release collateral to buyer on successful completion
+        if swap.collateral_amount > 0 {
+            if let Some(collateral) = env
+                .storage()
+                .persistent()
+                .get::<_, i128>(&DataKey::SwapCollateral(swap_id))
+            {
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &swap.buyer,
+                    &collateral,
+                );
+                env.storage()
+                    .persistent()
+                    .remove(&DataKey::SwapCollateral(swap_id));
+
+                env.events().publish(
+                    (soroban_sdk::symbol_short!("coll_rel"),),
+                    CollateralReleasedEvent {
+                        swap_id,
+                        buyer: swap.buyer.clone(),
+                        collateral_amount: collateral,
+                    },
+                );
+            }
+        }
 
         env.events().publish(
             (soroban_sdk::symbol_short!("key_rev"),),
@@ -915,12 +1000,41 @@ impl AtomicSwap {
             .persistent()
             .remove(&DataKey::ActiveSwap(swap.ip_id));
 
+        let token_client = token::Client::new(&env, &swap.token);
+
         // Refund buyer's escrowed payment (Issue #35)
-        token::Client::new(&env, &swap.token).transfer(
+        token_client.transfer(
             &env.current_contract_address(),
             &swap.buyer,
             &swap.price,
         );
+
+        // #350: Refund collateral on cancellation
+        if swap.collateral_amount > 0 {
+            if let Some(collateral) = env
+                .storage()
+                .persistent()
+                .get::<_, i128>(&DataKey::SwapCollateral(swap_id))
+            {
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &swap.buyer,
+                    &collateral,
+                );
+                env.storage()
+                    .persistent()
+                    .remove(&DataKey::SwapCollateral(swap_id));
+
+                env.events().publish(
+                    (soroban_sdk::symbol_short!("coll_ref"),),
+                    CollateralRefundedEvent {
+                        swap_id,
+                        buyer: swap.buyer.clone(),
+                        collateral_amount: collateral,
+                    },
+                );
+            }
+        }
 
         // #253: Log history entry
         Self::append_history(&env, swap_id, SwapStatus::Cancelled);
@@ -1462,6 +1576,517 @@ impl AtomicSwap {
         }
 
         swap_ids
+    }
+
+    // ── #347: IP Auction Mechanism ────────────────────────────────────────────
+
+    /// Seller starts an auction for their IP. Returns the auction ID.
+    pub fn start_ip_auction(
+        env: Env,
+        token: Address,
+        ip_id: u64,
+        seller: Address,
+        min_bid: i128,
+        duration_seconds: u64,
+    ) -> u64 {
+        require_not_paused(&env);
+        seller.require_auth();
+
+        require_positive_price(&env, min_bid);
+        registry::ensure_seller_owns_active_ip(&env, ip_id, &seller);
+
+        // Check no active auction exists
+        if env.storage().persistent().has(&DataKey::ActiveAuction(ip_id)) {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::ActiveAuctionAlreadyExists as u32,
+            ));
+        }
+
+        let auction_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NextAuctionId)
+            .unwrap_or(0);
+
+        let start_time = env.ledger().timestamp();
+        let end_time = start_time + duration_seconds;
+
+        let auction = AuctionRecord {
+            auction_id,
+            ip_id,
+            seller: seller.clone(),
+            token: token.clone(),
+            min_bid,
+            highest_bid: 0,
+            highest_bidder: None,
+            start_time,
+            end_time,
+            finalized: false,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Auction(auction_id), &auction);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Auction(auction_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ActiveAuction(ip_id), &auction_id);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::ActiveAuction(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::NextAuctionId, &(auction_id + 1));
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::NextAuctionId, LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("auction_start"),),
+            AuctionStartedEvent {
+                auction_id,
+                ip_id,
+                seller,
+                min_bid,
+                end_time,
+            },
+        );
+
+        auction_id
+    }
+
+    /// Place a bid on an active auction.
+    pub fn place_bid(env: Env, auction_id: u64, bidder: Address, bid_amount: i128) {
+        bidder.require_auth();
+
+        let mut auction: AuctionRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Auction(auction_id))
+            .unwrap_or_else(|| {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::AuctionNotFound as u32,
+                ));
+                unreachable!()
+            });
+
+        if auction.finalized {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::AuctionAlreadyFinalized as u32,
+            ));
+        }
+
+        if env.ledger().timestamp() >= auction.end_time {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::AuctionNotEnded as u32,
+            ));
+        }
+
+        if bid_amount < auction.min_bid {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::BidBelowMinimum as u32,
+            ));
+        }
+
+        if bid_amount <= auction.highest_bid {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::BidNotHigherThanCurrent as u32,
+            ));
+        }
+
+        // Refund previous highest bidder if exists
+        if let Some(ref prev_bidder) = auction.highest_bidder {
+            token::Client::new(&env, &auction.token).transfer(
+                &env.current_contract_address(),
+                prev_bidder,
+                &auction.highest_bid,
+            );
+        }
+
+        // Transfer new bid to contract
+        token::Client::new(&env, &auction.token).transfer(
+            &bidder,
+            &env.current_contract_address(),
+            &bid_amount,
+        );
+
+        auction.highest_bid = bid_amount;
+        auction.highest_bidder = Some(bidder.clone());
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Auction(auction_id), &auction);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Auction(auction_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("bid_placed"),),
+            BidPlacedEvent {
+                auction_id,
+                bidder,
+                bid_amount,
+            },
+        );
+    }
+
+    /// Finalize an auction after it ends. Creates a swap with the winning bid.
+    pub fn finalize_auction(env: Env, auction_id: u64) {
+        let mut auction: AuctionRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Auction(auction_id))
+            .unwrap_or_else(|| {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::AuctionNotFound as u32,
+                ));
+                unreachable!()
+            });
+
+        if auction.finalized {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::AuctionAlreadyFinalized as u32,
+            ));
+        }
+
+        if env.ledger().timestamp() < auction.end_time {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::AuctionNotEnded as u32,
+            ));
+        }
+
+        auction.finalized = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Auction(auction_id), &auction);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Auction(auction_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        // Remove active auction lock
+        env.storage()
+            .persistent()
+            .remove(&DataKey::ActiveAuction(auction.ip_id));
+
+        let winning_bid = auction.highest_bid;
+        let winner = auction.highest_bidder.clone();
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("auction_final"),),
+            AuctionFinalizedEvent {
+                auction_id,
+                winner: winner.clone(),
+                winning_bid,
+            },
+        );
+
+        // If there's a winner, create a swap automatically
+        if let Some(buyer) = winner {
+            let swap_id: u64 = env
+                .storage()
+                .instance()
+                .get(&DataKey::NextId)
+                .unwrap_or(0);
+
+            let swap = SwapRecord {
+                ip_id: auction.ip_id,
+                seller: auction.seller.clone(),
+                buyer: buyer.clone(),
+                price: winning_bid,
+                token: auction.token.clone(),
+                status: SwapStatus::Accepted,
+                expiry: env.ledger().timestamp() + 604800u64,
+                accept_timestamp: env.ledger().timestamp(),
+                required_approvals: 0,
+                dispute_timestamp: 0,
+                referrer: None,
+            };
+
+            env.storage()
+                .persistent()
+                .set(&DataKey::Swap(swap_id), &swap);
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::Swap(swap_id), LEDGER_BUMP, LEDGER_BUMP);
+
+            swap::append_swap_for_party(&env, &auction.seller, &buyer, swap_id);
+
+            let mut ip_swap_ids: Vec<u64> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::IpSwaps(auction.ip_id))
+                .unwrap_or(Vec::new(&env));
+            ip_swap_ids.push_back(swap_id);
+            env.storage()
+                .persistent()
+                .set(&DataKey::IpSwaps(auction.ip_id), &ip_swap_ids);
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::IpSwaps(auction.ip_id), LEDGER_BUMP, LEDGER_BUMP);
+
+            Self::append_history(&env, swap_id, SwapStatus::Accepted);
+            env.storage().instance().set(&DataKey::NextId, &(swap_id + 1));
+
+            env.events().publish(
+                (soroban_sdk::symbol_short!("swap_init"),),
+                SwapInitiatedEvent {
+                    swap_id,
+                    ip_id: auction.ip_id,
+                    seller: auction.seller,
+                    buyer,
+                    price: winning_bid,
+                },
+            );
+        }
+    }
+
+    /// Get auction details.
+    pub fn get_auction(env: Env, auction_id: u64) -> AuctionRecord {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Auction(auction_id))
+            .unwrap_or_else(|| {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::AuctionNotFound as u32,
+                ));
+                unreachable!()
+            })
+    }
+
+    // ── #349: Scheduled Payment Support ───────────────────────────────────────
+
+    /// Initiate a swap with a payment schedule. Seller-only.
+    pub fn initiate_swap_with_schedule(
+        env: Env,
+        token: Address,
+        ip_id: u64,
+        seller: Address,
+        schedule: Vec<PaymentSchedule>,
+        buyer: Address,
+    ) -> u64 {
+        require_not_paused(&env);
+        seller.require_auth();
+
+        if schedule.is_empty() {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::PriceMustBeGreaterThanZero as u32,
+            ));
+        }
+
+        // Calculate total price from schedule
+        let mut total_price: i128 = 0;
+        for payment in schedule.iter() {
+            total_price = total_price.saturating_add(payment.amount);
+        }
+
+        require_positive_price(&env, total_price);
+        registry::ensure_seller_owns_active_ip(&env, ip_id, &seller);
+        require_no_active_swap(&env, ip_id);
+
+        let id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(0);
+
+        let swap = SwapRecord {
+            ip_id,
+            seller: seller.clone(),
+            buyer: buyer.clone(),
+            price: total_price,
+            token: token.clone(),
+            status: SwapStatus::Pending,
+            expiry: env.ledger().timestamp() + 604800u64,
+            accept_timestamp: 0,
+            required_approvals: 0,
+            dispute_timestamp: 0,
+            referrer: None,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Swap(id), &swap);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Swap(id), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ActiveSwap(ip_id), &id);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::ActiveSwap(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        // Store payment schedule
+        env.storage()
+            .persistent()
+            .set(&DataKey::PaymentSchedule(id), &schedule);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::PaymentSchedule(id), LEDGER_BUMP, LEDGER_BUMP);
+
+        // Initialize payments tracking (all false initially)
+        let mut payments_made: Vec<bool> = Vec::new(&env);
+        for _ in 0..schedule.len() {
+            payments_made.push_back(false);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::PaymentsMade(id), &payments_made);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::PaymentsMade(id), LEDGER_BUMP, LEDGER_BUMP);
+
+        swap::append_swap_for_party(&env, &seller, &buyer, id);
+
+        let mut ip_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IpSwaps(ip_id))
+            .unwrap_or(Vec::new(&env));
+        ip_ids.push_back(id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::IpSwaps(ip_id), &ip_ids);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::IpSwaps(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        Self::append_history(&env, id, SwapStatus::Pending);
+        env.storage().instance().set(&DataKey::NextId, &(id + 1));
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("swap_init"),),
+            SwapInitiatedEvent {
+                swap_id: id,
+                ip_id,
+                seller,
+                buyer,
+                price: total_price,
+            },
+        );
+
+        id
+    }
+
+    /// Make a scheduled payment. Buyer-only.
+    pub fn make_scheduled_payment(env: Env, swap_id: u64, payment_index: u32) {
+        let mut swap = require_swap_exists(&env, swap_id);
+        swap.buyer.require_auth();
+
+        let schedule: Vec<PaymentSchedule> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PaymentSchedule(swap_id))
+            .unwrap_or_else(|| {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::PaymentScheduleNotFound as u32,
+                ));
+                unreachable!()
+            });
+
+        if (payment_index as usize) >= schedule.len() {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::PaymentIndexOutOfBounds as u32,
+            ));
+        }
+
+        let mut payments_made: Vec<bool> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PaymentsMade(swap_id))
+            .unwrap_or(Vec::new(&env));
+
+        if payments_made.get(payment_index as usize).unwrap_or(false) {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::PaymentAlreadyMade as u32,
+            ));
+        }
+
+        let payment = schedule.get(payment_index as usize).unwrap();
+        if env.ledger().timestamp() < payment.due_timestamp {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::PaymentNotYetDue as u32,
+            ));
+        }
+
+        // Transfer payment
+        token::Client::new(&env, &swap.token).transfer(
+            &swap.buyer,
+            &env.current_contract_address(),
+            &payment.amount,
+        );
+
+        // Mark payment as made
+        payments_made.set(payment_index as usize, true);
+        env.storage()
+            .persistent()
+            .set(&DataKey::PaymentsMade(swap_id), &payments_made);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::PaymentsMade(swap_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        // Check if all payments are made
+        let mut all_paid = true;
+        for i in 0..payments_made.len() {
+            if !payments_made.get(i).unwrap_or(false) {
+                all_paid = false;
+                break;
+            }
+        }
+
+        // If all payments made, transition to Accepted
+        if all_paid {
+            swap.status = SwapStatus::Accepted;
+            swap.accept_timestamp = env.ledger().timestamp();
+            swap::save_swap(&env, swap_id, &swap);
+            Self::append_history(&env, swap_id, SwapStatus::Accepted);
+
+            env.events().publish(
+                (soroban_sdk::symbol_short!("swap_acpt"),),
+                SwapAcceptedEvent {
+                    swap_id,
+                    buyer: swap.buyer.clone(),
+                },
+            );
+        }
+
+        let remaining = (schedule.len() as u32) - (payment_index + 1);
+        env.events().publish(
+            (soroban_sdk::symbol_short!("sched_pay"),),
+            ScheduledPaymentMadeEvent {
+                swap_id,
+                payment_index,
+                amount: payment.amount,
+                remaining_payments: remaining,
+            },
+        );
+    }
+
+    /// Get payment schedule for a swap.
+    pub fn get_payment_schedule(env: Env, swap_id: u64) -> Vec<PaymentSchedule> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PaymentSchedule(swap_id))
+            .unwrap_or(Vec::new(&env))
+    }
+
+    /// Get payment status for a swap.
+    pub fn get_payments_made(env: Env, swap_id: u64) -> Vec<bool> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PaymentsMade(swap_id))
+            .unwrap_or(Vec::new(&env))
+    }
+
+    // ── #350: Collateral Management ───────────────────────────────────────────
+
+    /// Get collateral amount for a swap.
+    pub fn get_swap_collateral(env: Env, swap_id: u64) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SwapCollateral(swap_id))
+            .unwrap_or(0)
     }
 }
 

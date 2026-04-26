@@ -42,6 +42,20 @@ pub enum DataKey {
     ContractSchema,
     /// #311: Maps swap_id → referrer Address for referral reward tracking.
     SwapReferrer(u64),
+    /// #347: Maps auction_id → AuctionRecord for IP auctions.
+    Auction(u64),
+    /// #347: Maps ip_id → auction_id for active auction.
+    ActiveAuction(u64),
+    /// #347: Maps auction_id → Vec<(bidder, amount)> for bid history.
+    AuctionBids(u64),
+    /// #347: Next auction ID counter.
+    NextAuctionId,
+    /// #349: Maps swap_id → Vec<PaymentSchedule> for scheduled payments.
+    PaymentSchedule(u64),
+    /// #349: Maps swap_id → Vec<bool> tracking which payments have been made.
+    PaymentsMade(u64),
+    /// #350: Maps swap_id → collateral amount held in escrow.
+    SwapCollateral(u64),
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -75,6 +89,8 @@ pub struct SwapRecord {
     pub dispute_timestamp: u64,
     /// #311: Optional referrer address for referral reward on completion.
     pub referrer: Option<Address>,
+    /// #350: Collateral amount required from buyer. Zero if no collateral.
+    pub collateral_amount: i128,
 }
 
 // ── Events ────────────────────────────────────────────────────────────────────
@@ -213,4 +229,91 @@ pub struct DisputeEvidenceSubmittedEvent {
     pub swap_id: u64,
     pub submitter: Address,
     pub evidence_hash: BytesN<32>,
+}
+
+// ── #347: Auction Types ───────────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone)]
+pub struct AuctionRecord {
+    pub auction_id: u64,
+    pub ip_id: u64,
+    pub seller: Address,
+    pub token: Address,
+    pub min_bid: i128,
+    pub highest_bid: i128,
+    pub highest_bidder: Option<Address>,
+    pub start_time: u64,
+    pub end_time: u64,
+    pub finalized: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct AuctionStartedEvent {
+    pub auction_id: u64,
+    pub ip_id: u64,
+    pub seller: Address,
+    pub min_bid: i128,
+    pub end_time: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct BidPlacedEvent {
+    pub auction_id: u64,
+    pub bidder: Address,
+    pub bid_amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct AuctionFinalizedEvent {
+    pub auction_id: u64,
+    pub winner: Option<Address>,
+    pub winning_bid: i128,
+}
+
+// ── #349: Payment Schedule Types ──────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone)]
+pub struct PaymentSchedule {
+    pub due_timestamp: u64,
+    pub amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScheduledPaymentMadeEvent {
+    pub swap_id: u64,
+    pub payment_index: u32,
+    pub amount: i128,
+    pub remaining_payments: u32,
+}
+
+// ── #350: Collateral Types ────────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CollateralDepositedEvent {
+    pub swap_id: u64,
+    pub buyer: Address,
+    pub collateral_amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CollateralReleasedEvent {
+    pub swap_id: u64,
+    pub buyer: Address,
+    pub collateral_amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CollateralRefundedEvent {
+    pub swap_id: u64,
+    pub buyer: Address,
+    pub collateral_amount: i128,
 }

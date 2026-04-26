@@ -31,6 +31,12 @@ pub enum ContractError {
     InsufficientPoW = 10,
     InvalidExpiry = 11,
     IpInDispute = 12,
+    /// #348: Co-owner not found in ownership list.
+    CoOwnerNotFound = 13,
+    /// #348: Invalid ownership percentage (must be 0-100).
+    InvalidOwnershipPercentage = 14,
+    /// #348: Only owner can manage co-owners.
+    OnlyOwnerCanManageCoOwners = 15,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────

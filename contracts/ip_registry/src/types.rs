@@ -51,3 +51,25 @@ pub struct IpRecord {
     pub parent_ip_id: Option<u64>, // parent IP ID for versioning
     pub notary_signature: Option<Bytes>, // Issue #345: notary signature for timestamp notarization
 }
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct OwnershipShare {
+    pub address: Address,
+    pub percentage: u32, // 0-100, sum of all should be 100
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CoOwnerAddedEvent {
+    pub ip_id: u64,
+    pub co_owner: Address,
+    pub percentage: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CoOwnerRemovedEvent {
+    pub ip_id: u64,
+    pub co_owner: Address,
+}
