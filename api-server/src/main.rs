@@ -7,6 +7,7 @@ use axum::extract::Request;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
+use std::sync::Arc;
 
 mod auth;
 mod cache;
@@ -14,6 +15,9 @@ mod handlers;
 mod metrics;
 mod schemas;
 mod webhook;
+mod websocket;
+mod graphql;
+mod request_signing;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -96,11 +100,13 @@ async fn main() {
     metrics::init();
 
     let schema = graphql::build_schema();
+    let broadcaster = Arc::new(websocket::EventBroadcaster::new());
 
     let app = Router::new()
         .merge(SwaggerUi::new("/docs").url("/openapi.json", ApiDoc::openapi()))
         .route("/metrics", get(metrics::metrics_handler))
         .route("/graphql", post(graphql_handler))
+        .route("/ws", get(ws_handler))
         .route("/ip/commit", post(handlers::commit_ip))
         .route("/ip/{ip_id}", get(handlers::get_ip))
         .route("/ip/transfer", post(handlers::transfer_ip))
@@ -113,14 +119,22 @@ async fn main() {
         .route("/swap/{swap_id}/cancel", post(handlers::cancel_swap))
         .route("/swap/{swap_id}/cancel-expired", post(handlers::cancel_expired_swap))
         .route("/swap/{swap_id}", get(handlers::get_swap))
-        .with_state(schema)
+        .with_state((schema, broadcaster.clone()))
         .layer(middleware::from_fn(metrics::track));
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
     println!("Swagger UI   -> http://localhost:8080/docs");
     println!("OpenAPI JSON -> http://localhost:8080/openapi.json");
     println!("Metrics      -> http://localhost:8080/metrics");
+    println!("WebSocket    -> ws://localhost:8080/ws");
     axum::serve(listener, app).await.unwrap();
+}
+
+async fn ws_handler(
+    ws: axum::extract::ws::WebSocketUpgrade,
+    axum::extract::State((_, broadcaster)): axum::extract::State<(graphql::AtomicIpSchema, Arc<websocket::EventBroadcaster>)>,
+) -> impl axum::response::IntoResponse {
+    ws.on_upgrade(|socket| websocket::handle_socket(socket, broadcaster))
 }
 
 fn build_app() -> Router {
