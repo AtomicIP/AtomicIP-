@@ -4,6 +4,9 @@ mod swap;
 mod upgrade;
 mod utils;
 mod multi_currency;
+mod reputation;
+mod contingency;
+mod dispute_evidence;
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token,
@@ -115,6 +118,20 @@ pub enum ContractError {
     InsufficientCollateral = 50,
     /// Collateral already deposited for this swap.
     CollateralAlreadyDeposited = 51,
+
+    // ── #359: Reputation errors (52) ─────────────────────────────────────────
+    /// User reputation not found.
+    ReputationNotFound = 52,
+
+    // ── #360: Contingent completion errors (53-54) ──────────────────────────
+    /// Contingency condition not met.
+    ContingencyConditionNotMet = 53,
+    /// Only seller can complete contingent swap.
+    OnlySellerCanCompleteContingent = 54,
+
+    // ── #361: Dispute evidence errors (55) ───────────────────────────────────
+    /// Dispute evidence not found.
+    DisputeEvidenceNotFound = 55,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -364,6 +381,7 @@ impl AtomicSwap {
         required_approvals: u32,
         referrer: Option<Address>,
         collateral_amount: i128,
+        contingency_condition: Option<Vec<u8>>,
     ) -> u64 {
         // Guard: reject new swaps when the contract is paused.
         require_not_paused(&env);
@@ -401,6 +419,7 @@ impl AtomicSwap {
             dispute_timestamp: 0,
             referrer: referrer.clone(),
             collateral_amount,
+            contingency_condition,
         };
 
         env.storage().persistent().set(&DataKey::Swap(id), &swap);
@@ -663,6 +682,9 @@ impl AtomicSwap {
                 );
             }
         }
+
+        // #359: Update reputation on completion
+        reputation::update_reputation_on_completion(&env, &swap.seller, &swap.buyer);
 
         env.events().publish(
             (soroban_sdk::symbol_short!("key_rev"),),
@@ -2087,6 +2109,98 @@ impl AtomicSwap {
             .persistent()
             .get(&DataKey::SwapCollateral(swap_id))
             .unwrap_or(0)
+    }
+
+    // ── #359: User Reputation Tracking ────────────────────────────────────────
+
+    /// Get user reputation (completed_swaps, rating).
+    pub fn get_user_reputation(env: Env, user: Address) -> (u32, u32) {
+        reputation::get_user_reputation(&env, user)
+    }
+
+    // ── #360: Contingent Completion ───────────────────────────────────────────
+
+    /// Complete a swap with contingency condition verification (seller-only).
+    pub fn complete_swap_contingent(
+        env: Env,
+        swap_id: u64,
+        condition_proof: Vec<u8>,
+    ) {
+        let swap = swap::get_swap(&env, swap_id);
+        swap.seller.require_auth();
+
+        if swap.status != SwapStatus::Accepted {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::SwapNotAccepted as u32,
+            ));
+        }
+
+        if swap.contingency_condition.is_none() {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::ContingencyConditionNotMet as u32,
+            ));
+        }
+
+        let condition = swap.contingency_condition.unwrap();
+        if condition != condition_proof {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::ContingencyConditionNotMet as u32,
+            ));
+        }
+
+        let mut updated_swap = swap.clone();
+        updated_swap.status = SwapStatus::Completed;
+        swap::save_swap(&env, swap_id, &updated_swap);
+        Self::append_history(&env, swap_id, SwapStatus::Completed);
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("cont_cmplt"),),
+            SwapContingentCompletedEvent {
+                swap_id,
+                seller: swap.seller.clone(),
+            },
+        );
+
+        reputation::update_reputation_on_completion(&env, &swap.seller, &swap.buyer);
+    }
+
+    // ── #361: Dispute Evidence Storage ────────────────────────────────────────
+
+    /// Raise a swap dispute with evidence (buyer or seller).
+    pub fn raise_swap_dispute(
+        env: Env,
+        swap_id: u64,
+        evidence_hash: BytesN<32>,
+    ) {
+        let swap = swap::get_swap(&env, swap_id);
+        
+        // Determine submitter (must be buyer or seller)
+        let submitter = if swap.seller.clone() == env.invoker() {
+            swap.seller.clone()
+        } else if swap.buyer.clone() == env.invoker() {
+            swap.buyer.clone()
+        } else {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::UnauthorizedEvidenceSubmitter as u32,
+            ));
+            return;
+        };
+
+        dispute_evidence::raise_swap_dispute(&env, swap_id, submitter.clone(), evidence_hash.clone());
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("disp_evid"),),
+            DisputeEvidenceStoredEvent {
+                swap_id,
+                submitter,
+                evidence_hash,
+            },
+        );
+    }
+
+    /// Get all dispute evidence for a swap.
+    pub fn get_dispute_evidence_list(env: Env, swap_id: u64) -> Vec<BytesN<32>> {
+        dispute_evidence::get_dispute_evidence_list(&env, swap_id)
     }
 }
 
