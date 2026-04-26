@@ -51,7 +51,7 @@ pub enum DataKey {
     Admin,
     PartialDisclosure(u64), // stores partial_hash for a given ip_id after reveal
     IpLicenses(u64),        // stores license entries for a given ip_id
-    PublicIps,              // stores list of public IP IDs
+    CategoryIps(BytesN<32>), // maps category hash -> Vec<u64> of IP IDs
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────

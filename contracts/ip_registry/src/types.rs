@@ -26,7 +26,7 @@ pub enum DataKey {
     NextId,
     CommitmentOwner(BytesN<32>), // tracks which owner already holds a commitment hash
     Admin,
-    PublicIps, // stores list of public IP IDs
+    CategoryIps(BytesN<32>), // maps category hash -> Vec<u64> of IP IDs
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────

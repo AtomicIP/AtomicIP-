@@ -1,0 +1,97 @@
+{
+  "dashboard": {
+    "title": "AtomicIP Platform Overview",
+    "tags": ["atomicip", "monitoring"],
+    "timezone": "browser",
+    "panels": [
+      {
+        "title": "API Status",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "up{job=\"atomicip-api\"}",
+            "legendFormat": "API Status"
+          }
+        ]
+      },
+      {
+        "title": "Request Rate",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "rate(http_requests_total[5m])",
+            "legendFormat": "{{method}} {{endpoint}}"
+          }
+        ]
+      },
+      {
+        "title": "Error Rate",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "rate(http_requests_total{status=~\"5..\"}[5m])",
+            "legendFormat": "5xx Errors"
+          }
+        ]
+      },
+      {
+        "title": "API Latency (P95)",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m]))",
+            "legendFormat": "P95 Latency"
+          }
+        ]
+      },
+      {
+        "title": "Swap Volume",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "rate(atomic_swap_total[1h])",
+            "legendFormat": "Total Swaps"
+          },
+          {
+            "expr": "rate(atomic_swap_completed[1h])",
+            "legendFormat": "Completed"
+          },
+          {
+            "expr": "rate(atomic_swap_cancelled[1h])",
+            "legendFormat": "Cancelled"
+          }
+        ]
+      },
+      {
+        "title": "Fee Revenue",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "rate(atomic_swap_fees_collected_total[1h])",
+            "legendFormat": "Fees/Hour"
+          }
+        ]
+      },
+      {
+        "title": "Active Swaps",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "active_swaps_count",
+            "legendFormat": "Active Swaps"
+          }
+        ]
+      },
+      {
+        "title": "Completion Rate",
+        "type": "gauge",
+        "targets": [
+          {
+            "expr": "rate(atomic_swap_completed[1h]) / rate(atomic_swap_total[1h])",
+            "legendFormat": "Completion %"
+          }
+        ]
+      }
+    ]
+  }
+}
