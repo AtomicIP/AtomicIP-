@@ -22,3 +22,4 @@ tower = "0.4"
 tower-http = { version = "0.5", features = ["trace"] }
 http-body-util = "0.1"
 once_cell = "1"
+dashmap = "5"

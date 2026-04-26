@@ -54,6 +54,8 @@ pub enum ContractError {
     InsufficientApprovals = 27,
     /// #254: Approver has already approved this swap.
     AlreadyApproved = 28,
+    /// #311: Referral fee bps exceeds allowed maximum.
+    InvalidReferralFeeBps = 35,
 
     // ── Upgrade-validation errors (29-34) ─────────────────────────────────────
     /// New schema version must be strictly greater than the current one.
@@ -108,6 +110,8 @@ pub enum DataKey {
     SupportedTokens,
     /// On-chain interface manifest used by validate_upgrade.
     ContractSchema,
+    /// #311: Maps swap_id → referrer Address for referral reward tracking.
+    SwapReferrer(u64),
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -139,6 +143,8 @@ pub struct SwapRecord {
     pub required_approvals: u32,
     /// Ledger timestamp when a dispute was raised. Zero if no dispute.
     pub dispute_timestamp: u64,
+    /// #311: Optional referrer address for referral reward on completion.
+    pub referrer: Option<Address>,
 }
 
 // ── Events ────────────────────────────────────────────────────────────────────
@@ -179,6 +185,15 @@ pub struct KeyRevealedEvent {
     pub fee_amount: i128,
 }
 
+/// #311: Payload published when a referral reward is paid out.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReferralPaidEvent {
+    pub swap_id: u64,
+    pub referrer: Address,
+    pub referral_amount: i128,
+}
+
 /// Payload published when protocol fee is deducted on swap completion.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -208,6 +223,8 @@ pub struct ProtocolConfig {
     pub treasury: Address,
     pub dispute_window_seconds: u64,
     pub dispute_resolution_timeout_seconds: u64,
+    /// #311: Referral fee in basis points (0-10000). Deducted from seller proceeds.
+    pub referral_fee_bps: u32,
 }
 
 // ── #253: Swap History ────────────────────────────────────────────────────────
@@ -273,6 +290,7 @@ impl AtomicSwap {
         price: i128,
         buyer: Address,
         required_approvals: u32,
+        referrer: Option<Address>,
     ) -> u64 {
         // Guard: reject new swaps when the contract is paused.
         require_not_paused(&env);
@@ -308,6 +326,7 @@ impl AtomicSwap {
             accept_timestamp: 0,
             required_approvals,
             dispute_timestamp: 0,
+            referrer: referrer.clone(),
         };
 
         env.storage().persistent().set(&DataKey::Swap(id), &swap);
@@ -456,7 +475,20 @@ impl AtomicSwap {
         } else {
             0
         };
-        let seller_amount = swap.price - fee_amount;
+
+        // #311: Referral fee deduction (from seller proceeds, only if referrer set)
+        let referral_amount = if let Some(ref referrer) = swap.referrer {
+            let rbps = config.referral_fee_bps as i128;
+            if rbps > 0 && swap.price > 0 {
+                (swap.price * rbps) / 10000
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
+        let seller_amount = swap.price - fee_amount - referral_amount;
         if fee_amount > 0 {
             token_client.transfer(
                 &env.current_contract_address(),
@@ -471,6 +503,24 @@ impl AtomicSwap {
                     treasury: config.treasury.clone(),
                 },
             );
+        }
+        // #311: Pay referral reward
+        if referral_amount > 0 {
+            if let Some(ref referrer) = swap.referrer {
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    referrer,
+                    &referral_amount,
+                );
+                env.events().publish(
+                    (soroban_sdk::symbol_short!("ref_paid"),),
+                    ReferralPaidEvent {
+                        swap_id,
+                        referrer: referrer.clone(),
+                        referral_amount,
+                    },
+                );
+            }
         }
         // Transfer net payment to seller
         token_client.transfer(
@@ -706,10 +756,16 @@ impl AtomicSwap {
         treasury: Address,
         dispute_window_seconds: u64,
         dispute_resolution_timeout_seconds: u64,
+        referral_fee_bps: u32,
     ) {
         if protocol_fee_bps > 10_000 {
             env.panic_with_error(Error::from_contract_error(
                 ContractError::InvalidFeeBps as u32,
+            ));
+        }
+        if referral_fee_bps > 10_000 {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::InvalidReferralFeeBps as u32,
             ));
         }
 
@@ -739,6 +795,7 @@ impl AtomicSwap {
                 treasury,
                 dispute_window_seconds,
                 dispute_resolution_timeout_seconds,
+                referral_fee_bps,
             },
         );
     }
@@ -761,6 +818,7 @@ impl AtomicSwap {
                 treasury: env.current_contract_address(),
                 dispute_window_seconds: 86400,
                 dispute_resolution_timeout_seconds: 2_592_000, // 30 days
+                referral_fee_bps: 0,
             })
     }
 
@@ -1091,6 +1149,86 @@ impl AtomicSwap {
                 approvals_count,
             },
         );
+    }
+
+    // ── #309: Batch swap initiation ───────────────────────────────────────────
+
+    /// Seller initiates multiple patent sales in one call. Returns a Vec of swap IDs.
+    /// Each ip_ids[i] is paired with prices[i]; all swaps share the same buyer and token.
+    pub fn batch_initiate_swap(
+        env: Env,
+        token: Address,
+        ip_ids: Vec<u64>,
+        seller: Address,
+        prices: Vec<i128>,
+        buyer: Address,
+        required_approvals: u32,
+        referrer: Option<Address>,
+    ) -> Vec<u64> {
+        require_not_paused(&env);
+        seller.require_auth();
+
+        let len = ip_ids.len();
+        let mut swap_ids: Vec<u64> = Vec::new(&env);
+
+        for i in 0..len {
+            let ip_id = ip_ids.get(i).unwrap();
+            let price = prices.get(i).unwrap();
+
+            require_positive_price(&env, price);
+            registry::ensure_seller_owns_active_ip(&env, ip_id, &seller);
+            require_no_active_swap(&env, ip_id);
+
+            let id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(0);
+
+            let swap = SwapRecord {
+                ip_id,
+                seller: seller.clone(),
+                buyer: buyer.clone(),
+                price,
+                token: token.clone(),
+                status: SwapStatus::Pending,
+                expiry: env.ledger().timestamp() + 604800u64,
+                accept_timestamp: 0,
+                required_approvals,
+                dispute_timestamp: 0,
+                referrer: referrer.clone(),
+            };
+
+            env.storage().persistent().set(&DataKey::Swap(id), &swap);
+            env.storage().persistent().extend_ttl(&DataKey::Swap(id), LEDGER_BUMP, LEDGER_BUMP);
+            env.storage().persistent().set(&DataKey::ActiveSwap(ip_id), &id);
+            env.storage().persistent().extend_ttl(&DataKey::ActiveSwap(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+
+            swap::append_swap_for_party(&env, &seller, &buyer, id);
+
+            let mut ip_swap_ids: Vec<u64> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::IpSwaps(ip_id))
+                .unwrap_or(Vec::new(&env));
+            ip_swap_ids.push_back(id);
+            env.storage().persistent().set(&DataKey::IpSwaps(ip_id), &ip_swap_ids);
+            env.storage().persistent().extend_ttl(&DataKey::IpSwaps(ip_id), 50000, 50000);
+
+            Self::append_history(&env, id, SwapStatus::Pending);
+            env.storage().instance().set(&DataKey::NextId, &(id + 1));
+
+            env.events().publish(
+                (soroban_sdk::symbol_short!("swap_init"),),
+                SwapInitiatedEvent {
+                    swap_id: id,
+                    ip_id,
+                    seller: seller.clone(),
+                    buyer: buyer.clone(),
+                    price,
+                },
+            );
+
+            swap_ids.push_back(id);
+        }
+
+        swap_ids
     }
 }
 

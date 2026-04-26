@@ -1,7 +1,15 @@
-use axum::{extract::Path, http::StatusCode, Json};
+use axum::{
+    extract::{Path, Query},
+    http::{header, StatusCode},
+    response::IntoResponse,
+    Json,
+};
 use tracing::instrument;
+use crate::cache;
 use crate::schemas::*;
 use crate::webhook;
+
+// ── IP Registry ───────────────────────────────────────────────────────────────
 
 /// Timestamp a new IP commitment. Returns the assigned IP ID.
 #[utoipa::path(
@@ -17,7 +25,6 @@ use crate::webhook;
 #[instrument(skip(body))]
 pub async fn commit_ip(Json(body): Json<CommitIpRequest>) -> Result<Json<u64>, (StatusCode, Json<ErrorResponse>)> {
     // TODO: Call Soroban RPC to invoke ip_registry.commit_ip
-    // For now, return a stub response
     Err((
         StatusCode::BAD_REQUEST,
         Json(ErrorResponse {
@@ -38,15 +45,23 @@ pub async fn commit_ip(Json(body): Json<CommitIpRequest>) -> Result<Json<u64>, (
     )
 )]
 #[instrument]
-pub async fn get_ip(Path(ip_id): Path<u64>) -> Result<Json<IpRecord>, (StatusCode, Json<ErrorResponse>)> {
+pub async fn get_ip(Path(ip_id): Path<u64>) -> impl IntoResponse {
+    // #316: Check cache first
+    let cache_key = cache::ip_key(ip_id);
+    if let Some(cached) = cache::get::<IpRecord>(&cache_key) {
+        return (
+            StatusCode::OK,
+            [(header::CACHE_CONTROL, cache::cache_control_header())],
+            Json(serde_json::to_value(cached).unwrap()),
+        ).into_response();
+    }
+
     // TODO: Call Soroban RPC to invoke ip_registry.get_ip
-    // For now, return a stub response
-    Err((
+    (
         StatusCode::NOT_FOUND,
-        Json(ErrorResponse {
-            error: format!("IP record {} not found", ip_id),
-        }),
-    ))
+        [(header::CACHE_CONTROL, cache::no_cache_header())],
+        Json(serde_json::json!({ "error": format!("IP record {} not found", ip_id) })),
+    ).into_response()
 }
 
 /// Transfer IP ownership to a new address.
@@ -62,6 +77,8 @@ pub async fn get_ip(Path(ip_id): Path<u64>) -> Result<Json<IpRecord>, (StatusCod
 )]
 #[instrument(skip(body))]
 pub async fn transfer_ip(Json(body): Json<TransferIpRequest>) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    // #316: Invalidate cache on mutation
+    cache::invalidate(&cache::ip_key(body.ip_id));
     // TODO: Call Soroban RPC to invoke ip_registry.transfer_ip
     Err((
         StatusCode::NOT_FOUND,
@@ -94,20 +111,59 @@ pub async fn verify_commitment(Json(body): Json<VerifyCommitmentRequest>) -> Res
 }
 
 /// List all IP IDs owned by a Stellar address.
+/// Supports `limit` and `offset` query parameters for pagination (#317).
 #[utoipa::path(
     get,
     path = "/ip/owner/{owner}",
     tag = "IP Registry",
-    params(("owner" = String, Path, description = "Stellar address of the owner")),
+    params(
+        ("owner" = String, Path, description = "Stellar address of the owner"),
+        PaginationParams,
+    ),
     responses(
-        (status = 200, description = "List of IP IDs (null if none)", body = ListIpByOwnerResponse),
+        (status = 200, description = "Paginated list of IP IDs", body = ListIpByOwnerResponse),
     )
 )]
 #[instrument]
-pub async fn list_ip_by_owner(Path(owner): Path<String>) -> Json<ListIpByOwnerResponse> {
+pub async fn list_ip_by_owner(
+    Path(owner): Path<String>,
+    Query(pagination): Query<PaginationParams>,
+) -> impl IntoResponse {
+    let limit = pagination.limit.min(200);
+    let offset = pagination.offset;
+
+    // #316: Check cache
+    let cache_key = cache::ip_list_key(&owner, limit, offset);
+    if let Some(cached) = cache::get::<ListIpByOwnerResponse>(&cache_key) {
+        return (
+            StatusCode::OK,
+            [(header::CACHE_CONTROL, cache::cache_control_header())],
+            Json(serde_json::to_value(cached).unwrap()),
+        ).into_response();
+    }
+
     // TODO: Call Soroban RPC to invoke ip_registry.list_ip_by_owner
-    Json(ListIpByOwnerResponse { ip_ids: None })
+    // Stub: empty paginated response
+    let all_ids: Vec<u64> = vec![];
+    let total_count = all_ids.len() as u64;
+    let page: Vec<u64> = all_ids
+        .into_iter()
+        .skip(offset as usize)
+        .take(limit as usize)
+        .collect();
+    let has_more = offset + limit < total_count;
+
+    let resp = ListIpByOwnerResponse { ip_ids: page, total_count, has_more };
+    cache::set(&cache_key, &resp);
+
+    (
+        StatusCode::OK,
+        [(header::CACHE_CONTROL, cache::cache_control_header())],
+        Json(serde_json::to_value(resp).unwrap()),
+    ).into_response()
 }
+
+// ── Atomic Swap ───────────────────────────────────────────────────────────────
 
 /// Seller initiates a patent sale. Returns the swap ID.
 #[utoipa::path(
@@ -131,6 +187,44 @@ pub async fn initiate_swap(Json(body): Json<InitiateSwapRequest>) -> Result<Json
     ))
 }
 
+/// Seller initiates multiple patent sales in one call. Returns a list of swap IDs (#309).
+#[utoipa::path(
+    post,
+    path = "/swap/batch-initiate",
+    tag = "Atomic Swap",
+    request_body = BatchInitiateSwapRequest,
+    responses(
+        (status = 200, description = "Swaps initiated, returns swap_ids", body = BatchInitiateSwapResponse),
+        (status = 400, description = "Validation error (mismatched lengths, invalid IP, etc.)", body = ErrorResponse),
+    )
+)]
+#[instrument(skip(body))]
+pub async fn batch_initiate_swap(Json(body): Json<BatchInitiateSwapRequest>) -> Result<Json<BatchInitiateSwapResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if body.ip_ids.len() != body.prices.len() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "ip_ids and prices must have the same length".to_string(),
+            }),
+        ));
+    }
+    if body.ip_ids.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "ip_ids must not be empty".to_string(),
+            }),
+        ));
+    }
+    // TODO: Call Soroban RPC to invoke atomic_swap.batch_initiate_swap
+    Err((
+        StatusCode::BAD_REQUEST,
+        Json(ErrorResponse {
+            error: "batch_initiate_swap not yet implemented".to_string(),
+        }),
+    ))
+}
+
 /// Buyer accepts a pending swap.
 #[utoipa::path(
     post,
@@ -146,8 +240,9 @@ pub async fn initiate_swap(Json(body): Json<InitiateSwapRequest>) -> Result<Json
 )]
 #[instrument(skip(body))]
 pub async fn accept_swap(Path(swap_id): Path<u64>, Json(body): Json<AcceptSwapRequest>) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    // #316: Invalidate swap cache on state change
+    cache::invalidate(&cache::swap_key(swap_id));
     // TODO: Call Soroban RPC to invoke atomic_swap.accept_swap
-    // Trigger webhook on status change (Pending -> Accepted)
     webhook::trigger_swap_status_changed(swap_id, Some("Pending".to_string()), "Accepted".to_string());
     Err((
         StatusCode::NOT_FOUND,
@@ -172,8 +267,9 @@ pub async fn accept_swap(Path(swap_id): Path<u64>, Json(body): Json<AcceptSwapRe
 )]
 #[instrument(skip(body))]
 pub async fn reveal_key(Path(swap_id): Path<u64>, Json(body): Json<RevealKeyRequest>) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    // #316: Invalidate swap cache on state change
+    cache::invalidate(&cache::swap_key(swap_id));
     // TODO: Call Soroban RPC to invoke atomic_swap.reveal_key
-    // Trigger webhook on status change (Accepted -> Completed)
     webhook::trigger_swap_status_changed(swap_id, Some("Accepted".to_string()), "Completed".to_string());
     Err((
         StatusCode::NOT_FOUND,
@@ -198,8 +294,9 @@ pub async fn reveal_key(Path(swap_id): Path<u64>, Json(body): Json<RevealKeyRequ
 )]
 #[instrument(skip(body))]
 pub async fn cancel_swap(Path(swap_id): Path<u64>, Json(body): Json<CancelSwapRequest>) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    // #316: Invalidate swap cache on state change
+    cache::invalidate(&cache::swap_key(swap_id));
     // TODO: Call Soroban RPC to invoke atomic_swap.cancel_swap
-    // Trigger webhook on status change (Pending -> Cancelled)
     webhook::trigger_swap_status_changed(swap_id, Some("Pending".to_string()), "Cancelled".to_string());
     Err((
         StatusCode::NOT_FOUND,
@@ -224,8 +321,9 @@ pub async fn cancel_swap(Path(swap_id): Path<u64>, Json(body): Json<CancelSwapRe
 )]
 #[instrument(skip(body))]
 pub async fn cancel_expired_swap(Path(swap_id): Path<u64>, Json(body): Json<CancelExpiredSwapRequest>) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    // #316: Invalidate swap cache on state change
+    cache::invalidate(&cache::swap_key(swap_id));
     // TODO: Call Soroban RPC to invoke atomic_swap.cancel_expired_swap
-    // Trigger webhook on status change (Accepted -> Cancelled)
     webhook::trigger_swap_status_changed(swap_id, Some("Accepted".to_string()), "Cancelled".to_string());
     Err((
         StatusCode::NOT_FOUND,
@@ -247,15 +345,26 @@ pub async fn cancel_expired_swap(Path(swap_id): Path<u64>, Json(body): Json<Canc
     )
 )]
 #[instrument]
-pub async fn get_swap(Path(swap_id): Path<u64>) -> Result<Json<SwapRecord>, (StatusCode, Json<ErrorResponse>)> {
+pub async fn get_swap(Path(swap_id): Path<u64>) -> impl IntoResponse {
+    // #316: Check cache first
+    let cache_key = cache::swap_key(swap_id);
+    if let Some(cached) = cache::get::<SwapRecord>(&cache_key) {
+        return (
+            StatusCode::OK,
+            [(header::CACHE_CONTROL, cache::cache_control_header())],
+            Json(serde_json::to_value(cached).unwrap()),
+        ).into_response();
+    }
+
     // TODO: Call Soroban RPC to invoke atomic_swap.get_swap
-    Err((
+    (
         StatusCode::NOT_FOUND,
-        Json(ErrorResponse {
-            error: format!("Swap {} not found", swap_id),
-        }),
-    ))
+        [(header::CACHE_CONTROL, cache::no_cache_header())],
+        Json(serde_json::json!({ "error": format!("Swap {} not found", swap_id) })),
+    ).into_response()
 }
+
+// ── Webhooks ──────────────────────────────────────────────────────────────────
 
 /// Register a webhook URL to receive swap event notifications.
 #[utoipa::path(

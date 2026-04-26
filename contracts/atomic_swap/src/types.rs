@@ -40,6 +40,8 @@ pub enum DataKey {
     SupportedTokens,
     /// On-chain interface manifest used by validate_upgrade.
     ContractSchema,
+    /// #311: Maps swap_id → referrer Address for referral reward tracking.
+    SwapReferrer(u64),
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -71,6 +73,8 @@ pub struct SwapRecord {
     pub required_approvals: u32,
     /// Ledger timestamp when a dispute was raised. Zero if no dispute.
     pub dispute_timestamp: u64,
+    /// #311: Optional referrer address for referral reward on completion.
+    pub referrer: Option<Address>,
 }
 
 // ── Events ────────────────────────────────────────────────────────────────────
@@ -140,6 +144,18 @@ pub struct ProtocolConfig {
     pub treasury: Address,
     pub dispute_window_seconds: u64,
     pub dispute_resolution_timeout_seconds: u64,
+    /// #311: Referral fee in basis points (0-10000). Deducted from seller proceeds.
+    pub referral_fee_bps: u32,
+}
+
+// ── #311: Referral Paid Event ─────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReferralPaidEvent {
+    pub swap_id: u64,
+    pub referrer: Address,
+    pub referral_amount: i128,
 }
 
 // ── #253: Swap History ────────────────────────────────────────────────────────

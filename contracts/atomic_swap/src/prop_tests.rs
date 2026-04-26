@@ -51,7 +51,7 @@ mod prop_tests {
         let client = AtomicSwapClient::new(&env, &contract_id);
         client.initialize(&registry_id);
 
-        client.initiate_swap(&token_id, &ip_id, &seller, &price, &buyer, &0_u32);
+        client.initiate_swap(&token_id, &ip_id, &seller, &price, &buyer, &0_u32, &None);
 
         (env, client, ip_id, secret, blinding, seller, buyer)
     }
@@ -86,7 +86,7 @@ mod prop_tests {
             let client = AtomicSwapClient::new(&env, &contract_id);
             client.initialize(&registry_id);
 
-            let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &price, &buyer, &0_u32);
+            let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &price, &buyer, &0_u32, &None);
             let swap = client.get_swap(&swap_id).unwrap();
 
             prop_assert_eq!(swap.status, SwapStatus::Pending);
@@ -120,7 +120,7 @@ mod prop_tests {
             let client = AtomicSwapClient::new(&env, &contract_id);
             client.initialize(&registry_id);
 
-            let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &price, &buyer, &0_u32);
+            let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &price, &buyer, &0_u32, &None);
 
             // Verify Pending before accept
             prop_assert_eq!(client.get_swap(&swap_id).unwrap().status, SwapStatus::Pending);
@@ -159,7 +159,7 @@ mod prop_tests {
             let client = AtomicSwapClient::new(&env, &contract_id);
             client.initialize(&registry_id);
 
-            let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &price, &buyer, &0_u32);
+            let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &price, &buyer, &0_u32, &None);
             client.accept_swap(&swap_id);
             client.reveal_key(&swap_id, &seller, &secret, &blinding);
 
@@ -203,7 +203,7 @@ mod prop_tests {
             let client = AtomicSwapClient::new(&env, &contract_id);
             client.initialize(&registry_id);
 
-            let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &price, &buyer, &0_u32);
+            let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &price, &buyer, &0_u32, &None);
             client.cancel_swap(&swap_id);
 
             prop_assert_eq!(client.get_swap(&swap_id).unwrap().status, SwapStatus::Cancelled);
@@ -236,7 +236,7 @@ mod prop_tests {
             let client = AtomicSwapClient::new(&env, &contract_id);
             client.initialize(&registry_id);
 
-            let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &price, &buyer, &0_u32);
+            let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &price, &buyer, &0_u32, &None);
             let swap = client.get_swap(&swap_id).unwrap();
 
             prop_assert_eq!(swap.price, price);
@@ -273,7 +273,7 @@ mod prop_tests {
 
             // initiate_swap with price <= 0 must panic (PriceMustBeGreaterThanZero = 3)
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                client.initiate_swap(&token_id, &ip_id, &seller, &price, &buyer, &0_u32);
+                client.initiate_swap(&token_id, &ip_id, &seller, &price, &buyer, &0_u32, &None);
             }));
             prop_assert!(result.is_err(), "Expected panic for price={}", price);
         }
@@ -305,7 +305,7 @@ mod prop_tests {
             let client = AtomicSwapClient::new(&env, &contract_id);
             client.initialize(&registry_id);
 
-            let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &price, &buyer, &0_u32);
+            let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &price, &buyer, &0_u32, &None);
             let swap = client.get_swap(&swap_id).unwrap();
 
             prop_assert_eq!(swap.seller, seller);
@@ -344,7 +344,7 @@ mod prop_tests {
         let client = AtomicSwapClient::new(&env, &contract_id);
         client.initialize(&registry_id);
 
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &1000, &buyer, &0_u32);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &1000, &buyer, &0_u32, &None);
         // Must panic: SwapNotAccepted = 8
         client.reveal_key(&swap_id, &seller, &secret, &blinding);
     }
@@ -377,7 +377,7 @@ mod prop_tests {
         let client = AtomicSwapClient::new(&env, &contract_id);
         client.initialize(&registry_id);
 
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &1000, &buyer, &0_u32);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &1000, &buyer, &0_u32, &None);
         client.cancel_swap(&swap_id);
         // Must panic: SwapNotPending = 6
         client.accept_swap(&swap_id);
@@ -411,7 +411,7 @@ mod prop_tests {
         let client = AtomicSwapClient::new(&env, &contract_id);
         client.initialize(&registry_id);
 
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &1000, &buyer, &0_u32);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &1000, &buyer, &0_u32, &None);
         client.accept_swap(&swap_id);
 
         let wrong_secret = BytesN::from_array(&env, &[0xFFu8; 32]);
@@ -448,7 +448,7 @@ mod prop_tests {
         let client = AtomicSwapClient::new(&env, &contract_id);
         client.initialize(&registry_id);
 
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &1000, &buyer, &0_u32);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &1000, &buyer, &0_u32, &None);
         client.accept_swap(&swap_id);
         // Must panic: SwapNotPending = 6
         client.accept_swap(&swap_id);
@@ -482,8 +482,8 @@ mod prop_tests {
         let client = AtomicSwapClient::new(&env, &contract_id);
         client.initialize(&registry_id);
 
-        client.initiate_swap(&token_id, &ip_id, &seller, &1000, &buyer, &0_u32);
+        client.initiate_swap(&token_id, &ip_id, &seller, &1000, &buyer, &0_u32, &None);
         // Must panic: ActiveSwapAlreadyExistsForThisIpId = 5
-        client.initiate_swap(&token_id, &ip_id, &seller, &500, &buyer, &0_u32);
+        client.initiate_swap(&token_id, &ip_id, &seller, &500, &buyer, &0_u32, &None);
     }
 }

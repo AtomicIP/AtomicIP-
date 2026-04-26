@@ -36,6 +36,14 @@ mod tests {
         contract_id
     }
 
+    fn setup_token(env: &Env, admin: &Address, recipient: &Address, amount: i128) -> Address {
+        let token_id = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        StellarAssetClient::new(env, &token_id).mint(recipient, &amount);
+        token_id
+    }
+
     // ── Initialize tests ──────────────────────────────────────────────────────
 
     #[test]
@@ -92,7 +100,7 @@ mod tests {
         let contract_id = setup_swap(&env, &registry_id);
         let client = AtomicSwapClient::new(&env, &contract_id);
 
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None);
 
         let swap = client.get_swap(&swap_id).expect("swap should exist");
         assert_eq!(swap.seller, seller);
@@ -112,7 +120,7 @@ mod tests {
         let contract_id = setup_swap(&env, &registry_id);
         let client = AtomicSwapClient::new(&env, &contract_id);
 
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None);
         client.accept_swap(&swap_id);
         client.reveal_key(&swap_id, &seller, &secret, &blinding_factor);
 
@@ -136,7 +144,7 @@ mod tests {
         let client = AtomicSwapClient::new(&env, &contract_id);
         let token_client = TokenClient::new(&env, &token_id);
 
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None);
 
         client.accept_swap(&swap_id);
         assert_eq!(token_client.balance(&buyer), 0);
@@ -163,7 +171,7 @@ mod tests {
         let client = AtomicSwapClient::new(&env, &contract_id);
         let token_client = TokenClient::new(&env, &token_id);
 
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &300_i128, &buyer, &0_u32);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &300_i128, &buyer, &0_u32, &None);
         client.accept_swap(&swap_id);
 
         assert_eq!(token_client.balance(&buyer), 700);
@@ -196,7 +204,7 @@ mod tests {
         let client = AtomicSwapClient::new(&env, &contract_id);
 
         // attacker is not the IP owner — must panic
-        client.initiate_swap(&token_id, &ip_id, &attacker, &500_i128, &buyer, &0_u32);
+        client.initiate_swap(&token_id, &ip_id, &attacker, &500_i128, &buyer, &0_u32, &None);
     }
 
     #[test]
@@ -216,7 +224,7 @@ mod tests {
         let contract_id = setup_swap(&env, &registry_id);
         let client = AtomicSwapClient::new(&env, &contract_id);
 
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None);
         client.accept_swap(&swap_id);
         // attacker != seller — must panic with ContractError(7)
         client.reveal_key(&swap_id, &attacker, &secret, &blinding_factor);
@@ -236,7 +244,7 @@ mod tests {
         let token_id = setup_token(&env, &admin, &buyer, 500);
 
         let client = AtomicSwapClient::new(&env, &setup_swap(&env, &registry_id));
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None);
         // attacker is neither seller nor buyer — must panic with ContractError(9)
         client.cancel_swap(&swap_id, &attacker);
     }
@@ -256,7 +264,7 @@ mod tests {
         let contract_id = setup_swap(&env, &registry_id);
         let client = AtomicSwapClient::new(&env, &contract_id);
 
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None);
         client.accept_swap(&swap_id);
 
         let garbage = BytesN::from_array(&env, &[0xffu8; 32]);
@@ -277,7 +285,7 @@ mod tests {
         let contract_id = setup_swap(&env, &registry_id);
         let client = AtomicSwapClient::new(&env, &contract_id);
 
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None);
         client.accept_swap(&swap_id);
         client.reveal_key(&swap_id, &seller, &secret, &blinding_factor);
 
@@ -303,7 +311,7 @@ mod tests {
         let contract_id = setup_swap(&env, &registry_id);
         let client = AtomicSwapClient::new(&env, &contract_id);
 
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None);
         client.accept_swap(&swap_id);
         client.reveal_key(&swap_id, &seller, &secret, &blinding_factor);
 
@@ -326,7 +334,7 @@ mod tests {
         let contract_id = setup_swap(&env, &registry_id);
         let client = AtomicSwapClient::new(&env, &contract_id);
 
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None);
         client.cancel_expired_swap(&swap_id, &buyer);
     }
 
@@ -347,7 +355,7 @@ mod tests {
         let client = AtomicSwapClient::new(&env, &contract_id);
 
         client.initialize(&registry_id);
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None);
         client.accept_swap(&swap_id);
         client.reveal_key(&swap_id, &seller, &secret, &blinding_factor);
 
@@ -376,7 +384,7 @@ mod tests {
         let contract_id = setup_swap(&env, &registry_id);
         let client = AtomicSwapClient::new(&env, &contract_id);
 
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None);
         client.cancel_swap(&swap_id, &seller);
 
         let all_events = env.events().all();
@@ -403,7 +411,7 @@ mod tests {
         let token_id = setup_token(&env, &admin, &buyer, 500);
 
         let client = AtomicSwapClient::new(&env, &setup_swap(&env, &registry_id));
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None);
 
         // Advance past expiry
         env.ledger().with_mut(|l| l.timestamp += 604801);
@@ -425,7 +433,7 @@ mod tests {
         let token_id = setup_token(&env, &admin, &buyer, 500);
 
         let client = AtomicSwapClient::new(&env, &setup_swap(&env, &registry_id));
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None);
 
         // Not expired yet — must panic with PendingSwapNotExpired (#25)
         client.cancel_pending_swap(&swap_id, &buyer);
@@ -445,7 +453,7 @@ mod tests {
         let token_id = setup_token(&env, &admin, &buyer, 500);
 
         let client = AtomicSwapClient::new(&env, &setup_swap(&env, &registry_id));
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None);
 
         let old_expiry = client.get_swap(&swap_id).unwrap().expiry;
         let new_expiry = old_expiry + 86400;
@@ -467,7 +475,7 @@ mod tests {
         let token_id = setup_token(&env, &admin, &buyer, 500);
 
         let client = AtomicSwapClient::new(&env, &setup_swap(&env, &registry_id));
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None);
 
         let old_expiry = client.get_swap(&swap_id).unwrap().expiry;
         // Same expiry — must panic with NewExpiryNotGreater (#26)
@@ -488,7 +496,7 @@ mod tests {
         let token_id = setup_token(&env, &admin, &buyer, 500);
 
         let client = AtomicSwapClient::new(&env, &setup_swap(&env, &registry_id));
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None);
         client.accept_swap(&swap_id);
         client.reveal_key(&swap_id, &seller, &secret, &blinding);
 
@@ -511,7 +519,7 @@ mod tests {
         let token_id = setup_token(&env, &admin, &buyer, 500);
 
         let client = AtomicSwapClient::new(&env, &setup_swap(&env, &registry_id));
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None);
         client.cancel_swap(&swap_id, &seller);
 
         let history = client.get_swap_history(&swap_id);
@@ -536,7 +544,7 @@ mod tests {
 
         let client = AtomicSwapClient::new(&env, &setup_swap(&env, &registry_id));
         // Require 1 approval
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &1_u32);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &1_u32, &None);
 
         client.approve_swap(&swap_id, &approver);
         client.accept_swap(&swap_id);
@@ -559,7 +567,7 @@ mod tests {
 
         let client = AtomicSwapClient::new(&env, &setup_swap(&env, &registry_id));
         // Require 2 approvals but provide none
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &2_u32);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &2_u32, &None);
 
         // Must panic with InsufficientApprovals (#27)
         client.accept_swap(&swap_id);
@@ -579,10 +587,160 @@ mod tests {
         let token_id = setup_token(&env, &admin, &buyer, 500);
 
         let client = AtomicSwapClient::new(&env, &setup_swap(&env, &registry_id));
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &2_u32);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &2_u32, &None);
 
         client.approve_swap(&swap_id, &approver);
         // Same approver again — must panic with AlreadyApproved (#28)
         client.approve_swap(&swap_id, &approver);
     }
+
+    // ── #309: batch_initiate_swap ─────────────────────────────────────────────
+
+    #[test]
+    fn test_batch_initiate_swap_returns_correct_ids() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let admin = Address::generate(&env);
+
+        let registry_id = env.register(IpRegistry, ());
+        let registry = IpRegistryClient::new(&env, &registry_id);
+        let ip_id_0 = registry.commit_ip(&seller, &BytesN::from_array(&env, &[10u8; 32]));
+        let ip_id_1 = registry.commit_ip(&seller, &BytesN::from_array(&env, &[11u8; 32]));
+
+        let token_id = setup_token(&env, &admin, &buyer, 3000);
+        let client = AtomicSwapClient::new(&env, &setup_swap(&env, &registry_id));
+
+        let ip_ids = soroban_sdk::vec![&env, ip_id_0, ip_id_1];
+        let prices = soroban_sdk::vec![&env, 1000_i128, 500_i128];
+
+        let swap_ids = client.batch_initiate_swap(&token_id, &ip_ids, &seller, &prices, &buyer, &0_u32, &None);
+
+        assert_eq!(swap_ids.len(), 2);
+        assert_ne!(swap_ids.get(0).unwrap(), swap_ids.get(1).unwrap());
+        assert_eq!(client.get_swap(&swap_ids.get(0).unwrap()).unwrap().ip_id, ip_id_0);
+        assert_eq!(client.get_swap(&swap_ids.get(1).unwrap()).unwrap().ip_id, ip_id_1);
+        assert_eq!(client.get_swap(&swap_ids.get(0).unwrap()).unwrap().price, 1000);
+        assert_eq!(client.get_swap(&swap_ids.get(1).unwrap()).unwrap().price, 500);
+    }
+
+    #[test]
+    fn test_batch_initiate_swap_all_pending() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let admin = Address::generate(&env);
+
+        let registry_id = env.register(IpRegistry, ());
+        let registry = IpRegistryClient::new(&env, &registry_id);
+        let ip_id_0 = registry.commit_ip(&seller, &BytesN::from_array(&env, &[20u8; 32]));
+        let ip_id_1 = registry.commit_ip(&seller, &BytesN::from_array(&env, &[21u8; 32]));
+        let ip_id_2 = registry.commit_ip(&seller, &BytesN::from_array(&env, &[22u8; 32]));
+
+        let token_id = setup_token(&env, &admin, &buyer, 5000);
+        let client = AtomicSwapClient::new(&env, &setup_swap(&env, &registry_id));
+
+        let ip_ids = soroban_sdk::vec![&env, ip_id_0, ip_id_1, ip_id_2];
+        let prices = soroban_sdk::vec![&env, 100_i128, 200_i128, 300_i128];
+
+        let swap_ids = client.batch_initiate_swap(&token_id, &ip_ids, &seller, &prices, &buyer, &0_u32, &None);
+
+        for i in 0..swap_ids.len() {
+            let swap = client.get_swap(&swap_ids.get(i).unwrap()).unwrap();
+            assert_eq!(swap.status, SwapStatus::Pending);
+            assert_eq!(swap.seller, seller);
+            assert_eq!(swap.buyer, buyer);
+        }
+    }
+
+    // ── #311: Referral rewards ────────────────────────────────────────────────
+
+    #[test]
+    fn test_referral_reward_paid_on_reveal() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let referrer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        let (registry_id, ip_id, secret, blinding_factor) = setup_registry(&env, &seller);
+        let price = 1000_i128;
+        let token_id = setup_token(&env, &admin, &buyer, price);
+        let token_client = TokenClient::new(&env, &token_id);
+
+        let contract_id = setup_swap(&env, &registry_id);
+        let client = AtomicSwapClient::new(&env, &contract_id);
+
+        // 100 bps protocol fee, 50 bps referral fee
+        client.admin_set_protocol_config(&100_u32, &treasury, &86400u64, &2_592_000u64, &50_u32);
+
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &price, &buyer, &0_u32, &Some(referrer.clone()));
+        client.accept_swap(&swap_id);
+        client.reveal_key(&swap_id, &seller, &secret, &blinding_factor);
+
+        // protocol fee = 1000 * 100 / 10000 = 10
+        // referral fee = 1000 * 50 / 10000 = 5
+        // seller gets = 1000 - 10 - 5 = 985
+        assert_eq!(token_client.balance(&referrer), 5);
+        assert_eq!(token_client.balance(&treasury), 10);
+        assert_eq!(token_client.balance(&seller), 985);
+    }
+
+    #[test]
+    fn test_no_referral_reward_when_referrer_is_none() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        let (registry_id, ip_id, secret, blinding_factor) = setup_registry(&env, &seller);
+        let price = 1000_i128;
+        let token_id = setup_token(&env, &admin, &buyer, price);
+        let token_client = TokenClient::new(&env, &token_id);
+
+        let contract_id = setup_swap(&env, &registry_id);
+        let client = AtomicSwapClient::new(&env, &contract_id);
+
+        // 100 bps protocol fee, 50 bps referral fee — but no referrer set
+        client.admin_set_protocol_config(&100_u32, &treasury, &86400u64, &2_592_000u64, &50_u32);
+
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &price, &buyer, &0_u32, &None);
+        client.accept_swap(&swap_id);
+        client.reveal_key(&swap_id, &seller, &secret, &blinding_factor);
+
+        // seller gets = 1000 - 10 = 990 (no referral deduction)
+        assert_eq!(token_client.balance(&treasury), 10);
+        assert_eq!(token_client.balance(&seller), 990);
+    }
+
+    #[test]
+    fn test_referral_stored_in_swap_record() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let referrer = Address::generate(&env);
+        let admin = Address::generate(&env);
+
+        let (registry_id, ip_id, _, _) = setup_registry(&env, &seller);
+        let token_id = setup_token(&env, &admin, &buyer, 500);
+
+        let client = AtomicSwapClient::new(&env, &setup_swap(&env, &registry_id));
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &Some(referrer.clone()));
+
+        let swap = client.get_swap(&swap_id).unwrap();
+        assert_eq!(swap.referrer, Some(referrer));
+    }
 }
+

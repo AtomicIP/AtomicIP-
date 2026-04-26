@@ -1,9 +1,14 @@
 use axum::{routing::get, routing::post, Router};
-use axum::middleware;
+use axum::body::Body;
+use axum::http::StatusCode;
+use axum::middleware::{self, Next};
+use axum::response::Response;
+use axum::extract::Request;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
 mod auth;
+mod cache;
 mod handlers;
 mod metrics;
 mod schemas;
@@ -23,6 +28,7 @@ mod webhook;
         handlers::verify_commitment,
         handlers::list_ip_by_owner,
         handlers::initiate_swap,
+        handlers::batch_initiate_swap,
         handlers::accept_swap,
         handlers::reveal_key,
         handlers::cancel_swap,
@@ -39,6 +45,8 @@ mod webhook;
         schemas::VerifyCommitmentResponse,
         schemas::ListIpByOwnerResponse,
         schemas::InitiateSwapRequest,
+        schemas::BatchInitiateSwapRequest,
+        schemas::BatchInitiateSwapResponse,
         schemas::AcceptSwapRequest,
         schemas::RevealKeyRequest,
         schemas::CancelSwapRequest,
@@ -87,6 +95,7 @@ async fn main() {
         .route("/ip/verify", post(handlers::verify_commitment))
         .route("/ip/owner/{owner}", get(handlers::list_ip_by_owner))
         .route("/swap/initiate", post(handlers::initiate_swap))
+        .route("/swap/batch-initiate", post(handlers::batch_initiate_swap))
         .route("/swap/{swap_id}/accept", post(handlers::accept_swap))
         .route("/swap/{swap_id}/reveal", post(handlers::reveal_key))
         .route("/swap/{swap_id}/cancel", post(handlers::cancel_swap))
@@ -109,6 +118,7 @@ fn build_app() -> Router {
         .route("/ip/verify", post(handlers::verify_commitment))
         .route("/ip/owner/{owner}", get(handlers::list_ip_by_owner))
         .route("/swap/initiate", post(handlers::initiate_swap))
+        .route("/swap/batch-initiate", post(handlers::batch_initiate_swap))
         .route("/swap/{swap_id}/accept", post(handlers::accept_swap))
         .route("/swap/{swap_id}/reveal", post(handlers::reveal_key))
         .route("/swap/{swap_id}/cancel", post(handlers::cancel_swap))
@@ -214,5 +224,118 @@ mod tests {
         assert_eq!(spec["info"]["title"], "Atomic Patent API");
         assert!(spec["paths"].is_object());
         assert!(spec["components"]["schemas"].is_object());
+    }
+
+    // ── #317: Pagination tests ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_list_ip_by_owner_returns_paginated_response() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/ip/owner/GADDR?limit=10&offset=0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["ip_ids"].is_array());
+        assert!(json["total_count"].is_number());
+        assert!(json["has_more"].is_boolean());
+    }
+
+    #[tokio::test]
+    async fn test_list_ip_by_owner_default_pagination() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/ip/owner/GADDR")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ── #316: Cache-Control header tests ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_get_ip_returns_cache_control_header() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/ip/1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Cache-Control header should be present regardless of hit/miss
+        assert!(resp.headers().contains_key("cache-control"));
+    }
+
+    #[tokio::test]
+    async fn test_get_swap_returns_cache_control_header() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/swap/1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(resp.headers().contains_key("cache-control"));
+    }
+
+    // ── #309: Batch initiate swap validation tests ────────────────────────────
+
+    #[tokio::test]
+    async fn test_batch_initiate_swap_mismatched_lengths_returns_400() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/swap/batch-initiate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"ip_registry_id":"C1","ip_ids":[1,2],"seller":"G1","prices":[100],"buyer":"G2","token":"C2"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["error"].as_str().unwrap().contains("same length"));
+    }
+
+    #[tokio::test]
+    async fn test_batch_initiate_swap_empty_ids_returns_400() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/swap/batch-initiate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"ip_registry_id":"C1","ip_ids":[],"seller":"G1","prices":[],"buyer":"G2","token":"C2"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }

@@ -53,7 +53,7 @@ mod tests {
         let contract_id = setup_swap(&env, &registry_id);
         let client = AtomicSwapClient::new(&env, &contract_id);
 
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &1000_i128, &buyer, &0_u32);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &1000_i128, &buyer, &0_u32, &None);
         assert_eq!(client.get_swap(&swap_id).unwrap().status, SwapStatus::Pending);
 
         client.accept_swap(&swap_id);
@@ -77,7 +77,7 @@ mod tests {
         let contract_id = setup_swap(&env, &registry_id);
         let client = AtomicSwapClient::new(&env, &contract_id);
 
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None);
         client.cancel_swap(&swap_id, &seller);
 
         assert_eq!(client.get_swap(&swap_id).unwrap().status, SwapStatus::Cancelled);
@@ -102,8 +102,8 @@ mod tests {
         let contract_id = setup_swap(&env, &registry_id);
         let client = AtomicSwapClient::new(&env, &contract_id);
 
-        let swap_id_0 = client.initiate_swap(&token_id, &ip_id_0, &seller, &1000_i128, &buyer, &0_u32);
-        let swap_id_1 = client.initiate_swap(&token_id, &ip_id_1, &seller, &1000_i128, &buyer, &0_u32);
+        let swap_id_0 = client.initiate_swap(&token_id, &ip_id_0, &seller, &1000_i128, &buyer, &0_u32, &None);
+        let swap_id_1 = client.initiate_swap(&token_id, &ip_id_1, &seller, &1000_i128, &buyer, &0_u32, &None);
 
         assert_eq!(client.get_swap(&swap_id_0).unwrap().ip_id, ip_id_0);
         assert_eq!(client.get_swap(&swap_id_1).unwrap().ip_id, ip_id_1);
@@ -124,7 +124,7 @@ mod tests {
         let contract_id = setup_swap(&env, &registry_id);
         let client = AtomicSwapClient::new(&env, &contract_id);
 
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None);
 
         assert_eq!(client.get_swap(&swap_id).unwrap().status, SwapStatus::Pending);
     }
