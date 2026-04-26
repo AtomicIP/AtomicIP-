@@ -31,6 +31,12 @@ pub enum ContractError {
     InsufficientPoW = 10,
     InvalidExpiry = 11,
     IpInDispute = 12,
+    /// #348: Co-owner not found in ownership list.
+    CoOwnerNotFound = 13,
+    /// #348: Invalid ownership percentage (must be 0-100).
+    InvalidOwnershipPercentage = 14,
+    /// #348: Only owner can manage co-owners.
+    OnlyOwnerCanManageCoOwners = 15,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -1029,6 +1035,121 @@ impl IpRegistry {
         }
 
         lineage
+    }
+
+    // ── #348: Fractional Ownership ────────────────────────────────────────────
+
+    /// Add a co-owner with fractional ownership percentage. Owner-only.
+    pub fn add_co_owner(
+        env: Env,
+        ip_id: u64,
+        co_owner: Address,
+        percentage: u32,
+    ) {
+        let record = require_ip_exists(&env, ip_id);
+        record.owner.require_auth();
+
+        if percentage == 0 || percentage > 100 {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::InvalidOwnershipPercentage as u32,
+            ));
+        }
+
+        let mut owners: Vec<OwnershipShare> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IpOwners(ip_id))
+            .unwrap_or(Vec::new(&env));
+
+        // Check if co-owner already exists and update, or add new
+        let mut found = false;
+        for i in 0..owners.len() {
+            let owner = owners.get(i).unwrap();
+            if owner.address == co_owner {
+                owners.set(
+                    i,
+                    OwnershipShare {
+                        address: co_owner.clone(),
+                        percentage,
+                    },
+                );
+                found = true;
+                break;
+            }
+        }
+
+        if !found {
+            owners.push_back(OwnershipShare {
+                address: co_owner.clone(),
+                percentage,
+            });
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::IpOwners(ip_id), &owners);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::IpOwners(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish(
+            (symbol_short!("co_owner_add"),),
+            CoOwnerAddedEvent {
+                ip_id,
+                co_owner,
+                percentage,
+            },
+        );
+    }
+
+    /// Remove a co-owner. Owner-only.
+    pub fn remove_co_owner(env: Env, ip_id: u64, co_owner: Address) {
+        let record = require_ip_exists(&env, ip_id);
+        record.owner.require_auth();
+
+        let mut owners: Vec<OwnershipShare> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IpOwners(ip_id))
+            .unwrap_or(Vec::new(&env));
+
+        let mut found = false;
+        for i in 0..owners.len() {
+            let owner = owners.get(i).unwrap();
+            if owner.address == co_owner {
+                owners.remove(i);
+                found = true;
+                break;
+            }
+        }
+
+        if !found {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::CoOwnerNotFound as u32,
+            ));
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::IpOwners(ip_id), &owners);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::IpOwners(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish(
+            (symbol_short!("co_owner_rm"),),
+            CoOwnerRemovedEvent { ip_id, co_owner },
+        );
+    }
+
+    /// Get all owners with their ownership percentages.
+    pub fn get_ip_owners(env: Env, ip_id: u64) -> Vec<OwnershipShare> {
+        require_ip_exists(&env, ip_id);
+
+        env.storage()
+            .persistent()
+            .get(&DataKey::IpOwners(ip_id))
+            .unwrap_or(Vec::new(&env))
     }
 }
 

@@ -83,6 +83,20 @@ pub enum ContractError {
     UpgradeErrorCodeChanged = 33,
     /// A storage key present in the current schema is missing from the new schema.
     UpgradeMissingStorageKey = 34,
+
+    // ── #347: Auction errors (39-44) ──────────────────────────────────────────
+    /// Auction not found.
+    AuctionNotFound = 39,
+    /// Active auction already exists for this IP.
+    ActiveAuctionAlreadyExists = 40,
+    /// Bid amount must be greater than or equal to minimum bid.
+    BidBelowMinimum = 41,
+    /// Bid amount must be greater than current highest bid.
+    BidNotHigherThanCurrent = 42,
+    /// Auction has not ended yet.
+    AuctionNotEnded = 43,
+    /// Auction has already been finalized.
+    AuctionAlreadyFinalized = 44,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -1462,6 +1476,285 @@ impl AtomicSwap {
         }
 
         swap_ids
+    }
+
+    // ── #347: IP Auction Mechanism ────────────────────────────────────────────
+
+    /// Seller starts an auction for their IP. Returns the auction ID.
+    pub fn start_ip_auction(
+        env: Env,
+        token: Address,
+        ip_id: u64,
+        seller: Address,
+        min_bid: i128,
+        duration_seconds: u64,
+    ) -> u64 {
+        require_not_paused(&env);
+        seller.require_auth();
+
+        require_positive_price(&env, min_bid);
+        registry::ensure_seller_owns_active_ip(&env, ip_id, &seller);
+
+        // Check no active auction exists
+        if env.storage().persistent().has(&DataKey::ActiveAuction(ip_id)) {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::ActiveAuctionAlreadyExists as u32,
+            ));
+        }
+
+        let auction_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NextAuctionId)
+            .unwrap_or(0);
+
+        let start_time = env.ledger().timestamp();
+        let end_time = start_time + duration_seconds;
+
+        let auction = AuctionRecord {
+            auction_id,
+            ip_id,
+            seller: seller.clone(),
+            token: token.clone(),
+            min_bid,
+            highest_bid: 0,
+            highest_bidder: None,
+            start_time,
+            end_time,
+            finalized: false,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Auction(auction_id), &auction);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Auction(auction_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ActiveAuction(ip_id), &auction_id);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::ActiveAuction(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::NextAuctionId, &(auction_id + 1));
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::NextAuctionId, LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("auction_start"),),
+            AuctionStartedEvent {
+                auction_id,
+                ip_id,
+                seller,
+                min_bid,
+                end_time,
+            },
+        );
+
+        auction_id
+    }
+
+    /// Place a bid on an active auction.
+    pub fn place_bid(env: Env, auction_id: u64, bidder: Address, bid_amount: i128) {
+        bidder.require_auth();
+
+        let mut auction: AuctionRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Auction(auction_id))
+            .unwrap_or_else(|| {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::AuctionNotFound as u32,
+                ));
+                unreachable!()
+            });
+
+        if auction.finalized {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::AuctionAlreadyFinalized as u32,
+            ));
+        }
+
+        if env.ledger().timestamp() >= auction.end_time {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::AuctionNotEnded as u32,
+            ));
+        }
+
+        if bid_amount < auction.min_bid {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::BidBelowMinimum as u32,
+            ));
+        }
+
+        if bid_amount <= auction.highest_bid {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::BidNotHigherThanCurrent as u32,
+            ));
+        }
+
+        // Refund previous highest bidder if exists
+        if let Some(ref prev_bidder) = auction.highest_bidder {
+            token::Client::new(&env, &auction.token).transfer(
+                &env.current_contract_address(),
+                prev_bidder,
+                &auction.highest_bid,
+            );
+        }
+
+        // Transfer new bid to contract
+        token::Client::new(&env, &auction.token).transfer(
+            &bidder,
+            &env.current_contract_address(),
+            &bid_amount,
+        );
+
+        auction.highest_bid = bid_amount;
+        auction.highest_bidder = Some(bidder.clone());
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Auction(auction_id), &auction);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Auction(auction_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("bid_placed"),),
+            BidPlacedEvent {
+                auction_id,
+                bidder,
+                bid_amount,
+            },
+        );
+    }
+
+    /// Finalize an auction after it ends. Creates a swap with the winning bid.
+    pub fn finalize_auction(env: Env, auction_id: u64) {
+        let mut auction: AuctionRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Auction(auction_id))
+            .unwrap_or_else(|| {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::AuctionNotFound as u32,
+                ));
+                unreachable!()
+            });
+
+        if auction.finalized {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::AuctionAlreadyFinalized as u32,
+            ));
+        }
+
+        if env.ledger().timestamp() < auction.end_time {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::AuctionNotEnded as u32,
+            ));
+        }
+
+        auction.finalized = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Auction(auction_id), &auction);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Auction(auction_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        // Remove active auction lock
+        env.storage()
+            .persistent()
+            .remove(&DataKey::ActiveAuction(auction.ip_id));
+
+        let winning_bid = auction.highest_bid;
+        let winner = auction.highest_bidder.clone();
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("auction_final"),),
+            AuctionFinalizedEvent {
+                auction_id,
+                winner: winner.clone(),
+                winning_bid,
+            },
+        );
+
+        // If there's a winner, create a swap automatically
+        if let Some(buyer) = winner {
+            let swap_id: u64 = env
+                .storage()
+                .instance()
+                .get(&DataKey::NextId)
+                .unwrap_or(0);
+
+            let swap = SwapRecord {
+                ip_id: auction.ip_id,
+                seller: auction.seller.clone(),
+                buyer: buyer.clone(),
+                price: winning_bid,
+                token: auction.token.clone(),
+                status: SwapStatus::Accepted,
+                expiry: env.ledger().timestamp() + 604800u64,
+                accept_timestamp: env.ledger().timestamp(),
+                required_approvals: 0,
+                dispute_timestamp: 0,
+                referrer: None,
+            };
+
+            env.storage()
+                .persistent()
+                .set(&DataKey::Swap(swap_id), &swap);
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::Swap(swap_id), LEDGER_BUMP, LEDGER_BUMP);
+
+            swap::append_swap_for_party(&env, &auction.seller, &buyer, swap_id);
+
+            let mut ip_swap_ids: Vec<u64> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::IpSwaps(auction.ip_id))
+                .unwrap_or(Vec::new(&env));
+            ip_swap_ids.push_back(swap_id);
+            env.storage()
+                .persistent()
+                .set(&DataKey::IpSwaps(auction.ip_id), &ip_swap_ids);
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::IpSwaps(auction.ip_id), LEDGER_BUMP, LEDGER_BUMP);
+
+            Self::append_history(&env, swap_id, SwapStatus::Accepted);
+            env.storage().instance().set(&DataKey::NextId, &(swap_id + 1));
+
+            env.events().publish(
+                (soroban_sdk::symbol_short!("swap_init"),),
+                SwapInitiatedEvent {
+                    swap_id,
+                    ip_id: auction.ip_id,
+                    seller: auction.seller,
+                    buyer,
+                    price: winning_bid,
+                },
+            );
+        }
+    }
+
+    /// Get auction details.
+    pub fn get_auction(env: Env, auction_id: u64) -> AuctionRecord {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Auction(auction_id))
+            .unwrap_or_else(|| {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::AuctionNotFound as u32,
+                ));
+                unreachable!()
+            })
     }
 }
 

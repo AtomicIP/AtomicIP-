@@ -23,6 +23,8 @@ pub enum DataKey {
     CategoryIps(BytesN<32>), // maps category hash -> Vec<u64> of IP IDs
     IpLineage(u64), // stores parent_ip_id for versioning
     IpVersions(u64), // stores Vec<u64> of all version IDs for a given IP
+    /// #348: Maps ip_id → Vec<(Address, u32)> for fractional ownership (address, percentage)
+    IpOwners(u64),
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -37,4 +39,26 @@ pub struct IpRecord {
     pub revoked: bool,
     pub co_owners: soroban_sdk::Vec<Address>,
     pub parent_ip_id: Option<u64>, // parent IP ID for versioning
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct OwnershipShare {
+    pub address: Address,
+    pub percentage: u32, // 0-100, sum of all should be 100
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CoOwnerAddedEvent {
+    pub ip_id: u64,
+    pub co_owner: Address,
+    pub percentage: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CoOwnerRemovedEvent {
+    pub ip_id: u64,
+    pub co_owner: Address,
 }
