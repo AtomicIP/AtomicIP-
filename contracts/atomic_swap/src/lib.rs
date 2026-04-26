@@ -97,6 +97,16 @@ pub enum ContractError {
     AuctionNotEnded = 43,
     /// Auction has already been finalized.
     AuctionAlreadyFinalized = 44,
+
+    // ── #349: Payment schedule errors (45-48) ────────────────────────────────
+    /// Payment schedule not found for this swap.
+    PaymentScheduleNotFound = 45,
+    /// Payment index out of bounds.
+    PaymentIndexOutOfBounds = 46,
+    /// Payment already made for this index.
+    PaymentAlreadyMade = 47,
+    /// Payment not yet due.
+    PaymentNotYetDue = 48,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -1755,6 +1765,228 @@ impl AtomicSwap {
                 ));
                 unreachable!()
             })
+    }
+
+    // ── #349: Scheduled Payment Support ───────────────────────────────────────
+
+    /// Initiate a swap with a payment schedule. Seller-only.
+    pub fn initiate_swap_with_schedule(
+        env: Env,
+        token: Address,
+        ip_id: u64,
+        seller: Address,
+        schedule: Vec<PaymentSchedule>,
+        buyer: Address,
+    ) -> u64 {
+        require_not_paused(&env);
+        seller.require_auth();
+
+        if schedule.is_empty() {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::PriceMustBeGreaterThanZero as u32,
+            ));
+        }
+
+        // Calculate total price from schedule
+        let mut total_price: i128 = 0;
+        for payment in schedule.iter() {
+            total_price = total_price.saturating_add(payment.amount);
+        }
+
+        require_positive_price(&env, total_price);
+        registry::ensure_seller_owns_active_ip(&env, ip_id, &seller);
+        require_no_active_swap(&env, ip_id);
+
+        let id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(0);
+
+        let swap = SwapRecord {
+            ip_id,
+            seller: seller.clone(),
+            buyer: buyer.clone(),
+            price: total_price,
+            token: token.clone(),
+            status: SwapStatus::Pending,
+            expiry: env.ledger().timestamp() + 604800u64,
+            accept_timestamp: 0,
+            required_approvals: 0,
+            dispute_timestamp: 0,
+            referrer: None,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Swap(id), &swap);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Swap(id), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ActiveSwap(ip_id), &id);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::ActiveSwap(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        // Store payment schedule
+        env.storage()
+            .persistent()
+            .set(&DataKey::PaymentSchedule(id), &schedule);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::PaymentSchedule(id), LEDGER_BUMP, LEDGER_BUMP);
+
+        // Initialize payments tracking (all false initially)
+        let mut payments_made: Vec<bool> = Vec::new(&env);
+        for _ in 0..schedule.len() {
+            payments_made.push_back(false);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::PaymentsMade(id), &payments_made);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::PaymentsMade(id), LEDGER_BUMP, LEDGER_BUMP);
+
+        swap::append_swap_for_party(&env, &seller, &buyer, id);
+
+        let mut ip_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IpSwaps(ip_id))
+            .unwrap_or(Vec::new(&env));
+        ip_ids.push_back(id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::IpSwaps(ip_id), &ip_ids);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::IpSwaps(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        Self::append_history(&env, id, SwapStatus::Pending);
+        env.storage().instance().set(&DataKey::NextId, &(id + 1));
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("swap_init"),),
+            SwapInitiatedEvent {
+                swap_id: id,
+                ip_id,
+                seller,
+                buyer,
+                price: total_price,
+            },
+        );
+
+        id
+    }
+
+    /// Make a scheduled payment. Buyer-only.
+    pub fn make_scheduled_payment(env: Env, swap_id: u64, payment_index: u32) {
+        let mut swap = require_swap_exists(&env, swap_id);
+        swap.buyer.require_auth();
+
+        let schedule: Vec<PaymentSchedule> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PaymentSchedule(swap_id))
+            .unwrap_or_else(|| {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::PaymentScheduleNotFound as u32,
+                ));
+                unreachable!()
+            });
+
+        if (payment_index as usize) >= schedule.len() {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::PaymentIndexOutOfBounds as u32,
+            ));
+        }
+
+        let mut payments_made: Vec<bool> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PaymentsMade(swap_id))
+            .unwrap_or(Vec::new(&env));
+
+        if payments_made.get(payment_index as usize).unwrap_or(false) {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::PaymentAlreadyMade as u32,
+            ));
+        }
+
+        let payment = schedule.get(payment_index as usize).unwrap();
+        if env.ledger().timestamp() < payment.due_timestamp {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::PaymentNotYetDue as u32,
+            ));
+        }
+
+        // Transfer payment
+        token::Client::new(&env, &swap.token).transfer(
+            &swap.buyer,
+            &env.current_contract_address(),
+            &payment.amount,
+        );
+
+        // Mark payment as made
+        payments_made.set(payment_index as usize, true);
+        env.storage()
+            .persistent()
+            .set(&DataKey::PaymentsMade(swap_id), &payments_made);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::PaymentsMade(swap_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        // Check if all payments are made
+        let mut all_paid = true;
+        for i in 0..payments_made.len() {
+            if !payments_made.get(i).unwrap_or(false) {
+                all_paid = false;
+                break;
+            }
+        }
+
+        // If all payments made, transition to Accepted
+        if all_paid {
+            swap.status = SwapStatus::Accepted;
+            swap.accept_timestamp = env.ledger().timestamp();
+            swap::save_swap(&env, swap_id, &swap);
+            Self::append_history(&env, swap_id, SwapStatus::Accepted);
+
+            env.events().publish(
+                (soroban_sdk::symbol_short!("swap_acpt"),),
+                SwapAcceptedEvent {
+                    swap_id,
+                    buyer: swap.buyer.clone(),
+                },
+            );
+        }
+
+        let remaining = (schedule.len() as u32) - (payment_index + 1);
+        env.events().publish(
+            (soroban_sdk::symbol_short!("sched_pay"),),
+            ScheduledPaymentMadeEvent {
+                swap_id,
+                payment_index,
+                amount: payment.amount,
+                remaining_payments: remaining,
+            },
+        );
+    }
+
+    /// Get payment schedule for a swap.
+    pub fn get_payment_schedule(env: Env, swap_id: u64) -> Vec<PaymentSchedule> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PaymentSchedule(swap_id))
+            .unwrap_or(Vec::new(&env))
+    }
+
+    /// Get payment status for a swap.
+    pub fn get_payments_made(env: Env, swap_id: u64) -> Vec<bool> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PaymentsMade(swap_id))
+            .unwrap_or(Vec::new(&env))
     }
 }
 

@@ -50,6 +50,10 @@ pub enum DataKey {
     AuctionBids(u64),
     /// #347: Next auction ID counter.
     NextAuctionId,
+    /// #349: Maps swap_id → Vec<PaymentSchedule> for scheduled payments.
+    PaymentSchedule(u64),
+    /// #349: Maps swap_id → Vec<bool> tracking which payments have been made.
+    PaymentsMade(u64),
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -264,4 +268,22 @@ pub struct AuctionFinalizedEvent {
     pub auction_id: u64,
     pub winner: Option<Address>,
     pub winning_bid: i128,
+}
+
+// ── #349: Payment Schedule Types ──────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone)]
+pub struct PaymentSchedule {
+    pub due_timestamp: u64,
+    pub amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScheduledPaymentMadeEvent {
+    pub swap_id: u64,
+    pub payment_index: u32,
+    pub amount: i128,
+    pub remaining_payments: u32,
 }
