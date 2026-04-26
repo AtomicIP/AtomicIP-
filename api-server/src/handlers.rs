@@ -427,3 +427,85 @@ pub async fn unregister_webhook(Path(id): Path<String>) -> Result<StatusCode, (S
         ))
     }
 }
+
+// ── Bulk Operations ───────────────────────────────────────────────────────────
+
+/// Commit multiple IP records in a single request (#321).
+#[utoipa::path(
+    post,
+    path = "/v1/bulk/commit-ip",
+    tag = "IP Registry",
+    request_body = BulkCommitIpRequest,
+    responses(
+        (status = 200, description = "Bulk commit completed with individual results", body = BulkCommitIpResponse),
+        (status = 400, description = "Invalid request (empty hashes, etc.)", body = ErrorResponse),
+    )
+)]
+#[instrument(skip(body))]
+pub async fn bulk_commit_ip(Json(body): Json<BulkCommitIpRequest>) -> Result<Json<BulkCommitIpResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if body.commitment_hashes.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "commitment_hashes must not be empty".to_string(),
+            }),
+        ));
+    }
+
+    let mut results = Vec::new();
+    for (index, hash) in body.commitment_hashes.iter().enumerate() {
+        // TODO: Call Soroban RPC to invoke ip_registry.commit_ip
+        results.push(BulkOperationResult {
+            index,
+            success: false,
+            data: None,
+            error: Some("bulk_commit_ip not yet implemented".to_string()),
+        });
+    }
+
+    Ok(Json(BulkCommitIpResponse { results }))
+}
+
+/// Initiate multiple swaps in a single request (#321).
+#[utoipa::path(
+    post,
+    path = "/v1/bulk/initiate-swap",
+    tag = "Atomic Swap",
+    request_body = BulkInitiateSwapRequest,
+    responses(
+        (status = 200, description = "Bulk swap initiation completed with individual results", body = BulkInitiateSwapResponse),
+        (status = 400, description = "Validation error (mismatched lengths, empty arrays, etc.)", body = ErrorResponse),
+    )
+)]
+#[instrument(skip(body))]
+pub async fn bulk_initiate_swap(Json(body): Json<BulkInitiateSwapRequest>) -> Result<Json<BulkInitiateSwapResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if body.ip_ids.len() != body.prices.len() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "ip_ids and prices must have the same length".to_string(),
+            }),
+        ));
+    }
+    if body.ip_ids.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "ip_ids must not be empty".to_string(),
+            }),
+        ));
+    }
+
+    let mut results = Vec::new();
+    for (index, ip_id) in body.ip_ids.iter().enumerate() {
+        // TODO: Call Soroban RPC to invoke atomic_swap.initiate_swap
+        results.push(BulkOperationResult {
+            index,
+            success: false,
+            data: None,
+            error: Some("bulk_initiate_swap not yet implemented".to_string()),
+        });
+    }
+
+    Ok(Json(BulkInitiateSwapResponse { results }))
+}

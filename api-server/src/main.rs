@@ -40,6 +40,8 @@ mod webhook;
         handlers::get_swap,
         handlers::register_webhook,
         handlers::unregister_webhook,
+        handlers::bulk_commit_ip,
+        handlers::bulk_initiate_swap,
     ),
     components(schemas(
         schemas::CommitIpRequest,
@@ -60,6 +62,11 @@ mod webhook;
         schemas::ErrorResponse,
         schemas::RegisterWebhookRequest,
         schemas::WebhookResponse,
+        schemas::BulkCommitIpRequest,
+        schemas::BulkCommitIpResponse,
+        schemas::BulkInitiateSwapRequest,
+        schemas::BulkInitiateSwapResponse,
+        schemas::BulkOperationResult,
     )),
     tags(
         (name = "IP Registry", description = "Commit and query intellectual property records"),
@@ -116,6 +123,8 @@ async fn main() {
         .route("/v1/swap/:swap_id/cancel", post(handlers::cancel_swap))
         .route("/v1/swap/:swap_id/cancel-expired", post(handlers::cancel_expired_swap))
         .route("/v1/swap/:swap_id", get(handlers::get_swap))
+        .route("/v1/bulk/commit-ip", post(handlers::bulk_commit_ip))
+        .route("/v1/bulk/initiate-swap", post(handlers::bulk_initiate_swap))
         .with_state(schema)
         .layer(middleware::from_fn(tracing_middleware::trace_requests))
         .layer(middleware::from_fn(versioning::version_negotiation))
@@ -145,6 +154,8 @@ fn build_app() -> Router {
         .route("/v1/swap/:swap_id/cancel", post(handlers::cancel_swap))
         .route("/v1/swap/:swap_id/cancel-expired", post(handlers::cancel_expired_swap))
         .route("/v1/swap/:swap_id", get(handlers::get_swap))
+        .route("/v1/bulk/commit-ip", post(handlers::bulk_commit_ip))
+        .route("/v1/bulk/initiate-swap", post(handlers::bulk_initiate_swap))
         .with_state(schema)
         .layer(middleware::from_fn(tracing_middleware::trace_requests))
         .layer(middleware::from_fn(versioning::version_negotiation))
@@ -454,5 +465,83 @@ mod tests {
             resp.headers().get("X-Trace-ID").unwrap().to_str().unwrap(),
             original_trace_id
         );
+    }
+
+    // ── #321: Bulk operations tests ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_bulk_commit_ip_empty_hashes_returns_400() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/bulk/commit-ip")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"owner":"GADDR","commitment_hashes":[]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_bulk_commit_ip_returns_results() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/bulk/commit-ip")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"owner":"GADDR","commitment_hashes":["abc123","def456"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["results"].is_array());
+        assert_eq!(json["results"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_bulk_initiate_swap_mismatched_lengths_returns_400() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/bulk/initiate-swap")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"ip_registry_id":"C1","ip_ids":[1,2],"seller":"G1","prices":[100],"buyer":"G2","token":"C2"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_bulk_initiate_swap_returns_results() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/bulk/initiate-swap")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"ip_registry_id":"C1","ip_ids":[1,2],"seller":"G1","prices":[100,200],"buyer":"G2","token":"C2"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["results"].is_array());
+        assert_eq!(json["results"].as_array().unwrap().len(), 2);
     }
 }
