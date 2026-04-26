@@ -45,4 +45,10 @@ pub enum ContractError {
     UpgradeMissingErrorCode               = 32,
     UpgradeErrorCodeChanged               = 33,
     UpgradeMissingStorageKey              = 34,
+    // #314: Arbitration errors
+    ArbitratorAlreadySet                  = 35,
+    NotArbitrator                         = 36,
+    NoArbitratorSet                       = 37,
+    // #313: Dispute evidence errors
+    UnauthorizedEvidenceSubmitter         = 38,
 }

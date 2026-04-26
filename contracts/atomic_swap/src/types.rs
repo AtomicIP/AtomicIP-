@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address};
+use soroban_sdk::{contracttype, Address, BytesN, Vec};
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
 
@@ -40,6 +40,10 @@ pub enum DataKey {
     SupportedTokens,
     /// On-chain interface manifest used by validate_upgrade.
     ContractSchema,
+    /// #314: Maps swap_id → arbitrator Address.
+    Arbitrator(u64),
+    /// #313: Maps swap_id → Vec<BytesN<32>> of evidence hashes.
+    DisputeEvidence(u64),
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -71,6 +75,11 @@ pub struct SwapRecord {
     pub required_approvals: u32,
     /// Ledger timestamp when a dispute was raised. Zero if no dispute.
     pub dispute_timestamp: u64,
+    /// #314: Optional neutral third-party arbitrator address.
+    pub arbitrator: Option<Address>,
+    /// #312: Volume discount tiers as (min_quantity, price_per_unit).
+    /// Sorted ascending by quantity. Empty means flat price.
+    pub price_tiers: Vec<(u32, i128)>,
 }
 
 // ── Events ────────────────────────────────────────────────────────────────────
@@ -170,4 +179,31 @@ pub struct SwapApprovedEvent {
     pub swap_id: u64,
     pub approver: Address,
     pub approvals_count: u32,
+}
+
+// ── #314: Arbitration Events ──────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ArbitratorSetEvent {
+    pub swap_id: u64,
+    pub arbitrator: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ArbitratedEvent {
+    pub swap_id: u64,
+    pub arbitrator: Address,
+    pub refunded: bool,
+}
+
+// ── #313: Dispute Evidence Event ──────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DisputeEvidenceSubmittedEvent {
+    pub swap_id: u64,
+    pub submitter: Address,
+    pub evidence_hash: BytesN<32>,
 }
