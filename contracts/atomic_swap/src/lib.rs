@@ -4,6 +4,7 @@ mod swap;
 mod upgrade;
 mod utils;
 mod multi_currency;
+mod types;
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token,
@@ -11,6 +12,7 @@ use soroban_sdk::{
 };
 
 pub use upgrade::{build_v1_schema, ContractSchema, ErrorEntry, FunctionEntry};
+pub use types::*;
 
 mod validation;
 use validation::*;
@@ -2087,6 +2089,200 @@ impl AtomicSwap {
             .persistent()
             .get(&DataKey::SwapCollateral(swap_id))
             .unwrap_or(0)
+    }
+
+    // ── #355: Arbitration by Third Party ──────────────────────────────────────
+
+    /// Request arbitration for a disputed swap. Buyer or seller only.
+    pub fn request_arbitration(
+        env: Env,
+        swap_id: u64,
+        requester: Address,
+        evidence_hash: BytesN<32>,
+    ) {
+        let swap = require_swap_exists(&env, swap_id);
+        requester.require_auth();
+
+        // Only buyer or seller can request arbitration
+        if requester != swap.buyer && requester != swap.seller {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::Unauthorized as u32,
+            ));
+        }
+
+        // Swap must be in Disputed state
+        require_swap_status(
+            &env,
+            &swap,
+            SwapStatus::Disputed,
+            ContractError::SwapNotDisputed,
+        );
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("arb_req"),),
+            ArbitrationRequestedEvent {
+                swap_id,
+                requester,
+                evidence_hash,
+            },
+        );
+    }
+
+    /// Set arbitrator for a swap. Called by admin or designated arbitrator.
+    pub fn set_arbitrator(env: Env, swap_id: u64, arbitrator: Address) {
+        let swap = require_swap_exists(&env, swap_id);
+
+        // Check if arbitrator already set
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::SwapArbitrator(swap_id))
+        {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::ArbitratorAlreadySet as u32,
+            ));
+        }
+
+        // Store arbitrator
+        env.storage()
+            .persistent()
+            .set(&DataKey::SwapArbitrator(swap_id), &arbitrator);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::SwapArbitrator(swap_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("arb_set"),),
+            ArbitratorSetEvent {
+                swap_id,
+                arbitrator,
+            },
+        );
+    }
+
+    /// Arbitrate a swap. Arbitrator-only. Decides to refund or complete.
+    pub fn arbitrate_swap(env: Env, swap_id: u64, arbitrator: Address, refund: bool) {
+        let mut swap = require_swap_exists(&env, swap_id);
+        arbitrator.require_auth();
+
+        // Verify arbitrator is set and matches
+        let stored_arbitrator: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SwapArbitrator(swap_id))
+            .unwrap_or_else(|| {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::NoArbitratorSet as u32,
+                ))
+            });
+
+        if arbitrator != stored_arbitrator {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::NotArbitrator as u32,
+            ));
+        }
+
+        let token_client = token::Client::new(&env, &swap.token);
+
+        if refund {
+            // Refund buyer
+            token_client.transfer(
+                &env.current_contract_address(),
+                &swap.buyer,
+                &swap.price,
+            );
+
+            // Refund collateral if present
+            if swap.collateral_amount > 0 {
+                if let Some(collateral) = env
+                    .storage()
+                    .persistent()
+                    .get::<_, i128>(&DataKey::SwapCollateral(swap_id))
+                {
+                    token_client.transfer(
+                        &env.current_contract_address(),
+                        &swap.buyer,
+                        &collateral,
+                    );
+                    env.storage()
+                        .persistent()
+                        .remove(&DataKey::SwapCollateral(swap_id));
+                }
+            }
+
+            swap.status = SwapStatus::Cancelled;
+        } else {
+            // Complete the swap
+            swap.status = SwapStatus::Completed;
+
+            // Release collateral to seller
+            if swap.collateral_amount > 0 {
+                if let Some(collateral) = env
+                    .storage()
+                    .persistent()
+                    .get::<_, i128>(&DataKey::SwapCollateral(swap_id))
+                {
+                    token_client.transfer(
+                        &env.current_contract_address(),
+                        &swap.seller,
+                        &collateral,
+                    );
+                    env.storage()
+                        .persistent()
+                        .remove(&DataKey::SwapCollateral(swap_id));
+
+                    env.events().publish(
+                        (soroban_sdk::symbol_short!("coll_rel"),),
+                        CollateralReleasedEvent {
+                            swap_id,
+                            buyer: swap.buyer.clone(),
+                            collateral_amount: collateral,
+                        },
+                    );
+                }
+            }
+
+            // Release payment to seller
+            let config = Self::protocol_config(&env);
+            let fee_bps = config.protocol_fee_bps as i128;
+            let fee_amount = if fee_bps > 0 && swap.price > 0 {
+                (swap.price * fee_bps) / 10000
+            } else {
+                0
+            };
+
+            let seller_amount = swap.price - fee_amount;
+            token_client.transfer(
+                &env.current_contract_address(),
+                &swap.seller,
+                &seller_amount,
+            );
+
+            if fee_amount > 0 {
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &config.treasury,
+                    &fee_amount,
+                );
+            }
+        }
+
+        swap::save_swap(&env, swap_id, &swap);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::ActiveSwap(swap.ip_id));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::SwapArbitrator(swap_id));
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("arb_dec"),),
+            ArbitratedEvent {
+                swap_id,
+                arbitrator,
+                refunded: refund,
+            },
+        );
     }
 }
 
