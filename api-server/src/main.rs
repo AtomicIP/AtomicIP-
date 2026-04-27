@@ -157,6 +157,7 @@ fn build_app() -> Router {
     let health_checker = Arc::new(health::HealthChecker::new());
     Router::new()
         .route("/health", get(health::health_handler))
+        .route("/version", get(versioning::get_version_info))
         .route("/v1/graphql", post(graphql_handler))
         .route("/v1/ip/commit", post(handlers::commit_ip))
         .route("/v1/ip/:ip_id", get(handlers::get_ip))
@@ -603,4 +604,77 @@ mod tests {
         assert!(json["components"]["contract_connectivity"]["latency_ms"].is_number());
         assert!(json["components"]["database"]["status"].is_string());
         assert!(json["components"]["cache"]["status"].is_string());
+    }
+
+    #[tokio::test]
+    async fn test_version_endpoint_returns_version_info() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/version")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["version"], "1.0.0");
+        assert_eq!(json["status"], "stable");
+        assert!(json["supported_versions"].is_array());
+    }
+
+    #[tokio::test]
+    async fn test_version_negotiation_with_accept_version_header() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/ip/1")
+                    .header("Accept-Version", "1.0.0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().contains_key("API-Version"));
+    }
+
+    #[tokio::test]
+    async fn test_version_negotiation_unsupported_version() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/ip/1")
+                    .header("Accept-Version", "2.0.0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_ACCEPTABLE);
+    }
+
+    #[tokio::test]
+    async fn test_version_header_in_response() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/ip/1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(resp.headers().contains_key("API-Version"));
+        assert_eq!(resp.headers().get("API-Version").unwrap(), "1.0.0");
     }
