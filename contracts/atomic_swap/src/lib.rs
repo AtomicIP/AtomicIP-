@@ -117,6 +117,20 @@ pub enum ContractError {
     InsufficientCollateral = 50,
     /// Collateral already deposited for this swap.
     CollateralAlreadyDeposited = 51,
+
+    // ── #359: Reputation errors (52) ─────────────────────────────────────────
+    /// User reputation not found.
+    ReputationNotFound = 52,
+
+    // ── #360: Contingent completion errors (53-54) ──────────────────────────
+    /// Contingency condition not met.
+    ContingencyConditionNotMet = 53,
+    /// Only seller can complete contingent swap.
+    OnlySellerCanCompleteContingent = 54,
+
+    // ── #361: Dispute evidence errors (55) ───────────────────────────────────
+    /// Dispute evidence not found.
+    DisputeEvidenceNotFound = 55,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -441,6 +455,7 @@ impl AtomicSwap {
         required_approvals: u32,
         referrer: Option<Address>,
         collateral_amount: i128,
+        contingency_condition: Option<Vec<u8>>,
     ) -> u64 {
         // Guard: reject new swaps when the contract is paused.
         require_not_paused(&env);
@@ -742,6 +757,9 @@ impl AtomicSwap {
                 );
             }
         }
+
+        // #359: Update reputation on completion
+        reputation::update_reputation_on_completion(&env, &swap.seller, &swap.buyer);
 
         env.events().publish(
             (soroban_sdk::symbol_short!("key_rev"),),
