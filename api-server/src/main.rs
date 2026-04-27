@@ -21,6 +21,9 @@ mod webhook;
 mod websocket;
 mod graphql;
 mod request_signing;
+mod invariants;
+mod health;
+mod compression;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -111,9 +114,11 @@ async fn main() {
 
     let schema = graphql::build_schema();
     let broadcaster = Arc::new(websocket::EventBroadcaster::new());
+    let health_checker = Arc::new(health::HealthChecker::new());
 
     let app = Router::new()
         .merge(SwaggerUi::new("/docs").url("/openapi.json", ApiDoc::openapi()))
+        .route("/health", get(health::health_handler))
         .route("/metrics", get(metrics::metrics_handler))
         .route("/graphql", post(graphql_handler))
         .route("/ws", get(ws_handler))
@@ -129,12 +134,13 @@ async fn main() {
         .route("/swap/{swap_id}/cancel", post(handlers::cancel_swap))
         .route("/swap/{swap_id}/cancel-expired", post(handlers::cancel_expired_swap))
         .route("/swap/{swap_id}", get(handlers::get_swap))
-        .with_state((schema, broadcaster.clone()))
+        .with_state((schema, broadcaster.clone(), health_checker.clone()))
         .layer(middleware::from_fn(metrics::track));
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
     println!("Swagger UI   -> http://localhost:8080/docs");
     println!("OpenAPI JSON -> http://localhost:8080/openapi.json");
+    println!("Health Check -> http://localhost:8080/health");
     println!("Metrics      -> http://localhost:8080/metrics");
     println!("WebSocket    -> ws://localhost:8080/ws");
     axum::serve(listener, app).await.unwrap();
@@ -142,14 +148,17 @@ async fn main() {
 
 async fn ws_handler(
     ws: axum::extract::ws::WebSocketUpgrade,
-    axum::extract::State((_, broadcaster)): axum::extract::State<(graphql::AtomicIpSchema, Arc<websocket::EventBroadcaster>)>,
+    axum::extract::State((_, broadcaster, _)): axum::extract::State<(graphql::AtomicIpSchema, Arc<websocket::EventBroadcaster>, Arc<health::HealthChecker>)>,
 ) -> impl axum::response::IntoResponse {
     ws.on_upgrade(|socket| websocket::handle_socket(socket, broadcaster))
 }
 
 fn build_app() -> Router {
     let schema = graphql::build_schema();
+    let health_checker = Arc::new(health::HealthChecker::new());
     Router::new()
+        .route("/health", get(health::health_handler))
+        .route("/version", get(versioning::get_version_info))
         .route("/v1/graphql", post(graphql_handler))
         .route("/v1/ip/commit", post(handlers::commit_ip))
         .route("/v1/ip/:ip_id", get(handlers::get_ip))
@@ -165,9 +174,10 @@ fn build_app() -> Router {
         .route("/v1/swap/:swap_id", get(handlers::get_swap))
         .route("/v1/bulk/commit-ip", post(handlers::bulk_commit_ip))
         .route("/v1/bulk/initiate-swap", post(handlers::bulk_initiate_swap))
-        .with_state(schema)
+        .with_state((schema, health_checker))
         .layer(middleware::from_fn(tracing_middleware::trace_requests))
         .layer(middleware::from_fn(versioning::version_negotiation))
+        .layer(middleware::from_fn(compression::compression_middleware))
         .layer(middleware::from_fn(require_json_content_type))
 }
 
@@ -553,4 +563,225 @@ mod tests {
         assert!(json["results"].is_array());
         assert_eq!(json["results"].as_array().unwrap().len(), 2);
     }
-}
+
+    #[tokio::test]
+    async fn test_health_check_endpoint_returns_ok() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["status"].is_string());
+        assert!(json["components"].is_object());
+        assert!(json["components"]["contract_connectivity"].is_object());
+        assert!(json["components"]["database"].is_object());
+        assert!(json["components"]["cache"].is_object());
+    }
+
+    #[tokio::test]
+    async fn test_health_check_includes_component_status() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["components"]["contract_connectivity"]["status"].is_string());
+        assert!(json["components"]["contract_connectivity"]["latency_ms"].is_number());
+        assert!(json["components"]["database"]["status"].is_string());
+        assert!(json["components"]["cache"]["status"].is_string());
+    }
+
+    #[tokio::test]
+    async fn test_version_endpoint_returns_version_info() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/version")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["version"], "1.0.0");
+        assert_eq!(json["status"], "stable");
+        assert!(json["supported_versions"].is_array());
+    }
+
+    #[tokio::test]
+    async fn test_version_negotiation_with_accept_version_header() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/ip/1")
+                    .header("Accept-Version", "1.0.0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().contains_key("API-Version"));
+    }
+
+    #[tokio::test]
+    async fn test_version_negotiation_unsupported_version() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/ip/1")
+                    .header("Accept-Version", "2.0.0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_ACCEPTABLE);
+    }
+
+    #[tokio::test]
+    async fn test_version_header_in_response() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/ip/1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(resp.headers().contains_key("API-Version"));
+        assert_eq!(resp.headers().get("API-Version").unwrap(), "1.0.0");
+    }
+
+    #[tokio::test]
+    async fn test_compression_vary_header_present() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/ip/1")
+                    .header("Accept-Encoding", "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(resp.headers().contains_key("Vary"));
+        assert_eq!(resp.headers().get("Vary").unwrap(), "Accept-Encoding");
+    }
+
+    #[tokio::test]
+    async fn test_compression_gzip_encoding_header() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/ip/1")
+                    .header("Accept-Encoding", "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(resp.headers().contains_key("Content-Encoding"));
+        assert_eq!(resp.headers().get("Content-Encoding").unwrap(), "gzip");
+    }
+
+    #[tokio::test]
+    async fn test_compression_brotli_encoding_header() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/ip/1")
+                    .header("Accept-Encoding", "br")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(resp.headers().contains_key("Content-Encoding"));
+        assert_eq!(resp.headers().get("Content-Encoding").unwrap(), "br");
+    }
+
+    #[tokio::test]
+    async fn test_compression_deflate_encoding_header() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/ip/1")
+                    .header("Accept-Encoding", "deflate")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(resp.headers().contains_key("Content-Encoding"));
+        assert_eq!(resp.headers().get("Content-Encoding").unwrap(), "deflate");
+    }
+
+    #[tokio::test]
+    async fn test_compression_no_accept_encoding() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/ip/1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(resp.headers().contains_key("Vary"));
+    }
+
+    #[tokio::test]
+    async fn test_compression_multiple_encodings_prefers_gzip() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/ip/1")
+                    .header("Accept-Encoding", "gzip, br, deflate")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.headers().get("Content-Encoding").unwrap(), "gzip");
+    }
