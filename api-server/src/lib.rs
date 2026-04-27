@@ -46,3 +46,4 @@ pub mod graphql;
 pub mod request_signing;
 pub mod invariants;
 pub mod health;
+pub mod compression;

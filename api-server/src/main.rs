@@ -23,6 +23,7 @@ mod graphql;
 mod request_signing;
 mod invariants;
 mod health;
+mod compression;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -176,6 +177,7 @@ fn build_app() -> Router {
         .with_state((schema, health_checker))
         .layer(middleware::from_fn(tracing_middleware::trace_requests))
         .layer(middleware::from_fn(versioning::version_negotiation))
+        .layer(middleware::from_fn(compression::compression_middleware))
         .layer(middleware::from_fn(require_json_content_type))
 }
 
@@ -677,4 +679,109 @@ mod tests {
             .unwrap();
         assert!(resp.headers().contains_key("API-Version"));
         assert_eq!(resp.headers().get("API-Version").unwrap(), "1.0.0");
+    }
+
+    #[tokio::test]
+    async fn test_compression_vary_header_present() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/ip/1")
+                    .header("Accept-Encoding", "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(resp.headers().contains_key("Vary"));
+        assert_eq!(resp.headers().get("Vary").unwrap(), "Accept-Encoding");
+    }
+
+    #[tokio::test]
+    async fn test_compression_gzip_encoding_header() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/ip/1")
+                    .header("Accept-Encoding", "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(resp.headers().contains_key("Content-Encoding"));
+        assert_eq!(resp.headers().get("Content-Encoding").unwrap(), "gzip");
+    }
+
+    #[tokio::test]
+    async fn test_compression_brotli_encoding_header() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/ip/1")
+                    .header("Accept-Encoding", "br")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(resp.headers().contains_key("Content-Encoding"));
+        assert_eq!(resp.headers().get("Content-Encoding").unwrap(), "br");
+    }
+
+    #[tokio::test]
+    async fn test_compression_deflate_encoding_header() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/ip/1")
+                    .header("Accept-Encoding", "deflate")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(resp.headers().contains_key("Content-Encoding"));
+        assert_eq!(resp.headers().get("Content-Encoding").unwrap(), "deflate");
+    }
+
+    #[tokio::test]
+    async fn test_compression_no_accept_encoding() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/ip/1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(resp.headers().contains_key("Vary"));
+    }
+
+    #[tokio::test]
+    async fn test_compression_multiple_encodings_prefers_gzip() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/ip/1")
+                    .header("Accept-Encoding", "gzip, br, deflate")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.headers().get("Content-Encoding").unwrap(), "gzip");
     }
