@@ -402,7 +402,7 @@ impl IpRegistry {
             .set(&DataKey::OwnerIps(old_owner.clone()), &old_ids);
         env.storage()
             .persistent()
-            .extend_ttl(&DataKey::OwnerIps(old_owner), 50000, 50000);
+            .extend_ttl(&DataKey::OwnerIps(old_owner.clone()), 50000, 50000);
 
         // Add to new owner's index
         let mut new_ids: Vec<u64> = env
@@ -429,13 +429,31 @@ impl IpRegistry {
             LEDGER_BUMP,
         );
 
-        record.owner = new_owner;
+        record.owner = new_owner.clone();
         env.storage()
             .persistent()
             .set(&DataKey::IpRecord(ip_id), &record);
         env.storage()
             .persistent()
-            .extend_ttl(&DataKey::IpRecord(ip_id), 50000, 50000);
+            .extend_ttl(&DataKey::IpRecord(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        // Emit transfer event: (ip_id, old_owner, new_owner)
+        env.events().publish(
+            (TRANSFER_TOPIC, ip_id),
+            (old_owner, new_owner),
+        );
+    }
+
+    /// Transfer IP ownership to a new address (named alias for transfer_ip).
+    ///
+    /// Supports use cases like company acquisitions or IP licensing agreements.
+    /// Only the current owner may authorize the transfer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the IP does not exist or the caller is not the current owner.
+    pub fn transfer_ip_ownership(env: Env, ip_id: u64, new_owner: Address) {
+        Self::transfer_ip(env, ip_id, new_owner);
     }
 
     /// Revoke an IP record, marking it as invalid.

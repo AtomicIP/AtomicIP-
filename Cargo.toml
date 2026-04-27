@@ -2,7 +2,7 @@
 members = [
     "contracts/ip_registry",
     "contracts/atomic_swap",
-    "api-server",
+    # "api-server",  # temporarily excluded: async-graphql version conflict
 ]
 resolver = "2"
 

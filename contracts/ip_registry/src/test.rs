@@ -7,6 +7,7 @@ mod tests {
     use soroban_sdk::{symbol_short, Address, BytesN, Env, IntoVal, TryFromVal, Vec};
 
     use crate::types::REVOKE_TOPIC;
+    use crate::types::TRANSFER_TOPIC;
 
     #[contractclient(name = "IpRegistryClient")]
     #[allow(dead_code)]
@@ -22,6 +23,7 @@ mod tests {
         ) -> bool;
         fn list_ip_by_owner(env: Env, owner: Address) -> Vec<u64>;
         fn transfer_ip(env: Env, ip_id: u64, new_owner: Address);
+        fn transfer_ip_ownership(env: Env, ip_id: u64, new_owner: Address);
         fn revoke_ip(env: Env, ip_id: u64);
         fn is_ip_owner(env: Env, ip_id: u64, address: Address) -> bool;
         fn reveal_partial(
@@ -216,6 +218,85 @@ mod tests {
         let bob = <Address as TestAddress>::generate(&env);
         env.mock_all_auths();
         client.transfer_ip(&999u64, &bob);
+    }
+
+    #[test]
+    fn test_transfer_ip_emits_event() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let alice = <Address as TestAddress>::generate(&env);
+        let bob = <Address as TestAddress>::generate(&env);
+        let commitment = BytesN::from_array(&env, &[20u8; 32]);
+
+        env.mock_all_auths();
+        let ip_id = client.commit_ip(&alice, &commitment, &0u32);
+
+        env.events().clear();
+        client.transfer_ip(&ip_id, &bob);
+
+        let all_events = env.events().all();
+        assert_eq!(all_events.len(), 1);
+        let event = all_events.get(0).unwrap();
+        let expected_topics = (TRANSFER_TOPIC, ip_id).into_val(&env);
+        assert_eq!(event.1, expected_topics);
+        let (old_owner, new_owner): (Address, Address) =
+            TryFromVal::try_from_val(&env, &event.2).unwrap();
+        assert_eq!(old_owner, alice);
+        assert_eq!(new_owner, bob);
+    }
+
+    #[test]
+    fn test_transfer_ip_ownership_successful() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let alice = <Address as TestAddress>::generate(&env);
+        let bob = <Address as TestAddress>::generate(&env);
+        let commitment = BytesN::from_array(&env, &[21u8; 32]);
+
+        env.mock_all_auths();
+        let ip_id = client.commit_ip(&alice, &commitment, &0u32);
+
+        client.transfer_ip_ownership(&ip_id, &bob);
+
+        let record = client.get_ip(&ip_id);
+        assert_eq!(record.owner, bob);
+
+        let alice_ips = client.list_ip_by_owner(&alice);
+        assert!(!alice_ips.iter().any(|x| x == ip_id));
+
+        let bob_ips = client.list_ip_by_owner(&bob);
+        assert!(bob_ips.iter().any(|x| x == ip_id));
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_transfer_ip_ownership_unauthorized_rejected() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let alice = <Address as TestAddress>::generate(&env);
+        let bob = <Address as TestAddress>::generate(&env);
+        let commitment = BytesN::from_array(&env, &[22u8; 32]);
+
+        env.mock_all_auths();
+        let ip_id = client.commit_ip(&alice, &commitment, &0u32);
+
+        // Only mock bob's auth — alice's auth absent, must panic
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &bob,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "transfer_ip_ownership",
+                args: (ip_id, bob.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.transfer_ip_ownership(&ip_id, &bob);
     }
 
     #[test]
