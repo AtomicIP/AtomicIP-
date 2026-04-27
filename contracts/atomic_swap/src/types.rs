@@ -56,14 +56,12 @@ pub enum DataKey {
     PaymentsMade(u64),
     /// #350: Maps swap_id → collateral amount held in escrow.
     SwapCollateral(u64),
-    /// #354: Maps swap_id → insurance premium amount.
-    SwapInsurance(u64),
-    /// #353: Maps swap_id → RenegotiationOffer for pending renegotiation.
-    SwapRenegotiations(u64),
-    /// #352: Maps swap_id → escrow agent address.
-    SwapEscrowAgent(u64),
-    /// #351: Maps swap_id → acceptance conditions bytes.
-    SwapConditions(u64),
+    /// #355: Maps swap_id → arbitrator Address for dispute resolution.
+    SwapArbitrator(u64),
+    /// #356: Maps swap_id → bool indicating if atomic refund was processed.
+    AtomicRefundProcessed(u64),
+    /// #358: Maps swap_id → new expiry timestamp for timeout escalation.
+    TimeoutExtension(u64),
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -330,49 +328,50 @@ pub struct CollateralRefundedEvent {
     pub collateral_amount: i128,
 }
 
-// ── #354: Insurance Types ─────────────────────────────────────────────────────
+
+// ── #355: Arbitration Request Event ───────────────────────────────────────────
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
-pub struct InsurancePayoutEvent {
+pub struct ArbitrationRequestedEvent {
+    pub swap_id: u64,
+    pub requester: Address,
+    pub evidence_hash: BytesN<32>,
+}
+
+// ── #356: Atomic Refund Event ─────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct AtomicRefundEvent {
     pub swap_id: u64,
     pub buyer: Address,
-    pub payout_amount: i128,
+    pub refund_amount: i128,
+    pub reason: String,
 }
 
-// ── #353: Renegotiation Types ─────────────────────────────────────────────────
+// ── #357: Batch Processing Events ─────────────────────────────────────────────
 
 #[contracttype]
-#[derive(Clone)]
-pub struct RenegotiationOffer {
-    pub new_price: i128,
-    pub proposer: Address,
-    pub timestamp: u64,
+#[derive(Clone, Debug, PartialEq)]
+pub struct BatchAcceptedEvent {
+    pub swap_ids: Vec<u64>,
+    pub buyer: Address,
 }
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
-pub struct RenegotiationProposedEvent {
-    pub swap_id: u64,
-    pub new_price: i128,
-    pub proposer: Address,
+pub struct BatchKeysRevealedEvent {
+    pub swap_ids: Vec<u64>,
+    pub seller: Address,
 }
 
-// ── #352: Escrow Types ────────────────────────────────────────────────────────
+// ── #358: Timeout Escalation Event ────────────────────────────────────────────
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
-pub struct EscrowReleasedEvent {
-    pub swap_id: u64,
-    pub escrow_agent: Address,
-    pub amount: i128,
-}
-
-// ── #351: Conditional Acceptance Types ────────────────────────────────────────
-
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct ConditionalAcceptanceEvent {
+pub struct TimeoutEscalationRequestedEvent {
     pub swap_id: u64,
     pub buyer: Address,
+    pub new_expiry: u64,
 }
