@@ -21,6 +21,8 @@ mod webhook;
 mod websocket;
 mod graphql;
 mod request_signing;
+mod invariants;
+mod health;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -111,9 +113,11 @@ async fn main() {
 
     let schema = graphql::build_schema();
     let broadcaster = Arc::new(websocket::EventBroadcaster::new());
+    let health_checker = Arc::new(health::HealthChecker::new());
 
     let app = Router::new()
         .merge(SwaggerUi::new("/docs").url("/openapi.json", ApiDoc::openapi()))
+        .route("/health", get(health::health_handler))
         .route("/metrics", get(metrics::metrics_handler))
         .route("/graphql", post(graphql_handler))
         .route("/ws", get(ws_handler))
@@ -129,12 +133,13 @@ async fn main() {
         .route("/swap/{swap_id}/cancel", post(handlers::cancel_swap))
         .route("/swap/{swap_id}/cancel-expired", post(handlers::cancel_expired_swap))
         .route("/swap/{swap_id}", get(handlers::get_swap))
-        .with_state((schema, broadcaster.clone()))
+        .with_state((schema, broadcaster.clone(), health_checker.clone()))
         .layer(middleware::from_fn(metrics::track));
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
     println!("Swagger UI   -> http://localhost:8080/docs");
     println!("OpenAPI JSON -> http://localhost:8080/openapi.json");
+    println!("Health Check -> http://localhost:8080/health");
     println!("Metrics      -> http://localhost:8080/metrics");
     println!("WebSocket    -> ws://localhost:8080/ws");
     axum::serve(listener, app).await.unwrap();
@@ -142,14 +147,16 @@ async fn main() {
 
 async fn ws_handler(
     ws: axum::extract::ws::WebSocketUpgrade,
-    axum::extract::State((_, broadcaster)): axum::extract::State<(graphql::AtomicIpSchema, Arc<websocket::EventBroadcaster>)>,
+    axum::extract::State((_, broadcaster, _)): axum::extract::State<(graphql::AtomicIpSchema, Arc<websocket::EventBroadcaster>, Arc<health::HealthChecker>)>,
 ) -> impl axum::response::IntoResponse {
     ws.on_upgrade(|socket| websocket::handle_socket(socket, broadcaster))
 }
 
 fn build_app() -> Router {
     let schema = graphql::build_schema();
+    let health_checker = Arc::new(health::HealthChecker::new());
     Router::new()
+        .route("/health", get(health::health_handler))
         .route("/v1/graphql", post(graphql_handler))
         .route("/v1/ip/commit", post(handlers::commit_ip))
         .route("/v1/ip/:ip_id", get(handlers::get_ip))
@@ -165,7 +172,7 @@ fn build_app() -> Router {
         .route("/v1/swap/:swap_id", get(handlers::get_swap))
         .route("/v1/bulk/commit-ip", post(handlers::bulk_commit_ip))
         .route("/v1/bulk/initiate-swap", post(handlers::bulk_initiate_swap))
-        .with_state(schema)
+        .with_state((schema, health_checker))
         .layer(middleware::from_fn(tracing_middleware::trace_requests))
         .layer(middleware::from_fn(versioning::version_negotiation))
         .layer(middleware::from_fn(require_json_content_type))
@@ -553,4 +560,47 @@ mod tests {
         assert!(json["results"].is_array());
         assert_eq!(json["results"].as_array().unwrap().len(), 2);
     }
-}
+
+    #[tokio::test]
+    async fn test_health_check_endpoint_returns_ok() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["status"].is_string());
+        assert!(json["components"].is_object());
+        assert!(json["components"]["contract_connectivity"].is_object());
+        assert!(json["components"]["database"].is_object());
+        assert!(json["components"]["cache"].is_object());
+    }
+
+    #[tokio::test]
+    async fn test_health_check_includes_component_status() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["components"]["contract_connectivity"]["status"].is_string());
+        assert!(json["components"]["contract_connectivity"]["latency_ms"].is_number());
+        assert!(json["components"]["database"]["status"].is_string());
+        assert!(json["components"]["cache"]["status"].is_string());
+    }
