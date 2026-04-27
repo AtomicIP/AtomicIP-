@@ -159,6 +159,28 @@ pub enum DataKey {
     ContractSchema,
     /// #311: Maps swap_id → referrer Address for referral reward tracking.
     SwapReferrer(u64),
+    /// #347: Maps auction_id → AuctionRecord for IP auctions.
+    Auction(u64),
+    /// #347: Maps ip_id → auction_id for active auction.
+    ActiveAuction(u64),
+    /// #347: Maps auction_id → Vec<(bidder, amount)> for bid history.
+    AuctionBids(u64),
+    /// #347: Next auction ID counter.
+    NextAuctionId,
+    /// #349: Maps swap_id → Vec<PaymentSchedule> for scheduled payments.
+    PaymentSchedule(u64),
+    /// #349: Maps swap_id → Vec<bool> tracking which payments have been made.
+    PaymentsMade(u64),
+    /// #350: Maps swap_id → collateral amount held in escrow.
+    SwapCollateral(u64),
+    /// #354: Maps swap_id → insurance premium amount.
+    SwapInsurance(u64),
+    /// #353: Maps swap_id → RenegotiationOffer for pending renegotiation.
+    SwapRenegotiations(u64),
+    /// #352: Maps swap_id → escrow agent address.
+    SwapEscrowAgent(u64),
+    /// #351: Maps swap_id → acceptance conditions bytes.
+    SwapConditions(u64),
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -192,6 +214,12 @@ pub struct SwapRecord {
     pub dispute_timestamp: u64,
     /// #311: Optional referrer address for referral reward on completion.
     pub referrer: Option<Address>,
+    /// #350: Collateral amount required from buyer. Zero if no collateral.
+    pub collateral_amount: i128,
+    /// #354: Insurance premium paid by buyer. Zero if no insurance.
+    pub insurance_premium: i128,
+    /// #352: Optional escrow agent address for high-value swaps.
+    pub escrow_agent: Option<Address>,
 }
 
 // ── Events ────────────────────────────────────────────────────────────────────
@@ -330,6 +358,53 @@ pub struct DisputeEvidenceSubmittedEvent {
     pub evidence_hash: BytesN<32>,
 }
 
+// ── #354: Insurance Types ─────────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct InsurancePayoutEvent {
+    pub swap_id: u64,
+    pub buyer: Address,
+    pub payout_amount: i128,
+}
+
+// ── #353: Renegotiation Types ─────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone)]
+pub struct RenegotiationOffer {
+    pub new_price: i128,
+    pub proposer: Address,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RenegotiationProposedEvent {
+    pub swap_id: u64,
+    pub new_price: i128,
+    pub proposer: Address,
+}
+
+// ── #352: Escrow Types ────────────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct EscrowReleasedEvent {
+    pub swap_id: u64,
+    pub escrow_agent: Address,
+    pub amount: i128,
+}
+
+// ── #351: Conditional Acceptance Types ────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConditionalAcceptanceEvent {
+    pub swap_id: u64,
+    pub buyer: Address,
+}
+
 // ── Contract ──────────────────────────────────────────────────────────────────
 
 #[contract]
@@ -403,6 +478,8 @@ impl AtomicSwap {
             dispute_timestamp: 0,
             referrer: referrer.clone(),
             collateral_amount,
+            insurance_premium: 0,
+            escrow_agent: None,
         };
 
         env.storage().persistent().set(&DataKey::Swap(id), &swap);

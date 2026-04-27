@@ -97,6 +97,10 @@ pub struct SwapRecord {
     pub referrer: Option<Address>,
     /// #350: Collateral amount required from buyer. Zero if no collateral.
     pub collateral_amount: i128,
+    /// #354: Insurance premium paid by buyer. Zero if no insurance.
+    pub insurance_premium: i128,
+    /// #352: Optional escrow agent address for high-value swaps.
+    pub escrow_agent: Option<Address>,
 }
 
 // ── Events ────────────────────────────────────────────────────────────────────
