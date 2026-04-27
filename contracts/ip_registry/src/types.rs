@@ -9,6 +9,7 @@ pub const LEDGER_BUMP: u32 = 6_307_200;
 // ── Event Topics ────────────────────────────────────────────────────────────
 
 pub const REVOKE_TOPIC: Symbol = soroban_sdk::symbol_short!("revoke");
+pub const TRANSFER_TOPIC: Symbol = soroban_sdk::symbol_short!("ip_xfer");
 
 // ── Access Control ────────────────────────────────────────────────────────────
 
