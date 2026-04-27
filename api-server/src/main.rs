@@ -10,7 +10,10 @@ use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
 use std::sync::Arc;
 
 mod auth;
+mod batch;
 mod cache;
+mod deduplication;
+mod events;
 mod graphql;
 mod handlers;
 mod metrics;
@@ -19,7 +22,6 @@ mod tracing_middleware;
 mod versioning;
 mod webhook;
 mod websocket;
-mod graphql;
 mod request_signing;
 mod invariants;
 mod health;
@@ -49,6 +51,8 @@ mod compression;
         handlers::unregister_webhook,
         handlers::bulk_commit_ip,
         handlers::bulk_initiate_swap,
+        batch::batch_handler,
+        events::events_handler,
     ),
     components(schemas(
         schemas::CommitIpRequest,
@@ -74,18 +78,30 @@ mod compression;
         schemas::BulkInitiateSwapRequest,
         schemas::BulkInitiateSwapResponse,
         schemas::BulkOperationResult,
+        batch::BatchRequest,
+        batch::BatchResponse,
+        batch::SingleRequest,
+        batch::SingleResponse,
+        events::ContractEvent,
     )),
     tags(
         (name = "IP Registry", description = "Commit and query intellectual property records"),
         (name = "Atomic Swap", description = "Trustless patent sale via atomic swap"),
         (name = "Webhooks", description = "Real-time event notifications"),
+        (name = "Batch", description = "Batch API operations"),
+        (name = "Events", description = "Server-Sent Events stream"),
     )
 )]
 pub struct ApiDoc;
 
 /// GraphQL endpoint — accepts POST requests with a GraphQL query body.
 async fn graphql_handler(
-    axum::extract::State(schema): axum::extract::State<graphql::AtomicIpSchema>,
+    axum::extract::State((schema, _, _, _)): axum::extract::State<(
+        graphql::AtomicIpSchema,
+        Arc<websocket::EventBroadcaster>,
+        Arc<events::EventBroadcaster>,
+        deduplication::DeduplicationStore,
+    )>,
     req: GraphQLRequest,
 ) -> GraphQLResponse {
     schema.execute(req.into_inner()).await.into()
@@ -122,6 +138,8 @@ async fn main() {
         .route("/metrics", get(metrics::metrics_handler))
         .route("/graphql", post(graphql_handler))
         .route("/ws", get(ws_handler))
+        .route("/events", get(events::events_handler))
+        .route("/batch", post(batch::batch_handler))
         .route("/ip/commit", post(handlers::commit_ip))
         .route("/ip/{ip_id}", get(handlers::get_ip))
         .route("/ip/transfer", post(handlers::transfer_ip))
@@ -143,6 +161,8 @@ async fn main() {
     println!("Health Check -> http://localhost:8080/health");
     println!("Metrics      -> http://localhost:8080/metrics");
     println!("WebSocket    -> ws://localhost:8080/ws");
+    println!("Events SSE   -> http://localhost:8080/events");
+    println!("Batch API    -> http://localhost:8080/batch");
     axum::serve(listener, app).await.unwrap();
 }
 
