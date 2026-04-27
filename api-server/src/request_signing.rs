@@ -55,35 +55,25 @@ pub fn verify_signature(
 
 /// Middleware to verify request signatures
 pub async fn verify_request_signature(
-    mut req: Request,
+    req: Request,
     next: Next,
-) -> Result<Response, (axum::http::StatusCode, String)> {
+) -> Result<Response, axum::http::StatusCode> {
     let headers = req.headers().clone();
 
     // Extract signature header
     let signature = headers
         .get("X-Signature")
         .and_then(|v| v.to_str().ok())
-        .ok_or((
-            axum::http::StatusCode::UNAUTHORIZED,
-            "Missing X-Signature header".to_string(),
-        ))?;
+        .ok_or(axum::http::StatusCode::UNAUTHORIZED)?;
 
     // Extract timestamp header
     let timestamp_str = headers
         .get("X-Timestamp")
         .and_then(|v| v.to_str().ok())
-        .ok_or((
-            axum::http::StatusCode::UNAUTHORIZED,
-            "Missing X-Timestamp header".to_string(),
-        ))?;
+        .ok_or(axum::http::StatusCode::UNAUTHORIZED)?;
 
-    let timestamp: u64 = timestamp_str.parse().map_err(|_| {
-        (
-            axum::http::StatusCode::UNAUTHORIZED,
-            "Invalid timestamp format".to_string(),
-        )
-    })?;
+    let timestamp: u64 = timestamp_str.parse()
+        .map_err(|_| axum::http::StatusCode::UNAUTHORIZED)?;
 
     // Check timestamp is recent (within 5 minutes)
     let now = std::time::SystemTime::now()
@@ -92,35 +82,74 @@ pub async fn verify_request_signature(
         .as_secs();
 
     if now.saturating_sub(timestamp) > 300 {
-        return Err((
-            axum::http::StatusCode::UNAUTHORIZED,
-            "Request timestamp too old".to_string(),
-        ));
+        return Err(axum::http::StatusCode::UNAUTHORIZED);
     }
 
     // Extract public key header
     let public_key = headers
         .get("X-Public-Key")
         .and_then(|v| v.to_str().ok())
-        .ok_or((
-            axum::http::StatusCode::UNAUTHORIZED,
-            "Missing X-Public-Key header".to_string(),
-        ))?;
+        .ok_or(axum::http::StatusCode::UNAUTHORIZED)?;
 
     let method = req.method().to_string();
     let path = req.uri().path().to_string();
 
-    // For now, we'll skip body verification in middleware
-    // In production, you'd need to buffer the body to compute its hash
-    let body_hash = "".to_string();
+    // Extract and hash body
+    let (parts, body) = req.into_parts();
+    let body_bytes = axum::body::to_bytes(body, usize::MAX).await
+        .map_err(|_| axum::http::StatusCode::BAD_REQUEST)?;
+    let body_hash = hash_body(&body_bytes);
 
     // Verify signature
     if !verify_signature(&method, &path, timestamp, &body_hash, signature, public_key) {
-        return Err((
-            axum::http::StatusCode::UNAUTHORIZED,
-            "Invalid signature".to_string(),
+        return Err(axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    // Reconstruct request with body
+    let req = Request::from_parts(parts, axum::body::Body::from(body_bytes));
+    Ok(next.run(req).await)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_signature_generation() {
+        let signature = generate_signature(
+            "POST",
+            "/ip/commit",
+            1234567890,
+            "body_hash",
+            "secret_key"
+        );
+        assert!(!signature.is_empty());
+    }
+
+    #[test]
+    fn test_signature_verification() {
+        let signature = generate_signature(
+            "POST",
+            "/ip/commit",
+            1234567890,
+            "body_hash",
+            "secret_key"
+        );
+        
+        assert!(verify_signature(
+            "POST",
+            "/ip/commit",
+            1234567890,
+            "body_hash",
+            &signature,
+            "secret_key"
         ));
     }
 
-    Ok(next.run(req).await)
+    #[test]
+    fn test_body_hashing() {
+        let body = b"test body";
+        let hash = hash_body(body);
+        assert_eq!(hash.len(), 64); // SHA256 hex string length
+    }
 }
