@@ -10,7 +10,10 @@ use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
 use std::sync::Arc;
 
 mod auth;
+mod batch;
 mod cache;
+mod deduplication;
+mod events;
 mod graphql;
 mod handlers;
 mod metrics;
@@ -19,7 +22,6 @@ mod tracing_middleware;
 mod versioning;
 mod webhook;
 mod websocket;
-mod graphql;
 mod request_signing;
 
 #[derive(OpenApi)]
@@ -46,6 +48,8 @@ mod request_signing;
         handlers::unregister_webhook,
         handlers::bulk_commit_ip,
         handlers::bulk_initiate_swap,
+        batch::batch_handler,
+        events::events_handler,
     ),
     components(schemas(
         schemas::CommitIpRequest,
@@ -71,18 +75,30 @@ mod request_signing;
         schemas::BulkInitiateSwapRequest,
         schemas::BulkInitiateSwapResponse,
         schemas::BulkOperationResult,
+        batch::BatchRequest,
+        batch::BatchResponse,
+        batch::SingleRequest,
+        batch::SingleResponse,
+        events::ContractEvent,
     )),
     tags(
         (name = "IP Registry", description = "Commit and query intellectual property records"),
         (name = "Atomic Swap", description = "Trustless patent sale via atomic swap"),
         (name = "Webhooks", description = "Real-time event notifications"),
+        (name = "Batch", description = "Batch API operations"),
+        (name = "Events", description = "Server-Sent Events stream"),
     )
 )]
 pub struct ApiDoc;
 
 /// GraphQL endpoint — accepts POST requests with a GraphQL query body.
 async fn graphql_handler(
-    axum::extract::State(schema): axum::extract::State<graphql::AtomicIpSchema>,
+    axum::extract::State((schema, _, _, _)): axum::extract::State<(
+        graphql::AtomicIpSchema,
+        Arc<websocket::EventBroadcaster>,
+        Arc<events::EventBroadcaster>,
+        deduplication::DeduplicationStore,
+    )>,
     req: GraphQLRequest,
 ) -> GraphQLResponse {
     schema.execute(req.into_inner()).await.into()
@@ -111,12 +127,16 @@ async fn main() {
 
     let schema = graphql::build_schema();
     let broadcaster = Arc::new(websocket::EventBroadcaster::new());
+    let (event_broadcaster, _) = events::create_event_broadcaster();
+    let dedup_store = deduplication::create_store();
 
     let app = Router::new()
         .merge(SwaggerUi::new("/docs").url("/openapi.json", ApiDoc::openapi()))
         .route("/metrics", get(metrics::metrics_handler))
         .route("/graphql", post(graphql_handler))
         .route("/ws", get(ws_handler))
+        .route("/events", get(events::events_handler))
+        .route("/batch", post(batch::batch_handler))
         .route("/ip/commit", post(handlers::commit_ip))
         .route("/ip/{ip_id}", get(handlers::get_ip))
         .route("/ip/transfer", post(handlers::transfer_ip))
@@ -129,7 +149,7 @@ async fn main() {
         .route("/swap/{swap_id}/cancel", post(handlers::cancel_swap))
         .route("/swap/{swap_id}/cancel-expired", post(handlers::cancel_expired_swap))
         .route("/swap/{swap_id}", get(handlers::get_swap))
-        .with_state((schema, broadcaster.clone()))
+        .with_state((schema, broadcaster.clone(), Arc::new(event_broadcaster), dedup_store.clone()))
         .layer(middleware::from_fn(metrics::track));
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
@@ -137,12 +157,19 @@ async fn main() {
     println!("OpenAPI JSON -> http://localhost:8080/openapi.json");
     println!("Metrics      -> http://localhost:8080/metrics");
     println!("WebSocket    -> ws://localhost:8080/ws");
+    println!("Events SSE   -> http://localhost:8080/events");
+    println!("Batch API    -> http://localhost:8080/batch");
     axum::serve(listener, app).await.unwrap();
 }
 
 async fn ws_handler(
     ws: axum::extract::ws::WebSocketUpgrade,
-    axum::extract::State((_, broadcaster)): axum::extract::State<(graphql::AtomicIpSchema, Arc<websocket::EventBroadcaster>)>,
+    axum::extract::State((_, broadcaster, _, _)): axum::extract::State<(
+        graphql::AtomicIpSchema, 
+        Arc<websocket::EventBroadcaster>,
+        Arc<events::EventBroadcaster>,
+        deduplication::DeduplicationStore,
+    )>,
 ) -> impl axum::response::IntoResponse {
     ws.on_upgrade(|socket| websocket::handle_socket(socket, broadcaster))
 }
