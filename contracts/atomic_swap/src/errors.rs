@@ -51,4 +51,6 @@ pub enum ContractError {
     NoArbitratorSet                       = 37,
     // #313: Dispute evidence errors
     UnauthorizedEvidenceSubmitter         = 38,
+    // Partial quantity swap errors
+    InvalidQuantity                       = 39,
 }

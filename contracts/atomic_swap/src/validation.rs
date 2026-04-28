@@ -232,6 +232,11 @@ mod tests {
             accept_timestamp: 0,
             required_approvals: 0,
             dispute_timestamp: 0,
+            referrer: None,
+            collateral_amount: 0,
+            insurance_premium: 0,
+            escrow_agent: None,
+            quantity: 1,
         }
     }
 
@@ -302,6 +307,11 @@ mod tests {
             accept_timestamp: 0,
             required_approvals: 0,
             dispute_timestamp: 0,
+            referrer: None,
+            collateral_amount: 0,
+            insurance_premium: 0,
+            escrow_agent: None,
+            quantity: 1,
         };
         // Should not panic
         require_seller(&env, &seller, &swap);
@@ -324,6 +334,11 @@ mod tests {
             accept_timestamp: 0,
             required_approvals: 0,
             dispute_timestamp: 0,
+            referrer: None,
+            collateral_amount: 0,
+            insurance_premium: 0,
+            escrow_agent: None,
+            quantity: 1,
         };
         require_seller(&env, &not_seller, &swap);
     }
@@ -343,6 +358,11 @@ mod tests {
             accept_timestamp: 0,
             required_approvals: 0,
             dispute_timestamp: 0,
+            referrer: None,
+            collateral_amount: 0,
+            insurance_premium: 0,
+            escrow_agent: None,
+            quantity: 1,
         };
         // Should not panic
         require_buyer(&env, &buyer, &swap);
@@ -365,6 +385,11 @@ mod tests {
             accept_timestamp: 0,
             required_approvals: 0,
             dispute_timestamp: 0,
+            referrer: None,
+            collateral_amount: 0,
+            insurance_premium: 0,
+            escrow_agent: None,
+            quantity: 1,
         };
         require_buyer(&env, &not_buyer, &swap);
     }
@@ -384,6 +409,11 @@ mod tests {
             accept_timestamp: 0,
             required_approvals: 0,
             dispute_timestamp: 0,
+            referrer: None,
+            collateral_amount: 0,
+            insurance_premium: 0,
+            escrow_agent: None,
+            quantity: 1,
         };
         // Should not panic
         require_seller_or_buyer(&env, &seller, &swap);
@@ -404,6 +434,11 @@ mod tests {
             accept_timestamp: 0,
             required_approvals: 0,
             dispute_timestamp: 0,
+            referrer: None,
+            collateral_amount: 0,
+            insurance_premium: 0,
+            escrow_agent: None,
+            quantity: 1,
         };
         // Should not panic
         require_seller_or_buyer(&env, &buyer, &swap);
@@ -427,6 +462,11 @@ mod tests {
             accept_timestamp: 0,
             required_approvals: 0,
             dispute_timestamp: 0,
+            referrer: None,
+            collateral_amount: 0,
+            insurance_premium: 0,
+            escrow_agent: None,
+            quantity: 1,
         };
         require_seller_or_buyer(&env, &neither, &swap);
     }
