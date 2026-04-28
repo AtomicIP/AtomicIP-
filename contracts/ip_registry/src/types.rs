@@ -36,6 +36,7 @@ pub enum DataKey {
     IpCommitmentChecksum, // Issue #346: stores hash of all commitments for rollback protection
     IpAccessGrants(u64), // Issue #344: stores Vec of (grantee, access_level) for tiered access
     NotarySignature(u64), // Issue #345: stores notary signature for timestamp notarization
+    IpVersionChain(u64), // stores Vec<u64> of the full version chain rooted at a given IP
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
