@@ -139,6 +139,10 @@ pub enum ContractError {
     NoRenegotiationOffer = 57,
     /// A buyer-set condition was not satisfied at acceptance time.
     ConditionNotMet = 58,
+    /// Insurance is not enabled for this swap.
+    InsuranceNotEnabled = 59,
+    /// This swap is not eligible for an insurance claim.
+    InsuranceNotClaimable = 60,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -197,6 +201,10 @@ pub enum DataKey {
     SwapCollateral(u64),
     /// #354: Maps swap_id → insurance premium amount.
     SwapInsurance(u64),
+    /// #354: Marks a swap as eligible for insurance claim (set when reveal_key fails with insurance).
+    InsuranceClaimable(u64),
+    /// #354: Global insurance pool balance for the token (token Address → i128).
+    InsurancePool(Address),
     /// #353: Maps swap_id → RenegotiationOffer for pending renegotiation.
     SwapRenegotiations(u64),
     /// #352: Maps swap_id → escrow agent address.
@@ -240,6 +248,8 @@ pub struct SwapRecord {
     pub collateral_amount: i128,
     /// #354: Insurance premium paid by buyer. Zero if no insurance.
     pub insurance_premium: i128,
+    /// #354: Whether insurance is enabled for this swap.
+    pub insurance_enabled: bool,
     /// #352: Optional escrow agent address for high-value swaps.
     pub escrow_agent: Option<Address>,
     /// Total quantity available for partial acceptance. Default 1 (full swap).
@@ -489,6 +499,7 @@ impl AtomicSwap {
         referrer: Option<Address>,
         collateral_amount: i128,
         contingency_condition: Option<Vec<u8>>,
+        insurance_enabled: bool,
     ) -> u64 {
         // Guard: reject new swaps when the contract is paused.
         require_not_paused(&env);
@@ -526,11 +537,23 @@ impl AtomicSwap {
             dispute_timestamp: 0,
             referrer: referrer.clone(),
             collateral_amount,
-            insurance_premium: 0,
+            insurance_premium: if insurance_enabled { price * 2 / 100 } else { 0 },
+            insurance_enabled,
             escrow_agent: None,
             quantity: 1,
             conditions: Vec::new(&env),
         };
+
+        // Store insurance premium in dedicated key so accept_swap can collect it
+        if insurance_enabled {
+            let premium = swap.insurance_premium;
+            env.storage()
+                .persistent()
+                .set(&DataKey::SwapInsurance(id), &premium);
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::SwapInsurance(id), LEDGER_BUMP, LEDGER_BUMP);
+        }
 
         env.storage().persistent().set(&DataKey::Swap(id), &swap);
         env.storage()
@@ -718,6 +741,19 @@ impl AtomicSwap {
             &swap.price,
         );
 
+        // #354: Collect insurance premium from buyer and add to pool.
+        if swap.insurance_enabled && swap.insurance_premium > 0 {
+            token::Client::new(&env, &swap.token).transfer(
+                &swap.buyer,
+                &env.current_contract_address(),
+                &swap.insurance_premium,
+            );
+            let pool_key = DataKey::InsurancePool(swap.token.clone());
+            let pool: i128 = env.storage().persistent().get(&pool_key).unwrap_or(0);
+            env.storage().persistent().set(&pool_key, &(pool + swap.insurance_premium));
+            env.storage().persistent().extend_ttl(&pool_key, LEDGER_BUMP, LEDGER_BUMP);
+        }
+
         swap.accept_timestamp = env.ledger().timestamp();
         swap.status = SwapStatus::Accepted;
 
@@ -757,6 +793,15 @@ impl AtomicSwap {
         // Verify commitment via IP registry
         let valid = registry::verify_commitment(&env, swap.ip_id, &secret, &blinding_factor);
         if !valid {
+            // #354: If insurance is enabled, mark swap as claimable before panicking.
+            if swap.insurance_enabled {
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::InsuranceClaimable(swap_id), &true);
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&DataKey::InsuranceClaimable(swap_id), LEDGER_BUMP, LEDGER_BUMP);
+            }
             env.panic_with_error(Error::from_contract_error(ContractError::InvalidKey as u32));
         }
 
@@ -1325,6 +1370,50 @@ impl AtomicSwap {
         env.events().publish(
             (soroban_sdk::symbol_short!("reneg_acpt"),),
             RenegotiationAcceptedEvent { swap_id, new_price: offer.new_price, buyer: swap.buyer },
+        );
+    }
+
+    // ── #354: Insurance ───────────────────────────────────────────────────────
+
+    /// Buyer claims insurance payout after seller revealed an invalid key.
+    /// Requires insurance to have been enabled and the swap to be marked claimable.
+    pub fn claim_insurance(env: Env, swap_id: u64) {
+        let swap = require_swap_exists(&env, swap_id);
+        swap.buyer.require_auth();
+
+        if !swap.insurance_enabled {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::InsuranceNotEnabled as u32,
+            ));
+        }
+
+        if !env.storage().persistent().has(&DataKey::InsuranceClaimable(swap_id)) {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::InsuranceNotClaimable as u32,
+            ));
+        }
+
+        // Payout = swap price (buyer gets their payment back from the pool)
+        let payout = swap.price;
+        let pool_key = DataKey::InsurancePool(swap.token.clone());
+        let pool: i128 = env.storage().persistent().get(&pool_key).unwrap_or(0);
+
+        // Deduct from pool (pool may be partially funded; pay what's available)
+        let actual_payout = if pool >= payout { payout } else { pool };
+
+        token::Client::new(&env, &swap.token).transfer(
+            &env.current_contract_address(),
+            &swap.buyer,
+            &actual_payout,
+        );
+
+        env.storage().persistent().set(&pool_key, &(pool - actual_payout));
+        // Clear claimable flag so it can't be claimed twice
+        env.storage().persistent().remove(&DataKey::InsuranceClaimable(swap_id));
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("ins_pay"),),
+            InsurancePayoutEvent { swap_id, buyer: swap.buyer, payout_amount: actual_payout },
         );
     }
 

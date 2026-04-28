@@ -68,7 +68,7 @@ mod snapshot_tests {
         let env = Env::default();
         let (swap, token_id, seller, buyer, ip_id, _, _) = setup(&env);
 
-        let sid = swap.initiate_swap(&token_id, &ip_id, &seller, &750_i128, &buyer, &0u32, &None);
+        let sid = swap.initiate_swap(&token_id, &ip_id, &seller, &750_i128, &buyer, &0u32, &None, &false);
 
         assert_eq!(
             snap_swap(&swap, sid),
@@ -83,7 +83,7 @@ mod snapshot_tests {
         let env = Env::default();
         let (swap, token_id, seller, buyer, ip_id, _, _) = setup(&env);
 
-        let sid = swap.initiate_swap(&token_id, &ip_id, &seller, &750_i128, &buyer, &0u32, &None);
+        let sid = swap.initiate_swap(&token_id, &ip_id, &seller, &750_i128, &buyer, &0u32, &None, &false);
         swap.accept_swap(&sid);
 
         assert_eq!(
@@ -99,7 +99,7 @@ mod snapshot_tests {
         let env = Env::default();
         let (swap, token_id, seller, buyer, ip_id, secret, blinding) = setup(&env);
 
-        let sid = swap.initiate_swap(&token_id, &ip_id, &seller, &750_i128, &buyer, &0u32, &None);
+        let sid = swap.initiate_swap(&token_id, &ip_id, &seller, &750_i128, &buyer, &0u32, &None, &false);
         swap.accept_swap(&sid);
         swap.reveal_key(&sid, &seller, &secret, &blinding);
 
@@ -116,7 +116,7 @@ mod snapshot_tests {
         let env = Env::default();
         let (swap, token_id, seller, buyer, ip_id, _, _) = setup(&env);
 
-        let sid = swap.initiate_swap(&token_id, &ip_id, &seller, &750_i128, &buyer, &0u32, &None);
+        let sid = swap.initiate_swap(&token_id, &ip_id, &seller, &750_i128, &buyer, &0u32, &None, &false);
         swap.cancel_swap(&sid, &seller);
 
         assert_eq!(
@@ -132,7 +132,7 @@ mod snapshot_tests {
         let env = Env::default();
         let (swap, token_id, seller, buyer, ip_id, _, _) = setup(&env);
 
-        let sid = swap.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0u32, &None);
+        let sid = swap.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0u32, &None, &false);
         let snap_before = snap_swap(&swap, sid);
 
         // Cancel so the IP is free, then verify first swap record is unchanged.
