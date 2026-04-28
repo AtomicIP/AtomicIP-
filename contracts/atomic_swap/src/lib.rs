@@ -2883,3 +2883,6 @@ mod mutation_tests;
 
 #[cfg(test)]
 mod snapshot_tests;
+
+#[cfg(test)]
+mod stress_tests;
