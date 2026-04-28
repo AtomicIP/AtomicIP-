@@ -1,0 +1,15 @@
+# cargo-mutants configuration (#378)
+# Run: cargo mutants -p ip_registry -p atomic_swap
+
+[mutants]
+# Exclude generated/boilerplate code that is not worth mutating
+exclude_globs = [
+    "contracts/*/src/upgrade.rs",
+    "contracts/*/src/types.rs",
+    "contracts/*/src/errors.rs",
+    "contracts/*/src/utils.rs",
+    "contracts/*/src/registry.rs",
+]
+
+# Timeout per mutant test run (seconds)
+timeout_multiplier = 3.0
