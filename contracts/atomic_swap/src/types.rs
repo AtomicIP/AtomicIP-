@@ -231,6 +231,18 @@ pub struct ArbitratedEvent {
     pub refunded: bool,
 }
 
+// ── #360: Admin Rollback Event ───────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct AdminRollbackEvent {
+    pub swap_id: u64,
+    pub reason: Bytes<64>,
+    pub buyer_refund: i128,
+    pub seller_refund: i128,
+    pub timestamp: u64,
+}
+
 // ── #313: Dispute Evidence Event ──────────────────────────────────────────────
 
 #[contracttype]

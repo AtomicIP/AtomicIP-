@@ -832,6 +832,85 @@ impl AtomicSwap {
         );
     }
 
+    // ── #360: Admin Rollback ───────────────────────────────────────────────────
+
+    /// Admin rollback: refund both parties and cancel a swap due to fraud or issues.
+    /// This is a safety mechanism for extreme cases where the normal dispute process
+    /// is insufficient. Both buyer and seller receive full refunds.
+    pub fn admin_rollback_swap(env: Env, swap_id: u64, caller: Address, reason: Bytes<64>) {
+        caller.require_auth();
+        require_admin(&env, &caller);
+
+        let mut swap = require_swap_exists(&env, swap_id);
+
+        // Cannot rollback already completed swaps
+        if swap.status == SwapStatus::Completed {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::SwapNotInAcceptedState as u32,
+            ));
+        }
+
+        let token_client = token::Client::new(&env, &swap.token);
+        let mut buyer_refund = 0i128;
+        let mut seller_refund = 0i128;
+
+        // Refund buyer: price (if already paid) + collateral + insurance
+        if swap.status == SwapStatus::Accepted || swap.status == SwapStatus::Disputed {
+            // Refund price to buyer
+            buyer_refund += swap.price;
+            token_client.transfer(&env.current_contract_address(), &swap.buyer, &swap.price);
+
+            // Refund collateral to buyer
+            if let Some(collateral) = env
+                .storage()
+                .persistent()
+                .get::<_, i128>(&DataKey::SwapCollateral(swap_id))
+            {
+                buyer_refund += collateral;
+                token_client.transfer(&env.current_contract_address(), &swap.buyer, &collateral);
+                env.storage().persistent().remove(&DataKey::SwapCollateral(swap_id));
+            }
+
+            // Refund insurance premium to buyer
+            if swap.insurance_premium > 0 {
+                buyer_refund += swap.insurance_premium;
+                token_client.transfer(&env.current_contract_address(), &swap.buyer, &swap.insurance_premium);
+            }
+        }
+
+        // Refund seller: any held amounts (in case seller deposited something)
+        // For now, seller doesn't deposit anything extra, but we track it for completeness
+        // In future extensions, seller might have deposited security deposits
+
+        // Update swap status
+        swap.status = SwapStatus::Cancelled;
+        swap::save_swap(&env, swap_id, &swap);
+
+        // Release the IP lock
+        env.storage().persistent().remove(&DataKey::ActiveSwap(swap.ip_id));
+
+        // Store rollback reason
+        env.storage().persistent().set(&DataKey::CancelReason(swap_id), &reason);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::CancelReason(swap_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        // #253: Log history entry
+        Self::append_history(&env, swap_id, SwapStatus::Cancelled);
+
+        // Emit rollback event
+        env.events().publish(
+            (soroban_sdk::symbol_short!("admin_rlbk"),),
+            AdminRollbackEvent {
+                swap_id,
+                reason,
+                buyer_refund,
+                seller_refund,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+    }
+
     /// Anyone can call after dispute_resolution_timeout_seconds to auto-refund the buyer.
     pub fn auto_resolve_dispute(env: Env, swap_id: u64) {
         let mut swap = require_swap_exists(&env, swap_id);

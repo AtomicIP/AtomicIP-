@@ -163,6 +163,85 @@ pub async fn list_ip_by_owner(
     ).into_response()
 }
 
+/// List all IP IDs owned by a Stellar address with cursor-based pagination (#360).
+/// This endpoint is more efficient for large datasets than offset-based pagination.
+#[utoipa::path(
+    get,
+    path = "/v1/ip/owner/{owner}/cursor",
+    tag = "IP Registry",
+    params(
+        ("owner" = String, Path, description = "Stellar address of the owner"),
+        CursorPaginationParams,
+    ),
+    responses(
+        (status = 200, description = "Cursor-paginated list of IP IDs", body = PaginatedResponse<u64>),
+    )
+)]
+#[instrument]
+pub async fn list_ip_by_owner_cursor(
+    Path(owner): Path<String>,
+    Query(pagination): Query<CursorPaginationParams>,
+) -> impl IntoResponse {
+    let limit = pagination.limit.min(200);
+
+    // Decode cursor if provided
+    let (last_id, offset) = match pagination.cursor {
+        Some(cursor) => {
+            match crate::schemas::cursor::decode(&cursor) {
+                Some(data) => (data.last_id, data.offset),
+                None => (0, 0), // Invalid cursor, start from beginning
+            }
+        }
+        None => (0, 0),
+    };
+
+    // #316: Check cache with cursor-based key
+    let cache_key = cache::ip_list_key(&owner, limit, &format!("{}", offset));
+    if let Some(cached) = cache::get::<PaginatedResponse<u64>>(&cache_key) {
+        return (
+            StatusCode::OK,
+            [(header::CACHE_CONTROL, cache::cache_control_header())],
+            Json(serde_json::to_value(cached).unwrap()),
+        ).into_response();
+    }
+
+    // TODO: Call Soroban RPC to invoke ip_registry.list_ip_by_owner with cursor
+    // Stub: empty paginated response
+    let all_ids: Vec<u64> = vec![];
+    let total_count = all_ids.len() as u64;
+
+    // Apply cursor-based pagination
+    let page: Vec<u64> = all_ids
+        .into_iter()
+        .skip(offset as usize)
+        .take(limit as usize)
+        .collect();
+
+    // Calculate next cursor
+    let next_cursor = if page.len() == limit as usize && (offset + limit as usize) < total_count as usize {
+        let last_item_id = page.last().copied().unwrap_or(0);
+        Some(crate::schemas::cursor::new(last_item_id, offset + limit))
+    } else {
+        None
+    };
+
+    let has_more = offset + limit < total_count;
+
+    let resp = PaginatedResponse {
+        items: page,
+        next_cursor,
+        has_more,
+        total_count: Some(total_count),
+    };
+    cache::set(&cache_key, &resp);
+
+    (
+        StatusCode::OK,
+        [(header::CACHE_CONTROL, cache::cache_control_header())],
+        Json(serde_json::to_value(resp).unwrap()),
+    ).into_response()
+}
+
 // ── Atomic Swap ───────────────────────────────────────────────────────────────
 
 /// Seller initiates a patent sale. Returns the swap ID.

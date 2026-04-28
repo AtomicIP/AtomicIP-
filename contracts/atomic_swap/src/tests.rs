@@ -387,4 +387,149 @@ mod tests {
         let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None);
         assert!(client.get_cancellation_reason(&swap_id).is_none());
     }
+
+    // ── #360: Admin Rollback Tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_admin_rollback_pending_swap() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (registry_id, ip_id, _, _) = setup_registry(&env, &seller);
+        let token_id = setup_token(&env, &admin, &buyer, 500);
+        let contract_id = setup_swap(&env, &registry_id);
+        let client = AtomicSwapClient::new(&env, &contract_id);
+
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None);
+        assert_eq!(client.get_swap(&swap_id).unwrap().status, SwapStatus::Pending);
+
+        let reason = soroban_sdk::Bytes::from_slice(&env, b"fraudulent_seller");
+        client.admin_rollback_swap(&swap_id, &admin, &reason);
+
+        assert_eq!(client.get_swap(&swap_id).unwrap().status, SwapStatus::Cancelled);
+        let stored_reason = client.get_cancellation_reason(&swap_id).unwrap();
+        assert_eq!(stored_reason, reason);
+    }
+
+    #[test]
+    fn test_admin_rollback_accepted_swap_refunds_buyer() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (registry_id, ip_id, _, _) = setup_registry(&env, &seller);
+        let token_id = setup_token(&env, &admin, &buyer, 1000);
+        let contract_id = setup_swap(&env, &registry_id);
+        let client = AtomicSwapClient::new(&env, &contract_id);
+
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None);
+        client.accept_swap(&swap_id);
+        assert_eq!(client.get_swap(&swap_id).unwrap().status, SwapStatus::Accepted);
+
+        let reason = soroban_sdk::Bytes::from_slice(&env, b"buyer_complaint");
+        client.admin_rollback_swap(&swap_id, &admin, &reason);
+
+        assert_eq!(client.get_swap(&swap_id).unwrap().status, SwapStatus::Cancelled);
+        // Buyer should be refunded (price was 500)
+        let buyer_balance = StellarAssetClient::new(&env, &token_id).balance(&buyer);
+        assert_eq!(buyer_balance, 1000); // Original 1000 - 500 (paid) + 500 (refund) = 1000
+    }
+
+    #[test]
+    fn test_admin_rollback_disputed_swap_refunds_buyer() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (registry_id, ip_id, _, _) = setup_registry(&env, &seller);
+        let token_id = setup_token(&env, &admin, &buyer, 1000);
+        let contract_id = setup_swap(&env, &registry_id);
+        let client = AtomicSwapClient::new(&env, &contract_id);
+
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None);
+        client.accept_swap(&swap_id);
+        client.raise_dispute(&swap_id);
+        assert_eq!(client.get_swap(&swap_id).unwrap().status, SwapStatus::Disputed);
+
+        let reason = soroban_sdk::Bytes::from_slice(&env, b"mutual_agreement");
+        client.admin_rollback_swap(&swap_id, &admin, &reason);
+
+        assert_eq!(client.get_swap(&swap_id).unwrap().status, SwapStatus::Cancelled);
+        let buyer_balance = StellarAssetClient::new(&env, &token_id).balance(&buyer);
+        assert_eq!(buyer_balance, 1000);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #23)")]
+    fn test_admin_rollback_rejected_for_non_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (registry_id, ip_id, _, _) = setup_registry(&env, &seller);
+        let token_id = setup_token(&env, &admin, &buyer, 500);
+        let contract_id = setup_swap(&env, &registry_id);
+        let client = AtomicSwapClient::new(&env, &contract_id);
+
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None);
+        // Try to rollback with non-admin (seller)
+        let reason = soroban_sdk::Bytes::from_slice(&env, b"unauthorized");
+        client.admin_rollback_swap(&swap_id, &seller, &reason);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #11)")]
+    fn test_admin_rollback_rejected_for_completed_swap() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (registry_id, ip_id, secret, blinding) = setup_registry(&env, &seller);
+        let token_id = setup_token(&env, &admin, &buyer, 1000);
+        let contract_id = setup_swap(&env, &registry_id);
+        let client = AtomicSwapClient::new(&env, &contract_id);
+
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None);
+        client.accept_swap(&swap_id);
+        client.reveal_key(&swap_id, &seller, &secret, &blinding);
+        assert_eq!(client.get_swap(&swap_id).unwrap().status, SwapStatus::Completed);
+
+        // Try to rollback a completed swap - should fail
+        let reason = soroban_sdk::Bytes::from_slice(&env, b"too_late");
+        client.admin_rollback_swap(&swap_id, &admin, &reason);
+    }
+
+    #[test]
+    fn test_admin_rollback_with_collateral_refunds_buyer() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (registry_id, ip_id, _, _) = setup_registry(&env, &seller);
+        let token_id = setup_token(&env, &admin, &buyer, 1500);
+        let contract_id = setup_swap(&env, &registry_id);
+        let client = AtomicSwapClient::new(&env, &contract_id);
+
+        let swap_id = client.initiate_swap_with_collateral(
+            &token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None,
+            &100_i128, // collateral
+        );
+        client.accept_swap(&swap_id);
+        assert_eq!(client.get_swap(&swap_id).unwrap().status, SwapStatus::Accepted);
+
+        let reason = soroban_sdk::Bytes::from_slice(&env, b"collateral_refund");
+        client.admin_rollback_swap(&swap_id, &admin, &reason);
+
+        assert_eq!(client.get_swap(&swap_id).unwrap().status, SwapStatus::Cancelled);
+        // Buyer should be refunded: 1500 - 500 (price) - 100 (collateral) + 500 + 100 = 1500
+        let buyer_balance = StellarAssetClient::new(&env, &token_id).balance(&buyer);
+        assert_eq!(buyer_balance, 1500);
+    }
 }
