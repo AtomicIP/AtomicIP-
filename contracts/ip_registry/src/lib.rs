@@ -13,6 +13,18 @@ use types::*;
 #[cfg(test)]
 mod test;
 
+#[cfg(test)]
+mod benchmarks;
+
+#[cfg(test)]
+mod mutation_tests;
+
+#[cfg(test)]
+mod snapshot_tests;
+
+#[cfg(test)]
+mod differential_tests;
+
 // ── Error Codes ────────────────────────────────────────────────────────────
 
 #[contracterror]

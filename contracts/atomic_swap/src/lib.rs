@@ -2795,3 +2795,12 @@ mod regression_tests;
 
 #[cfg(test)]
 mod arbitration_tests;
+
+#[cfg(test)]
+mod benchmarks;
+
+#[cfg(test)]
+mod mutation_tests;
+
+#[cfg(test)]
+mod snapshot_tests;
