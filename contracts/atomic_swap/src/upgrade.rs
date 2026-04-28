@@ -254,6 +254,8 @@ pub fn build_v1_schema(env: &Env) -> ContractSchema {
     f!("batch_initiate_swap",      "batch_initiate_swap(token:Address,ip_ids:Vec<u64>,seller:Address,prices:Vec<i128>,buyer:Address,required_approvals:u32,referrer:Option<Address>)->Vec<u64>");
     f!("accept_swap",              "accept_swap(swap_id:u64)->()");
     f!("accept_swap_partial",      "accept_swap_partial(swap_id:u64,quantity:u32)->()");
+    f!("renegotiate_swap",         "renegotiate_swap(swap_id:u64,new_price:i128)->()");
+    f!("accept_renegotiation",     "accept_renegotiation(swap_id:u64)->()");
     f!("reveal_key",               "reveal_key(swap_id:u64,caller:Address,secret:BytesN<32>,blinding_factor:BytesN<32>)->()");
     f!("cancel_swap",              "cancel_swap(swap_id:u64,canceller:Address)->()");
     f!("cancel_pending_swap",      "cancel_pending_swap(swap_id:u64,caller:Address)->()");
@@ -319,6 +321,7 @@ pub fn build_v1_schema(env: &Env) -> ContractSchema {
     e!("UpgradeErrorCodeChanged",               33);
     e!("UpgradeMissingStorageKey",              34);
     e!("InvalidQuantity",                       56);
+    e!("NoRenegotiationOffer",                  57);
 
     let mut storage_keys: Vec<String> = Vec::new(env);
 
@@ -344,6 +347,7 @@ pub fn build_v1_schema(env: &Env) -> ContractSchema {
     k!("MultiCurrencyConfig");
     k!("SupportedTokens");
     k!("ContractSchema");
+    k!("SwapRenegotiations");
 
     ContractSchema {
         version: 1,

@@ -135,6 +135,8 @@ pub enum ContractError {
     // ── Partial quantity swap errors (56) ────────────────────────────────────
     /// Requested quantity is zero or exceeds the swap's total quantity.
     InvalidQuantity = 56,
+    /// No pending renegotiation offer exists for this swap.
+    NoRenegotiationOffer = 57,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -404,6 +406,14 @@ pub struct RenegotiationProposedEvent {
     pub swap_id: u64,
     pub new_price: i128,
     pub proposer: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RenegotiationAcceptedEvent {
+    pub swap_id: u64,
+    pub new_price: i128,
+    pub buyer: Address,
 }
 
 // ── #352: Escrow Types ────────────────────────────────────────────────────────
@@ -1170,6 +1180,65 @@ impl AtomicSwap {
         env.events().publish(
             (soroban_sdk::symbol_short!("swap_acpt"),),
             SwapAcceptedEvent { swap_id, buyer: swap.buyer },
+        );
+    }
+
+    // ── #353: Renegotiation ───────────────────────────────────────────────────
+
+    /// Seller proposes a new price for a Pending swap.
+    /// Overwrites any existing pending offer.
+    pub fn renegotiate_swap(env: Env, swap_id: u64, new_price: i128) {
+        require_not_paused(&env);
+        let swap = require_swap_exists(&env, swap_id);
+        require_swap_status(&env, &swap, SwapStatus::Pending, ContractError::SwapNotPending);
+        swap.seller.require_auth();
+        require_positive_price(&env, new_price);
+
+        let offer = RenegotiationOffer {
+            new_price,
+            proposer: swap.seller.clone(),
+            timestamp: env.ledger().timestamp(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::SwapRenegotiations(swap_id), &offer);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::SwapRenegotiations(swap_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("reneg_prop"),),
+            RenegotiationProposedEvent { swap_id, new_price, proposer: swap.seller },
+        );
+    }
+
+    /// Buyer accepts the pending renegotiation offer, updating the swap price.
+    pub fn accept_renegotiation(env: Env, swap_id: u64) {
+        require_not_paused(&env);
+        let mut swap = require_swap_exists(&env, swap_id);
+        require_swap_status(&env, &swap, SwapStatus::Pending, ContractError::SwapNotPending);
+        swap.buyer.require_auth();
+
+        let offer: RenegotiationOffer = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SwapRenegotiations(swap_id))
+            .unwrap_or_else(|| {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::NoRenegotiationOffer as u32,
+                ))
+            });
+
+        swap.price = offer.new_price;
+        swap::save_swap(&env, swap_id, &swap);
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::SwapRenegotiations(swap_id));
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("reneg_acpt"),),
+            RenegotiationAcceptedEvent { swap_id, new_price: offer.new_price, buyer: swap.buyer },
         );
     }
 
