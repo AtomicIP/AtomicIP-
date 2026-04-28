@@ -64,6 +64,106 @@ pub struct ListIpByOwnerResponse {
     pub has_more: bool,
 }
 
+// ── #360: Cursor-based Pagination ─────────────────────────────────────────────
+
+/// Cursor-based pagination parameters.
+/// Use this instead of offset-based pagination for better performance on large datasets.
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct CursorPaginationParams {
+    /// Maximum number of items to return (default: 50, max: 200).
+    #[serde(default = "default_limit")]
+    pub limit: u64,
+    /// Cursor from the previous page response. Omit for the first page.
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+fn default_limit() -> u64 {
+    50
+}
+
+/// Response type for cursor-paginated list endpoints.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct PaginatedResponse<T> {
+    /// Items on this page.
+    pub items: Vec<T>,
+    /// Cursor for the next page. Null if this is the last page.
+    pub next_cursor: Option<String>,
+    /// Whether there are more items available.
+    pub has_more: bool,
+    /// Total count of items (if available).
+    pub total_count: Option<u64>,
+}
+
+/// Cursor encoding/decoding utilities.
+pub mod cursor {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use serde::{Deserialize, Serialize};
+
+    /// Cursor data structure.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct CursorData {
+        pub last_id: u64,
+        pub offset: u64,
+    }
+
+    /// Encode a cursor from cursor data.
+    pub fn encode(data: &CursorData) -> String {
+        let json = serde_json::to_string(data).unwrap_or_default();
+        STANDARD.encode(json)
+    }
+
+    /// Decode a cursor to cursor data. Returns None if invalid.
+    pub fn decode(cursor: &str) -> Option<CursorData> {
+        let decoded = STANDARD.decode(cursor).ok()?;
+        let json = String::from_utf8(decoded).ok()?;
+        serde_json::from_str(&json).ok()
+    }
+
+    /// Create a cursor from the last item ID and offset.
+    pub fn new(last_id: u64, offset: u64) -> String {
+        encode(&CursorData { last_id, offset })
+    }
+
+    /// Get the next cursor for the following page.
+    pub fn next_cursor(last_id: u64, current_offset: u64, items_per_page: u64) -> String {
+        new(last_id, current_offset + items_per_page)
+    }
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::*;
+
+    #[test]
+    fn test_cursor_encode_decode_roundtrip() {
+        let data = cursor::CursorData { last_id: 100, offset: 50 };
+        let encoded = cursor::encode(&data);
+        let decoded = cursor::decode(&encoded).unwrap();
+        assert_eq!(decoded.last_id, 100);
+        assert_eq!(decoded.offset, 50);
+    }
+
+    #[test]
+    fn test_cursor_new_and_next() {
+        let cursor = cursor::new(50, 0);
+        let next = cursor::next_cursor(50, 0, 20);
+        assert_ne!(cursor, next);
+    }
+
+    #[test]
+    fn test_cursor_decode_invalid_returns_none() {
+        assert!(cursor::decode("invalid_base64").is_none());
+        assert!(cursor::decode("").is_none());
+    }
+
+    #[test]
+    fn test_cursor_decode_malformed_json_returns_none() {
+        let encoded = STANDARD.encode("not_json");
+        assert!(cursor::decode(&encoded).is_none());
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub enum SwapStatus {
