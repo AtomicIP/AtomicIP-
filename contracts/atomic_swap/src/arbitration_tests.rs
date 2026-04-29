@@ -286,4 +286,110 @@ mod arbitration_tests {
         assert_eq!(swap.price, 1000);
         assert_eq!(swap.status, SwapStatus::Accepted);
     }
+
+    // ── accept_swap_partial ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_accept_swap_partial_proportional_price() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (registry_id, ip_id, _, _) = setup_registry(&env, &seller);
+        let token_id = setup_token(&env, &admin, &buyer, 10_000);
+
+        let contract_id = env.register(AtomicSwap, ());
+        let client = AtomicSwapClient::new(&env, &contract_id);
+        client.initialize(&registry_id);
+
+        // Initiate with price=1000, default quantity=1 — set quantity via initiate_swap
+        // then manually bump quantity to 10 by accepting partial
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &1000_i128, &buyer, &0_u32);
+
+        // Patch quantity to 10 so partial acceptance makes sense
+        let mut swap = client.get_swap(&swap_id).unwrap();
+        swap.quantity = 10;
+        // Save via storage directly in test env
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .set(&crate::DataKey::Swap(swap_id), &swap);
+        });
+
+        // Accept 3 out of 10 → price = 1000 * 3 / 10 = 300
+        client.accept_swap_partial(&swap_id, &3_u32);
+
+        let accepted = client.get_swap(&swap_id).unwrap();
+        assert_eq!(accepted.status, SwapStatus::Accepted);
+        assert_eq!(accepted.price, 300);
+        assert_eq!(accepted.quantity, 3);
+    }
+
+    #[test]
+    fn test_accept_swap_partial_full_quantity_equals_accept() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (registry_id, ip_id, _, _) = setup_registry(&env, &seller);
+        let token_id = setup_token(&env, &admin, &buyer, 10_000);
+
+        let contract_id = env.register(AtomicSwap, ());
+        let client = AtomicSwapClient::new(&env, &contract_id);
+        client.initialize(&registry_id);
+
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32);
+
+        // quantity=1 (default), accepting 1/1 = full price
+        client.accept_swap_partial(&swap_id, &1_u32);
+
+        let swap = client.get_swap(&swap_id).unwrap();
+        assert_eq!(swap.status, SwapStatus::Accepted);
+        assert_eq!(swap.price, 500);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_accept_swap_partial_zero_quantity_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (registry_id, ip_id, _, _) = setup_registry(&env, &seller);
+        let token_id = setup_token(&env, &admin, &buyer, 10_000);
+
+        let contract_id = env.register(AtomicSwap, ());
+        let client = AtomicSwapClient::new(&env, &contract_id);
+        client.initialize(&registry_id);
+
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32);
+        client.accept_swap_partial(&swap_id, &0_u32);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_accept_swap_partial_exceeds_quantity_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (registry_id, ip_id, _, _) = setup_registry(&env, &seller);
+        let token_id = setup_token(&env, &admin, &buyer, 10_000);
+
+        let contract_id = env.register(AtomicSwap, ());
+        let client = AtomicSwapClient::new(&env, &contract_id);
+        client.initialize(&registry_id);
+
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32);
+        // quantity=1 by default, requesting 2 should panic
+        client.accept_swap_partial(&swap_id, &2_u32);
+    }
 }
