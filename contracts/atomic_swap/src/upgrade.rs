@@ -257,6 +257,7 @@ pub fn build_v1_schema(env: &Env) -> ContractSchema {
     f!("renegotiate_swap",         "renegotiate_swap(swap_id:u64,new_price:i128)->()");
     f!("accept_renegotiation",     "accept_renegotiation(swap_id:u64)->()");
     f!("accept_swap_conditional",  "accept_swap_conditional(swap_id:u64,conditions:Vec<SwapCondition>)->()");
+    f!("claim_insurance",          "claim_insurance(swap_id:u64)->()");
     f!("reveal_key",               "reveal_key(swap_id:u64,caller:Address,secret:BytesN<32>,blinding_factor:BytesN<32>)->()");
     f!("cancel_swap",              "cancel_swap(swap_id:u64,canceller:Address)->()");
     f!("cancel_pending_swap",      "cancel_pending_swap(swap_id:u64,caller:Address)->()");
@@ -324,6 +325,8 @@ pub fn build_v1_schema(env: &Env) -> ContractSchema {
     e!("InvalidQuantity",                       56);
     e!("NoRenegotiationOffer",                  57);
     e!("ConditionNotMet",                       58);
+    e!("InsuranceNotEnabled",                   59);
+    e!("InsuranceNotClaimable",                 60);
 
     let mut storage_keys: Vec<String> = Vec::new(env);
 
@@ -350,6 +353,8 @@ pub fn build_v1_schema(env: &Env) -> ContractSchema {
     k!("SupportedTokens");
     k!("ContractSchema");
     k!("SwapRenegotiations");
+    k!("InsuranceClaimable");
+    k!("InsurancePool");
 
     ContractSchema {
         version: 1,
