@@ -3172,3 +3172,6 @@ mod mutation_tests;
 
 #[cfg(test)]
 mod snapshot_tests;
+
+#[cfg(test)]
+mod upgrade_chaos_tests;
