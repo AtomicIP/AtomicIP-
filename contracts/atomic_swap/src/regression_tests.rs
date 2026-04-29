@@ -142,7 +142,7 @@ mod regression_tests {
         let contract_id = setup_swap(&env, &registry_id);
         let client = AtomicSwapClient::new(&env, &contract_id);
 
-        client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer1, &0_u32, &None);
+        client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer1, &0_u32, &None, &false);
 
         let result = client.try_initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer2, &0_u32, &None);
         assert_eq!(
@@ -200,7 +200,7 @@ mod regression_tests {
         let contract_id = setup_swap(&env, &registry_id);
         let client = AtomicSwapClient::new(&env, &contract_id);
 
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None, &false);
         client.accept_swap(&swap_id, &buyer);
 
         let wrong_key = BytesN::from_array(&env, &[0xFFu8; 32]);
@@ -235,7 +235,7 @@ mod regression_tests {
         let contract_id = setup_swap(&env, &registry_id);
         let client = AtomicSwapClient::new(&env, &contract_id);
 
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None, &false);
         client.accept_swap(&swap_id, &buyer);
 
         // Advance ledger past expiry
@@ -273,7 +273,7 @@ mod regression_tests {
         let contract_id = setup_swap(&env, &registry_id);
         let client = AtomicSwapClient::new(&env, &contract_id);
 
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None, &false);
         client.accept_swap(&swap_id, &buyer);
 
         // Do NOT advance ledger — swap is not expired
@@ -302,7 +302,7 @@ mod regression_tests {
         let contract_id = setup_swap(&env, &registry_id);
         let client = AtomicSwapClient::new(&env, &contract_id);
 
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None, &false);
         client.accept_swap(&swap_id, &buyer);
 
         // Build the correct preimage key: secret || blinding

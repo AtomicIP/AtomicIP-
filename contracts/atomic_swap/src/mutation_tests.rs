@@ -54,7 +54,7 @@ mod mutation_tests {
     fn initiate_swap_sets_pending_status() {
         let env = Env::default();
         let (swap, token_id, seller, buyer, ip_id, _, _) = setup(&env);
-        let sid = swap.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0u32, &None);
+        let sid = swap.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0u32, &None, &false);
         let record = swap.get_swap(&sid).unwrap();
         assert_eq!(record.status, SwapStatus::Pending);
     }
@@ -64,7 +64,7 @@ mod mutation_tests {
     fn accept_swap_sets_accepted_status() {
         let env = Env::default();
         let (swap, token_id, seller, buyer, ip_id, _, _) = setup(&env);
-        let sid = swap.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0u32, &None);
+        let sid = swap.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0u32, &None, &false);
         swap.accept_swap(&sid);
         let record = swap.get_swap(&sid).unwrap();
         assert_eq!(record.status, SwapStatus::Accepted);
@@ -75,7 +75,7 @@ mod mutation_tests {
     fn reveal_key_sets_completed_status() {
         let env = Env::default();
         let (swap, token_id, seller, buyer, ip_id, secret, blinding) = setup(&env);
-        let sid = swap.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0u32, &None);
+        let sid = swap.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0u32, &None, &false);
         swap.accept_swap(&sid);
         swap.reveal_key(&sid, &seller, &secret, &blinding);
         let record = swap.get_swap(&sid).unwrap();
@@ -90,7 +90,7 @@ mod mutation_tests {
     fn reveal_key_rejects_wrong_secret() {
         let env = Env::default();
         let (swap, token_id, seller, buyer, ip_id, _secret, blinding) = setup(&env);
-        let sid = swap.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0u32, &None);
+        let sid = swap.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0u32, &None, &false);
         swap.accept_swap(&sid);
         let wrong = BytesN::from_array(&env, &[0xFFu8; 32]);
         swap.reveal_key(&sid, &seller, &wrong, &blinding);
@@ -104,7 +104,7 @@ mod mutation_tests {
     fn zero_price_is_rejected() {
         let env = Env::default();
         let (swap, token_id, seller, buyer, ip_id, _, _) = setup(&env);
-        swap.initiate_swap(&token_id, &ip_id, &seller, &0_i128, &buyer, &0u32, &None);
+        swap.initiate_swap(&token_id, &ip_id, &seller, &0_i128, &buyer, &0u32, &None, &false);
     }
 
     // ── Double-accept guard ───────────────────────────────────────────────────
@@ -115,7 +115,7 @@ mod mutation_tests {
     fn accept_swap_twice_is_rejected() {
         let env = Env::default();
         let (swap, token_id, seller, buyer, ip_id, _, _) = setup(&env);
-        let sid = swap.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0u32, &None);
+        let sid = swap.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0u32, &None, &false);
         swap.accept_swap(&sid);
         swap.accept_swap(&sid);
     }
@@ -128,7 +128,7 @@ mod mutation_tests {
     fn reveal_key_on_pending_swap_is_rejected() {
         let env = Env::default();
         let (swap, token_id, seller, buyer, ip_id, secret, blinding) = setup(&env);
-        let sid = swap.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0u32, &None);
+        let sid = swap.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0u32, &None, &false);
         // Do NOT call accept_swap — reveal must fail
         swap.reveal_key(&sid, &seller, &secret, &blinding);
     }
@@ -140,7 +140,7 @@ mod mutation_tests {
     fn swap_ids_start_at_zero() {
         let env = Env::default();
         let (swap, token_id, seller, buyer, ip_id, _, _) = setup(&env);
-        let sid = swap.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0u32, &None);
+        let sid = swap.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0u32, &None, &false);
         assert_eq!(sid, 0, "first swap ID must be 0");
     }
 }
