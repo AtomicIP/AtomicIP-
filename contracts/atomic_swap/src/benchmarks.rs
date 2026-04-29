@@ -61,7 +61,7 @@ mod benchmarks {
         let (swap, token_id, seller, buyer, ip_id, _secret, _blinding) = setup(&env);
 
         env.budget().reset_default();
-        swap.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0u32, &None);
+        swap.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0u32, &None, &false);
         let cpu = env.budget().cpu_instruction_count();
 
         assert!(
@@ -77,7 +77,7 @@ mod benchmarks {
         let (swap, token_id, seller, buyer, ip_id, _secret, _blinding) = setup(&env);
 
         env.budget().reset_default();
-        swap.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0u32, &None);
+        swap.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0u32, &None, &false);
         let mem = env.budget().memory_bytes_count();
 
         assert!(
@@ -94,7 +94,7 @@ mod benchmarks {
         let env = Env::default();
         let (swap, token_id, seller, buyer, ip_id, secret, blinding) = setup(&env);
 
-        let swap_id = swap.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0u32, &None);
+        let swap_id = swap.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0u32, &None, &false);
         swap.accept_swap(&swap_id);
 
         env.budget().reset_default();
@@ -113,7 +113,7 @@ mod benchmarks {
         let env = Env::default();
         let (swap, token_id, seller, buyer, ip_id, secret, blinding) = setup(&env);
 
-        let swap_id = swap.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0u32, &None);
+        let swap_id = swap.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0u32, &None, &false);
         swap.accept_swap(&swap_id);
 
         env.budget().reset_default();
