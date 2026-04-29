@@ -101,6 +101,8 @@ pub struct SwapRecord {
     pub insurance_premium: i128,
     /// #352: Optional escrow agent address for high-value swaps.
     pub escrow_agent: Option<Address>,
+    /// Total quantity available for partial acceptance. Default 1 (full swap).
+    pub quantity: u32,
 }
 
 // ── Events ────────────────────────────────────────────────────────────────────

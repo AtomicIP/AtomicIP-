@@ -131,6 +131,10 @@ pub enum ContractError {
     // ── #361: Dispute evidence errors (55) ───────────────────────────────────
     /// Dispute evidence not found.
     DisputeEvidenceNotFound = 55,
+
+    // ── Partial quantity swap errors (56) ────────────────────────────────────
+    /// Requested quantity is zero or exceeds the swap's total quantity.
+    InvalidQuantity = 56,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -234,6 +238,8 @@ pub struct SwapRecord {
     pub insurance_premium: i128,
     /// #352: Optional escrow agent address for high-value swaps.
     pub escrow_agent: Option<Address>,
+    /// Total quantity available for partial acceptance. Default 1 (full swap).
+    pub quantity: u32,
 }
 
 // ── Events ────────────────────────────────────────────────────────────────────
@@ -495,6 +501,7 @@ impl AtomicSwap {
             collateral_amount,
             insurance_premium: 0,
             escrow_agent: None,
+            quantity: 1,
         };
 
         env.storage().persistent().set(&DataKey::Swap(id), &swap);
@@ -1116,6 +1123,44 @@ impl AtomicSwap {
         );
 
         swap.price = effective_price;
+        swap.accept_timestamp = env.ledger().timestamp();
+        swap.status = SwapStatus::Accepted;
+        swap::save_swap(&env, swap_id, &swap);
+
+        Self::append_history(&env, swap_id, SwapStatus::Accepted);
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("swap_acpt"),),
+            SwapAcceptedEvent { swap_id, buyer: swap.buyer },
+        );
+    }
+
+    /// Buyer accepts a partial quantity of a bulk swap at a proportional price.
+    /// `quantity` must be ≥ 1 and ≤ `swap.quantity`.
+    /// Payment = swap.price * quantity / swap.quantity (integer division, rounded down).
+    pub fn accept_swap_partial(env: Env, swap_id: u64, quantity: u32) {
+        require_not_paused(&env);
+
+        let mut swap = require_swap_exists(&env, swap_id);
+        swap.buyer.require_auth();
+        require_swap_status(&env, &swap, SwapStatus::Pending, ContractError::SwapNotPending);
+
+        if quantity == 0 || quantity > swap.quantity {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::InvalidQuantity as u32,
+            ));
+        }
+
+        let partial_price = swap.price * quantity as i128 / swap.quantity as i128;
+
+        token::Client::new(&env, &swap.token).transfer(
+            &swap.buyer,
+            &env.current_contract_address(),
+            &partial_price,
+        );
+
+        swap.price = partial_price;
+        swap.quantity = quantity;
         swap.accept_timestamp = env.ledger().timestamp();
         swap.status = SwapStatus::Accepted;
         swap::save_swap(&env, swap_id, &swap);
