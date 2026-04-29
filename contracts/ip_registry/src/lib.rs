@@ -84,6 +84,7 @@ pub enum DataKey {
     IpCommitmentChecksum,   // Issue #346: stores hash of all commitments for rollback protection
     IpAccessGrants(u64),    // Issue #344: stores Vec of (grantee, access_level) for tiered access
     NotarySignature(u64),   // Issue #345: stores notary signature for timestamp notarization
+    IpAttestations(u64),    // stores Vec<Attestation> for third-party attestations
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -103,6 +104,14 @@ pub struct IpDispute {
     pub evidence_hash: BytesN<32>,
     pub timestamp: u64,
     pub resolved: bool,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct Attestation {
+    pub attestor: Address,
+    pub attestation_data: Bytes,
+    pub timestamp: u64,
 }
 
 // ── Contract ─────────────────────────────────────────────────────────────────
@@ -1269,6 +1278,53 @@ impl IpRegistry {
     pub fn get_ip_notary_signature(env: Env, ip_id: u64) -> Option<Bytes> {
         let record = require_ip_exists(&env, ip_id);
         record.notary_signature.clone()
+    }
+
+    // ── Third-Party Attestations ───────────────────────────────────────────────
+
+    /// Allow any third party (notary, university, etc.) to attest to an IP's authenticity.
+    ///
+    /// Anyone can call this — no owner restriction. The attestor must authorize the call.
+    pub fn attest_ip(env: Env, ip_id: u64, attestor: Address, attestation_data: Bytes) {
+        // Verify the IP exists
+        require_ip_exists(&env, ip_id);
+
+        // Attestor must authorize their own attestation
+        attestor.require_auth();
+
+        let attestation = Attestation {
+            attestor: attestor.clone(),
+            attestation_data,
+            timestamp: env.ledger().timestamp(),
+        };
+
+        let mut attestations: Vec<Attestation> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IpAttestations(ip_id))
+            .unwrap_or(Vec::new(&env));
+        attestations.push_back(attestation);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::IpAttestations(ip_id), &attestations);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::IpAttestations(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish(
+            (symbol_short!("attest"), attestor),
+            (ip_id, env.ledger().timestamp()),
+        );
+    }
+
+    /// Retrieve all attestations for a given IP.
+    pub fn get_ip_attestations(env: Env, ip_id: u64) -> Vec<Attestation> {
+        require_ip_exists(&env, ip_id);
+        env.storage()
+            .persistent()
+            .get(&DataKey::IpAttestations(ip_id))
+            .unwrap_or(Vec::new(&env))
     }
 
     // ── Issue #346: Commitment Rollback Protection ─────────────────────────────

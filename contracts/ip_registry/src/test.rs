@@ -43,6 +43,8 @@ mod tests {
         fn revoke_delegation(env: Env, owner: Address, delegate_address: Address);
         fn is_delegate(env: Env, owner: Address, delegate_address: Address) -> bool;
         fn commit_ip_delegated(env: Env, owner: Address, commitment_hash: BytesN<32>, pow_difficulty: u32) -> u64;
+        fn attest_ip(env: Env, ip_id: u64, attestor: Address, attestation_data: soroban_sdk::Bytes);
+        fn get_ip_attestations(env: Env, ip_id: u64) -> Vec<crate::Attestation>;
     }
 
     #[test]
@@ -941,5 +943,79 @@ mod tests {
         let record = client.get_ip(&ip_id);
         assert_eq!(record.owner, owner);
         assert_eq!(record.commitment_hash, hash);
+    }
+
+    // ── Tests for Third-Party Attestations ──
+
+    #[test]
+    fn test_attest_ip_by_third_party() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let notary = <Address as TestAddress>::generate(&env);
+        let commitment = BytesN::from_array(&env, &[10u8; 32]);
+        let attestation_data = soroban_sdk::Bytes::from_array(&env, &[0xABu8; 32]);
+
+        let ip_id = client.commit_ip(&owner, &commitment, &0u32);
+        client.attest_ip(&ip_id, &notary, &attestation_data);
+
+        let attestations = client.get_ip_attestations(&ip_id);
+        assert_eq!(attestations.len(), 1);
+        let att = attestations.get(0).unwrap();
+        assert_eq!(att.attestor, notary);
+        assert_eq!(att.attestation_data, attestation_data);
+    }
+
+    #[test]
+    fn test_multiple_attestors() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let notary = <Address as TestAddress>::generate(&env);
+        let university = <Address as TestAddress>::generate(&env);
+        let commitment = BytesN::from_array(&env, &[11u8; 32]);
+
+        let ip_id = client.commit_ip(&owner, &commitment, &0u32);
+        client.attest_ip(&ip_id, &notary, &soroban_sdk::Bytes::from_array(&env, &[1u8; 32]));
+        client.attest_ip(&ip_id, &university, &soroban_sdk::Bytes::from_array(&env, &[2u8; 32]));
+
+        let attestations = client.get_ip_attestations(&ip_id);
+        assert_eq!(attestations.len(), 2);
+        assert_eq!(attestations.get(0).unwrap().attestor, notary);
+        assert_eq!(attestations.get(1).unwrap().attestor, university);
+    }
+
+    #[test]
+    fn test_get_ip_attestations_empty() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let commitment = BytesN::from_array(&env, &[12u8; 32]);
+
+        let ip_id = client.commit_ip(&owner, &commitment, &0u32);
+        let attestations = client.get_ip_attestations(&ip_id);
+        assert_eq!(attestations.len(), 0);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_attest_ip_nonexistent() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let attestor = <Address as TestAddress>::generate(&env);
+        // IP ID 999 does not exist — should panic
+        client.attest_ip(&999u64, &attestor, &soroban_sdk::Bytes::from_array(&env, &[1u8; 32]));
     }
 }
