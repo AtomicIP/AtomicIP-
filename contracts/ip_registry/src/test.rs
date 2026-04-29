@@ -47,6 +47,9 @@ mod tests {
         fn get_ip_attestations(env: Env, ip_id: u64) -> Vec<crate::Attestation>;
         fn set_ip_expiry(env: Env, ip_id: u64, expiry_timestamp: u64);
         fn renew_ip(env: Env, ip_id: u64, new_expiry: u64);
+        fn challenge_ip(env: Env, ip_id: u64, challenger: Address, reason: soroban_sdk::Bytes);
+        fn resolve_ip_dispute(env: Env, ip_id: u64, resolution: soroban_sdk::Bytes);
+        fn get_ip_disputes(env: Env, ip_id: u64) -> Vec<crate::IpChallenge>;
     }
 
     #[test]
@@ -1125,5 +1128,125 @@ mod tests {
             },
         }]);
         client.renew_ip(&ip_id, &2000u64);
+    }
+
+    // ── Tests for IP Dispute Challenges ──
+
+    #[test]
+    fn test_challenge_ip_stored() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let challenger = <Address as TestAddress>::generate(&env);
+        let commitment = BytesN::from_array(&env, &[30u8; 32]);
+        let reason = soroban_sdk::Bytes::from_array(&env, &[0xAAu8; 32]);
+
+        let ip_id = client.commit_ip(&owner, &commitment, &0u32);
+        client.challenge_ip(&ip_id, &challenger, &reason);
+
+        let disputes = client.get_ip_disputes(&ip_id);
+        assert_eq!(disputes.len(), 1);
+        let d = disputes.get(0).unwrap();
+        assert_eq!(d.challenger, challenger);
+        assert_eq!(d.reason, reason);
+        assert_eq!(d.resolved, false);
+    }
+
+    #[test]
+    fn test_challenge_ip_multiple_challengers() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let c1 = <Address as TestAddress>::generate(&env);
+        let c2 = <Address as TestAddress>::generate(&env);
+        let commitment = BytesN::from_array(&env, &[31u8; 32]);
+
+        let ip_id = client.commit_ip(&owner, &commitment, &0u32);
+        client.challenge_ip(&ip_id, &c1, &soroban_sdk::Bytes::from_array(&env, &[1u8; 32]));
+        client.challenge_ip(&ip_id, &c2, &soroban_sdk::Bytes::from_array(&env, &[2u8; 32]));
+
+        let disputes = client.get_ip_disputes(&ip_id);
+        assert_eq!(disputes.len(), 2);
+        assert_eq!(disputes.get(0).unwrap().challenger, c1);
+        assert_eq!(disputes.get(1).unwrap().challenger, c2);
+    }
+
+    #[test]
+    fn test_resolve_ip_dispute_marks_resolved() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let challenger = <Address as TestAddress>::generate(&env);
+        let commitment = BytesN::from_array(&env, &[32u8; 32]);
+        let resolution = soroban_sdk::Bytes::from_array(&env, &[0xBBu8; 32]);
+
+        let ip_id = client.commit_ip(&owner, &commitment, &0u32);
+        client.challenge_ip(&ip_id, &challenger, &soroban_sdk::Bytes::from_array(&env, &[1u8; 32]));
+
+        client.resolve_ip_dispute(&ip_id, &resolution);
+
+        let disputes = client.get_ip_disputes(&ip_id);
+        assert_eq!(disputes.len(), 1);
+        let d = disputes.get(0).unwrap();
+        assert_eq!(d.resolved, true);
+        assert_eq!(d.resolution, resolution);
+    }
+
+    #[test]
+    fn test_resolve_ip_dispute_resolves_all_open() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let commitment = BytesN::from_array(&env, &[33u8; 32]);
+        let resolution = soroban_sdk::Bytes::from_array(&env, &[0xCCu8; 32]);
+
+        let ip_id = client.commit_ip(&owner, &commitment, &0u32);
+        client.challenge_ip(&ip_id, &<Address as TestAddress>::generate(&env), &soroban_sdk::Bytes::from_array(&env, &[1u8; 32]));
+        client.challenge_ip(&ip_id, &<Address as TestAddress>::generate(&env), &soroban_sdk::Bytes::from_array(&env, &[2u8; 32]));
+
+        client.resolve_ip_dispute(&ip_id, &resolution);
+
+        let disputes = client.get_ip_disputes(&ip_id);
+        assert_eq!(disputes.len(), 2);
+        assert!(disputes.get(0).unwrap().resolved);
+        assert!(disputes.get(1).unwrap().resolved);
+    }
+
+    #[test]
+    fn test_get_ip_disputes_empty() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let commitment = BytesN::from_array(&env, &[34u8; 32]);
+
+        let ip_id = client.commit_ip(&owner, &commitment, &0u32);
+        assert_eq!(client.get_ip_disputes(&ip_id).len(), 0);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_challenge_ip_nonexistent_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let challenger = <Address as TestAddress>::generate(&env);
+        client.challenge_ip(&999u64, &challenger, &soroban_sdk::Bytes::from_array(&env, &[1u8; 32]));
     }
 }

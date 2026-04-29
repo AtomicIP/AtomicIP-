@@ -85,6 +85,7 @@ pub enum DataKey {
     IpAccessGrants(u64),    // Issue #344: stores Vec of (grantee, access_level) for tiered access
     NotarySignature(u64),   // Issue #345: stores notary signature for timestamp notarization
     IpAttestations(u64),    // stores Vec<Attestation> for third-party attestations
+    IpDisputes(u64),        // stores Vec<IpChallenge> for dispute challenges
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -112,6 +113,16 @@ pub struct Attestation {
     pub attestor: Address,
     pub attestation_data: Bytes,
     pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct IpChallenge {
+    pub challenger: Address,
+    pub reason: Bytes,
+    pub timestamp: u64,
+    pub resolved: bool,
+    pub resolution: Bytes,
 }
 
 // ── Contract ─────────────────────────────────────────────────────────────────
@@ -1347,6 +1358,95 @@ impl IpRegistry {
         env.storage()
             .persistent()
             .get(&DataKey::IpAttestations(ip_id))
+            .unwrap_or(Vec::new(&env))
+    }
+
+    // ── IP Dispute Challenges ─────────────────────────────────────────────────
+
+    /// Submit a challenge against an IP commitment. Anyone can challenge.
+    ///
+    /// The challenger must authorize the call. Appends a new `IpChallenge` to
+    /// the dispute list for the given IP.
+    pub fn challenge_ip(env: Env, ip_id: u64, challenger: Address, reason: Bytes) {
+        require_ip_exists(&env, ip_id);
+        challenger.require_auth();
+
+        let challenge = IpChallenge {
+            challenger: challenger.clone(),
+            reason,
+            timestamp: env.ledger().timestamp(),
+            resolved: false,
+            resolution: Bytes::new(&env),
+        };
+
+        let mut disputes: Vec<IpChallenge> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IpDisputes(ip_id))
+            .unwrap_or(Vec::new(&env));
+        disputes.push_back(challenge);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::IpDisputes(ip_id), &disputes);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::IpDisputes(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish(
+            (symbol_short!("challenge"), challenger),
+            (ip_id, env.ledger().timestamp()),
+        );
+    }
+
+    /// Resolve all open disputes for an IP. Admin-only.
+    ///
+    /// Marks every unresolved challenge as resolved with the provided `resolution`.
+    pub fn resolve_ip_dispute(env: Env, ip_id: u64, resolution: Bytes) {
+        require_ip_exists(&env, ip_id);
+
+        // Admin check: admin must be set and must authorize
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| env.panic_with_error(Error::from_contract_error(ContractError::Unauthorized as u32)));
+        admin.require_auth();
+
+        let mut disputes: Vec<IpChallenge> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IpDisputes(ip_id))
+            .unwrap_or(Vec::new(&env));
+
+        let mut updated = Vec::new(&env);
+        for mut d in disputes.iter() {
+            if !d.resolved {
+                d.resolved = true;
+                d.resolution = resolution.clone();
+            }
+            updated.push_back(d);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::IpDisputes(ip_id), &updated);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::IpDisputes(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish(
+            (symbol_short!("resolved"), admin),
+            (ip_id, env.ledger().timestamp()),
+        );
+    }
+
+    /// Retrieve all challenges for a given IP.
+    pub fn get_ip_disputes(env: Env, ip_id: u64) -> Vec<IpChallenge> {
+        require_ip_exists(&env, ip_id);
+        env.storage()
+            .persistent()
+            .get(&DataKey::IpDisputes(ip_id))
             .unwrap_or(Vec::new(&env))
     }
 
