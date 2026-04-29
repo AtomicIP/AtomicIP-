@@ -84,7 +84,7 @@ pub enum DataKey {
     IpCommitmentChecksum,   // Issue #346: stores hash of all commitments for rollback protection
     IpAccessGrants(u64),    // Issue #344: stores Vec of (grantee, access_level) for tiered access
     NotarySignature(u64),   // Issue #345: stores notary signature for timestamp notarization
-    IpAttestations(u64),    // stores Vec<Attestation> for third-party attestations
+    IpVersionChain(u64),    // stores Vec<u64> of the full version chain rooted at a given IP
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -260,6 +260,9 @@ impl IpRegistry {
 
         // Issue #346: Update commitment checksum for rollback protection
         Self::update_commitment_checksum(&env);
+
+        // Adjust PoW difficulty based on daily commit volume
+        Self::adjust_pow_difficulty(&env);
 
         id
     }
@@ -665,6 +668,104 @@ impl IpRegistry {
             .unwrap_or(4u32)
     }
 
+    /// Returns the current protocol configuration.
+    pub fn get_protocol_config(env: Env) -> ProtocolConfig {
+        let pow_difficulty = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PowDifficulty)
+            .unwrap_or(2u32);
+        ProtocolConfig { pow_difficulty }
+    }
+
+    /// Verify that a commitment hash meets the PoW requirement for a given nonce.
+    ///
+    /// Computes `sha256(commitment_hash || nonce_be_bytes)` and checks that the
+    /// result has at least `pow_difficulty` leading zero bits (current on-chain value).
+    ///
+    /// Returns `true` if the PoW is valid, `false` otherwise.
+    pub fn verify_commitment_pow(env: Env, commitment_hash: BytesN<32>, nonce: u64) -> bool {
+        let difficulty: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PowDifficulty)
+            .unwrap_or(2u32);
+
+        if difficulty == 0 {
+            return true;
+        }
+
+        let mut preimage = Bytes::new(&env);
+        preimage.append(&commitment_hash.into());
+        preimage.append(&Bytes::from_array(&env, &nonce.to_be_bytes()));
+        let hash: BytesN<32> = env.crypto().sha256(&preimage).into();
+        let hash_bytes = hash.to_array();
+
+        let mut remaining = difficulty;
+        for byte in hash_bytes.iter() {
+            if remaining == 0 {
+                break;
+            }
+            let bits = if remaining >= 8 { 8 } else { remaining };
+            let mask: u8 = !((1u8 << (8 - bits)).wrapping_sub(1));
+            if byte & mask != 0 {
+                return false;
+            }
+            remaining = remaining.saturating_sub(8);
+        }
+        true
+    }
+
+    /// Adjust PoW difficulty based on daily commit volume.
+    ///
+    /// - commits today > 100 → increase difficulty by 1 (max 32)
+    /// - commits today < 10  → decrease difficulty by 1 (min 1)
+    /// - otherwise           → no change
+    fn adjust_pow_difficulty(env: &Env) {
+        const SECONDS_PER_DAY: u64 = 86_400;
+        let today = env.ledger().timestamp() / SECONDS_PER_DAY;
+
+        let stored_day: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DailyCommitDay)
+            .unwrap_or(0);
+
+        let count: u64 = if stored_day == today {
+            env.storage()
+                .persistent()
+                .get(&DataKey::DailyCommitCount)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        let new_count = count + 1;
+        env.storage().persistent().set(&DataKey::DailyCommitDay, &today);
+        env.storage().persistent().set(&DataKey::DailyCommitCount, &new_count);
+        env.storage().persistent().extend_ttl(&DataKey::DailyCommitDay, LEDGER_BUMP, LEDGER_BUMP);
+        env.storage().persistent().extend_ttl(&DataKey::DailyCommitCount, LEDGER_BUMP, LEDGER_BUMP);
+
+        let current: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PowDifficulty)
+            .unwrap_or(2u32);
+
+        let new_difficulty = if new_count > 100 {
+            (current + 1).min(32)
+        } else if new_count < 10 {
+            current.saturating_sub(1).max(1)
+        } else {
+            current
+        };
+
+        if new_difficulty != current {
+            env.storage().persistent().set(&DataKey::PowDifficulty, &new_difficulty);
+            env.storage().persistent().extend_ttl(&DataKey::PowDifficulty, LEDGER_BUMP, LEDGER_BUMP);
+        }
+    }
+
     /// Partially disclose an IP commitment by revealing a hash of the design
     /// without exposing the full secret.
     ///
@@ -939,6 +1040,37 @@ impl IpRegistry {
         // Reject duplicate commitment hash globally
         require_unique_commitment(&env, &new_commitment_hash);
 
+        // Prevent circular version chains: walk up the parent chain and ensure
+        // the new ID (which will be `id`) does not already appear. Since `id`
+        // hasn't been assigned yet we check that parent_ip_id is not already
+        // an ancestor of itself (i.e. the parent chain is acyclic).
+        {
+            let mut visited: Vec<u64> = Vec::new(&env);
+            let mut cur = parent_ip_id;
+            loop {
+                // If we've seen this node before, there's a cycle
+                for v in visited.iter() {
+                    if v == cur {
+                        env.panic_with_error(Error::from_contract_error(
+                            ContractError::Unauthorized as u32,
+                        ));
+                    }
+                }
+                visited.push_back(cur);
+                let rec: Option<IpRecord> = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::IpRecord(cur));
+                match rec {
+                    Some(r) => match r.parent_ip_id {
+                        Some(p) => cur = p,
+                        None => break,
+                    },
+                    None => break,
+                }
+            }
+        }
+
         // Get next ID
         let id: u64 = env
             .storage()
@@ -991,7 +1123,7 @@ impl IpRegistry {
             LEDGER_BUMP,
         );
 
-        // Add to version lineage
+        // Add to version lineage (direct children of parent)
         let mut versions: Vec<u64> = env
             .storage()
             .persistent()
@@ -1006,6 +1138,42 @@ impl IpRegistry {
             LEDGER_BUMP,
             LEDGER_BUMP,
         );
+
+        // Update IpVersionChain for the root IP: append new version ID
+        {
+            let mut root_id = parent_ip_id;
+            loop {
+                let rec: Option<IpRecord> = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::IpRecord(root_id));
+                match rec {
+                    Some(r) => match r.parent_ip_id {
+                        Some(p) => root_id = p,
+                        None => break,
+                    },
+                    None => break,
+                }
+            }
+            let mut chain: Vec<u64> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::IpVersionChain(root_id))
+                .unwrap_or_else(|| {
+                    let mut v = Vec::new(&env);
+                    v.push_back(root_id);
+                    v
+                });
+            chain.push_back(id);
+            env.storage()
+                .persistent()
+                .set(&DataKey::IpVersionChain(root_id), &chain);
+            env.storage().persistent().extend_ttl(
+                &DataKey::IpVersionChain(root_id),
+                LEDGER_BUMP,
+                LEDGER_BUMP,
+            );
+        }
 
         // Increment next ID
         env.storage().persistent().set(&DataKey::NextId, &(id + 1));
@@ -1074,9 +1242,60 @@ impl IpRegistry {
         lineage
     }
 
-    // ── Issue #343: Merkle Tree Proof ──────────────────────────────────────────
+    /// Alias for `create_ip_version`. Commit a new version of an existing IP.
+    ///
+    /// Links the new commitment to `parent_ip_id`, establishing a verifiable
+    /// version history while preserving prior-art proof for each version.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the parent IP does not exist, the caller is not the owner,
+    /// the hash is zero/duplicate, or a circular chain would be created.
+    pub fn commit_ip_version(env: Env, owner: Address, commitment_hash: BytesN<32>, parent_ip_id: u64) -> u64 {
+        owner.require_auth();
+        Self::create_ip_version(env, parent_ip_id, commitment_hash)
+    }
 
-    /// Compute the Merkle root of all IP commitments for an owner.
+    /// Retrieve the full version chain for an IP, rooted at the original.
+    ///
+    /// Returns a `Vec<u64>` starting with the root IP ID followed by all
+    /// descendant version IDs in the order they were committed.
+    /// If the IP has no versions, returns a single-element vec with the root ID.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the IP record does not exist (IpNotFound error).
+    pub fn get_ip_version_chain(env: Env, ip_id: u64) -> Vec<u64> {
+        require_ip_exists(&env, ip_id);
+
+        // Walk up to find the root
+        let mut root_id = ip_id;
+        loop {
+            let rec: Option<IpRecord> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::IpRecord(root_id));
+            match rec {
+                Some(r) => match r.parent_ip_id {
+                    Some(p) => root_id = p,
+                    None => break,
+                },
+                None => break,
+            }
+        }
+
+        // Return stored chain, or a single-element vec if no versions exist yet
+        env.storage()
+            .persistent()
+            .get(&DataKey::IpVersionChain(root_id))
+            .unwrap_or_else(|| {
+                let mut v = Vec::new(&env);
+                v.push_back(root_id);
+                v
+            })
+    }
+
+    // ── Issue #343: Merkle Tree Proof ──────────────────────────────────────────
     /// This enables proving membership in a set of IPs without full disclosure.
     pub fn compute_ip_merkle_root(env: Env, owner: Address) -> BytesN<32> {
         let ip_ids: Vec<u64> = env
@@ -1645,5 +1864,93 @@ mod tests {
         env.mock_all_auths();
 
         client.commit_ip_anonymous(&commitment, &zk_proof);
+    }
+
+    // ── Tests for IP Commitment Versioning System ──────────────────────────────
+
+    #[test]
+    fn test_commit_ip_version_links_parent() {
+        let env = Env::default();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+        env.mock_all_auths();
+
+        let hash_v1 = BytesN::from_array(&env, &[0xA1u8; 32]);
+        let hash_v2 = BytesN::from_array(&env, &[0xA2u8; 32]);
+
+        let v1 = client.commit_ip(&owner, &hash_v1, &0u32);
+        let v2 = client.commit_ip_version(&owner, &hash_v2, &v1);
+
+        let record_v2 = client.get_ip(&v2);
+        assert_eq!(record_v2.parent_ip_id, Some(v1));
+    }
+
+    #[test]
+    fn test_get_ip_version_chain_single() {
+        let env = Env::default();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+        env.mock_all_auths();
+
+        let hash = BytesN::from_array(&env, &[0xB1u8; 32]);
+        let ip_id = client.commit_ip(&owner, &hash, &0u32);
+
+        let chain = client.get_ip_version_chain(&ip_id);
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain.get(0).unwrap(), ip_id);
+    }
+
+    #[test]
+    fn test_get_ip_version_chain_multiple_versions() {
+        let env = Env::default();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+        env.mock_all_auths();
+
+        let h1 = BytesN::from_array(&env, &[0xC1u8; 32]);
+        let h2 = BytesN::from_array(&env, &[0xC2u8; 32]);
+        let h3 = BytesN::from_array(&env, &[0xC3u8; 32]);
+
+        let v1 = client.commit_ip(&owner, &h1, &0u32);
+        let v2 = client.commit_ip_version(&owner, &h2, &v1);
+        let v3 = client.commit_ip_version(&owner, &h3, &v2);
+
+        // Chain from root should contain v1, v2, v3
+        let chain = client.get_ip_version_chain(&v1);
+        assert_eq!(chain.len(), 3);
+        assert_eq!(chain.get(0).unwrap(), v1);
+        assert_eq!(chain.get(1).unwrap(), v2);
+        assert_eq!(chain.get(2).unwrap(), v3);
+
+        // Chain from any version should return the same root chain
+        let chain_from_v3 = client.get_ip_version_chain(&v3);
+        assert_eq!(chain_from_v3.len(), 3);
+        assert_eq!(chain_from_v3.get(0).unwrap(), v1);
+    }
+
+    #[test]
+    fn test_version_chain_preserves_prior_art() {
+        let env = Env::default();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+        env.mock_all_auths();
+
+        let h1 = BytesN::from_array(&env, &[0xD1u8; 32]);
+        let h2 = BytesN::from_array(&env, &[0xD2u8; 32]);
+
+        let v1 = client.commit_ip(&owner, &h1, &0u32);
+        let ts_v1 = client.get_ip(&v1).timestamp;
+
+        let v2 = client.commit_ip_version(&owner, &h2, &v1);
+
+        // v1 record is unchanged — prior art is preserved
+        let record_v1 = client.get_ip(&v1);
+        assert_eq!(record_v1.timestamp, ts_v1);
+        assert_eq!(record_v1.commitment_hash, h1);
+        assert_eq!(record_v1.parent_ip_id, None);
     }
 }
