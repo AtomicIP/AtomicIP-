@@ -4,7 +4,7 @@
 //! and ensure consistent error handling across the contract.
 
 use crate::{ContractError, DataKey, SwapRecord, SwapStatus};
-use soroban_sdk::{Address, Env, Error};
+use soroban_sdk::{Address, Env, Error, Vec};
 
 /// Validates that the contract is not paused.
 ///
@@ -237,6 +237,7 @@ mod tests {
             insurance_premium: 0,
             escrow_agent: None,
             quantity: 1,
+            conditions: Vec::new(env),
         }
     }
 
@@ -312,6 +313,7 @@ mod tests {
             insurance_premium: 0,
             escrow_agent: None,
             quantity: 1,
+            conditions: Vec::new(env),
         };
         // Should not panic
         require_seller(&env, &seller, &swap);
@@ -339,6 +341,7 @@ mod tests {
             insurance_premium: 0,
             escrow_agent: None,
             quantity: 1,
+            conditions: Vec::new(env),
         };
         require_seller(&env, &not_seller, &swap);
     }
@@ -363,6 +366,7 @@ mod tests {
             insurance_premium: 0,
             escrow_agent: None,
             quantity: 1,
+            conditions: Vec::new(env),
         };
         // Should not panic
         require_buyer(&env, &buyer, &swap);
@@ -390,6 +394,7 @@ mod tests {
             insurance_premium: 0,
             escrow_agent: None,
             quantity: 1,
+            conditions: Vec::new(env),
         };
         require_buyer(&env, &not_buyer, &swap);
     }
@@ -414,6 +419,7 @@ mod tests {
             insurance_premium: 0,
             escrow_agent: None,
             quantity: 1,
+            conditions: Vec::new(env),
         };
         // Should not panic
         require_seller_or_buyer(&env, &seller, &swap);
@@ -439,6 +445,7 @@ mod tests {
             insurance_premium: 0,
             escrow_agent: None,
             quantity: 1,
+            conditions: Vec::new(env),
         };
         // Should not panic
         require_seller_or_buyer(&env, &buyer, &swap);
@@ -467,6 +474,7 @@ mod tests {
             insurance_premium: 0,
             escrow_agent: None,
             quantity: 1,
+            conditions: Vec::new(env),
         };
         require_seller_or_buyer(&env, &neither, &swap);
     }

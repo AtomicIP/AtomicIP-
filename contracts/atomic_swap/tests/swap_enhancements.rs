@@ -1,11 +1,11 @@
 #[cfg(test)]
 mod tests {
-    use atomic_swap::{AtomicSwap, AtomicSwapClient, SwapStatus};
+    use atomic_swap::{AtomicSwap, AtomicSwapClient, SwapCondition, SwapStatus};
     use ip_registry::{IpRegistry, IpRegistryClient};
     use soroban_sdk::{
-        testutils::Address as _,
+        testutils::{Address as _, Ledger},
         token::StellarAssetClient,
-        Address, BytesN, Env,
+        vec, Address, BytesN, Env,
     };
 
     fn setup_registry(env: &Env, owner: &Address) -> (Address, u64) {
@@ -144,5 +144,124 @@ mod tests {
     #[test]
     fn test_accept_swap_conditional() {
         // placeholder — conditional acceptance not yet implemented
+    }
+}
+
+    // ── conditional acceptance ────────────────────────────────────────────────
+
+    #[test]
+    fn test_accept_swap_conditional_key_valid_passes() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, swap_id, _seller, _buyer) = setup_swap(&env);
+
+        // KeyValid always passes at accept time
+        let conditions = vec![&env, SwapCondition::KeyValid];
+        client.accept_swap_conditional(&swap_id, &conditions);
+
+        let swap = client.get_swap(&swap_id).unwrap();
+        assert_eq!(swap.status, SwapStatus::Accepted);
+    }
+
+    #[test]
+    fn test_accept_swap_conditional_price_below_passes() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, swap_id, _seller, _buyer) = setup_swap(&env);
+
+        // price=1000, threshold=2000 → passes
+        let conditions = vec![&env, SwapCondition::PriceBelow(2000)];
+        client.accept_swap_conditional(&swap_id, &conditions);
+
+        let swap = client.get_swap(&swap_id).unwrap();
+        assert_eq!(swap.status, SwapStatus::Accepted);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_accept_swap_conditional_price_below_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, swap_id, _seller, _buyer) = setup_swap(&env);
+
+        // price=1000, threshold=500 → fails
+        let conditions = vec![&env, SwapCondition::PriceBelow(500)];
+        client.accept_swap_conditional(&swap_id, &conditions);
+    }
+
+    #[test]
+    fn test_accept_swap_conditional_time_after_passes() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, swap_id, _seller, _buyer) = setup_swap(&env);
+
+        // Advance ledger past the threshold
+        env.ledger().with_mut(|l| l.timestamp = 1000);
+        let conditions = vec![&env, SwapCondition::TimeAfter(500)];
+        client.accept_swap_conditional(&swap_id, &conditions);
+
+        let swap = client.get_swap(&swap_id).unwrap();
+        assert_eq!(swap.status, SwapStatus::Accepted);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_accept_swap_conditional_time_after_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, swap_id, _seller, _buyer) = setup_swap(&env);
+
+        // Ledger timestamp is 0, threshold is in the future
+        let conditions = vec![&env, SwapCondition::TimeAfter(9999)];
+        client.accept_swap_conditional(&swap_id, &conditions);
+    }
+
+    #[test]
+    fn test_accept_swap_conditional_multiple_conditions_all_pass() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, swap_id, _seller, _buyer) = setup_swap(&env);
+
+        env.ledger().with_mut(|l| l.timestamp = 100);
+        let conditions = vec![
+            &env,
+            SwapCondition::KeyValid,
+            SwapCondition::PriceBelow(5000),
+            SwapCondition::TimeAfter(50),
+        ];
+        client.accept_swap_conditional(&swap_id, &conditions);
+
+        let swap = client.get_swap(&swap_id).unwrap();
+        assert_eq!(swap.status, SwapStatus::Accepted);
+        assert_eq!(swap.conditions.len(), 3);
+    }
+
+    #[test]
+    fn test_accept_swap_unconditional_ignores_empty_conditions() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, swap_id, _seller, _buyer) = setup_swap(&env);
+
+        // Plain accept_swap still works with no conditions
+        client.accept_swap(&swap_id);
+
+        let swap = client.get_swap(&swap_id).unwrap();
+        assert_eq!(swap.status, SwapStatus::Accepted);
+        assert_eq!(swap.conditions.len(), 0);
+    }
+
+    #[test]
+    fn test_accept_swap_with_insurance() {
+        // placeholder — insurance feature not yet implemented
+    }
+
+    #[test]
+    fn test_initiate_swap_with_escrow() {
+        // placeholder — escrow feature not yet implemented
+    }
+
+    #[test]
+    fn test_escrow_release_funds() {
+        // placeholder — escrow feature not yet implemented
     }
 }
