@@ -253,6 +253,9 @@ impl IpRegistry {
         // Issue #346: Update commitment checksum for rollback protection
         Self::update_commitment_checksum(&env);
 
+        // Adjust PoW difficulty based on daily commit volume
+        Self::adjust_pow_difficulty(&env);
+
         id
     }
 
@@ -655,6 +658,104 @@ impl IpRegistry {
             .persistent()
             .get(&DataKey::PowDifficulty)
             .unwrap_or(4u32)
+    }
+
+    /// Returns the current protocol configuration.
+    pub fn get_protocol_config(env: Env) -> ProtocolConfig {
+        let pow_difficulty = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PowDifficulty)
+            .unwrap_or(2u32);
+        ProtocolConfig { pow_difficulty }
+    }
+
+    /// Verify that a commitment hash meets the PoW requirement for a given nonce.
+    ///
+    /// Computes `sha256(commitment_hash || nonce_be_bytes)` and checks that the
+    /// result has at least `pow_difficulty` leading zero bits (current on-chain value).
+    ///
+    /// Returns `true` if the PoW is valid, `false` otherwise.
+    pub fn verify_commitment_pow(env: Env, commitment_hash: BytesN<32>, nonce: u64) -> bool {
+        let difficulty: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PowDifficulty)
+            .unwrap_or(2u32);
+
+        if difficulty == 0 {
+            return true;
+        }
+
+        let mut preimage = Bytes::new(&env);
+        preimage.append(&commitment_hash.into());
+        preimage.append(&Bytes::from_array(&env, &nonce.to_be_bytes()));
+        let hash: BytesN<32> = env.crypto().sha256(&preimage).into();
+        let hash_bytes = hash.to_array();
+
+        let mut remaining = difficulty;
+        for byte in hash_bytes.iter() {
+            if remaining == 0 {
+                break;
+            }
+            let bits = if remaining >= 8 { 8 } else { remaining };
+            let mask: u8 = !((1u8 << (8 - bits)).wrapping_sub(1));
+            if byte & mask != 0 {
+                return false;
+            }
+            remaining = remaining.saturating_sub(8);
+        }
+        true
+    }
+
+    /// Adjust PoW difficulty based on daily commit volume.
+    ///
+    /// - commits today > 100 → increase difficulty by 1 (max 32)
+    /// - commits today < 10  → decrease difficulty by 1 (min 1)
+    /// - otherwise           → no change
+    fn adjust_pow_difficulty(env: &Env) {
+        const SECONDS_PER_DAY: u64 = 86_400;
+        let today = env.ledger().timestamp() / SECONDS_PER_DAY;
+
+        let stored_day: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DailyCommitDay)
+            .unwrap_or(0);
+
+        let count: u64 = if stored_day == today {
+            env.storage()
+                .persistent()
+                .get(&DataKey::DailyCommitCount)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        let new_count = count + 1;
+        env.storage().persistent().set(&DataKey::DailyCommitDay, &today);
+        env.storage().persistent().set(&DataKey::DailyCommitCount, &new_count);
+        env.storage().persistent().extend_ttl(&DataKey::DailyCommitDay, LEDGER_BUMP, LEDGER_BUMP);
+        env.storage().persistent().extend_ttl(&DataKey::DailyCommitCount, LEDGER_BUMP, LEDGER_BUMP);
+
+        let current: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PowDifficulty)
+            .unwrap_or(2u32);
+
+        let new_difficulty = if new_count > 100 {
+            (current + 1).min(32)
+        } else if new_count < 10 {
+            current.saturating_sub(1).max(1)
+        } else {
+            current
+        };
+
+        if new_difficulty != current {
+            env.storage().persistent().set(&DataKey::PowDifficulty, &new_difficulty);
+            env.storage().persistent().extend_ttl(&DataKey::PowDifficulty, LEDGER_BUMP, LEDGER_BUMP);
+        }
     }
 
     /// Partially disclose an IP commitment by revealing a hash of the design
