@@ -45,6 +45,8 @@ mod tests {
         fn commit_ip_delegated(env: Env, owner: Address, commitment_hash: BytesN<32>, pow_difficulty: u32) -> u64;
         fn attest_ip(env: Env, ip_id: u64, attestor: Address, attestation_data: soroban_sdk::Bytes);
         fn get_ip_attestations(env: Env, ip_id: u64) -> Vec<crate::Attestation>;
+        fn set_ip_expiry(env: Env, ip_id: u64, expiry_timestamp: u64);
+        fn renew_ip(env: Env, ip_id: u64, new_expiry: u64);
     }
 
     #[test]
@@ -1017,5 +1019,111 @@ mod tests {
         let attestor = <Address as TestAddress>::generate(&env);
         // IP ID 999 does not exist — should panic
         client.attest_ip(&999u64, &attestor, &soroban_sdk::Bytes::from_array(&env, &[1u8; 32]));
+    }
+
+    // ── Tests for renew_ip ──
+
+    #[test]
+    fn test_renew_ip_success() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let commitment = BytesN::from_array(&env, &[20u8; 32]);
+
+        let ip_id = client.commit_ip(&owner, &commitment, &0u32);
+        client.set_ip_expiry(&ip_id, &1000u64);
+        client.renew_ip(&ip_id, &2000u64);
+
+        let record = client.get_ip(&ip_id);
+        assert_eq!(record.expiry_timestamp, 2000u64);
+    }
+
+    #[test]
+    fn test_renew_ip_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let commitment = BytesN::from_array(&env, &[21u8; 32]);
+
+        let ip_id = client.commit_ip(&owner, &commitment, &0u32);
+        client.set_ip_expiry(&ip_id, &500u64);
+
+        let events_before = env.events().all().len();
+        client.renew_ip(&ip_id, &1500u64);
+
+        let all_events = env.events().all();
+        assert!(all_events.len() > events_before);
+        // Last event should be the renew event
+        let renew_event = all_events.get(all_events.len() - 1).unwrap();
+        let data: (u64, u64, u64) = soroban_sdk::TryFromVal::try_from_val(&env, &renew_event.2).unwrap();
+        assert_eq!(data.0, ip_id);
+        assert_eq!(data.1, 500u64);  // old_expiry
+        assert_eq!(data.2, 1500u64); // new_expiry
+    }
+
+    #[test]
+    #[should_panic(expected = "InvalidExpiry")]
+    fn test_renew_ip_same_expiry_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let commitment = BytesN::from_array(&env, &[22u8; 32]);
+
+        let ip_id = client.commit_ip(&owner, &commitment, &0u32);
+        client.set_ip_expiry(&ip_id, &1000u64);
+        client.renew_ip(&ip_id, &1000u64); // same expiry — must panic
+    }
+
+    #[test]
+    #[should_panic(expected = "InvalidExpiry")]
+    fn test_renew_ip_lower_expiry_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let commitment = BytesN::from_array(&env, &[23u8; 32]);
+
+        let ip_id = client.commit_ip(&owner, &commitment, &0u32);
+        client.set_ip_expiry(&ip_id, &1000u64);
+        client.renew_ip(&ip_id, &500u64); // lower expiry — must panic
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_renew_ip_non_owner_panics() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let other = <Address as TestAddress>::generate(&env);
+        let commitment = BytesN::from_array(&env, &[24u8; 32]);
+
+        env.mock_all_auths();
+        let ip_id = client.commit_ip(&owner, &commitment, &0u32);
+        client.set_ip_expiry(&ip_id, &1000u64);
+
+        // Only mock other's auth — owner's auth not present for renew_ip
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &other,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "renew_ip",
+                args: (ip_id, 2000u64).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.renew_ip(&ip_id, &2000u64);
     }
 }

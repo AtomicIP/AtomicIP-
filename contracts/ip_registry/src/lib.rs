@@ -777,6 +777,29 @@ impl IpRegistry {
         env.storage().persistent().extend_ttl(&DataKey::IpRecord(ip_id), LEDGER_BUMP, LEDGER_BUMP);
     }
 
+    /// Renew an IP's expiry to extend its protection period. Owner-only.
+    ///
+    /// `new_expiry` must be strictly greater than the current expiry timestamp.
+    /// Emits an event with (ip_id, old_expiry, new_expiry).
+    pub fn renew_ip(env: Env, ip_id: u64, new_expiry: u64) {
+        let mut record = require_ip_exists(&env, ip_id);
+        record.owner.require_auth();
+
+        let old_expiry = record.expiry_timestamp;
+        if new_expiry <= old_expiry {
+            env.panic_with_error(Error::from_contract_error(ContractError::InvalidExpiry as u32));
+        }
+
+        record.expiry_timestamp = new_expiry;
+        env.storage().persistent().set(&DataKey::IpRecord(ip_id), &record);
+        env.storage().persistent().extend_ttl(&DataKey::IpRecord(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish(
+            (symbol_short!("renew_ip"), record.owner),
+            (ip_id, old_expiry, new_expiry),
+        );
+    }
+
     /// Set or update metadata for an IP (max 1 KB). Owner-only.
     pub fn set_ip_metadata(env: Env, ip_id: u64, metadata: Bytes) {
         if metadata.len() > MAX_METADATA_BYTES {
