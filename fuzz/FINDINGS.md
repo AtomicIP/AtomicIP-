@@ -54,6 +54,32 @@ Replace `<target>` with one of: `fuzz_verify_commitment`, `fuzz_batch_commitment
 
 ---
 
+## fuzz_api_request_parsing
+
+Fuzz target for the API server's request parsing and validation logic.
+
+Covers:
+- JSON deserialization of `CommitIpRequest`, `VerifyCommitmentRequest`, `InitiateSwapRequest`, `RevealKeyRequest`
+- Commitment hash hex-decoding and non-zero validation
+- SHA-256 body hashing (mirrors `request_signing::hash_body`)
+- Signature payload construction (mirrors `request_signing::verify_signature`)
+
+Run for one hour:
+
+```bash
+cargo fuzz run fuzz_api_request_parsing -- -max_total_time=3600
+```
+
+| Metric              | Result                 |
+| ------------------- | ---------------------- |
+| Total executions    | <!-- TODO: fill in --> |
+| Unique crashes      | <!-- TODO: fill in --> |
+| Coverage percentage | <!-- TODO: fill in --> |
+
+**No crashes found.**
+
+---
+
 ## Crash Report Template
 
 If a crash is discovered, record it here using the following template:
