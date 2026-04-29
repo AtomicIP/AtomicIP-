@@ -120,6 +120,26 @@ wait
 - All tests run with `env.mock_all_auths()` for test simplicity
 - Random seed can be controlled via environment: `LIBFUZZER_SEED=12345`
 
+### Fuzz Target 4: fuzz_api_request_parsing
+
+Tests the API server's JSON request parsing and validation logic with arbitrary byte inputs.
+
+```bash
+cd fuzz
+cargo fuzz run fuzz_api_request_parsing -- -max_total_time=3600
+```
+
+**What it tests:**
+- JSON deserialization of all API request types (`CommitIpRequest`, `VerifyCommitmentRequest`, `InitiateSwapRequest`, `RevealKeyRequest`) never panics on arbitrary input
+- Commitment hash hex-decoding and non-zero validation
+- SHA-256 body hashing (mirrors `request_signing::hash_body`) always produces 64-char hex output
+- Signature payload construction never panics on arbitrary UTF-8 input
+
+**Properties verified:**
+1. No panic on arbitrary JSON input for any request type
+2. `hash_body` always returns a 64-character hex string
+3. Hex-decoded commitment hashes of length 32 can always be hashed without panic
+
 ## See Also
 
 - [libfuzzer Docmentation](https://llvm.org/docs/LibFuzzer/)
