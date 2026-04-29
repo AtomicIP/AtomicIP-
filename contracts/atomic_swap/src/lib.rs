@@ -211,6 +211,10 @@ pub enum DataKey {
     SwapEscrowAgent(u64),
     /// #351: Maps swap_id → acceptance conditions bytes.
     SwapConditions(u64),
+    /// Escrow: maps swap_id → SwapMode (Atomic | Escrow).
+    SwapMode(u64),
+    /// Escrow: maps swap_id → deposited amount (set when buyer deposits).
+    EscrowDeposit(u64),
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -223,6 +227,13 @@ pub enum SwapStatus {
     Completed,
     Disputed,
     Cancelled,
+}
+
+#[contracttype]
+#[derive(Clone, PartialEq, Debug)]
+pub enum SwapMode {
+    Atomic,
+    Escrow,
 }
 
 #[contracttype]
@@ -3148,12 +3159,170 @@ impl AtomicSwap {
             },
         );
     }
+
+    // ── Escrow Swap Flow ──────────────────────────────────────────────────────
+
+    /// Initiate an escrow-mode swap. Seller creates the swap; buyer deposits later.
+    ///
+    /// Returns the swap_id. The swap is stored with `SwapMode::Escrow` and
+    /// `SwapStatus::Pending`. The `timeout` parameter sets the deadline (ledger
+    /// timestamp) after which the buyer may withdraw their deposit if the seller
+    /// has not revealed the key.
+    pub fn initiate_escrow_swap(
+        env: Env,
+        token: Address,
+        ip_id: u64,
+        seller: Address,
+        price: i128,
+        buyer: Address,
+        timeout: u64,
+    ) -> u64 {
+        require_not_paused(&env);
+        seller.require_auth();
+        require_positive_price(&env, price);
+        registry::ensure_seller_owns_active_ip(&env, ip_id, &seller);
+        require_no_active_swap(&env, ip_id);
+
+        let id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(0);
+
+        let swap = SwapRecord {
+            ip_id,
+            seller: seller.clone(),
+            buyer: buyer.clone(),
+            price,
+            token: token.clone(),
+            status: SwapStatus::Pending,
+            expiry: timeout,
+            accept_timestamp: 0,
+            required_approvals: 0,
+            dispute_timestamp: 0,
+            referrer: None,
+            collateral_amount: 0,
+            insurance_premium: 0,
+            escrow_agent: None,
+        };
+
+        env.storage().persistent().set(&DataKey::Swap(id), &swap);
+        env.storage().persistent().extend_ttl(&DataKey::Swap(id), LEDGER_BUMP, LEDGER_BUMP);
+        env.storage().persistent().set(&DataKey::ActiveSwap(ip_id), &id);
+        env.storage().persistent().extend_ttl(&DataKey::ActiveSwap(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+        env.storage().persistent().set(&DataKey::SwapMode(id), &SwapMode::Escrow);
+        env.storage().persistent().extend_ttl(&DataKey::SwapMode(id), LEDGER_BUMP, LEDGER_BUMP);
+
+        swap::append_swap_for_party(&env, &seller, &buyer, id);
+        Self::append_history(&env, id, SwapStatus::Pending);
+        env.storage().instance().set(&DataKey::NextId, &(id + 1));
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("escrow_ini"),),
+            SwapInitiatedEvent { swap_id: id, ip_id, seller, buyer, price },
+        );
+
+        id
+    }
+
+    /// Buyer deposits funds into escrow. Moves swap to `Accepted`.
+    ///
+    /// Transfers `price` tokens from buyer to the contract. Can only be called
+    /// on an escrow-mode swap in `Pending` status.
+    pub fn escrow_deposit(env: Env, swap_id: u64) {
+        let mut swap = require_swap_exists(&env, swap_id);
+        swap.buyer.require_auth();
+
+        // Must be escrow mode
+        let mode: SwapMode = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SwapMode(swap_id))
+            .unwrap_or(SwapMode::Atomic);
+        if mode != SwapMode::Escrow {
+            env.panic_with_error(Error::from_contract_error(ContractError::Unauthorized as u32));
+        }
+
+        require_swap_status(&env, &swap, SwapStatus::Pending, ContractError::SwapNotPending);
+
+        // Transfer payment from buyer into contract escrow
+        token::Client::new(&env, &swap.token).transfer(
+            &swap.buyer,
+            &env.current_contract_address(),
+            &swap.price,
+        );
+
+        env.storage().persistent().set(&DataKey::EscrowDeposit(swap_id), &swap.price);
+        env.storage().persistent().extend_ttl(&DataKey::EscrowDeposit(swap_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        swap.accept_timestamp = env.ledger().timestamp();
+        swap.status = SwapStatus::Accepted;
+        swap::save_swap(&env, swap_id, &swap);
+        Self::append_history(&env, swap_id, SwapStatus::Accepted);
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("escrow_dep"),),
+            SwapAcceptedEvent { swap_id, buyer: swap.buyer },
+        );
+    }
+
+    /// Buyer withdraws their deposit after timeout if seller never revealed.
+    ///
+    /// Can only be called on an escrow-mode swap in `Accepted` status after
+    /// `swap.expiry` has passed. Refunds the full deposit to the buyer and
+    /// cancels the swap.
+    pub fn escrow_withdraw(env: Env, swap_id: u64) {
+        let mut swap = require_swap_exists(&env, swap_id);
+        swap.buyer.require_auth();
+
+        // Must be escrow mode
+        let mode: SwapMode = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SwapMode(swap_id))
+            .unwrap_or(SwapMode::Atomic);
+        if mode != SwapMode::Escrow {
+            env.panic_with_error(Error::from_contract_error(ContractError::Unauthorized as u32));
+        }
+
+        require_swap_status(&env, &swap, SwapStatus::Accepted, ContractError::SwapNotAccepted);
+
+        // Timeout must have passed
+        if env.ledger().timestamp() <= swap.expiry {
+            env.panic_with_error(Error::from_contract_error(ContractError::SwapHasNotExpiredYet as u32));
+        }
+
+        let deposit: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EscrowDeposit(swap_id))
+            .unwrap_or(0);
+
+        swap.status = SwapStatus::Cancelled;
+        swap::save_swap(&env, swap_id, &swap);
+        env.storage().persistent().remove(&DataKey::ActiveSwap(swap.ip_id));
+        env.storage().persistent().remove(&DataKey::EscrowDeposit(swap_id));
+        Self::append_history(&env, swap_id, SwapStatus::Cancelled);
+
+        // Refund buyer
+        if deposit > 0 {
+            token::Client::new(&env, &swap.token).transfer(
+                &env.current_contract_address(),
+                &swap.buyer,
+                &deposit,
+            );
+        }
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("escrow_wdr"),),
+            SwapCancelledEvent { swap_id, canceller: swap.buyer },
+        );
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod escrow_tests;
 
 #[cfg(test)]
 mod prop_tests;
