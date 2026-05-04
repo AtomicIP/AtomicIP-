@@ -4,7 +4,7 @@
 //! and ensure consistent error handling across the contract.
 
 use crate::{ContractError, DataKey, SwapRecord, SwapStatus};
-use soroban_sdk::{Address, Env, Error, Vec};
+use soroban_sdk::{Address, Env, Error};
 
 /// Validates that the contract is not paused.
 ///
@@ -23,7 +23,7 @@ pub fn require_not_paused(env: &Env) {
         .unwrap_or(false)
     {
         env.panic_with_error(Error::from_contract_error(
-            ContractError::ContractPaused as u32,
+            ContractError::Paused as u32,
         ));
     }
 }
@@ -89,7 +89,7 @@ pub fn require_swap_status(
 pub fn require_positive_price(env: &Env, price: i128) {
     if price <= 0 {
         env.panic_with_error(Error::from_contract_error(
-            ContractError::PriceMustBeGreaterThanZero as u32,
+            ContractError::PriceTooSmall as u32,
         ));
     }
 }
@@ -108,7 +108,7 @@ pub fn require_positive_price(env: &Env, price: i128) {
 pub fn require_seller(env: &Env, caller: &Address, swap: &SwapRecord) {
     if caller != &swap.seller {
         env.panic_with_error(Error::from_contract_error(
-            ContractError::OnlyTheSellerCanRevealTheKey as u32,
+            ContractError::OnlySellerReveal as u32,
         ));
     }
 }
@@ -127,7 +127,7 @@ pub fn require_seller(env: &Env, caller: &Address, swap: &SwapRecord) {
 pub fn require_buyer(env: &Env, caller: &Address, swap: &SwapRecord) {
     if caller != &swap.buyer {
         env.panic_with_error(Error::from_contract_error(
-            ContractError::OnlyTheBuyerCanCancelAnExpiredSwap as u32,
+            ContractError::OnlyBuyerCancel as u32,
         ));
     }
 }
@@ -146,7 +146,7 @@ pub fn require_buyer(env: &Env, caller: &Address, swap: &SwapRecord) {
 pub fn require_seller_or_buyer(env: &Env, caller: &Address, swap: &SwapRecord) {
     if caller != &swap.seller && caller != &swap.buyer {
         env.panic_with_error(Error::from_contract_error(
-            ContractError::OnlyTheSellerOrBuyerCanCancel as u32,
+            ContractError::OnlySellerBuyer as u32,
         ));
     }
 }
@@ -164,7 +164,7 @@ pub fn require_seller_or_buyer(env: &Env, caller: &Address, swap: &SwapRecord) {
 pub fn require_swap_expired(env: &Env, swap: &SwapRecord) {
     if env.ledger().timestamp() <= swap.expiry {
         env.panic_with_error(Error::from_contract_error(
-            ContractError::SwapHasNotExpiredYet as u32,
+            ContractError::NotExpired as u32,
         ));
     }
 }
@@ -182,7 +182,7 @@ pub fn require_swap_expired(env: &Env, swap: &SwapRecord) {
 pub fn require_no_active_swap(env: &Env, ip_id: u64) {
     if env.storage().persistent().has(&DataKey::ActiveSwap(ip_id)) {
         env.panic_with_error(Error::from_contract_error(
-            ContractError::ActiveSwapAlreadyExistsForThisIpId as u32,
+            ContractError::SwapExists as u32,
         ));
     }
 }
@@ -283,7 +283,7 @@ mod tests {
         let env = Env::default();
         let swap = make_swap(&env, SwapStatus::Pending, 0);
         // Should not panic
-        require_swap_status(&env, &swap, SwapStatus::Pending, ContractError::SwapNotPending);
+        require_swap_status(&env, &swap, SwapStatus::Pending, ContractError::NotPending);
     }
 
     #[test]
@@ -291,7 +291,7 @@ mod tests {
     fn test_require_swap_status_panics_when_not_matching() {
         let env = Env::default();
         let swap = make_swap(&env, SwapStatus::Accepted, 0);
-        require_swap_status(&env, &swap, SwapStatus::Pending, ContractError::SwapNotPending);
+        require_swap_status(&env, &swap, SwapStatus::Pending, ContractError::NotPending);
     }
 
     #[test]

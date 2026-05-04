@@ -126,17 +126,17 @@ pub fn check_schema_compatibility(
 ) -> Result<(), ContractError> {
     // 1. Version must advance.
     if new_schema.version <= current.version {
-        return Err(ContractError::UpgradeSchemaVersionNotGreater);
+        return Err(ContractError::SchemaNotGreater);
     }
 
     // 2. No function removed or signature changed.
     for i in 0..current.functions.len() {
         let cur_fn = current.functions.get(i).unwrap();
         match find_function(&new_schema.functions, &cur_fn.name) {
-            None => return Err(ContractError::UpgradeMissingFunction),
+            None => return Err(ContractError::MissingFunc),
             Some(new_fn) => {
                 if new_fn.signature != cur_fn.signature {
-                    return Err(ContractError::UpgradeFunctionSignatureChanged);
+                    return Err(ContractError::FuncChanged);
                 }
             }
         }
@@ -146,10 +146,10 @@ pub fn check_schema_compatibility(
     for i in 0..current.errors.len() {
         let cur_err = current.errors.get(i).unwrap();
         match find_error(&new_schema.errors, &cur_err.name) {
-            None => return Err(ContractError::UpgradeMissingErrorCode),
+            None => return Err(ContractError::MissingFunc),
             Some(new_err) => {
                 if new_err.code != cur_err.code {
-                    return Err(ContractError::UpgradeErrorCodeChanged);
+                    return Err(ContractError::FuncChanged);
                 }
             }
         }
@@ -159,7 +159,7 @@ pub fn check_schema_compatibility(
     for i in 0..current.storage_keys.len() {
         let cur_key = current.storage_keys.get(i).unwrap();
         if !contains_string(&new_schema.storage_keys, &cur_key) {
-            return Err(ContractError::UpgradeMissingStorageKey);
+            return Err(ContractError::MissingFunc);
         }
     }
 
@@ -290,16 +290,16 @@ pub fn build_v1_schema(env: &Env) -> ContractSchema {
 
     e!("SwapNotFound",                          1);
     e!("InvalidKey",                            2);
-    e!("PriceMustBeGreaterThanZero",            3);
+    e!("PriceTooSmall",                         3);
     e!("SellerIsNotTheIPOwner",                 4);
-    e!("ActiveSwapAlreadyExistsForThisIpId",    5);
+    e!("ActiveSwapExists",                      5);
     e!("SwapNotPending",                        6);
-    e!("OnlyTheSellerCanRevealTheKey",          7);
+    e!("OnlySellerCanReveal",                   7);
     e!("SwapNotAccepted",                       8);
-    e!("OnlyTheSellerOrBuyerCanCancel",         9);
-    e!("OnlyPendingSwapsCanBeCancelledThisWay", 10);
+    e!("OnlySellerOrBuyer",                     9);
+    e!("OnlyPendingSwaps",                      10);
     e!("SwapNotInAcceptedState",                11);
-    e!("OnlyTheBuyerCanCancelAnExpiredSwap",    12);
+    e!("OnlyBuyerCanCancel",                    12);
     e!("SwapHasNotExpiredYet",                  13);
     e!("IpIsRevoked",                           14);
     e!("UnauthorizedUpgrade",                   15);
@@ -316,9 +316,9 @@ pub fn build_v1_schema(env: &Env) -> ContractSchema {
     e!("NewExpiryNotGreater",                   26);
     e!("InsufficientApprovals",                 27);
     e!("AlreadyApproved",                       28);
-    e!("UpgradeSchemaVersionNotGreater",        29);
+    e!("UpgradeSchemaVersionGreater",           29);
     e!("UpgradeMissingFunction",                30);
-    e!("UpgradeFunctionSignatureChanged",       31);
+    e!("UpgradeFunctionSigChanged",             31);
     e!("UpgradeMissingErrorCode",               32);
     e!("UpgradeErrorCodeChanged",               33);
     e!("UpgradeMissingStorageKey",              34);
@@ -442,7 +442,7 @@ mod tests {
         let v1 = build_v1_schema(&env);
         assert_eq!(
             check_schema_compatibility(&v1, &v1.clone()),
-            Err(ContractError::UpgradeSchemaVersionNotGreater)
+            Err(ContractError::SchemaNotGreater)
         );
     }
 
@@ -456,7 +456,7 @@ mod tests {
         bad.version = 3;
         assert_eq!(
             check_schema_compatibility(&v1, &bad),
-            Err(ContractError::UpgradeSchemaVersionNotGreater)
+            Err(ContractError::SchemaNotGreater)
         );
     }
 
@@ -481,7 +481,7 @@ mod tests {
 
         assert_eq!(
             check_schema_compatibility(&v1, &v2),
-            Err(ContractError::UpgradeMissingFunction)
+            Err(ContractError::MissingFunc)
         );
     }
 
@@ -530,7 +530,7 @@ mod tests {
 
         assert_eq!(
             check_schema_compatibility(&v1, &v2),
-            Err(ContractError::UpgradeMissingStorageKey)
+            Err(ContractError::MissingFunc)
         );
     }
 
@@ -555,7 +555,7 @@ mod tests {
 
         assert_eq!(
             check_schema_compatibility(&v1, &v2),
-            Err(ContractError::UpgradeMissingErrorCode)
+            Err(ContractError::MissingFunc)
         );
     }
 
@@ -579,7 +579,7 @@ mod tests {
 
         assert_eq!(
             check_schema_compatibility(&v1, &v2),
-            Err(ContractError::UpgradeErrorCodeChanged)
+            Err(ContractError::FuncChanged)
         );
     }
 

@@ -77,7 +77,7 @@ mod chaos {
 
         assert_eq!(
             check_schema_compatibility(&v1, &empty),
-            Err(ContractError::UpgradeMissingFunction)
+            Err(ContractError::MissingFunc)
         );
     }
 
@@ -91,7 +91,7 @@ mod chaos {
 
         assert_eq!(
             check_schema_compatibility(&v1, &bad),
-            Err(ContractError::UpgradeMissingFunction)
+            Err(ContractError::MissingFunc)
         );
     }
 
@@ -105,7 +105,7 @@ mod chaos {
 
         assert_eq!(
             check_schema_compatibility(&v1, &bad),
-            Err(ContractError::UpgradeMissingErrorCode)
+            Err(ContractError::MissingFunc)
         );
     }
 
@@ -119,7 +119,7 @@ mod chaos {
 
         assert_eq!(
             check_schema_compatibility(&v1, &bad),
-            Err(ContractError::UpgradeMissingStorageKey)
+            Err(ContractError::MissingFunc)
         );
     }
 
@@ -180,7 +180,7 @@ mod chaos {
 
             assert_eq!(
                 check_schema_compatibility(&v1, &candidate),
-                Err(ContractError::UpgradeMissingFunction),
+                Err(ContractError::MissingFunc),
                 "removing function at index {idx} should be rejected"
             );
         }
@@ -199,7 +199,7 @@ mod chaos {
 
             assert_eq!(
                 check_schema_compatibility(&v1, &candidate),
-                Err(ContractError::UpgradeMissingErrorCode),
+                Err(ContractError::MissingFunc),
                 "removing error at index {idx} should be rejected"
             );
         }
@@ -218,7 +218,7 @@ mod chaos {
 
             assert_eq!(
                 check_schema_compatibility(&v1, &candidate),
-                Err(ContractError::UpgradeMissingStorageKey),
+                Err(ContractError::MissingFunc),
                 "removing storage key at index {idx} should be rejected"
             );
         }
@@ -299,7 +299,7 @@ mod chaos {
 
         assert_eq!(
             check_schema_compatibility(&v1, &v2),
-            Err(ContractError::UpgradeErrorCodeChanged)
+            Err(ContractError::FuncChanged)
         );
     }
 
@@ -326,7 +326,7 @@ mod chaos {
         };
         assert_eq!(
             check_schema_compatibility(&maxed, &candidate),
-            Err(ContractError::UpgradeSchemaVersionNotGreater)
+            Err(ContractError::SchemaNotGreater)
         );
     }
 
@@ -345,7 +345,7 @@ mod chaos {
 
         assert_eq!(
             check_schema_compatibility(&v1, &zero),
-            Err(ContractError::UpgradeSchemaVersionNotGreater)
+            Err(ContractError::SchemaNotGreater)
         );
     }
 

@@ -1,9 +1,10 @@
-use soroban_sdk::{contracttype, Address, BytesN, Symbol, Vec, Env, Bytes};
+use soroban_sdk::{contracttype, Address, BytesN, Symbol, Bytes};
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
 
 /// Minimum ledger TTL bump applied to every persistent storage write.
 /// ~1 year at ~5s per ledger: 365 * 24 * 3600 / 5 ≈ 6_307_200 ledgers.
+#[allow(dead_code)]
 pub const LEDGER_BUMP: u32 = 6_307_200;
 
 // ── Event Topics ────────────────────────────────────────────────────────────
@@ -17,7 +18,7 @@ pub const TRANSFER_TOPIC: Symbol = soroban_sdk::symbol_short!("ip_xfer");
 #[derive(Clone)]
 pub struct IpAccessGrant {
     pub grantee: Address,
-    pub access_level: u8, // 0 = none, 1 = read-only, 2 = read-write
+    pub access_level: u32, // 0 = none, 1 = read-only, 2 = read-write
 }
 
 // ── Storage Keys ────────────────────────────────────────────────────────────

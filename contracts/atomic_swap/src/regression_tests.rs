@@ -177,7 +177,7 @@ mod regression_tests {
         let result = client.try_initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None);
         assert_eq!(
             result.unwrap_err().unwrap(),
-            ContractError::IpIsRevoked,
+            ContractError::IpRevoked,
             "swap on revoked IP must be rejected"
         );
     }
@@ -280,7 +280,7 @@ mod regression_tests {
         let result = client.try_cancel_expired_swap(&swap_id, &buyer);
         assert_eq!(
             result.unwrap_err().unwrap(),
-            ContractError::SwapHasNotExpiredYet,
+            ContractError::NotExpired,
             "cancellation before expiry must be rejected"
         );
     }

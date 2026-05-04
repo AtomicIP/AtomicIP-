@@ -4,6 +4,7 @@ use soroban_sdk::{contracttype, Address, BytesN, Vec};
 
 /// Minimum ledger TTL bump applied to every persistent storage write.
 /// ~1 year at ~5s per ledger: 365 * 24 * 3600 / 5 ≈ 6_307_200 ledgers.
+#[allow(dead_code)]
 pub const LEDGER_BUMP: u32 = 6_307_200;
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
@@ -76,34 +77,7 @@ pub enum SwapStatus {
     Cancelled,
 }
 
-#[contracttype]
-#[derive(Clone)]
-pub struct SwapRecord {
-    pub ip_id: u64,
-    pub seller: Address,
-    pub buyer: Address,
-    pub price: i128,
-    pub token: Address,
-    pub status: SwapStatus,
-    /// Ledger timestamp after which the buyer may cancel an Accepted swap
-    /// if reveal_key has not been called. Set at initiation time.
-    pub expiry: u64,
-    pub accept_timestamp: u64,
-    /// #254: Number of approvals required before accept_swap is allowed.
-    pub required_approvals: u32,
-    /// Ledger timestamp when a dispute was raised. Zero if no dispute.
-    pub dispute_timestamp: u64,
-    /// #311: Optional referrer address for referral reward on completion.
-    pub referrer: Option<Address>,
-    /// #350: Collateral amount required from buyer. Zero if no collateral.
-    pub collateral_amount: i128,
-    /// #354: Insurance premium paid by buyer. Zero if no insurance.
-    pub insurance_premium: i128,
-    /// #352: Optional escrow agent address for high-value swaps.
-    pub escrow_agent: Option<Address>,
-    /// Total quantity available for partial acceptance. Default 1 (full swap).
-    pub quantity: u32,
-}
+// SwapRecord is defined in lib.rs (not a contracttype due to Vec<SwapCondition> field)
 
 // ── Events ────────────────────────────────────────────────────────────────────
 
@@ -165,16 +139,7 @@ pub struct DisputeResolvedEvent {
     pub refunded: bool,
 }
 
-#[contracttype]
-#[derive(Clone)]
-pub struct ProtocolConfig {
-    pub protocol_fee_bps: u32,  // 0-10000 (0.00% - 100.00%)
-    pub treasury: Address,
-    pub dispute_window_seconds: u64,
-    pub dispute_resolution_timeout_seconds: u64,
-    /// #311: Referral fee in basis points (0-10000). Deducted from seller proceeds.
-    pub referral_fee_bps: u32,
-}
+// ProtocolConfig is defined in lib.rs (needs to be in same file as contractimpl)
 
 // ── #311: Referral Paid Event ─────────────────────────────────────────────────
 
@@ -239,7 +204,7 @@ pub struct ArbitratedEvent {
 #[derive(Clone, Debug, PartialEq)]
 pub struct AdminRollbackEvent {
     pub swap_id: u64,
-    pub reason: Bytes<64>,
+    pub reason: soroban_sdk::Bytes,
     pub buyer_refund: i128,
     pub seller_refund: i128,
     pub timestamp: u64,
@@ -361,7 +326,7 @@ pub struct AtomicRefundEvent {
     pub swap_id: u64,
     pub buyer: Address,
     pub refund_amount: i128,
-    pub reason: String,
+    pub reason: soroban_sdk::String,
 }
 
 // ── #357: Batch Processing Events ─────────────────────────────────────────────
@@ -388,4 +353,40 @@ pub struct TimeoutEscalationRequestedEvent {
     pub swap_id: u64,
     pub buyer: Address,
     pub new_expiry: u64,
+}
+
+// ── #352: Renegotiation Types ─────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone)]
+pub struct RenegotiationOffer {
+    pub new_price: i128,
+    pub proposer: Address,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RenegotiationProposedEvent {
+    pub swap_id: u64,
+    pub new_price: i128,
+    pub proposer: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RenegotiationAcceptedEvent {
+    pub swap_id: u64,
+    pub new_price: i128,
+    pub buyer: Address,
+}
+
+// ── #354: Insurance Types ─────────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct InsurancePayoutEvent {
+    pub swap_id: u64,
+    pub buyer: Address,
+    pub payout_amount: i128,
 }

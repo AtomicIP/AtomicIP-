@@ -15,11 +15,11 @@ pub fn ensure_seller_owns_active_ip(env: &Env, ip_id: u64, seller: &Address) {
     let record = registry.get_ip(&ip_id);
 
     if record.owner != *seller {
-        panic_with_error(env, ContractError::SellerIsNotTheIPOwner);
+        panic_with_error(env, ContractError::NotIPOwner);
     }
 
     if record.revoked {
-        panic_with_error(env, ContractError::IpIsRevoked);
+        panic_with_error(env, ContractError::IpRevoked);
     }
 }
 
