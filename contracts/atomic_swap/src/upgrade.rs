@@ -370,8 +370,8 @@ pub fn build_v1_schema(env: &Env) -> ContractSchema {
 // does NOT invoke `env.deployer().update_current_contract_wasm`.  This avoids
 // the need for a real Soroban deployer in unit tests.
 
-#[cfg(test)]
-mod tests {
+// #[cfg(test)]
+// mod tests {
     use super::*;
     use soroban_sdk::Env;
 

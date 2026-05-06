@@ -218,8 +218,8 @@ pub fn require_admin(env: &Env, caller: &Address) {
     }
 }
 
-#[cfg(test)]
-mod tests {
+// #[cfg(test)]
+// mod tests {
     use super::*;
     use soroban_sdk::{testutils::Address as _, Env};
 
