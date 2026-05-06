@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, BytesN, Symbol, Bytes};
+use soroban_sdk::{contracttype, Address, Bytes, BytesN, Symbol};
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
 
@@ -32,12 +32,12 @@ pub enum DataKey {
     CommitmentOwner(BytesN<32>), // tracks which owner already holds a commitment hash
     Admin,
     CategoryIps(BytesN<32>), // maps category hash -> Vec<u64> of IP IDs
-    IpLineage(u64), // stores parent_ip_id for versioning
-    IpVersions(u64), // stores Vec<u64> of all version IDs for a given IP
-    IpCommitmentChecksum, // Issue #346: stores hash of all commitments for rollback protection
-    IpAccessGrants(u64), // Issue #344: stores Vec of (grantee, access_level) for tiered access
-    NotarySignature(u64), // Issue #345: stores notary signature for timestamp notarization
-    IpVersionChain(u64), // stores Vec<u64> of the full version chain rooted at a given IP
+    IpLineage(u64),          // stores parent_ip_id for versioning
+    IpVersions(u64),         // stores Vec<u64> of all version IDs for a given IP
+    IpCommitmentChecksum,    // Issue #346: stores hash of all commitments for rollback protection
+    IpAccessGrants(u64),     // Issue #344: stores Vec of (grantee, access_level) for tiered access
+    NotarySignature(u64),    // Issue #345: stores notary signature for timestamp notarization
+    IpVersionChain(u64),     // stores Vec<u64> of the full version chain rooted at a given IP
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -51,7 +51,7 @@ pub struct IpRecord {
     pub timestamp: u64,
     pub revoked: bool,
     pub co_owners: soroban_sdk::Vec<Address>,
-    pub parent_ip_id: Option<u64>, // parent IP ID for versioning
+    pub parent_ip_id: Option<u64>,       // parent IP ID for versioning
     pub notary_signature: Option<Bytes>, // Issue #345: notary signature for timestamp notarization
 }
 

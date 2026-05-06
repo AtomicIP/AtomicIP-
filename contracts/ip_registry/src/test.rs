@@ -1247,6 +1247,10 @@ mod tests {
         let client = IpRegistryClient::new(&env, &contract_id);
 
         let challenger = <Address as TestAddress>::generate(&env);
-        client.challenge_ip(&999u64, &challenger, &soroban_sdk::Bytes::from_array(&env, &[1u8; 32]));
+        client.challenge_ip(
+            &999u64,
+            &challenger,
+            &soroban_sdk::Bytes::from_array(&env, &[1u8; 32]),
+        );
     }
 }
