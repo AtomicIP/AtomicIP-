@@ -372,8 +372,8 @@ pub fn build_v1_schema(env: &Env) -> ContractSchema {
 
 // #[cfg(test)]
 // mod tests {
-    use super::*;
-    use soroban_sdk::Env;
+//     use super::*;
+//     use soroban_sdk::Env;
 
     // ── helpers ───────────────────────────────────────────────────────────────
 
