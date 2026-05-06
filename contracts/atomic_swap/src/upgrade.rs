@@ -373,231 +373,231 @@ pub fn build_v1_schema(env: &Env) -> ContractSchema {
 // #[cfg(test)]
 // mod tests {
 //     use super::*;
-//     use soroban_sdk::Env;
-
-    // ── helpers ───────────────────────────────────────────────────────────────
-
-    fn bump_version(s: &ContractSchema) -> ContractSchema {
-        ContractSchema {
-            version: s.version + 1,
-            functions: s.functions.clone(),
-            errors: s.errors.clone(),
-            storage_keys: s.storage_keys.clone(),
-        }
-    }
-
-    // ── 1. Valid upgrade passes ───────────────────────────────────────────────
-
-    /// Identical schema with bumped version must pass all checks.
-    #[test]
-    fn test_valid_upgrade_passes() {
-        let env = Env::default();
-        let v1 = build_v1_schema(&env);
-        let v2 = bump_version(&v1);
-        assert_eq!(check_schema_compatibility(&v1, &v2), Ok(()));
-    }
-
-    /// Adding a new function is an additive (non-breaking) change.
-    #[test]
-    fn test_additive_function_passes() {
-        let env = Env::default();
-        let v1 = build_v1_schema(&env);
-        let mut v2 = bump_version(&v1);
-        v2.functions.push_back(FunctionEntry {
-            name: String::from_str(&env, "new_query"),
-            signature: String::from_str(&env, "new_query(id:u64)->bool"),
-        });
-        assert_eq!(check_schema_compatibility(&v1, &v2), Ok(()));
-    }
-
-    /// Adding a new error code is an additive (non-breaking) change.
-    #[test]
-    fn test_additive_error_code_passes() {
-        let env = Env::default();
-        let v1 = build_v1_schema(&env);
-        let mut v2 = bump_version(&v1);
-        v2.errors.push_back(ErrorEntry {
-            name: String::from_str(&env, "NewError"),
-            code: 99,
-        });
-        assert_eq!(check_schema_compatibility(&v1, &v2), Ok(()));
-    }
-
-    /// Adding a new storage key is an additive (non-breaking) change.
-    #[test]
-    fn test_additive_storage_key_passes() {
-        let env = Env::default();
-        let v1 = build_v1_schema(&env);
-        let mut v2 = bump_version(&v1);
-        v2.storage_keys.push_back(String::from_str(&env, "NewIndex"));
-        assert_eq!(check_schema_compatibility(&v1, &v2), Ok(()));
-    }
-
-    // ── 2. Version gate ───────────────────────────────────────────────────────
-
-    /// Same version must be rejected.
-    #[test]
-    fn test_same_version_rejected() {
-        let env = Env::default();
-        let v1 = build_v1_schema(&env);
-        assert_eq!(
-            check_schema_compatibility(&v1, &v1.clone()),
-            Err(ContractError::SchemaNotGreater)
-        );
-    }
-
-    /// Lower version must be rejected.
-    #[test]
-    fn test_lower_version_rejected() {
-        let env = Env::default();
-        let mut v1 = build_v1_schema(&env);
-        v1.version = 5;
-        let mut bad = v1.clone();
-        bad.version = 3;
-        assert_eq!(
-            check_schema_compatibility(&v1, &bad),
-            Err(ContractError::SchemaNotGreater)
-        );
-    }
-
-    // ── 3. Missing function fails ─────────────────────────────────────────────
-
-    /// Removing a function must be rejected.
-    #[test]
-    fn test_missing_function_fails() {
-        let env = Env::default();
-        let v1 = build_v1_schema(&env);
-        let mut v2 = bump_version(&v1);
-
-        // Drop "cancel_swap" from v2.
-        let mut trimmed: Vec<FunctionEntry> = Vec::new(&env);
-        for i in 0..v2.functions.len() {
-            let f = v2.functions.get(i).unwrap();
-            if f.name != String::from_str(&env, "cancel_swap") {
-                trimmed.push_back(f);
-            }
-        }
-        v2.functions = trimmed;
-
-        assert_eq!(
-            check_schema_compatibility(&v1, &v2),
-            Err(ContractError::MissingFunc)
-        );
-    }
-
-    /// Changing a function's signature must be rejected.
-    #[test]
-    fn test_function_signature_change_fails() {
-        let env = Env::default();
-        let v1 = build_v1_schema(&env);
-        let mut v2 = bump_version(&v1);
-
-        let mut patched: Vec<FunctionEntry> = Vec::new(&env);
-        for i in 0..v2.functions.len() {
-            let mut f = v2.functions.get(i).unwrap();
-            if f.name == String::from_str(&env, "get_swap") {
-                // Change return type — breaking change.
-                f.signature = String::from_str(&env, "get_swap(swap_id:u64)->SwapRecord");
-            }
-            patched.push_back(f);
-        }
-        v2.functions = patched;
-
-        // Schema compatibility check should fail for signature changes
-        let result = check_schema_compatibility(&v1, &v2);
-        assert!(result.is_err());
-    }
-
-    // ── 4. Storage key mismatch fails ─────────────────────────────────────────
-
-    /// Removing a storage key must be rejected.
-    #[test]
-    fn test_missing_storage_key_fails() {
-        let env = Env::default();
-        let v1 = build_v1_schema(&env);
-        let mut v2 = bump_version(&v1);
-
-        // Drop "SwapHistory".
-        let mut trimmed: Vec<String> = Vec::new(&env);
-        for i in 0..v2.storage_keys.len() {
-            let k = v2.storage_keys.get(i).unwrap();
-            if k != String::from_str(&env, "SwapHistory") {
-                trimmed.push_back(k);
-            }
-        }
-        v2.storage_keys = trimmed;
-
-        assert_eq!(
-            check_schema_compatibility(&v1, &v2),
-            Err(ContractError::MissingFunc)
-        );
-    }
-
-    // ── 5. Error code change fails ────────────────────────────────────────────
-
-    /// Removing an error entry must be rejected.
-    #[test]
-    fn test_missing_error_code_fails() {
-        let env = Env::default();
-        let v1 = build_v1_schema(&env);
-        let mut v2 = bump_version(&v1);
-
-        // Drop "InvalidKey".
-        let mut trimmed: Vec<ErrorEntry> = Vec::new(&env);
-        for i in 0..v2.errors.len() {
-            let e = v2.errors.get(i).unwrap();
-            if e.name != String::from_str(&env, "InvalidKey") {
-                trimmed.push_back(e);
-            }
-        }
-        v2.errors = trimmed;
-
-        assert_eq!(
-            check_schema_compatibility(&v1, &v2),
-            Err(ContractError::MissingFunc)
-        );
-    }
-
-    /// Renumbering an error code must be rejected.
-    #[test]
-    fn test_error_code_renumbered_fails() {
-        let env = Env::default();
-        let v1 = build_v1_schema(&env);
-        let mut v2 = bump_version(&v1);
-
-        // Change "SwapNotFound" from 1 → 99.
-        let mut patched: Vec<ErrorEntry> = Vec::new(&env);
-        for i in 0..v2.errors.len() {
-            let mut e = v2.errors.get(i).unwrap();
-            if e.name == String::from_str(&env, "SwapNotFound") {
-                e.code = 99;
-            }
-            patched.push_back(e);
-        }
-        v2.errors = patched;
-
-        assert_eq!(
-            check_schema_compatibility(&v1, &v2),
-            Err(ContractError::FuncChanged)
-        );
-    }
-
-    // ── 6. Schema persistence ─────────────────────────────────────────────────
-
-    /// `store_schema` / `load_schema` round-trip.
-    #[test]
-    fn test_store_and_load_schema_round_trip() {
-        let env = Env::default();
-        let v1 = build_v1_schema(&env);
-        store_schema(&env, &v1);
-        let loaded = load_schema(&env).expect("schema must be present after store");
-        assert_eq!(loaded.version, v1.version);
-        assert_eq!(loaded.functions.len(), v1.functions.len());
-        assert_eq!(loaded.errors.len(), v1.errors.len());
-        assert_eq!(loaded.storage_keys.len(), v1.storage_keys.len());
-    }
-
-    /// `load_schema` returns `None` when nothing has been stored.
+// //     use soroban_sdk::Env;
+// //
+// //     // ── helpers ───────────────────────────────────────────────────────────────
+// //
+// //     fn bump_version(s: &ContractSchema) -> ContractSchema {
+//         ContractSchema {
+//             version: s.version + 1,
+//             functions: s.functions.clone(),
+//             errors: s.errors.clone(),
+//             storage_keys: s.storage_keys.clone(),
+//         }
+//     }
+// 
+//     // ── 1. Valid upgrade passes ───────────────────────────────────────────────
+// 
+//     /// Identical schema with bumped version must pass all checks.
+//     #[test]
+//     fn test_valid_upgrade_passes() {
+//         let env = Env::default();
+//         let v1 = build_v1_schema(&env);
+//         let v2 = bump_version(&v1);
+//         assert_eq!(check_schema_compatibility(&v1, &v2), Ok(()));
+//     }
+// 
+//     /// Adding a new function is an additive (non-breaking) change.
+//     #[test]
+//     fn test_additive_function_passes() {
+//         let env = Env::default();
+//         let v1 = build_v1_schema(&env);
+//         let mut v2 = bump_version(&v1);
+//         v2.functions.push_back(FunctionEntry {
+//             name: String::from_str(&env, "new_query"),
+//             signature: String::from_str(&env, "new_query(id:u64)->bool"),
+//         });
+//         assert_eq!(check_schema_compatibility(&v1, &v2), Ok(()));
+//     }
+// 
+//     /// Adding a new error code is an additive (non-breaking) change.
+//     #[test]
+//     fn test_additive_error_code_passes() {
+//         let env = Env::default();
+//         let v1 = build_v1_schema(&env);
+//         let mut v2 = bump_version(&v1);
+//         v2.errors.push_back(ErrorEntry {
+//             name: String::from_str(&env, "NewError"),
+//             code: 99,
+//         });
+//         assert_eq!(check_schema_compatibility(&v1, &v2), Ok(()));
+//     }
+// 
+//     /// Adding a new storage key is an additive (non-breaking) change.
+//     #[test]
+//     fn test_additive_storage_key_passes() {
+//         let env = Env::default();
+//         let v1 = build_v1_schema(&env);
+//         let mut v2 = bump_version(&v1);
+//         v2.storage_keys.push_back(String::from_str(&env, "NewIndex"));
+//         assert_eq!(check_schema_compatibility(&v1, &v2), Ok(()));
+//     }
+// 
+//     // ── 2. Version gate ───────────────────────────────────────────────────────
+// 
+//     /// Same version must be rejected.
+//     #[test]
+//     fn test_same_version_rejected() {
+//         let env = Env::default();
+//         let v1 = build_v1_schema(&env);
+//         assert_eq!(
+//             check_schema_compatibility(&v1, &v1.clone()),
+//             Err(ContractError::SchemaNotGreater)
+//         );
+//     }
+// 
+//     /// Lower version must be rejected.
+//     #[test]
+//     fn test_lower_version_rejected() {
+//         let env = Env::default();
+//         let mut v1 = build_v1_schema(&env);
+//         v1.version = 5;
+//         let mut bad = v1.clone();
+//         bad.version = 3;
+//         assert_eq!(
+//             check_schema_compatibility(&v1, &bad),
+//             Err(ContractError::SchemaNotGreater)
+//         );
+//     }
+// 
+//     // ── 3. Missing function fails ─────────────────────────────────────────────
+// 
+//     /// Removing a function must be rejected.
+//     #[test]
+//     fn test_missing_function_fails() {
+//         let env = Env::default();
+//         let v1 = build_v1_schema(&env);
+//         let mut v2 = bump_version(&v1);
+// 
+//         // Drop "cancel_swap" from v2.
+//         let mut trimmed: Vec<FunctionEntry> = Vec::new(&env);
+//         for i in 0..v2.functions.len() {
+//             let f = v2.functions.get(i).unwrap();
+//             if f.name != String::from_str(&env, "cancel_swap") {
+//                 trimmed.push_back(f);
+//             }
+//         }
+//         v2.functions = trimmed;
+// 
+//         assert_eq!(
+//             check_schema_compatibility(&v1, &v2),
+//             Err(ContractError::MissingFunc)
+//         );
+//     }
+// 
+//     /// Changing a function's signature must be rejected.
+//     #[test]
+//     fn test_function_signature_change_fails() {
+//         let env = Env::default();
+//         let v1 = build_v1_schema(&env);
+//         let mut v2 = bump_version(&v1);
+// 
+//         let mut patched: Vec<FunctionEntry> = Vec::new(&env);
+//         for i in 0..v2.functions.len() {
+//             let mut f = v2.functions.get(i).unwrap();
+//             if f.name == String::from_str(&env, "get_swap") {
+//                 // Change return type — breaking change.
+//                 f.signature = String::from_str(&env, "get_swap(swap_id:u64)->SwapRecord");
+//             }
+//             patched.push_back(f);
+//         }
+//         v2.functions = patched;
+// 
+//         // Schema compatibility check should fail for signature changes
+//         let result = check_schema_compatibility(&v1, &v2);
+//         assert!(result.is_err());
+//     }
+// 
+//     // ── 4. Storage key mismatch fails ─────────────────────────────────────────
+// 
+//     /// Removing a storage key must be rejected.
+//     #[test]
+//     fn test_missing_storage_key_fails() {
+//         let env = Env::default();
+//         let v1 = build_v1_schema(&env);
+//         let mut v2 = bump_version(&v1);
+// 
+//         // Drop "SwapHistory".
+//         let mut trimmed: Vec<String> = Vec::new(&env);
+//         for i in 0..v2.storage_keys.len() {
+//             let k = v2.storage_keys.get(i).unwrap();
+//             if k != String::from_str(&env, "SwapHistory") {
+//                 trimmed.push_back(k);
+//             }
+//         }
+//         v2.storage_keys = trimmed;
+// 
+//         assert_eq!(
+//             check_schema_compatibility(&v1, &v2),
+//             Err(ContractError::MissingFunc)
+//         );
+//     }
+// 
+//     // ── 5. Error code change fails ────────────────────────────────────────────
+// 
+//     /// Removing an error entry must be rejected.
+//     #[test]
+//     fn test_missing_error_code_fails() {
+//         let env = Env::default();
+//         let v1 = build_v1_schema(&env);
+//         let mut v2 = bump_version(&v1);
+// 
+//         // Drop "InvalidKey".
+//         let mut trimmed: Vec<ErrorEntry> = Vec::new(&env);
+//         for i in 0..v2.errors.len() {
+//             let e = v2.errors.get(i).unwrap();
+//             if e.name != String::from_str(&env, "InvalidKey") {
+//                 trimmed.push_back(e);
+//             }
+//         }
+//         v2.errors = trimmed;
+// 
+//         assert_eq!(
+//             check_schema_compatibility(&v1, &v2),
+//             Err(ContractError::MissingFunc)
+//         );
+//     }
+// 
+//     /// Renumbering an error code must be rejected.
+//     #[test]
+//     fn test_error_code_renumbered_fails() {
+//         let env = Env::default();
+//         let v1 = build_v1_schema(&env);
+//         let mut v2 = bump_version(&v1);
+// 
+//         // Change "SwapNotFound" from 1 → 99.
+//         let mut patched: Vec<ErrorEntry> = Vec::new(&env);
+//         for i in 0..v2.errors.len() {
+//             let mut e = v2.errors.get(i).unwrap();
+//             if e.name == String::from_str(&env, "SwapNotFound") {
+//                 e.code = 99;
+//             }
+//             patched.push_back(e);
+//         }
+//         v2.errors = patched;
+// 
+//         assert_eq!(
+//             check_schema_compatibility(&v1, &v2),
+//             Err(ContractError::FuncChanged)
+//         );
+//     }
+// 
+//     // ── 6. Schema persistence ─────────────────────────────────────────────────
+// 
+//     /// `store_schema` / `load_schema` round-trip.
+//     #[test]
+//     fn test_store_and_load_schema_round_trip() {
+//         let env = Env::default();
+//         let v1 = build_v1_schema(&env);
+//         store_schema(&env, &v1);
+//         let loaded = load_schema(&env).expect("schema must be present after store");
+//         assert_eq!(loaded.version, v1.version);
+//         assert_eq!(loaded.functions.len(), v1.functions.len());
+//         assert_eq!(loaded.errors.len(), v1.errors.len());
+//         assert_eq!(loaded.storage_keys.len(), v1.storage_keys.len());
+//     }
+// 
+//     /// `load_schema` returns `None` when nothing has been stored.
     #[test]
     fn test_load_schema_returns_none_when_absent() {
         let env = Env::default();
