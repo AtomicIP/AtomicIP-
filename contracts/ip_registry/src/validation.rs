@@ -231,8 +231,9 @@ mod tests {
             commitment_hash: BytesN::from_array(&env, &[1u8; 32]),
             timestamp: 0,
             revoked: false,
-            expiry_timestamp: 0,
-            metadata: soroban_sdk::Bytes::new(&env),
+            co_owners: soroban_sdk::Vec::new(&env),
+            parent_ip_id: None,
+            notary_signature: None,
         };
         // Should not panic
         require_not_revoked(&env, &record);
@@ -248,8 +249,9 @@ mod tests {
             commitment_hash: BytesN::from_array(&env, &[1u8; 32]),
             timestamp: 0,
             revoked: true,
-            expiry_timestamp: 0,
-            metadata: soroban_sdk::Bytes::new(&env),
+            co_owners: soroban_sdk::Vec::new(&env),
+            parent_ip_id: None,
+            notary_signature: None,
         };
         require_not_revoked(&env, &record);
     }
@@ -264,8 +266,9 @@ mod tests {
             commitment_hash: BytesN::from_array(&env, &[1u8; 32]),
             timestamp: 0,
             revoked: false,
-            expiry_timestamp: 0,
-            metadata: soroban_sdk::Bytes::new(&env),
+            co_owners: soroban_sdk::Vec::new(&env),
+            parent_ip_id: None,
+            notary_signature: None,
         };
         // Should not panic
         require_owner(&env, &owner, &record);
@@ -283,8 +286,9 @@ mod tests {
             commitment_hash: BytesN::from_array(&env, &[1u8; 32]),
             timestamp: 0,
             revoked: false,
-            expiry_timestamp: 0,
-            metadata: soroban_sdk::Bytes::new(&env),
+            co_owners: soroban_sdk::Vec::new(&env),
+            parent_ip_id: None,
+            notary_signature: None,
         };
         require_owner(&env, &not_owner, &record);
     }
