@@ -1057,26 +1057,26 @@ impl AtomicSwap {
     ///
     /// Additions (new functions, new error codes, new storage keys) are allowed.
     /// The schema version must be strictly greater than the current version.
-    pub fn validate_upgrade(
-        env: Env,
-        new_wasm_hash: BytesN<32>,
-        new_schema: ContractSchema,
-    ) -> Result<(), ContractError> {
-        // Only the admin may trigger an upgrade.
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .unwrap_or_else(|| {
-                env.panic_with_error(Error::from_contract_error(
-                    ContractError::UnauthorizedUpg as u32,
-                ))
-            });
-        admin.require_auth();
-
-        // upgrade::validate_upgrade(&env, new_wasm_hash, new_schema)
-        Ok(())
-    }
+    // pub fn validate_upgrade(
+    //     env: Env,
+    //     new_wasm_hash: BytesN<32>,
+    //     new_schema: ContractSchema,
+    // ) -> Result<(), ContractError> {
+    //     // Only the admin may trigger an upgrade.
+    //     let admin: Address = env
+    //         .storage()
+    //         .persistent()
+    //         .get(&DataKey::Admin)
+    //         .unwrap_or_else(|| {
+    //             env.panic_with_error(Error::from_contract_error(
+    //                 ContractError::UnauthorizedUpg as u32,
+    //             ))
+    //         });
+    //     admin.require_auth();
+    //
+    //     // upgrade::validate_upgrade(&env, new_wasm_hash, new_schema)
+    //     Ok(())
+    // }
 
     /// Updates the protocol config.
     pub fn admin_set_protocol_config(
