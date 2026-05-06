@@ -1696,7 +1696,7 @@ mod tests {
         let v1 = client.commit_ip(&owner, &h1, &0u32);
         let ts_v1 = client.get_ip(&v1).timestamp;
 
-        let v2 = client.commit_ip_version(&owner, &h2, &v1);
+        let _v2 = client.commit_ip_version(&owner, &h2, &v1);
 
         // v1 record is unchanged — prior art is preserved
         let record_v1 = client.get_ip(&v1);

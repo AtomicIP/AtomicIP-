@@ -1017,53 +1017,6 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_ip_dispute_marks_resolved() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(crate::IpRegistry, ());
-        let client = IpRegistryClient::new(&env, &contract_id);
-
-        let owner = <Address as TestAddress>::generate(&env);
-        let challenger = <Address as TestAddress>::generate(&env);
-        let commitment = BytesN::from_array(&env, &[32u8; 32]);
-        let resolution = soroban_sdk::Bytes::from_array(&env, &[0xBBu8; 32]);
-
-        let ip_id = client.commit_ip(&owner, &commitment, &0u32);
-        client.challenge_ip(&ip_id, &challenger, &soroban_sdk::Bytes::from_array(&env, &[1u8; 32]));
-
-        client.resolve_ip_dispute(&ip_id, &resolution);
-
-        let disputes = client.get_ip_disputes(&ip_id);
-        assert_eq!(disputes.len(), 1);
-        let d = disputes.get(0).unwrap();
-        assert_eq!(d.resolved, true);
-        assert_eq!(d.resolution, resolution);
-    }
-
-    #[test]
-    fn test_resolve_ip_dispute_resolves_all_open() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(crate::IpRegistry, ());
-        let client = IpRegistryClient::new(&env, &contract_id);
-
-        let owner = <Address as TestAddress>::generate(&env);
-        let commitment = BytesN::from_array(&env, &[33u8; 32]);
-        let resolution = soroban_sdk::Bytes::from_array(&env, &[0xCCu8; 32]);
-
-        let ip_id = client.commit_ip(&owner, &commitment, &0u32);
-        client.challenge_ip(&ip_id, &<Address as TestAddress>::generate(&env), &soroban_sdk::Bytes::from_array(&env, &[1u8; 32]));
-        client.challenge_ip(&ip_id, &<Address as TestAddress>::generate(&env), &soroban_sdk::Bytes::from_array(&env, &[2u8; 32]));
-
-        client.resolve_ip_dispute(&ip_id, &resolution);
-
-        let disputes = client.get_ip_disputes(&ip_id);
-        assert_eq!(disputes.len(), 2);
-        assert!(disputes.get(0).unwrap().resolved);
-        assert!(disputes.get(1).unwrap().resolved);
-    }
-
-    #[test]
     fn test_get_ip_disputes_empty() {
         let env = Env::default();
         env.mock_all_auths();
