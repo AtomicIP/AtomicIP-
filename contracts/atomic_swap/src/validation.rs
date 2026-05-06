@@ -6,6 +6,7 @@
 use crate::{ContractError, DataKey, SwapRecord, SwapStatus};
 use soroban_sdk::{Address, Env, Error, Vec};
 
+#[allow(unused_imports)]
 #[cfg(test)]
 use soroban_sdk::testutils::Ledger;
 
