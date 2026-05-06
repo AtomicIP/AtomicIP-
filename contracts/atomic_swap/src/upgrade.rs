@@ -603,4 +603,4 @@ pub fn build_v1_schema(env: &Env) -> ContractSchema {
         let env = Env::default();
         assert!(load_schema(&env).is_none());
     }
-}
+// }

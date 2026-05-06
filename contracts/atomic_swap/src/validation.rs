@@ -529,5 +529,5 @@ pub fn require_admin(env: &Env, caller: &Address) {
             .set(&DataKey::ActiveSwap(1), &0u64);
         require_no_active_swap(&env, 1);
     }
-}
+// }
 
