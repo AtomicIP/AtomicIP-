@@ -17,7 +17,7 @@ mod mutation_tests {
         e
     }
 
-    fn client(e: &Env) -> IpRegistryClient {
+    fn client(e: &Env) -> IpRegistryClient<'_> {
         IpRegistryClient::new(e, &e.register(IpRegistry, ()))
     }
 
