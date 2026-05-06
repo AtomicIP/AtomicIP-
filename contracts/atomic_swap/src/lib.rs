@@ -1,7 +1,7 @@
 #![no_std]
 mod registry;
 mod swap;
-mod upgrade;
+// mod upgrade;
 mod utils;
 mod multi_currency;
 mod types;

@@ -4,7 +4,7 @@
 //! and ensure consistent error handling across the contract.
 
 use crate::{ContractError, DataKey, SwapRecord, SwapStatus};
-use soroban_sdk::{Address, Env, Error, Vec};
+use soroban_sdk::{Address, Env, Error};
 
 #[allow(unused_imports)]
 #[cfg(test)]
