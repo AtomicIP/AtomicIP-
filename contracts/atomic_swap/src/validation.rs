@@ -4,7 +4,10 @@
 //! and ensure consistent error handling across the contract.
 
 use crate::{ContractError, DataKey, SwapRecord, SwapStatus};
-use soroban_sdk::{Address, Env, Error};
+use soroban_sdk::{Address, Env, Error, Vec};
+
+#[cfg(test)]
+use soroban_sdk::testutils::Ledger;
 
 /// Validates that the contract is not paused.
 ///
