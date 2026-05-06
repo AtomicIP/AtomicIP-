@@ -821,7 +821,7 @@ mod tests {
 
         // Strength should be calculated based on secret length (32) and PoW difficulty (4)
         // Formula: min(100, (32 * 2) + (4 * 3)) = min(100, 64 + 12) = 76
-        assert_eq!(strength, 76u8);
+        assert_eq!(strength, 76u32);
     }
 
     #[test]
@@ -838,7 +838,7 @@ mod tests {
         let strength = client.get_ip_strength(&ip_id);
 
         // Strength should be capped at 100
-        assert_eq!(strength, 100u8);
+        assert_eq!(strength, 100u32);
     }
 
     // ── Tests for Issue #338: IP Commitment Delegation ────────────────────────
