@@ -237,6 +237,8 @@ mod tests {
             co_owners: soroban_sdk::Vec::new(&env),
             parent_ip_id: None,
             notary_signature: None,
+            expiry_timestamp: 0,
+            grace_period_seconds: 0,
         };
         // Should not panic
         require_not_revoked(&env, &record);
@@ -256,6 +258,8 @@ mod tests {
             co_owners: soroban_sdk::Vec::new(&env),
             parent_ip_id: None,
             notary_signature: None,
+            expiry_timestamp: 0,
+            grace_period_seconds: 0,
         };
         require_not_revoked(&env, &record);
     }
@@ -273,6 +277,8 @@ mod tests {
             co_owners: soroban_sdk::Vec::new(&env),
             parent_ip_id: None,
             notary_signature: None,
+            expiry_timestamp: 0,
+            grace_period_seconds: 0,
         };
         // Should not panic
         require_owner(&env, &owner, &record);
@@ -294,6 +300,8 @@ mod tests {
             co_owners: soroban_sdk::Vec::new(&env),
             parent_ip_id: None,
             notary_signature: None,
+            expiry_timestamp: 0,
+            grace_period_seconds: 0,
         };
         require_owner(&env, &not_owner, &record);
     }
