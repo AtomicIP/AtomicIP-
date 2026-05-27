@@ -3,7 +3,7 @@ mod tests {
     use crate::IpRecord;
     use soroban_sdk::contractclient;
     use soroban_sdk::testutils::Address as TestAddress;
-    use soroban_sdk::testutils::Events;
+    use soroban_sdk::testutils::{Events, Ledger};
     use soroban_sdk::{symbol_short, Address, BytesN, Env, IntoVal, TryFromVal, Vec};
 
     use crate::types::REVOKE_TOPIC;
@@ -46,6 +46,9 @@ mod tests {
         fn challenge_ip(env: Env, ip_id: u64, challenger: Address, reason: soroban_sdk::Bytes);
         fn get_ip_disputes(env: Env, ip_id: u64) -> Vec<crate::IpChallenge>;
         fn commit_ip_version(env: Env, owner: Address, commitment_hash: BytesN<32>, parent_ip_id: u64) -> u64;
+        fn set_ip_expiry(env: Env, ip_id: u64, expiry_timestamp: u64, grace_period_seconds: u64);
+        fn renew_ip_commitment(env: Env, ip_id: u64, new_expiry: u64) -> bool;
+        fn cleanup_expired_ips(env: Env, ip_ids: Vec<u64>);
     }
 
     #[test]
@@ -1057,5 +1060,136 @@ mod tests {
             &challenger,
             &soroban_sdk::Bytes::from_array(&env, &[1u8; 32]),
         );
+    }
+
+    // ── Expiry & Grace Period Tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_set_ip_expiry_stores_fields() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = <Address as TestAddress>::generate(&env);
+        env.mock_all_auths();
+
+        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[1u8; 32]), &0u32);
+        client.set_ip_expiry(&ip_id, &9_999_999u64, &3600u64);
+
+        let record = client.get_ip(&ip_id);
+        assert_eq!(record.expiry_timestamp, 9_999_999u64);
+        assert_eq!(record.grace_period_seconds, 3600u64);
+    }
+
+    #[test]
+    fn test_renew_ip_commitment_extends_expiry() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = <Address as TestAddress>::generate(&env);
+        env.mock_all_auths();
+
+        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[2u8; 32]), &0u32);
+        client.set_ip_expiry(&ip_id, &1_000u64, &0u64);
+        let result = client.renew_ip_commitment(&ip_id, &2_000u64);
+
+        assert!(result);
+        assert_eq!(client.get_ip(&ip_id).expiry_timestamp, 2_000u64);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_renew_ip_commitment_lower_expiry_panics() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = <Address as TestAddress>::generate(&env);
+        env.mock_all_auths();
+
+        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[3u8; 32]), &0u32);
+        client.set_ip_expiry(&ip_id, &5_000u64, &0u64);
+        // new_expiry <= current expiry — must panic
+        client.renew_ip_commitment(&ip_id, &4_000u64);
+    }
+
+    #[test]
+    fn test_cleanup_removes_ip_past_grace_period() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = <Address as TestAddress>::generate(&env);
+        env.mock_all_auths();
+
+        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[4u8; 32]), &0u32);
+        client.set_ip_expiry(&ip_id, &1u64, &0u64);
+        env.ledger().set_timestamp(100);
+
+        let mut ids = soroban_sdk::Vec::new(&env);
+        ids.push_back(ip_id);
+        // Must not panic — cleanup runs successfully
+        client.cleanup_expired_ips(&ids);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_get_ip_after_cleanup_panics() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = <Address as TestAddress>::generate(&env);
+        env.mock_all_auths();
+
+        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[40u8; 32]), &0u32);
+        client.set_ip_expiry(&ip_id, &1u64, &0u64);
+        env.ledger().set_timestamp(100);
+
+        let mut ids = soroban_sdk::Vec::new(&env);
+        ids.push_back(ip_id);
+        client.cleanup_expired_ips(&ids);
+
+        // Record is gone — must panic
+        client.get_ip(&ip_id);
+    }
+
+    #[test]
+    fn test_cleanup_skips_ip_within_grace_period() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = <Address as TestAddress>::generate(&env);
+        env.mock_all_auths();
+
+        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[5u8; 32]), &0u32);
+
+        // Expired but still within grace period (grace = 1000s, now = 100)
+        client.set_ip_expiry(&ip_id, &1u64, &1000u64);
+        env.ledger().set_timestamp(100);
+
+        let mut ids = soroban_sdk::Vec::new(&env);
+        ids.push_back(ip_id);
+        client.cleanup_expired_ips(&ids);
+
+        // Record must still exist
+        let record = client.get_ip(&ip_id);
+        assert_eq!(record.ip_id, ip_id);
+    }
+
+    #[test]
+    fn test_cleanup_skips_ip_with_no_expiry() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = <Address as TestAddress>::generate(&env);
+        env.mock_all_auths();
+
+        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[6u8; 32]), &0u32);
+        // No expiry set (expiry_timestamp = 0)
+        env.ledger().set_timestamp(999_999_999);
+
+        let mut ids = soroban_sdk::Vec::new(&env);
+        ids.push_back(ip_id);
+        client.cleanup_expired_ips(&ids);
+
+        // Record must still exist
+        assert_eq!(client.get_ip(&ip_id).ip_id, ip_id);
     }
 }
