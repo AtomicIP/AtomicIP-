@@ -3728,6 +3728,56 @@ impl IpRegistry {
             .get(&DataKey::OwnerCategories(owner))
             .unwrap_or(Vec::new(&env))
     }
+
+    // ── Issue #461: Batch Renewal ─────────────────────────────────────────────
+
+    /// Renew multiple IP commitments in a single transaction.
+    ///
+    /// Requires auth from `owner`. Each IP must exist, belong to `owner`, and
+    /// not be revoked. Extends storage TTL for every IP and increments each
+    /// IP's renewal counter.
+    ///
+    /// # Panics
+    ///
+    /// Panics with `IpNotFound` if any ID does not exist, `Unauthorized` if
+    /// any IP is not owned by `owner`, or `IpAlreadyRevoked` if any IP is revoked.
+    pub fn batch_renew_ip(env: Env, owner: Address, ip_ids: Vec<u64>) {
+        owner.require_auth();
+
+        for ip_id in ip_ids.iter() {
+            let record = require_ip_exists(&env, ip_id);
+
+            if record.owner != owner {
+                panic_with_error!(&env, ContractError::Unauthorized);
+            }
+
+            require_not_revoked(&env, &record);
+
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::IpRecord(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+
+            let count: u32 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::RenewalCount(ip_id))
+                .unwrap_or(0u32);
+            let new_count = count + 1;
+            env.storage()
+                .persistent()
+                .set(&DataKey::RenewalCount(ip_id), &new_count);
+            env.storage().persistent().extend_ttl(
+                &DataKey::RenewalCount(ip_id),
+                LEDGER_BUMP,
+                LEDGER_BUMP,
+            );
+
+            env.events().publish(
+                (symbol_short!("renewed"), owner.clone()),
+                (ip_id, new_count),
+            );
+        }
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -4453,5 +4503,102 @@ mod tests {
 
         let ids = client.list_ip_by_category(&owner, &category);
         assert_eq!(ids.len(), 0);
+    }
+
+    // ── Issue #461: Batch Renewal Tests ──────────────────────────────────────
+
+    #[test]
+    fn test_batch_renew_ip_increments_each_count() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let hash1 = BytesN::from_array(&env, &[0xA1u8; 32]);
+        let hash2 = BytesN::from_array(&env, &[0xA2u8; 32]);
+
+        let id1 = client.commit_ip(&owner, &hash1, &0u32);
+        let id2 = client.commit_ip(&owner, &hash2, &0u32);
+
+        let mut ids = soroban_sdk::Vec::new(&env);
+        ids.push_back(id1);
+        ids.push_back(id2);
+
+        client.batch_renew_ip(&owner, &ids);
+
+        assert_eq!(client.get_renewal_count(&id1), 1);
+        assert_eq!(client.get_renewal_count(&id2), 1);
+    }
+
+    #[test]
+    fn test_batch_renew_ip_multiple_rounds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[0xB1u8; 32]);
+        let id = client.commit_ip(&owner, &hash, &0u32);
+
+        let mut ids = soroban_sdk::Vec::new(&env);
+        ids.push_back(id);
+
+        client.batch_renew_ip(&owner, &ids);
+        client.batch_renew_ip(&owner, &ids);
+
+        assert_eq!(client.get_renewal_count(&id), 2);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_batch_renew_ip_revoked_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[0xC5u8; 32]);
+        let id = client.commit_ip(&owner, &hash, &0u32);
+        client.revoke_ip(&id);
+
+        let mut ids = soroban_sdk::Vec::new(&env);
+        ids.push_back(id);
+
+        client.batch_renew_ip(&owner, &ids);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_batch_renew_ip_wrong_owner_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let attacker = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[0xD5u8; 32]);
+        let id = client.commit_ip(&owner, &hash, &0u32);
+
+        let mut ids = soroban_sdk::Vec::new(&env);
+        ids.push_back(id);
+
+        client.batch_renew_ip(&attacker, &ids);
+    }
+
+    #[test]
+    fn test_batch_renew_ip_empty_list() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let ids = soroban_sdk::Vec::new(&env);
+
+        client.batch_renew_ip(&owner, &ids);
     }
 }
