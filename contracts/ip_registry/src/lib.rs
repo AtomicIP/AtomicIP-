@@ -3728,6 +3728,89 @@ impl IpRegistry {
             .get(&DataKey::OwnerCategories(owner))
             .unwrap_or(Vec::new(&env))
     }
+
+    // ── Issue #460: Batch Delegation ──────────────────────────────────────────
+
+    /// Delegate multiple addresses to a root owner's commitment authority in one call.
+    ///
+    /// Equivalent to calling `delegate_commitment_authority` for each address in
+    /// `delegates`. Requires auth from `delegator`. The delegator must be the
+    /// `root_owner` or an existing registered delegate to sub-delegate.
+    /// Duplicate addresses are silently skipped.
+    ///
+    /// # Panics
+    ///
+    /// Panics with `Unauthorized` if the delegator is not authorized or if
+    /// the delegation depth limit would be exceeded.
+    pub fn batch_delegate_commitment(
+        env: Env,
+        root_owner: Address,
+        delegator: Address,
+        delegates: Vec<Address>,
+    ) {
+        delegator.require_auth();
+
+        let new_depth: u32 = if delegator == root_owner {
+            0
+        } else {
+            let stored: Option<u32> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::DelegateDepth(delegator.clone()));
+            match stored {
+                Some(d) => d + 1,
+                None => panic_with_error!(&env, ContractError::Unauthorized),
+            }
+        };
+
+        if new_depth >= MAX_DELEGATION_DEPTH {
+            panic_with_error!(&env, ContractError::Unauthorized);
+        }
+
+        let key = DataKey::Delegates(root_owner.clone());
+        let mut stored_delegates: Vec<DelegationRecord> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(Vec::new(&env));
+
+        for delegate_address in delegates.iter() {
+            let mut already_exists = false;
+            for i in 0..stored_delegates.len() {
+                if stored_delegates.get(i).unwrap().delegate == delegate_address {
+                    already_exists = true;
+                    break;
+                }
+            }
+            if already_exists {
+                continue;
+            }
+
+            stored_delegates.push_back(DelegationRecord {
+                delegate: delegate_address.clone(),
+                depth: new_depth,
+            });
+
+            env.storage()
+                .persistent()
+                .set(&DataKey::DelegateDepth(delegate_address.clone()), &new_depth);
+            env.storage().persistent().extend_ttl(
+                &DataKey::DelegateDepth(delegate_address.clone()),
+                LEDGER_BUMP,
+                LEDGER_BUMP,
+            );
+
+            env.events().publish(
+                (symbol_short!("delegated"), root_owner.clone()),
+                (delegate_address, new_depth),
+            );
+        }
+
+        env.storage().persistent().set(&key, &stored_delegates);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, LEDGER_BUMP, LEDGER_BUMP);
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -4453,5 +4536,81 @@ mod tests {
 
         let ids = client.list_ip_by_category(&owner, &category);
         assert_eq!(ids.len(), 0);
+    }
+
+    // ── Issue #460: Batch Delegation Tests ────────────────────────────────────
+
+    #[test]
+    fn test_batch_delegate_commitment_registers_all() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let delegate1 = Address::generate(&env);
+        let delegate2 = Address::generate(&env);
+
+        let mut delegates = soroban_sdk::Vec::new(&env);
+        delegates.push_back(delegate1.clone());
+        delegates.push_back(delegate2.clone());
+
+        client.batch_delegate_commitment(&owner, &owner, &delegates);
+
+        assert!(client.is_delegate(&owner, &delegate1));
+        assert!(client.is_delegate(&owner, &delegate2));
+    }
+
+    #[test]
+    fn test_batch_delegate_commitment_skips_duplicates() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+
+        let mut delegates = soroban_sdk::Vec::new(&env);
+        delegates.push_back(delegate.clone());
+        delegates.push_back(delegate.clone());
+
+        client.batch_delegate_commitment(&owner, &owner, &delegates);
+
+        assert!(client.is_delegate(&owner, &delegate));
+    }
+
+    #[test]
+    fn test_batch_delegate_commitment_empty_list() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let unrelated = Address::generate(&env);
+
+        let delegates = soroban_sdk::Vec::new(&env);
+        client.batch_delegate_commitment(&owner, &owner, &delegates);
+
+        assert!(!client.is_delegate(&owner, &unrelated));
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_batch_delegate_commitment_unauthorized_delegator_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let stranger = Address::generate(&env);
+        let target = Address::generate(&env);
+
+        let mut delegates = soroban_sdk::Vec::new(&env);
+        delegates.push_back(target.clone());
+
+        client.batch_delegate_commitment(&owner, &stranger, &delegates);
     }
 }
