@@ -13,6 +13,7 @@
 ///   print(hashlib.sha256(s+b).hex())
 ///   "
 #[cfg(test)]
+#[allow(clippy::module_inception)]
 mod differential_tests {
     use soroban_sdk::{testutils::Address as _, Address, BytesN, Env};
 

@@ -6,6 +6,7 @@
 ///   - off-by-one errors in ID counters
 ///   - missing auth checks
 #[cfg(test)]
+#[allow(clippy::module_inception)]
 mod mutation_tests {
     use soroban_sdk::{testutils::Address as _, Address, BytesN, Env};
 

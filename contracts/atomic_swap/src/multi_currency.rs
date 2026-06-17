@@ -8,6 +8,7 @@ use soroban_sdk::{contracttype, Address, Env, String, Vec};
 /// Supported payment tokens.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
+#[allow(clippy::upper_case_acronyms)]
 pub enum SupportedToken {
     XLM,    // Native XLM
     USDC,   // USD Coin

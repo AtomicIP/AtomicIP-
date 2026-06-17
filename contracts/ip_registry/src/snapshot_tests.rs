@@ -3,6 +3,7 @@
 /// Verifies contract state after key operations via field-level snapshots.
 /// Catches state corruption and unintended side-effects.
 #[cfg(test)]
+#[allow(clippy::module_inception)]
 mod snapshot_tests {
     use soroban_sdk::{testutils::Address as _, Address, BytesN, Env};
 
@@ -68,8 +69,14 @@ mod snapshot_tests {
         c.revoke_ip(&id);
 
         let record = c.get_ip(&id);
-        assert!(record.revoked, "snapshot must show revoked=true after revoke_ip");
-        assert_eq!(record.commitment_hash, hash, "hash must not change on revoke");
+        assert!(
+            record.revoked,
+            "snapshot must show revoked=true after revoke_ip"
+        );
+        assert_eq!(
+            record.commitment_hash, hash,
+            "hash must not change on revoke"
+        );
     }
 
     // ── owner index snapshot ──────────────────────────────────────────────────

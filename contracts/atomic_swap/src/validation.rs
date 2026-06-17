@@ -26,9 +26,7 @@ pub fn require_not_paused(env: &Env) {
         .get::<DataKey, bool>(&DataKey::Paused)
         .unwrap_or(false)
     {
-        env.panic_with_error(Error::from_contract_error(
-            ContractError::Paused as u32,
-        ));
+        env.panic_with_error(Error::from_contract_error(ContractError::Paused as u32));
     }
 }
 
@@ -167,9 +165,7 @@ pub fn require_seller_or_buyer(env: &Env, caller: &Address, swap: &SwapRecord) {
 /// Panics with `SwapHasNotExpiredYet` error if the swap has not expired.
 pub fn require_swap_expired(env: &Env, swap: &SwapRecord) {
     if env.ledger().timestamp() <= swap.expiry {
-        env.panic_with_error(Error::from_contract_error(
-            ContractError::NotExpired as u32,
-        ));
+        env.panic_with_error(Error::from_contract_error(ContractError::NotExpired as u32));
     }
 }
 
@@ -185,9 +181,7 @@ pub fn require_swap_expired(env: &Env, swap: &SwapRecord) {
 /// Panics with `ActiveSwapAlreadyExistsForThisIpId` error if an active swap exists.
 pub fn require_no_active_swap(env: &Env, ip_id: u64) {
     if env.storage().persistent().has(&DataKey::ActiveSwap(ip_id)) {
-        env.panic_with_error(Error::from_contract_error(
-            ContractError::SwapExists as u32,
-        ));
+        env.panic_with_error(Error::from_contract_error(ContractError::SwapExists as u32));
     }
 }
 
@@ -530,4 +524,3 @@ pub fn require_admin(env: &Env, caller: &Address) {
 //         require_no_active_swap(&env, 1);
 //     }
 // }
-

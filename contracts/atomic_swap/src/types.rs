@@ -308,7 +308,6 @@ pub struct CollateralRefundedEvent {
     pub collateral_amount: i128,
 }
 
-
 // ── #355: Arbitration Request Event ───────────────────────────────────────────
 
 #[contracttype]
