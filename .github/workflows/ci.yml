@@ -29,7 +29,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Security audit
         run: |
@@ -37,10 +37,10 @@ jobs:
           cargo audit
 
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
       - name: Regression tests
-        run: cargo test --workspace regression_tests
+        run: cargo test --workspace regression_tests --locked
 
       - name: Code coverage
         run: |
