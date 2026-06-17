@@ -52,6 +52,24 @@ pub enum DataKey {
     MerkleRoot(Address),     // Issue #435: cached Merkle root for an owner's commitment set
     NotaryPublicKey,         // Issue #428: stores the trusted notary Ed25519 public key (32 bytes)
     CommitmentHashes,        // Issue #429: stores Vec<BytesN<32>> of all commitment hashes for rollback protection
+    CompressedCommitment(u64), // stores 16-byte compressed commitment for an ip_id
+    IpBatchMetadata(u64),    // stores BatchMetadata for an ip_id (Issue #455)
+    IpCompression(u64),      // stores CompressionSelection for an ip_id (Issue #456)
+    IpEncryptedCommitment(u64), // stores EncryptedCommitmentRecord for an ip_id (Issue #457)
+    IpThresholdConfig(u64),  // stores ThresholdConfig for an ip_id (Issue #454)
+    IpThresholdSignatures(u64), // stores Vec<ThresholdSignature> for an ip_id (Issue #454)
+    IpDisputes(u64),         // stores DisputeRecord for a given dispute_id
+    NextDisputeId,           // monotonic dispute ID counter
+    IpStake(u64),            // stores StakeRecord for an ip_id
+    OwnerReputation(Address), // stores ReputationRecord for an owner
+    ArbitratorPool,          // stores Vec<Address> of nominated arbitrators
+    ArbitrationCase(u64),    // stores ArbitrationRecord for a given arbitration_id
+    NextArbitrationId,       // monotonic arbitration ID counter
+    RenewalCount(u64),       // stores renewal count for an ip_id
+    DelegateDepth(Address),  // stores delegation depth for a delegate
+    Delegates(Address),      // stores Vec<DelegationRecord> for an owner
+    ShardIps(u32),           // maps shard_id -> Vec<u64> of IP IDs in that shard
+    IpAuditTrail(u64),       // stores Vec<AuditEntry> for an IP
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────

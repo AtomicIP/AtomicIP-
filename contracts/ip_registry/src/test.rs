@@ -76,11 +76,29 @@ mod tests {
         fn revoke_ip_access(env: Env, ip_id: u64, grantee: Address);
         fn get_ip_access_grants(env: Env, ip_id: u64) -> Vec<crate::IpAccessGrant>;
         fn check_ip_access(env: Env, ip_id: u64, grantee: Address, required_level: u32) -> bool;
-        // Issue #459: Category methods
+        fn initiate_dispute(env: Env, ip_id: u64, challenger: Address, evidence_hash: BytesN<32>) -> u64;
+        fn submit_dispute_evidence(env: Env, dispute_id: u64, submitter: Address, evidence_hash: BytesN<32>);
+        fn resolve_dispute(env: Env, dispute_id: u64, winner: Address);
+        fn get_dispute(env: Env, dispute_id: u64) -> crate::DisputeRecord;
         fn validate_category_path(env: Env, path: Bytes) -> BytesN<32>;
         fn assign_ip_to_category(env: Env, ip_id: u64, category_hash: BytesN<32>);
         fn list_ip_by_category(env: Env, owner: Address, category_hash: BytesN<32>) -> Vec<u64>;
         fn list_owner_categories(env: Env, owner: Address) -> Vec<BytesN<32>>;
+        // Issue #454: Threshold signatures
+        fn add_threshold_signature(env: Env, ip_id: u64, signer: Address, signature_hash: BytesN<32>);
+        fn get_threshold_signatures(env: Env, ip_id: u64) -> soroban_sdk::Vec<crate::ThresholdSignature>;
+        fn get_threshold_config(env: Env, ip_id: u64) -> Option<crate::ThresholdConfig>;
+        fn verify_threshold_signatures(env: Env, ip_id: u64) -> bool;
+        // Issue #455: Batch metadata
+        fn set_batch_metadata(env: Env, ip_id: u64, batch_id: BytesN<32>, description: Bytes);
+        fn get_batch_metadata(env: Env, ip_id: u64) -> Option<crate::BatchMetadata>;
+        // Issue #456: Compression algorithm selection
+        fn set_commitment_compression(env: Env, ip_id: u64, algorithm: crate::CompressionAlgo);
+        fn get_commitment_compression(env: Env, ip_id: u64) -> crate::CompressionAlgo;
+        fn get_compressed_by_algo(env: Env, ip_id: u64) -> Bytes;
+        // Issue #457: Commitment encryption
+        fn encrypt_commitment(env: Env, ip_id: u64, encrypted_hash: Bytes, key_hint: BytesN<32>);
+        fn get_encrypted_commitment(env: Env, ip_id: u64) -> Option<crate::EncryptedCommitmentRecord>;
     }
 
     #[test]
@@ -977,7 +995,7 @@ mod tests {
         let owner = <Address as TestAddress>::generate(&env);
         let delegate = <Address as TestAddress>::generate(&env);
 
-        client.delegate_commitment_authority(&owner, &delegate);
+        client.delegate_commitment_authority(&owner, &owner, &delegate);
 
         let is_delegate = client.is_delegate(&owner, &delegate);
         assert!(is_delegate);
@@ -994,7 +1012,7 @@ mod tests {
         let owner = <Address as TestAddress>::generate(&env);
         let delegate = <Address as TestAddress>::generate(&env);
 
-        client.delegate_commitment_authority(&owner, &delegate);
+        client.delegate_commitment_authority(&owner, &owner, &delegate);
         assert!(client.is_delegate(&owner, &delegate));
 
         client.revoke_delegation(&owner, &delegate);
@@ -1013,7 +1031,7 @@ mod tests {
         let delegate = <Address as TestAddress>::generate(&env);
         let hash = BytesN::from_array(&env, &[1u8; 32]);
 
-        client.delegate_commitment_authority(&owner, &delegate);
+        client.delegate_commitment_authority(&owner, &owner, &delegate);
         let ip_id = client.commit_ip_delegated(&owner, &hash, &0u32);
 
         let record = client.get_ip(&ip_id);
@@ -1368,7 +1386,7 @@ mod tests {
     // ── Tests for Issue #428: Commitment Timestamp Notarization (continued) ──
 
     #[test]
-    fn test_notarize_ip_timestamp_with_valid_signature() {
+    fn test_notarize_ip_timestamp_with_valid_signature_2() {
         use ed25519_dalek::{Signer, SigningKey};
 
         let env = Env::default();
@@ -2030,7 +2048,7 @@ mod tests {
         assert_eq!(client.get_anonymous_owner(&h), None);
     }
 
-    /// Each commitment emits an "ip_commit_anon" event with (id, timestamp, blinded_owner).
+    /// Each commitment emits an "anon_cmit" event with (id, timestamp, blinded_owner).
     #[test]
     fn test_anon_batch_emits_event_per_commitment() {
         let env = Env::default();
@@ -2046,17 +2064,17 @@ mod tests {
         );
 
         let all_events = env.events().all();
-        // Exactly two ip_commit_anon events (one per hash).
+        // Exactly two anon_cmit events (one per hash).
         let anon_events: soroban_sdk::Vec<_> = {
             let mut v = soroban_sdk::Vec::new(&env);
             for e in all_events.iter() {
-                let (_, topics, _) = e;
-                if let Ok(t) = soroban_sdk::Vec::<soroban_sdk::Val>::try_from_val(&env, &topics) {
-                    if let Some(first) = t.get(0) {
-                        if let Ok(s) = soroban_sdk::Symbol::try_from_val(&env, &first) {
-                            if s == symbol_short!("ip_commit_anon") {
-                                v.push_back(e);
-                            }
+                let (_, ref topics, _) = e;
+                let t = soroban_sdk::Vec::<soroban_sdk::Val>::try_from_val(&env, &topics)
+                    .expect("topics should be Vec<Val>");
+                if let Some(first) = t.get(0) {
+                    if let Ok(s) = soroban_sdk::Symbol::try_from_val(&env, &first) {
+                        if s == symbol_short!("anon_cmit") {
+                            v.push_back(e.clone());
                         }
                     }
                 }
@@ -2304,7 +2322,7 @@ mod tests {
 
     /// Category hierarchy depth: 6 levels panics.
     #[test]
-    #[should_panic(expected = "CategoryDepthExceeded")]
+    #[should_panic(expected = "#30")]
     fn test_validate_category_path_depth_exceeded() {
         let env = Env::default();
         let contract_id = env.register(crate::IpRegistry, ());
@@ -2320,7 +2338,7 @@ mod tests {
 
     /// Path traversal ".." is rejected.
     #[test]
-    #[should_panic(expected = "CategoryPathTraversal")]
+    #[should_panic(expected = "#31")]
     fn test_validate_category_path_traversal_dotdot() {
         let env = Env::default();
         let contract_id = env.register(crate::IpRegistry, ());
@@ -2332,7 +2350,7 @@ mod tests {
 
     /// Leading slash is rejected.
     #[test]
-    #[should_panic(expected = "CategoryPathTraversal")]
+    #[should_panic(expected = "#31")]
     fn test_validate_category_path_leading_slash() {
         let env = Env::default();
         let contract_id = env.register(crate::IpRegistry, ());
@@ -2344,7 +2362,7 @@ mod tests {
 
     /// Trailing slash is rejected.
     #[test]
-    #[should_panic(expected = "CategoryPathTraversal")]
+    #[should_panic(expected = "#31")]
     fn test_validate_category_path_trailing_slash() {
         let env = Env::default();
         let contract_id = env.register(crate::IpRegistry, ());
@@ -2356,7 +2374,7 @@ mod tests {
 
     /// Double slash is rejected.
     #[test]
-    #[should_panic(expected = "CategoryPathTraversal")]
+    #[should_panic(expected = "#31")]
     fn test_validate_category_path_double_slash() {
         let env = Env::default();
         let contract_id = env.register(crate::IpRegistry, ());
@@ -2368,7 +2386,7 @@ mod tests {
 
     /// Empty path is rejected.
     #[test]
-    #[should_panic(expected = "CategoryPathTraversal")]
+    #[should_panic(expected = "#31")]
     fn test_validate_category_path_empty() {
         let env = Env::default();
         let contract_id = env.register(crate::IpRegistry, ());
@@ -2380,7 +2398,7 @@ mod tests {
 
     /// Zero category hash is rejected on assign.
     #[test]
-    #[should_panic(expected = "InvalidCategoryHash")]
+    #[should_panic(expected = "#29")]
     fn test_assign_ip_to_category_zero_hash() {
         let env = Env::default();
         env.mock_all_auths();
