@@ -67,6 +67,8 @@ pub struct IpRecord {
     pub co_owners: soroban_sdk::Vec<Address>,
     pub parent_ip_id: Option<u64>,       // parent IP ID for versioning
     pub notary_signature: Option<Bytes>, // Issue #345: notary signature for timestamp notarization
+    pub expiry_timestamp: u64,           // 0 = no expiry
+    pub grace_period_seconds: u64,       // seconds after expiry before permanent deletion
 }
 
 #[contracttype]

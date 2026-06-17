@@ -88,7 +88,7 @@ mod arbitration_timeout_tests {
         // Advance only 7 days (half of 14-day timeout)
         env.ledger().with_mut(|l| l.timestamp += 604_800);
 
-        let result = client.try_auto_refund_on_arbitration_timeout(&swap_id);
+        let result = client.try_auto_refund_timeout(&swap_id);
         assert!(
             result.is_err(),
             "auto_refund must fail before timeout elapses"
@@ -109,7 +109,7 @@ mod arbitration_timeout_tests {
         // Advance 14 days + 1 second
         env.ledger().with_mut(|l| l.timestamp += 1_209_601);
 
-        client.auto_refund_on_arbitration_timeout(&swap_id);
+        client.auto_refund_timeout(&swap_id);
 
         let swap = client.get_swap(&swap_id).unwrap();
         assert_eq!(swap.status, SwapStatus::Cancelled);
@@ -126,7 +126,7 @@ mod arbitration_timeout_tests {
         // No request_arbitration call — no timestamp stored
         env.ledger().with_mut(|l| l.timestamp += 2_000_000);
 
-        let result = client.try_auto_refund_on_arbitration_timeout(&swap_id);
+        let result = client.try_auto_refund_timeout(&swap_id);
         assert!(
             result.is_err(),
             "auto_refund must fail when no arbitration was requested"
@@ -145,10 +145,10 @@ mod arbitration_timeout_tests {
         client.request_arbitration(&swap_id, &buyer, &evidence);
 
         env.ledger().with_mut(|l| l.timestamp += 1_209_601);
-        client.auto_refund_on_arbitration_timeout(&swap_id);
+        client.auto_refund_timeout(&swap_id);
 
         // Second call must fail — swap is now Cancelled, not Disputed
-        let result = client.try_auto_refund_on_arbitration_timeout(&swap_id);
+        let result = client.try_auto_refund_timeout(&swap_id);
         assert!(result.is_err(), "second auto_refund call must fail");
     }
 
@@ -166,7 +166,7 @@ mod arbitration_timeout_tests {
         env.ledger().with_mut(|l| l.timestamp += 1_209_601);
 
         // A completely unrelated address triggers the refund
-        client.auto_refund_on_arbitration_timeout(&swap_id);
+        client.auto_refund_timeout(&swap_id);
 
         let swap = client.get_swap(&swap_id).unwrap();
         assert_eq!(swap.status, SwapStatus::Cancelled);
@@ -194,7 +194,7 @@ mod arbitration_timeout_tests {
         env.ledger().with_mut(|l| l.timestamp += 604_801);
 
         // Should succeed — timeout measured from first request
-        client.auto_refund_on_arbitration_timeout(&swap_id);
+        client.auto_refund_timeout(&swap_id);
         let swap = client.get_swap(&swap_id).unwrap();
         assert_eq!(swap.status, SwapStatus::Cancelled);
     }

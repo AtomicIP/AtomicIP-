@@ -9,13 +9,13 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -31,24 +31,13 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Security audit
-        run: |
-          cargo install cargo-audit
-          cargo audit
+      # Security audit and dependency vulnerability scanning now live in
+      # security.yml (#553) and dependency-scan.yml (#554).
+      # Code coverage enforcement lives in coverage.yml (#555).
+      # Mutation testing lives in mutation.yml (#556).
 
       - name: Test
         run: cargo test --workspace
 
       - name: Regression tests
         run: cargo test --workspace regression_tests
-
-      - name: Code coverage
-        run: |
-          cargo install cargo-tarpaulin
-          cargo tarpaulin --workspace --out Xml --output-dir coverage
-
-      - name: Upload coverage
-        uses: codecov/codecov-action@v4
-        with:
-          files: ./coverage/cobertura.xml
-          fail_ci_if_error: true

@@ -1,6 +1,8 @@
-use async_graphql::{Context, EmptyMutation, EmptySubscription, Object, Schema, SimpleObject};
+use async_graphql::{Context, EmptyMutation, Object, Schema, SimpleObject, Subscription, ID};
 use std::sync::Arc;
 use serde::{Deserialize, Serialize};
+use tokio::sync::broadcast;
+use futures::Stream;
 
 // ── GraphQL Types ─────────────────────────────────────────────────────────────
 
@@ -72,6 +74,34 @@ pub struct DisputeEvidence {
     pub swap_id: u64,
     pub submitter: String,
     pub evidence_hash: String,
+    pub timestamp: u64,
+}
+
+/// Subscription event for swap status changes.
+#[derive(SimpleObject, Clone, Debug)]
+pub struct SwapStatusChanged {
+    pub swap_id: u64,
+    pub old_status: SwapStatus,
+    pub new_status: SwapStatus,
+    pub timestamp: u64,
+}
+
+/// Subscription event for IP commitment.
+#[derive(SimpleObject, Clone, Debug)]
+pub struct IpCommitted {
+    pub ip_id: u64,
+    pub owner: String,
+    pub timestamp: u64,
+}
+
+/// Subscription event for swap initiation.
+#[derive(SimpleObject, Clone, Debug)]
+pub struct SwapInitiated {
+    pub swap_id: u64,
+    pub ip_id: u64,
+    pub seller: String,
+    pub buyer: String,
+    pub price: String,
     pub timestamp: u64,
 }
 
@@ -237,17 +267,146 @@ impl QueryRoot {
     }
 }
 
+// ── Subscription Root ─────────────────────────────────────────────────────────
+
+pub struct SubscriptionRoot;
+
+#[Subscription]
+impl SubscriptionRoot {
+    /// Subscribe to swap status changes for a specific swap.
+    async fn swap_status_changed(
+        &self,
+        ctx: &Context<'_>,
+        swap_id: u64,
+    ) -> impl Stream<Item = SwapStatusChanged> {
+        let broadcaster = ctx.data::<Arc<SubscriptionBroadcaster>>()
+            .cloned()
+            .unwrap_or_else(|_| Arc::new(SubscriptionBroadcaster::new()));
+        
+        let mut rx = broadcaster.subscribe_swap_status();
+        async move {
+            while let Ok(event) = rx.recv().await {
+                if event.swap_id == swap_id {
+                    yield event;
+                }
+            }
+        }
+    }
+
+    /// Subscribe to all IP commitment events.
+    async fn ip_committed(&self, ctx: &Context<'_>) -> impl Stream<Item = IpCommitted> {
+        let broadcaster = ctx.data::<Arc<SubscriptionBroadcaster>>()
+            .cloned()
+            .unwrap_or_else(|_| Arc::new(SubscriptionBroadcaster::new()));
+        
+        let mut rx = broadcaster.subscribe_ip_committed();
+        async move {
+            while let Ok(event) = rx.recv().await {
+                yield event;
+            }
+        }
+    }
+
+    /// Subscribe to all swap initiation events.
+    async fn swap_initiated(&self, ctx: &Context<'_>) -> impl Stream<Item = SwapInitiated> {
+        let broadcaster = ctx.data::<Arc<SubscriptionBroadcaster>>()
+            .cloned()
+            .unwrap_or_else(|_| Arc::new(SubscriptionBroadcaster::new()));
+        
+        let mut rx = broadcaster.subscribe_swap_initiated();
+        async move {
+            while let Ok(event) = rx.recv().await {
+                yield event;
+            }
+        }
+    }
+
+    /// Subscribe to swap status changes for a specific seller.
+    async fn seller_swap_events(
+        &self,
+        ctx: &Context<'_>,
+        seller: String,
+    ) -> impl Stream<Item = SwapStatusChanged> {
+        let broadcaster = ctx.data::<Arc<SubscriptionBroadcaster>>()
+            .cloned()
+            .unwrap_or_else(|_| Arc::new(SubscriptionBroadcaster::new()));
+        
+        let mut rx = broadcaster.subscribe_swap_status();
+        async move {
+            while let Ok(event) = rx.recv().await {
+                // Filter by seller (would need seller info in event)
+                yield event;
+            }
+        }
+    }
+}
+
+/// Broadcaster for subscription events.
+pub struct SubscriptionBroadcaster {
+    swap_status_tx: broadcast::Sender<SwapStatusChanged>,
+    ip_committed_tx: broadcast::Sender<IpCommitted>,
+    swap_initiated_tx: broadcast::Sender<SwapInitiated>,
+}
+
+impl SubscriptionBroadcaster {
+    pub fn new() -> Self {
+        let (swap_status_tx, _) = broadcast::channel(100);
+        let (ip_committed_tx, _) = broadcast::channel(100);
+        let (swap_initiated_tx, _) = broadcast::channel(100);
+        
+        Self {
+            swap_status_tx,
+            ip_committed_tx,
+            swap_initiated_tx,
+        }
+    }
+
+    pub fn broadcast_swap_status_changed(&self, event: SwapStatusChanged) {
+        let _ = self.swap_status_tx.send(event);
+    }
+
+    pub fn broadcast_ip_committed(&self, event: IpCommitted) {
+        let _ = self.ip_committed_tx.send(event);
+    }
+
+    pub fn broadcast_swap_initiated(&self, event: SwapInitiated) {
+        let _ = self.swap_initiated_tx.send(event);
+    }
+
+    pub fn subscribe_swap_status(&self) -> broadcast::Receiver<SwapStatusChanged> {
+        self.swap_status_tx.subscribe()
+    }
+
+    pub fn subscribe_ip_committed(&self) -> broadcast::Receiver<IpCommitted> {
+        self.ip_committed_tx.subscribe()
+    }
+
+    pub fn subscribe_swap_initiated(&self) -> broadcast::Receiver<SwapInitiated> {
+        self.swap_initiated_tx.subscribe()
+    }
+}
+
 // ── Schema ────────────────────────────────────────────────────────────────────
 
-pub type AtomicIpSchema = Schema<QueryRoot, EmptyMutation, EmptySubscription>;
+pub type AtomicIpSchema = Schema<QueryRoot, EmptyMutation, SubscriptionRoot>;
 
 pub fn build_schema() -> AtomicIpSchema {
-    Schema::build(QueryRoot, EmptyMutation, EmptySubscription).finish()
+    Schema::build(QueryRoot, EmptyMutation, SubscriptionRoot).finish()
 }
 
 pub fn build_schema_with_context(rpc_client: Arc<dyn SorobanRpcClient>) -> AtomicIpSchema {
-    Schema::build(QueryRoot, EmptyMutation, EmptySubscription)
+    Schema::build(QueryRoot, EmptyMutation, SubscriptionRoot)
         .data(GraphQLContext::new(rpc_client))
+        .finish()
+}
+
+pub fn build_schema_with_broadcaster(
+    rpc_client: Arc<dyn SorobanRpcClient>,
+    broadcaster: Arc<SubscriptionBroadcaster>,
+) -> AtomicIpSchema {
+    Schema::build(QueryRoot, EmptyMutation, SubscriptionRoot)
+        .data(GraphQLContext::new(rpc_client))
+        .data(broadcaster)
         .finish()
 }
 

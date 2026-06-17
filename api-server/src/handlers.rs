@@ -4,10 +4,18 @@ use axum::{
     response::IntoResponse,
     Json,
 };
+use once_cell::sync::Lazy;
+use serde_json::Value;
+use std::collections::HashSet;
+use tokio::time::{Duration, Instant};
 use tracing::instrument;
 use crate::cache;
+use crate::deduplication::{create_store, DeduplicationStore};
 use crate::schemas::*;
 use crate::webhook;
+
+// #523: Per-handler idempotency store for batch swap operations.
+static BATCH_SWAP_IDEMPOTENCY: Lazy<DeduplicationStore> = Lazy::new(create_store);
 
 // ── IP Registry ───────────────────────────────────────────────────────────────
 
@@ -295,7 +303,37 @@ pub async fn batch_initiate_swap(Json(body): Json<BatchInitiateSwapRequest>) -> 
             }),
         ));
     }
+
+    // #524: Reject requests that contain duplicate ip_ids.
+    let mut seen: HashSet<u64> = HashSet::new();
+    for &id in &body.ip_ids {
+        if !seen.insert(id) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("duplicate ip_id {} in batch request", id),
+                }),
+            ));
+        }
+    }
+
+    // #523: Return cached result if the caller supplied a matching idempotency key.
+    if let Some(ref key) = body.idempotency_key {
+        if let Some(entry) = BATCH_SWAP_IDEMPOTENCY.get(key.as_str()) {
+            let (ref cached, ref ts) = *entry;
+            if ts.elapsed() < Duration::from_secs(3600) {
+                if let Ok(response) = serde_json::from_value::<BatchInitiateSwapResponse>(cached.clone()) {
+                    return Ok(Json(response));
+                }
+            } else {
+                drop(entry);
+                BATCH_SWAP_IDEMPOTENCY.remove(key.as_str());
+            }
+        }
+    }
+
     // TODO: Call Soroban RPC to invoke atomic_swap.batch_initiate_swap
+    // On success, cache the result: BATCH_SWAP_IDEMPOTENCY.insert(key, (json_value, Instant::now()));
     Err((
         StatusCode::BAD_REQUEST,
         Json(ErrorResponse {

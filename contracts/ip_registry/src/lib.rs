@@ -1,7 +1,7 @@
 #![no_std]
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
-    Bytes, BytesN, Env, Error, Vec,
+    Bytes, BytesN, Env, Error, IntoVal, Vec,
 };
 
 mod validation;
@@ -24,6 +24,12 @@ mod snapshot_tests;
 
 #[cfg(test)]
 mod differential_tests;
+
+#[cfg(test)]
+mod invariant_tests;
+
+#[cfg(test)]
+mod upgrade_tests;
 
 // ── Error Codes ────────────────────────────────────────────────────────────
 
@@ -67,12 +73,12 @@ pub enum ContractError {
     BatchMetadataTooLarge = 27,
     /// #457: Encrypted data too large.
     EncryptedDataTooLarge = 28,
-    /// #459: Category hash is invalid (all zeros or malformed).
-    InvalidCategoryHash = 29,
-    /// #459: Category hierarchy depth exceeds maximum allowed (5 levels).
-    CategoryDepthExceeded = 30,
-    /// #459: Category path contains traversal or empty segments.
-    CategoryPathTraversal = 31,
+    /// #465: Escrow not found.
+    EscrowNotFound = 29,
+    /// #465: Escrow already released or cancelled.
+    EscrowNotActive = 30,
+    /// #465: Timeout not reached for cancellation.
+    EscrowTimeoutNotReached = 31,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -125,6 +131,34 @@ pub enum DataKey {
     NotaryPublicKey,        // Issue #428: stores the trusted notary Ed25519 public key (32 bytes)
     CommitmentHashes,       // Issue #429: stores Vec<BytesN<32>> of all commitment hashes for rollback protection
     IpPowDifficulty(u64),   // stores the pow_difficulty used at commit time for strength scoring
+    // Previously missing variants (used in existing code)
+    ShardIps(u32),          // Issue #437: maps shard_id -> Vec<u64> of IP IDs
+    IpAuditTrail(u64),      // Issue #436: stores Vec<AuditEntry> for a given ip_id
+    RenewalCount(u64),      // stores renewal count for a given ip_id
+    Delegates(Address),     // stores Vec<DelegationRecord> for a given owner
+    DelegateDepth(Address), // stores delegation depth for a given delegate
+    IpDisputes(u64),        // stores DisputeRecord for a given dispute_id
+    NextDisputeId,          // monotonic dispute ID counter
+    IpStake(u64),           // Issue #447: stores StakeRecord for a given ip_id
+    OwnerReputation(Address), // Issue #448: stores ReputationRecord for a given owner
+    ArbitrationCase(u64),   // Issue #449: stores ArbitrationRecord for a given arbitration_id
+    NextArbitrationId,      // Issue #449: monotonic arbitration ID counter
+    ArbitratorPool,         // Issue #449: stores Vec<Address> of registered arbitrators
+    CompressedCommitment(u64), // Issue #438: stores compressed commitment bytes for a given ip_id
+    // Issue #458: Batch verification result cache
+    BatchVerifyResult(BytesN<32>), // maps batch_proof_id -> BatchVerifyResult
+    // Issue #459: Hierarchical storage
+    HierarchyNode(Address, BytesN<32>), // maps (owner, category_hash) -> Vec<u64> of IP IDs
+    OwnerCategories(Address),           // maps owner -> Vec<BytesN<32>> of category hashes
+    // Issue #454: Threshold signatures
+    ThresholdConfig(u64),
+    ThresholdSignatures(u64),
+    // Issue #455: Batch metadata
+    BatchMetadata(u64),
+    // Issue #457: Encrypted commitment
+    EncryptedCommitment(u64),
+    // Issue #465: Batch escrow — keyed by escrow_id (sha256 of ip_ids + timestamp)
+    BatchEscrow(BytesN<32>),
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -295,6 +329,62 @@ pub struct EncryptedCommitmentRecord {
     pub timestamp: u64,
 }
 
+// ── Issue #465: Batch Escrow ─────────────────────────────────────────────────
+
+/// Escrow status for batch commitment escrow.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+#[repr(u32)]
+pub enum EscrowStatus {
+    Active = 0,
+    Released = 1,
+    Cancelled = 2,
+}
+
+/// Escrow record for multiple commitments held in trust.
+#[contracttype]
+#[derive(Clone)]
+pub struct EscrowRecord {
+    pub escrow_id: BytesN<32>,
+    pub depositor: Address,
+    pub ip_ids: soroban_sdk::Vec<u64>,
+    pub release_to: Address,
+    pub timeout: u64,
+    pub status: EscrowStatus,
+    pub timestamp: u64,
+}
+
+// ── Issue #458: Batch Verification with ZK Proofs ────────────────────────────
+
+/// A single verification request in a batch.
+#[contracttype]
+#[derive(Clone)]
+pub struct VerifyRequest {
+    pub ip_id: u64,
+    pub secret: BytesN<32>,
+    pub blinding_factor: BytesN<32>,
+}
+
+/// Result of a single commitment verification within a batch.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct VerifyResult {
+    pub ip_id: u64,
+    pub valid: bool,
+}
+
+// ── Issue #459: Hierarchical Storage ─────────────────────────────────────────
+
+/// A node in the hierarchical commitment tree.
+/// Organises IPs under owner → category → ip_ids for O(1) category lookups.
+#[contracttype]
+#[derive(Clone)]
+pub struct HierarchyNode {
+    pub owner: Address,
+    pub category_hash: BytesN<32>, // sha256 of the category label
+    pub ip_ids: soroban_sdk::Vec<u64>,
+}
+
 // ── Contract ─────────────────────────────────────────────────────────────────
 
 #[contract]
@@ -384,6 +474,8 @@ impl IpRegistry {
             co_owners: Vec::new(&env),
             parent_ip_id: None,
             notary_signature: None,
+            expiry_timestamp: 0,
+            grace_period_seconds: 0,
         };
 
         env.storage()
@@ -531,6 +623,8 @@ impl IpRegistry {
                 co_owners: Vec::new(&env),
                 parent_ip_id: None,
                 notary_signature: None,
+                expiry_timestamp: 0,
+                grace_period_seconds: 0,
             };
 
             env.storage()
@@ -619,8 +713,8 @@ impl IpRegistry {
     ///
     /// # Events
     ///
-    /// Emits one `"ip_commit_anon"` event per commitment:
-    /// - Topics: `(symbol_short!("ip_commit_anon"), contract_address)`
+    /// Emits one `"ip_cmt_a"` event per commitment:
+    /// - Topics: `(symbol_short!("ip_cmt_a"), contract_address)`
     /// - Data: `(ip_id: u64, timestamp: u64, blinded_owner: BytesN<32>)`
     ///
     /// # Storage
@@ -709,7 +803,7 @@ impl IpRegistry {
             );
 
             env.events().publish(
-                (symbol_short!("ip_commit_anon"), env.current_contract_address()),
+                (symbol_short!("ip_cmt_a"), env.current_contract_address()),
                 (id, timestamp, blinded_owner.clone()),
             );
 
@@ -745,6 +839,156 @@ impl IpRegistry {
         env.storage()
             .persistent()
             .get(&DataKey::AnonymousOwner(commitment_hash))
+    }
+
+    /// Retrieve blinded owner identifiers for multiple commitment hashes in a batch.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `commitment_hashes` - Vector of commitment hashes to look up
+    ///
+    /// # Returns
+    ///
+    /// `Vec<Option<BytesN<32>>>` — For each hash, the blinded owner or `None`.
+    pub fn get_blinded_owner_batch(env: Env, commitment_hashes: Vec<BytesN<32>>) -> Vec<Option<BytesN<32>>> {
+        let mut results = Vec::new(&env);
+        for hash in commitment_hashes.iter() {
+            results.push_back(Self::get_anonymous_owner(env.clone(), hash));
+        }
+        results
+    }
+
+    // ── Issue #465: Batch Escrow ────────────────────────────────────────────
+
+    /// Escrow multiple IP commitments for conditional release.
+    ///
+    /// Creates an escrow record holding multiple IP IDs. The depositor locks
+    /// ownership until either released to the beneficiary or cancelled after timeout.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `depositor` - Address initiating the escrow (must own all IP IDs)
+    /// * `ip_ids` - Vector of IP IDs to escrow
+    /// * `release_to` - Address that can claim the IPs upon release
+    /// * `timeout` - Ledger timestamp after which depositor can cancel
+    ///
+    /// # Returns
+    ///
+    /// `BytesN<32>` — Unique escrow ID (sha256 of ip_ids + timestamp)
+    pub fn batch_escrow_commitments(
+        env: Env,
+        depositor: Address,
+        ip_ids: Vec<u64>,
+        release_to: Address,
+        timeout: u64,
+    ) -> BytesN<32> {
+        depositor.require_auth();
+
+        for ip_id in ip_ids.iter() {
+            let record = require_ip_exists(&env, ip_id);
+            if record.owner != depositor {
+                panic_with_error!(&env, ContractError::Unauthorized);
+            }
+        }
+
+        let timestamp = env.ledger().timestamp();
+        let mut id_bytes = Bytes::new(&env);
+        for ip_id in ip_ids.iter() {
+            id_bytes.append(&Bytes::from_array(&env, &ip_id.to_be_bytes()));
+        }
+        id_bytes.append(&Bytes::from_array(&env, &timestamp.to_be_bytes()));
+        let escrow_id: BytesN<32> = env.crypto().sha256(&id_bytes).into();
+
+        let escrow = EscrowRecord {
+            escrow_id: escrow_id.clone(),
+            depositor: depositor.clone(),
+            ip_ids: ip_ids.clone(),
+            release_to,
+            timeout,
+            status: EscrowStatus::Active,
+            timestamp,
+        };
+
+        env.storage().persistent().set(&DataKey::BatchEscrow(escrow_id.clone()), &escrow);
+        env.storage().persistent().extend_ttl(&DataKey::BatchEscrow(escrow_id.clone()), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish((symbol_short!("escrow"), depositor), (escrow_id.clone(), ip_ids.len()));
+
+        escrow_id
+    }
+
+    /// Retrieve an escrow record by ID.
+    ///
+    /// # Returns
+    ///
+    /// `Option<EscrowRecord>` — The escrow record, or `None` if not found.
+    pub fn get_batch_escrow(env: Env, escrow_id: BytesN<32>) -> Option<EscrowRecord> {
+        env.storage().persistent().get(&DataKey::BatchEscrow(escrow_id))
+    }
+
+    /// Release escrowed IPs to the beneficiary.
+    ///
+    /// Transfers ownership of all escrowed IPs to `release_to` address.
+    /// Only the depositor can release before timeout.
+    ///
+    /// # Panics
+    ///
+    /// Panics if escrow not found, not active, or caller unauthorized.
+    pub fn release_batch_escrow(env: Env, escrow_id: BytesN<32>) {
+        let mut escrow: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BatchEscrow(escrow_id.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::EscrowNotFound));
+
+        if escrow.status != EscrowStatus::Active {
+            panic_with_error!(&env, ContractError::EscrowNotActive);
+        }
+
+        escrow.depositor.require_auth();
+
+        for ip_id in escrow.ip_ids.iter() {
+            Self::transfer_ip(env.clone(), ip_id, escrow.release_to.clone());
+        }
+
+        escrow.status = EscrowStatus::Released;
+        env.storage().persistent().set(&DataKey::BatchEscrow(escrow_id.clone()), &escrow);
+        env.storage().persistent().extend_ttl(&DataKey::BatchEscrow(escrow_id.clone()), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish((symbol_short!("esc_rel"), escrow.depositor.clone()), escrow_id);
+    }
+
+    /// Cancel escrow and return IPs to depositor.
+    ///
+    /// Only callable by depositor after timeout has passed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if escrow not found, not active, timeout not reached, or caller unauthorized.
+    pub fn cancel_batch_escrow(env: Env, escrow_id: BytesN<32>) {
+        let mut escrow: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BatchEscrow(escrow_id.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::EscrowNotFound));
+
+        if escrow.status != EscrowStatus::Active {
+            panic_with_error!(&env, ContractError::EscrowNotActive);
+        }
+
+        escrow.depositor.require_auth();
+
+        if env.ledger().timestamp() < escrow.timeout {
+            panic_with_error!(&env, ContractError::EscrowTimeoutNotReached);
+        }
+
+        escrow.status = EscrowStatus::Cancelled;
+        env.storage().persistent().set(&DataKey::BatchEscrow(escrow_id.clone()), &escrow);
+        env.storage().persistent().extend_ttl(&DataKey::BatchEscrow(escrow_id.clone()), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish((symbol_short!("esc_cnl"), escrow.depositor.clone()), escrow_id);
     }
 
     /// Transfer IP ownership to a new address.
@@ -943,6 +1187,199 @@ impl IpRegistry {
     /// Panics if the IP record does not exist (IpNotFound error).
     pub fn get_ip(env: Env, ip_id: u64) -> IpRecord {
         require_ip_exists(&env, ip_id)
+    }
+
+    // ── Issue #454: Threshold Signatures ───────────────────────────────────
+    pub fn require_threshold_signatures(
+        env: Env,
+        ip_id: u64,
+        threshold: u32,
+        signers: soroban_sdk::Vec<Address>,
+    ) {
+        require_ip_exists(&env, ip_id);
+        if threshold == 0 || threshold > signers.len() as u32 {
+            panic_with_error!(&env, ContractError::ThresholdNotMet);
+        }
+
+        let config = ThresholdConfig {
+            ip_id,
+            threshold,
+            total: signers.len() as u32,
+            signers: signers.clone(),
+        };
+
+        env.storage().persistent().set(&DataKey::ThresholdConfig(ip_id), &config);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::ThresholdConfig(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ThresholdSignatures(ip_id), &soroban_sdk::Vec::<ThresholdSignature>::new(&env));
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::ThresholdSignatures(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+    }
+
+    pub fn get_threshold_config(env: Env, ip_id: u64) -> Option<ThresholdConfig> {
+        require_ip_exists(&env, ip_id);
+        env.storage().persistent().get(&DataKey::ThresholdConfig(ip_id))
+    }
+
+    pub fn add_threshold_signature(env: Env, ip_id: u64, signer: Address, signature_hash: BytesN<32>) {
+        require_ip_exists(&env, ip_id);
+        let config: ThresholdConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ThresholdConfig(ip_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::SignerNotAuthorized));
+
+        if !config.signers.iter().any(|entry| entry == signer) {
+            panic_with_error!(&env, ContractError::SignerNotAuthorized);
+        }
+
+        let mut signatures: soroban_sdk::Vec<ThresholdSignature> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ThresholdSignatures(ip_id))
+            .unwrap_or(soroban_sdk::Vec::new(&env));
+
+        if signatures.iter().any(|entry| entry.signer == signer) {
+            panic_with_error!(&env, ContractError::AlreadySigned);
+        }
+
+        signatures.push_back(ThresholdSignature {
+            signer: signer.clone(),
+            signature_hash,
+            timestamp: env.ledger().timestamp(),
+        });
+
+        env.storage().persistent().set(&DataKey::ThresholdSignatures(ip_id), &signatures);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::ThresholdSignatures(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+    }
+
+    pub fn get_threshold_signatures(env: Env, ip_id: u64) -> soroban_sdk::Vec<ThresholdSignature> {
+        require_ip_exists(&env, ip_id);
+        env.storage()
+            .persistent()
+            .get(&DataKey::ThresholdSignatures(ip_id))
+            .unwrap_or(soroban_sdk::Vec::new(&env))
+    }
+
+    pub fn verify_threshold_signatures(env: Env, ip_id: u64) -> bool {
+        require_ip_exists(&env, ip_id);
+        let config: Option<ThresholdConfig> = env.storage().persistent().get(&DataKey::ThresholdConfig(ip_id));
+        let config = match config {
+            Some(c) => c,
+            None => return false,
+        };
+        let signatures = Self::get_threshold_signatures(env.clone(), ip_id);
+        signatures.len() >= config.threshold as u32
+    }
+
+    // ── Issue #455: Batch Metadata ──────────────────────────────────────────
+    pub fn set_batch_metadata(env: Env, ip_id: u64, batch_id: BytesN<32>, description: Bytes) {
+        require_ip_exists(&env, ip_id);
+        if description.len() > MAX_METADATA_BYTES {
+            panic_with_error!(&env, ContractError::BatchMetadataTooLarge);
+        }
+
+        let record = BatchMetadata {
+            ip_id,
+            batch_id,
+            description,
+            timestamp: env.ledger().timestamp(),
+        };
+
+        env.storage().persistent().set(&DataKey::BatchMetadata(ip_id), &record);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::BatchMetadata(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+    }
+
+    pub fn get_batch_metadata(env: Env, ip_id: u64) -> Option<BatchMetadata> {
+        require_ip_exists(&env, ip_id);
+        env.storage().persistent().get(&DataKey::BatchMetadata(ip_id))
+    }
+
+    // ── Issue #456: Compression Algorithm Selection ────────────────────────
+    pub fn get_commitment_compression(env: Env, ip_id: u64) -> CompressionAlgo {
+        require_ip_exists(&env, ip_id);
+        env.storage()
+            .persistent()
+            .get(&DataKey::CompressionSelection(ip_id))
+            .map(|selection: CompressionSelection| selection.algorithm)
+            .unwrap_or(CompressionAlgo::Truncate16)
+    }
+
+    pub fn set_commitment_compression(env: Env, ip_id: u64, algorithm: CompressionAlgo) {
+        require_ip_exists(&env, ip_id);
+        let selection = CompressionSelection {
+            ip_id,
+            algorithm,
+        };
+        env.storage().persistent().set(&DataKey::CompressionSelection(ip_id), &selection);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::CompressionSelection(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+    }
+
+    pub fn get_compressed_bytes(env: Env, ip_id: u64) -> Bytes {
+        require_ip_exists(&env, ip_id);
+        let record = require_ip_exists(&env, ip_id);
+        let algo = Self::get_commitment_compression(env.clone(), ip_id);
+        let hash = record.commitment_hash;
+
+        match algo {
+            CompressionAlgo::None => Bytes::from_array(&env, &hash.to_array()).into(),
+            CompressionAlgo::Truncate16 => {
+                let mut bytes = Bytes::new(&env);
+                let arr = hash.to_array();
+                for i in 0..16 {
+                    bytes.push_back(arr[i as usize]);
+                }
+                bytes
+            }
+            CompressionAlgo::Xor8 => {
+                let mut bytes = Bytes::new(&env);
+                let arr = hash.to_array();
+                let mut acc = 0u8;
+                for b in arr.iter() {
+                    acc ^= *b;
+                }
+                for _ in 0..8 {
+                    bytes.push_back(acc);
+                }
+                bytes
+            }
+        }
+    }
+
+    // ── Issue #457: Commitment Encryption ───────────────────────────────────
+    pub fn encrypt_commitment(env: Env, ip_id: u64, encrypted_hash: Bytes, key_hint: BytesN<32>) {
+        require_ip_exists(&env, ip_id);
+        if encrypted_hash.len() > 256 {
+            panic_with_error!(&env, ContractError::EncryptedDataTooLarge);
+        }
+
+        let record = EncryptedCommitmentRecord {
+            ip_id,
+            encrypted_hash,
+            key_hint,
+            timestamp: env.ledger().timestamp(),
+        };
+
+        env.storage().persistent().set(&DataKey::EncryptedCommitment(ip_id), &record);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::EncryptedCommitment(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+    }
+
+    pub fn get_encrypted_commitment(env: Env, ip_id: u64) -> Option<EncryptedCommitmentRecord> {
+        require_ip_exists(&env, ip_id);
+        env.storage().persistent().get(&DataKey::EncryptedCommitment(ip_id))
     }
 
     /// Verify a commitment: hash the secret and blinding factor, then compare to stored commitment hash.
@@ -1598,6 +2035,8 @@ impl IpRegistry {
                     co_owners: Vec::new(&env),
                     parent_ip_id: Some(parent_ip_id),
                     notary_signature: None,
+                    expiry_timestamp: 0,
+                    grace_period_seconds: 0,
                 };
 
         // Store the new version
@@ -2013,16 +2452,25 @@ impl IpRegistry {
         all_leaves: &Vec<BytesN<32>>,
     ) -> bool {
         let root = Self::merkle_root(env, all_leaves);
-        let mut computed = leaf.clone();
 
-        for proof_hash in proof.iter() {
+        fn hash_pair(env: &Env, left: &BytesN<32>, right: &BytesN<32>) -> BytesN<32> {
             let mut combined = Bytes::new(env);
-            combined.append(&computed.into());
-            combined.append(&proof_hash.into());
-            computed = env.crypto().sha256(&combined).into();
+            combined.append(&left.clone().into());
+            combined.append(&right.clone().into());
+            env.crypto().sha256(&combined).into()
         }
 
-        computed == root
+        let mut candidates = Vec::from_array(env, [leaf.clone()]);
+        for proof_hash in proof.iter() {
+            let mut next = Vec::new(env);
+            for candidate in candidates.iter() {
+                next.push_back(hash_pair(env, &candidate, &proof_hash));
+                next.push_back(hash_pair(env, &proof_hash, &candidate));
+            }
+            candidates = next;
+        }
+
+        candidates.iter().any(|candidate| candidate == root)
     }
 
     // ── Issue #344: Tiered Access Control ──────────────────────────────────────
@@ -2324,7 +2772,7 @@ impl IpRegistry {
         let owner: Option<Address> = env
             .storage()
             .persistent()
-            .get(&DataKey::CommitmentOwner(commitment_hash));
+            .get(&DataKey::CommitmentOwner(commitment_hash.clone()));
         if owner.is_none() {
             return None;
         }
@@ -2964,569 +3412,66 @@ impl IpRegistry {
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::DisputeNotFound))
     }
 
-    // ── Issue #447: IP Commitment Staking ─────────────────────────────────────
+    // ── IP Expiry & Grace Period ───────────────────────────────────────────────
 
-    /// Stake XLM (represented as an i128 amount) against an IP commitment.
-    /// Only the IP owner may stake. One active stake per IP.
-    pub fn stake_commitment(env: Env, ip_id: u64, amount: i128) {
-        let record = require_ip_exists(&env, ip_id);
+    /// Set expiry and grace period for an IP. Owner-only.
+    /// Pass expiry_timestamp = 0 to remove expiry.
+    pub fn set_ip_expiry(env: Env, ip_id: u64, expiry_timestamp: u64, grace_period_seconds: u64) {
+        let mut record = require_ip_exists(&env, ip_id);
         record.owner.require_auth();
 
-        if env.storage().persistent().has(&DataKey::IpStake(ip_id)) {
-            panic_with_error!(&env, ContractError::AlreadyStaked);
+        if expiry_timestamp != 0 && expiry_timestamp <= env.ledger().timestamp() {
+            env.panic_with_error(Error::from_contract_error(ContractError::InvalidExpiry as u32));
         }
 
-        let stake = StakeRecord {
-            ip_id,
-            owner: record.owner.clone(),
-            amount,
-            slashed: false,
-        };
-        env.storage().persistent().set(&DataKey::IpStake(ip_id), &stake);
-        env.storage().persistent().extend_ttl(&DataKey::IpStake(ip_id), LEDGER_BUMP, LEDGER_BUMP);
-
-        env.events().publish((symbol_short!("staked"), record.owner), (ip_id, amount));
+        record.expiry_timestamp = expiry_timestamp;
+        record.grace_period_seconds = grace_period_seconds;
+        env.storage().persistent().set(&DataKey::IpRecord(ip_id), &record);
+        env.storage().persistent().extend_ttl(&DataKey::IpRecord(ip_id), LEDGER_BUMP, LEDGER_BUMP);
     }
 
-    /// Slash the stake for an IP (admin-only). Marks the stake as slashed and
-    /// decrements the owner's reputation score.
-    pub fn slash_stake(env: Env, ip_id: u64) {
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::Unauthorized));
-        admin.require_auth();
-
-        let mut stake: StakeRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::IpStake(ip_id))
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::StakeNotFound));
-
-        if stake.slashed {
-            panic_with_error!(&env, ContractError::StakeAlreadySlashed);
-        }
-
-        stake.slashed = true;
-        env.storage().persistent().set(&DataKey::IpStake(ip_id), &stake);
-        env.storage().persistent().extend_ttl(&DataKey::IpStake(ip_id), LEDGER_BUMP, LEDGER_BUMP);
-
-        // Penalise reputation
-        let mut rep: ReputationRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::OwnerReputation(stake.owner.clone()))
-            .unwrap_or(ReputationRecord {
-                owner: stake.owner.clone(),
-                score: 0,
-                commitments: 0,
-                disputes_lost: 0,
-            });
-        rep.score = rep.score.saturating_sub(10);
-        rep.disputes_lost += 1;
-        env.storage().persistent().set(&DataKey::OwnerReputation(stake.owner.clone()), &rep);
-        env.storage().persistent().extend_ttl(&DataKey::OwnerReputation(stake.owner.clone()), LEDGER_BUMP, LEDGER_BUMP);
-
-        env.events().publish((symbol_short!("slashed"), stake.owner), ip_id);
-    }
-
-    /// Unstake: remove an active (non-slashed) stake. Owner-only.
-    pub fn unstake(env: Env, ip_id: u64) {
-        let stake: StakeRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::IpStake(ip_id))
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::StakeNotFound));
-
-        stake.owner.require_auth();
-
-        if stake.slashed {
-            panic_with_error!(&env, ContractError::StakeAlreadySlashed);
-        }
-
-        env.storage().persistent().remove(&DataKey::IpStake(ip_id));
-        env.events().publish((symbol_short!("unstaked"), stake.owner), ip_id);
-    }
-
-    /// Get the stake record for an IP.
-    pub fn get_stake(env: Env, ip_id: u64) -> Option<StakeRecord> {
-        env.storage().persistent().get(&DataKey::IpStake(ip_id))
-    }
-
-    // ── Issue #448: IP Commitment Reputation System ───────────────────────────
-
-    /// Get the reputation record for an owner. Returns a default record if none exists.
-    pub fn get_reputation(env: Env, owner: Address) -> ReputationRecord {
-        env.storage()
-            .persistent()
-            .get(&DataKey::OwnerReputation(owner.clone()))
-            .unwrap_or(ReputationRecord {
-                owner,
-                score: 0,
-                commitments: 0,
-                disputes_lost: 0,
-            })
-    }
-
-    /// Increment the commitment count and score for an owner (called internally on commit).
-    /// Also callable by admin to manually adjust reputation.
-    pub fn update_reputation(env: Env, owner: Address, score_delta: i64) {
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::Unauthorized));
-        admin.require_auth();
-
-        let mut rep: ReputationRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::OwnerReputation(owner.clone()))
-            .unwrap_or(ReputationRecord {
-                owner: owner.clone(),
-                score: 0,
-                commitments: 0,
-                disputes_lost: 0,
-            });
-        rep.score = rep.score.saturating_add(score_delta);
-        env.storage().persistent().set(&DataKey::OwnerReputation(owner.clone()), &rep);
-        env.storage().persistent().extend_ttl(&DataKey::OwnerReputation(owner), LEDGER_BUMP, LEDGER_BUMP);
-    }
-
-    // ── Issue #449: IP Commitment Dispute Arbitration ─────────────────────────
-
-    /// Nominate an address as an arbitrator (admin-only).
-    pub fn nominate_arbitrator(env: Env, arbitrator: Address) {
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::Unauthorized));
-        admin.require_auth();
-
-        let mut pool: Vec<Address> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::ArbitratorPool)
-            .unwrap_or(Vec::new(&env));
-
-        // Idempotent: skip if already in pool
-        for a in pool.iter() {
-            if a == arbitrator {
-                return;
-            }
-        }
-        pool.push_back(arbitrator.clone());
-        env.storage().persistent().set(&DataKey::ArbitratorPool, &pool);
-        env.storage().persistent().extend_ttl(&DataKey::ArbitratorPool, LEDGER_BUMP, LEDGER_BUMP);
-
-        env.events().publish((symbol_short!("arb_nom"), admin), arbitrator);
-    }
-
-    /// Open an arbitration case for an existing dispute. Admin-only.
-    /// Returns the new arbitration_id.
-    pub fn open_arbitration(env: Env, dispute_id: u64) -> u64 {
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::Unauthorized));
-        admin.require_auth();
-
-        // Ensure dispute exists
-        let _dispute: DisputeRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::IpDisputes(dispute_id))
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::DisputeNotFound));
-
-        let arb_id: u64 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::NextArbitrationId)
-            .unwrap_or(1);
-
-        let pool: Vec<Address> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::ArbitratorPool)
-            .unwrap_or(Vec::new(&env));
-
-        let case = ArbitrationRecord {
-            arbitration_id: arb_id,
-            dispute_id,
-            arbitrators: pool,
-            votes_owner: 0,
-            votes_challenger: 0,
-            finalized: false,
-            winner: None,
-        };
-
-        env.storage().persistent().set(&DataKey::ArbitrationCase(arb_id), &case);
-        env.storage().persistent().extend_ttl(&DataKey::ArbitrationCase(arb_id), LEDGER_BUMP, LEDGER_BUMP);
-        env.storage().persistent().set(&DataKey::NextArbitrationId, &(arb_id + 1));
-        env.storage().persistent().extend_ttl(&DataKey::NextArbitrationId, LEDGER_BUMP, LEDGER_BUMP);
-
-        arb_id
-    }
-
-    /// Cast a vote on an arbitration case. `vote_for_owner = true` votes for the
-    /// IP owner; `false` votes for the challenger. Caller must be a nominated arbitrator.
-    pub fn vote_on_dispute(env: Env, arbitration_id: u64, voter: Address, vote_for_owner: bool) {
-        voter.require_auth();
-
-        let mut case: ArbitrationRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::ArbitrationCase(arbitration_id))
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::ArbitrationNotFound));
-
-        if case.finalized {
-            panic_with_error!(&env, ContractError::ArbitrationAlreadyFinalized);
-        }
-
-        // Verify voter is in the arbitrator pool
-        let mut is_arbitrator = false;
-        for a in case.arbitrators.iter() {
-            if a == voter {
-                is_arbitrator = true;
-                break;
-            }
-        }
-        if !is_arbitrator {
-            panic_with_error!(&env, ContractError::NotAnArbitrator);
-        }
-
-        if vote_for_owner {
-            case.votes_owner += 1;
-        } else {
-            case.votes_challenger += 1;
-        }
-
-        env.storage().persistent().set(&DataKey::ArbitrationCase(arbitration_id), &case);
-        env.storage().persistent().extend_ttl(&DataKey::ArbitrationCase(arbitration_id), LEDGER_BUMP, LEDGER_BUMP);
-
-        env.events().publish((symbol_short!("arb_vote"), voter), (arbitration_id, vote_for_owner));
-    }
-
-    /// Finalize an arbitration case. Admin-only. Determines winner by majority vote
-    /// and resolves the underlying dispute.
-    pub fn finalize_arbitration(env: Env, arbitration_id: u64) {
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::Unauthorized));
-        admin.require_auth();
-
-        let mut case: ArbitrationRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::ArbitrationCase(arbitration_id))
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::ArbitrationNotFound));
-
-        if case.finalized {
-            panic_with_error!(&env, ContractError::ArbitrationAlreadyFinalized);
-        }
-
-        let mut dispute: DisputeRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::IpDisputes(case.dispute_id))
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::DisputeNotFound));
-
-        let ip_record = require_ip_exists(&env, dispute.ip_id);
-
-        // Majority vote determines winner; ties go to the IP owner
-        let winner = if case.votes_challenger > case.votes_owner {
-            dispute.challenger.clone()
-        } else {
-            ip_record.owner.clone()
-        };
-
-        case.finalized = true;
-        case.winner = Some(winner.clone());
-        dispute.resolved = true;
-        dispute.winner = Some(winner.clone());
-
-        env.storage().persistent().set(&DataKey::ArbitrationCase(arbitration_id), &case);
-        env.storage().persistent().extend_ttl(&DataKey::ArbitrationCase(arbitration_id), LEDGER_BUMP, LEDGER_BUMP);
-        env.storage().persistent().set(&DataKey::IpDisputes(case.dispute_id), &dispute);
-        env.storage().persistent().extend_ttl(&DataKey::IpDisputes(case.dispute_id), LEDGER_BUMP, LEDGER_BUMP);
-
-        env.events().publish((symbol_short!("arb_fin"), winner.clone()), arbitration_id);
-    }
-
-    /// Get an arbitration case by ID.
-    pub fn get_arbitration(env: Env, arbitration_id: u64) -> ArbitrationRecord {
-        env.storage()
-            .persistent()
-            .get(&DataKey::ArbitrationCase(arbitration_id))
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::ArbitrationNotFound))
-    }
-
-    // ── Issue: IP Commitment Renewal ───────────────────────────────────────────
-
-    /// Renew an expiring IP commitment by extending its on-chain TTL.
-    ///
-    /// Bumps the storage TTL of the IP record back to `LEDGER_BUMP` ledgers
-    /// without creating a new commitment or changing the commitment hash.
-    /// A renewal counter is incremented on each call.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the IP does not exist, the caller is not the owner, or the IP
-    /// is revoked.
-    pub fn renew_ip(env: Env, ip_id: u64) {
-        let record = require_ip_exists(&env, ip_id);
+    /// Renew an IP commitment's expiry. Owner-only.
+    /// new_expiry must be strictly greater than the current expiry_timestamp.
+    pub fn renew_ip_commitment(env: Env, ip_id: u64, new_expiry: u64) -> bool {
+        let mut record = require_ip_exists(&env, ip_id);
         record.owner.require_auth();
-        require_not_revoked(&env, &record);
 
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::IpRecord(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+        if new_expiry <= record.expiry_timestamp {
+            env.panic_with_error(Error::from_contract_error(ContractError::InvalidExpiry as u32));
+        }
 
-        let count: u32 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::RenewalCount(ip_id))
-            .unwrap_or(0u32);
-        let new_count = count + 1;
-        env.storage()
-            .persistent()
-            .set(&DataKey::RenewalCount(ip_id), &new_count);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::RenewalCount(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+        let old_expiry = record.expiry_timestamp;
+        record.expiry_timestamp = new_expiry;
+        env.storage().persistent().set(&DataKey::IpRecord(ip_id), &record);
+        env.storage().persistent().extend_ttl(&DataKey::IpRecord(ip_id), LEDGER_BUMP, LEDGER_BUMP);
 
         env.events().publish(
-            (symbol_short!("renewed"), record.owner),
-            (ip_id, new_count),
+            (symbol_short!("ip_renew"), record.owner),
+            (ip_id, old_expiry, new_expiry),
         );
+
+        true
     }
 
-    /// Get the number of times an IP commitment has been renewed.
-    pub fn get_renewal_count(env: Env, ip_id: u64) -> u32 {
-        require_ip_exists(&env, ip_id);
-        env.storage()
-            .persistent()
-            .get(&DataKey::RenewalCount(ip_id))
-            .unwrap_or(0u32)
-    }
-
-    // ── Issue: Delegation Chains ───────────────────────────────────────────────────────────────
-
-    pub fn delegate_commitment_authority(
-        env: Env,
-        root_owner: Address,
-        delegator: Address,
-        delegate_address: Address,
-    ) {
-        delegator.require_auth();
-
-        let new_depth: u32 = if delegator == root_owner {
-            0
-        } else {
-            let stored: Option<u32> = env
-                .storage()
-                .persistent()
-                .get(&DataKey::DelegateDepth(delegator.clone()));
-            match stored {
-                Some(d) => d + 1,
-                None => panic_with_error!(&env, ContractError::Unauthorized),
-            }
-        };
-
-        if new_depth >= MAX_DELEGATION_DEPTH {
-            panic_with_error!(&env, ContractError::Unauthorized);
-        }
-
-        let key = DataKey::Delegates(root_owner.clone());
-        let mut delegates: Vec<DelegationRecord> = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or(Vec::new(&env));
-
-        for i in 0..delegates.len() {
-            if delegates.get(i).unwrap().delegate == delegate_address {
-                return;
+    /// Remove expired IPs that are past their grace period. Anyone can call.
+    /// Skips IPs with expiry_timestamp == 0 (no expiry set).
+    pub fn cleanup_expired_ips(env: Env, ip_ids: Vec<u64>) {
+        let now = env.ledger().timestamp();
+        for ip_id in ip_ids.iter() {
+            let record: Option<IpRecord> = env.storage().persistent().get(&DataKey::IpRecord(ip_id));
+            if let Some(rec) = record {
+                if rec.expiry_timestamp == 0 {
+                    continue;
+                }
+                if now >= rec.expiry_timestamp.saturating_add(rec.grace_period_seconds) {
+                    env.storage().persistent().remove(&DataKey::IpRecord(ip_id));
+                    env.events().publish(
+                        (symbol_short!("ip_clean"),),
+                        (ip_id, now),
+                    );
+                }
             }
         }
-
-        delegates.push_back(DelegationRecord {
-            delegate: delegate_address.clone(),
-            depth: new_depth,
-        });
-        env.storage().persistent().set(&key, &delegates);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, LEDGER_BUMP, LEDGER_BUMP);
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::DelegateDepth(delegate_address.clone()), &new_depth);
-        env.storage().persistent().extend_ttl(
-            &DataKey::DelegateDepth(delegate_address.clone()),
-            LEDGER_BUMP,
-            LEDGER_BUMP,
-        );
-
-        env.events().publish(
-            (symbol_short!("delegated"), root_owner),
-            (delegate_address, new_depth),
-        );
-    }
-
-    pub fn revoke_delegation(env: Env, owner: Address, delegate_address: Address) {
-        owner.require_auth();
-
-        let key = DataKey::Delegates(owner.clone());
-        let delegates: Vec<DelegationRecord> = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or(Vec::new(&env));
-
-        let mut updated = Vec::new(&env);
-        for i in 0..delegates.len() {
-            let rec = delegates.get(i).unwrap();
-            if rec.delegate != delegate_address {
-                updated.push_back(rec);
-            }
-        }
-
-        env.storage().persistent().set(&key, &updated);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, LEDGER_BUMP, LEDGER_BUMP);
-
-        env.storage()
-            .persistent()
-            .remove(&DataKey::DelegateDepth(delegate_address.clone()));
-
-        env.events().publish(
-            (symbol_short!("revoke"), owner),
-            delegate_address,
-        );
-    }
-
-    pub fn is_delegate(env: Env, owner: Address, delegate_address: Address) -> bool {
-        Self::is_delegate_in_chain(&env, &owner, &delegate_address, 0)
-    }
-
-    pub fn commit_ip_delegated(
-        env: Env,
-        owner: Address,
-        commitment_hash: BytesN<32>,
-        pow_difficulty: u32,
-    ) -> u64 {
-        owner.require_auth();
-
-        let key = DataKey::Delegates(owner.clone());
-        let delegates: Vec<DelegationRecord> = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or(Vec::new(&env));
-        if delegates.is_empty() {
-            panic_with_error!(&env, ContractError::Unauthorized);
-        }
-
-        require_non_zero_commitment(&env, &commitment_hash);
-        require_unique_commitment(&env, &commitment_hash);
-        require_pow(&env, &commitment_hash, pow_difficulty);
-
-        let id: u64 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::NextId)
-            .unwrap_or(1);
-
-        let record = IpRecord {
-            ip_id: id,
-            owner: owner.clone(),
-            commitment_hash: commitment_hash.clone(),
-            timestamp: env.ledger().timestamp(),
-            revoked: false,
-            co_owners: Vec::new(&env),
-            parent_ip_id: None,
-            notary_signature: None,
-        };
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::IpRecord(id), &record);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::IpRecord(id), LEDGER_BUMP, LEDGER_BUMP);
-
-        let mut ids: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::OwnerIps(owner.clone()))
-            .unwrap_or(Vec::new(&env));
-        ids.push_back(id);
-        env.storage()
-            .persistent()
-            .set(&DataKey::OwnerIps(owner.clone()), &ids);
-        env.storage().persistent().extend_ttl(
-            &DataKey::OwnerIps(owner.clone()),
-            LEDGER_BUMP,
-            LEDGER_BUMP,
-        );
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::CommitmentOwner(commitment_hash.clone()), &owner);
-        env.storage().persistent().extend_ttl(
-            &DataKey::CommitmentOwner(commitment_hash.clone()),
-            LEDGER_BUMP,
-            LEDGER_BUMP,
-        );
-
-        env.storage().persistent().set(&DataKey::NextId, &(id + 1));
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::NextId, LEDGER_BUMP, LEDGER_BUMP);
-
-        env.events().publish(
-            (symbol_short!("ip_commit"), owner.clone()),
-            (id, record.timestamp),
-        );
-
-        Self::update_commitment_checksum(&env);
-
-        id
-    }
-
-    fn is_delegate_in_chain(
-        env: &Env,
-        root: &Address,
-        candidate: &Address,
-        depth: u32,
-    ) -> bool {
-        if depth >= MAX_DELEGATION_DEPTH {
-            return false;
-        }
-        let key = DataKey::Delegates(root.clone());
-        let delegates: Vec<DelegationRecord> = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or(Vec::new(env));
-
-        for i in 0..delegates.len() {
-            let rec = delegates.get(i).unwrap();
-            if &rec.delegate == candidate {
-                return true;
-            }
-            if Self::is_delegate_in_chain(env, &rec.delegate, candidate, depth + 1) {
-                return true;
-            }
-        }
-        false
     }
 }
 
@@ -3994,7 +3939,7 @@ mod tests {
         let ip_id = client.commit_ip(&owner, &hash, &0u32);
 
         client.set_commitment_compression(&ip_id, &CompressionAlgo::Truncate16);
-        assert_eq!(client.get_compressed_commitment_by_algo(&ip_id).len(), 16);
+        assert_eq!(client.get_compressed_bytes(&ip_id).len(), 16);
     }
 
     #[test]
@@ -4009,7 +3954,7 @@ mod tests {
         let ip_id = client.commit_ip(&owner, &hash, &0u32);
 
         client.set_commitment_compression(&ip_id, &CompressionAlgo::Xor8);
-        assert_eq!(client.get_compressed_commitment_by_algo(&ip_id).len(), 8);
+        assert_eq!(client.get_compressed_bytes(&ip_id).len(), 8);
     }
 
     #[test]
@@ -4024,7 +3969,7 @@ mod tests {
         let ip_id = client.commit_ip(&owner, &hash, &0u32);
 
         client.set_commitment_compression(&ip_id, &CompressionAlgo::None);
-        assert_eq!(client.get_compressed_commitment_by_algo(&ip_id).len(), 32);
+        assert_eq!(client.get_compressed_bytes(&ip_id).len(), 32);
     }
 
     // ── Issue #457: Commitment Encryption Tests ───────────────────────────────
@@ -4099,5 +4044,332 @@ mod tests {
 
         let record = client.get_encrypted_commitment(&ip_id).unwrap();
         assert_eq!(record.encrypted_hash, soroban_sdk::Bytes::from_array(&env, &[0x02u8; 32]));
+    }
+
+    // ── Issue #458: Batch Verification Tests ──────────────────────────────────
+
+    #[test]
+    fn test_batch_verify_all_valid() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+
+        let secret1 = BytesN::from_array(&env, &[0x01u8; 32]);
+        let blind1 = BytesN::from_array(&env, &[0x02u8; 32]);
+        let mut pre1 = soroban_sdk::Bytes::new(&env);
+        pre1.append(&secret1.clone().into());
+        pre1.append(&blind1.clone().into());
+        let hash1: BytesN<32> = env.crypto().sha256(&pre1).into();
+
+        let secret2 = BytesN::from_array(&env, &[0x03u8; 32]);
+        let blind2 = BytesN::from_array(&env, &[0x04u8; 32]);
+        let mut pre2 = soroban_sdk::Bytes::new(&env);
+        pre2.append(&secret2.clone().into());
+        pre2.append(&blind2.clone().into());
+        let hash2: BytesN<32> = env.crypto().sha256(&pre2).into();
+
+        let id1 = client.commit_ip(&owner, &hash1, &0u32);
+        let id2 = client.commit_ip(&owner, &hash2, &0u32);
+
+        let mut requests = soroban_sdk::Vec::new(&env);
+        requests.push_back(VerifyRequest { ip_id: id1, secret: secret1, blinding_factor: blind1 });
+        requests.push_back(VerifyRequest { ip_id: id2, secret: secret2, blinding_factor: blind2 });
+
+        let results = client.batch_verify_commitments(&requests);
+        assert_eq!(results.len(), 2);
+        assert!(results.get(0).unwrap().valid);
+        assert!(results.get(1).unwrap().valid);
+    }
+
+    #[test]
+    fn test_batch_verify_invalid_proof() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+
+        let secret = BytesN::from_array(&env, &[0xAAu8; 32]);
+        let blind = BytesN::from_array(&env, &[0xBBu8; 32]);
+        let mut pre = soroban_sdk::Bytes::new(&env);
+        pre.append(&secret.clone().into());
+        pre.append(&blind.clone().into());
+        let hash: BytesN<32> = env.crypto().sha256(&pre).into();
+        let id = client.commit_ip(&owner, &hash, &0u32);
+
+        // Wrong blinding factor
+        let wrong_blind = BytesN::from_array(&env, &[0xCCu8; 32]);
+        let mut requests = soroban_sdk::Vec::new(&env);
+        requests.push_back(VerifyRequest { ip_id: id, secret, blinding_factor: wrong_blind });
+
+        let results = client.batch_verify_commitments(&requests);
+        assert!(!results.get(0).unwrap().valid);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_batch_verify_nonexistent_ip_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let mut requests = soroban_sdk::Vec::new(&env);
+        requests.push_back(VerifyRequest {
+            ip_id: 9999,
+            secret: BytesN::from_array(&env, &[0x01u8; 32]),
+            blinding_factor: BytesN::from_array(&env, &[0x02u8; 32]),
+        });
+        client.batch_verify_commitments(&requests);
+    }
+
+    // ── Issue #459: Hierarchical Storage Tests ────────────────────────────────
+
+    #[test]
+    fn test_assign_and_list_ip_by_category() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+
+        let hash = BytesN::from_array(&env, &[0x10u8; 32]);
+        let ip_id = client.commit_ip(&owner, &hash, &0u32);
+
+        let category = BytesN::from_array(&env, &[0xCAu8; 32]);
+        client.assign_ip_to_category(&ip_id, &category);
+
+        let ids = client.list_ip_by_category(&owner, &category);
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids.get(0).unwrap(), ip_id);
+    }
+
+    #[test]
+    fn test_list_owner_categories() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+
+        let hash1 = BytesN::from_array(&env, &[0x11u8; 32]);
+        let hash2 = BytesN::from_array(&env, &[0x12u8; 32]);
+        let id1 = client.commit_ip(&owner, &hash1, &0u32);
+        let id2 = client.commit_ip(&owner, &hash2, &0u32);
+
+        let cat1 = BytesN::from_array(&env, &[0xC1u8; 32]);
+        let cat2 = BytesN::from_array(&env, &[0xC2u8; 32]);
+        client.assign_ip_to_category(&id1, &cat1);
+        client.assign_ip_to_category(&id2, &cat2);
+
+        let cats = client.list_owner_categories(&owner);
+        assert_eq!(cats.len(), 2);
+    }
+
+    #[test]
+    fn test_assign_ip_to_category_no_duplicates() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+
+        let hash = BytesN::from_array(&env, &[0x13u8; 32]);
+        let ip_id = client.commit_ip(&owner, &hash, &0u32);
+        let category = BytesN::from_array(&env, &[0xC3u8; 32]);
+
+        client.assign_ip_to_category(&ip_id, &category);
+        client.assign_ip_to_category(&ip_id, &category); // duplicate call
+
+        let ids = client.list_ip_by_category(&owner, &category);
+        assert_eq!(ids.len(), 1); // still only one entry
+    }
+
+    #[test]
+    fn test_list_ip_by_category_empty() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+        let category = BytesN::from_array(&env, &[0xC4u8; 32]);
+
+        let ids = client.list_ip_by_category(&owner, &category);
+        assert_eq!(ids.len(), 0);
+    }
+
+    // ── Issue #460: Batch Delegation Tests ────────────────────────────────────
+
+    #[test]
+    fn test_batch_delegate_commitment_registers_all() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let delegate1 = Address::generate(&env);
+        let delegate2 = Address::generate(&env);
+
+        let mut delegates = soroban_sdk::Vec::new(&env);
+        delegates.push_back(delegate1.clone());
+        delegates.push_back(delegate2.clone());
+
+        client.batch_delegate_commitment(&owner, &owner, &delegates);
+
+        assert!(client.is_delegate(&owner, &delegate1));
+        assert!(client.is_delegate(&owner, &delegate2));
+    }
+
+    #[test]
+    fn test_batch_delegate_commitment_skips_duplicates() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+
+        let mut delegates = soroban_sdk::Vec::new(&env);
+        delegates.push_back(delegate.clone());
+        delegates.push_back(delegate.clone());
+
+        client.batch_delegate_commitment(&owner, &owner, &delegates);
+
+        assert!(client.is_delegate(&owner, &delegate));
+    }
+
+    #[test]
+    fn test_batch_delegate_commitment_empty_list() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let unrelated = Address::generate(&env);
+
+        let delegates = soroban_sdk::Vec::new(&env);
+        client.batch_delegate_commitment(&owner, &owner, &delegates);
+
+        assert!(!client.is_delegate(&owner, &unrelated));
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_batch_delegate_commitment_unauthorized_delegator_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let stranger = Address::generate(&env);
+        let target = Address::generate(&env);
+
+        let mut delegates = soroban_sdk::Vec::new(&env);
+        delegates.push_back(target.clone());
+
+        client.batch_delegate_commitment(&owner, &stranger, &delegates);
+    }
+
+    // ── Issue #461: Batch Renewal Tests ──────────────────────────────────────
+
+    #[test]
+    fn test_batch_renew_ip_increments_each_count() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let hash1 = BytesN::from_array(&env, &[0xA1u8; 32]);
+        let hash2 = BytesN::from_array(&env, &[0xA2u8; 32]);
+
+        let id1 = client.commit_ip(&owner, &hash1, &0u32);
+        let id2 = client.commit_ip(&owner, &hash2, &0u32);
+
+        let mut ids = soroban_sdk::Vec::new(&env);
+        ids.push_back(id1);
+        ids.push_back(id2);
+
+        client.batch_renew_ip(&owner, &ids);
+
+        assert_eq!(client.get_renewal_count(&id1), 1);
+        assert_eq!(client.get_renewal_count(&id2), 1);
+    }
+
+    #[test]
+    fn test_batch_renew_ip_multiple_rounds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[0xB1u8; 32]);
+        let id = client.commit_ip(&owner, &hash, &0u32);
+
+        let mut ids = soroban_sdk::Vec::new(&env);
+        ids.push_back(id);
+
+        client.batch_renew_ip(&owner, &ids);
+        client.batch_renew_ip(&owner, &ids);
+
+        assert_eq!(client.get_renewal_count(&id), 2);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_batch_renew_ip_revoked_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[0xC5u8; 32]);
+        let id = client.commit_ip(&owner, &hash, &0u32);
+        client.revoke_ip(&id);
+
+        let mut ids = soroban_sdk::Vec::new(&env);
+        ids.push_back(id);
+
+        client.batch_renew_ip(&owner, &ids);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_batch_renew_ip_wrong_owner_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let attacker = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[0xD5u8; 32]);
+        let id = client.commit_ip(&owner, &hash, &0u32);
+
+        let mut ids = soroban_sdk::Vec::new(&env);
+        ids.push_back(id);
+
+        client.batch_renew_ip(&attacker, &ids);
+    }
+
+    #[test]
+    fn test_batch_renew_ip_empty_list() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let ids = soroban_sdk::Vec::new(&env);
+
+        client.batch_renew_ip(&owner, &ids);
     }
 }

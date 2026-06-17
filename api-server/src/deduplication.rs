@@ -16,6 +16,8 @@ pub fn create_store() -> DeduplicationStore {
     Arc::new(DashMap::new())
 }
 
+/// Deduplication middleware for idempotent requests.
+/// Uses x-idempotency-key header to deduplicate identical concurrent requests.
 pub async fn deduplication_middleware(
     headers: HeaderMap,
     mut req: Request,
@@ -40,6 +42,7 @@ pub async fn deduplication_middleware(
             let response = Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", "application/json")
+                .header("x-idempotency-replayed", "true")
                 .body(cached_result.to_string().into())
                 .unwrap();
             return Ok(response);
@@ -57,7 +60,7 @@ pub async fn deduplication_middleware(
                 store.insert(idempotency_key.to_string(), (json_value.clone(), Instant::now()));
                 
                 let new_response = Response::builder()
-                    .status(StatusCode::OK)
+                    .status(response.status())
                     .header("content-type", "application/json")
                     .body(body_bytes.into())
                     .unwrap();
@@ -67,6 +70,44 @@ pub async fn deduplication_middleware(
     }
 
     Ok(response)
+}
+
+/// Concurrent request deduplication - prevents duplicate concurrent requests
+/// from hitting the backend multiple times.
+pub struct ConcurrentDeduplicator {
+    pending: Arc<DashMap<String, Arc<tokio::sync::Notify>>>,
+}
+
+impl ConcurrentDeduplicator {
+    pub fn new() -> Self {
+        Self {
+            pending: Arc::new(DashMap::new()),
+        }
+    }
+
+    /// Check if a request is already in flight. If so, wait for it.
+    /// Returns true if this is the first request, false if it's a duplicate.
+    pub async fn acquire_or_wait(&self, key: &str) -> bool {
+        if let Some(_) = self.pending.get(key) {
+            // Request already in flight, wait for it
+            let notify = self.pending.get(key).unwrap().clone();
+            drop(notify);
+            let notify = self.pending.get(key).unwrap().clone();
+            notify.notified().await;
+            false
+        } else {
+            // First request, mark as in-flight
+            self.pending.insert(key.to_string(), Arc::new(tokio::sync::Notify::new()));
+            true
+        }
+    }
+
+    /// Mark a request as complete and notify waiters
+    pub fn release(&self, key: &str) {
+        if let Some((_, notify)) = self.pending.remove(key) {
+            notify.notify_waiters();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -89,5 +130,32 @@ mod tests {
         
         let result = deduplication_middleware(HeaderMap::new(), req, next).await;
         assert_eq!(result.unwrap_err(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_deduplicator_first_request() {
+        let dedup = ConcurrentDeduplicator::new();
+        let is_first = dedup.acquire_or_wait("test-key").await;
+        assert!(is_first);
+        dedup.release("test-key");
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_deduplicator_duplicate_waits() {
+        let dedup = Arc::new(ConcurrentDeduplicator::new());
+        let dedup_clone = dedup.clone();
+
+        let handle = tokio::spawn(async move {
+            let is_first = dedup_clone.acquire_or_wait("test-key").await;
+            assert!(is_first);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            dedup_clone.release("test-key");
+        });
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let is_first = dedup.acquire_or_wait("test-key").await;
+        assert!(!is_first);
+
+        handle.await.unwrap();
     }
 }

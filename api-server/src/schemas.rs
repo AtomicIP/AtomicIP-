@@ -211,6 +211,8 @@ pub struct BatchInitiateSwapRequest {
     pub token: String,
     /// #311: Optional referrer address for referral reward
     pub referrer: Option<String>,
+    /// #523: Client-supplied idempotency key; repeated requests with the same key return the cached result.
+    pub idempotency_key: Option<String>,
 }
 
 /// #309: Batch swap initiation response.

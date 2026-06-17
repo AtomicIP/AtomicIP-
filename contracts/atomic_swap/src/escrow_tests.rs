@@ -140,7 +140,7 @@ mod tests {
         let client = AtomicSwapClient::new(&env, &contract_id);
 
         // Regular atomic swap
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None, &0_i128, &false);
 
         // escrow_deposit on an atomic swap must panic
         client.escrow_deposit(&swap_id);

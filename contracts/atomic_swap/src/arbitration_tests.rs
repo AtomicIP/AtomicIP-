@@ -39,7 +39,7 @@ mod arbitration_tests {
         let client = AtomicSwapClient::new(env, &contract_id);
         client.initialize(&registry_id);
 
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None, &0_i128, &false);
         client.accept_swap(&swap_id);
         client.raise_dispute(&swap_id);
 
@@ -95,7 +95,7 @@ mod arbitration_tests {
         let client = AtomicSwapClient::new(&env, &contract_id);
         client.initialize(&registry_id);
 
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None, &0_i128, &false);
         // Swap is Pending, not Disputed — should panic
         let admin = Address::generate(&env);
         let arbitrator = Address::generate(&env);
@@ -253,7 +253,7 @@ mod arbitration_tests {
         client.initialize(&registry_id);
 
         // Initiate with flat price 500
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None, &0_i128, &false);
 
         // Accept with quantity=1 (no tiers set, uses flat price)
         client.accept_swap_with_quantity(&swap_id, &1_u32);
@@ -278,7 +278,7 @@ mod arbitration_tests {
         let client = AtomicSwapClient::new(&env, &contract_id);
         client.initialize(&registry_id);
 
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &1000_i128, &buyer, &0_u32);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &1000_i128, &buyer, &0_u32, &None, &0_i128, &false);
         client.accept_swap_with_quantity(&swap_id, &5_u32);
 
         let swap = client.get_swap(&swap_id).unwrap();
@@ -306,7 +306,7 @@ mod arbitration_tests {
 
         // Initiate with price=1000, default quantity=1 — set quantity via initiate_swap
         // then manually bump quantity to 10 by accepting partial
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &1000_i128, &buyer, &0_u32);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &1000_i128, &buyer, &0_u32, &None, &0_i128, &false);
 
         // Patch quantity to 10 so partial acceptance makes sense
         let mut swap = client.get_swap(&swap_id).unwrap();
@@ -342,7 +342,7 @@ mod arbitration_tests {
         let client = AtomicSwapClient::new(&env, &contract_id);
         client.initialize(&registry_id);
 
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None, &0_i128, &false);
 
         // quantity=1 (default), accepting 1/1 = full price
         client.accept_swap_partial(&swap_id, &1_u32);
@@ -368,7 +368,7 @@ mod arbitration_tests {
         let client = AtomicSwapClient::new(&env, &contract_id);
         client.initialize(&registry_id);
 
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None, &0_i128, &false);
         client.accept_swap_partial(&swap_id, &0_u32);
     }
 
@@ -388,7 +388,7 @@ mod arbitration_tests {
         let client = AtomicSwapClient::new(&env, &contract_id);
         client.initialize(&registry_id);
 
-        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32);
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None, &0_i128, &false);
         // quantity=1 by default, requesting 2 should panic
         client.accept_swap_partial(&swap_id, &2_u32);
     }

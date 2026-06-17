@@ -1,0 +1,24 @@
+name: Rollback Test
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  rollback-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run rollback tests
+        run: bash ./scripts/test_rollback.sh --network testnet
+
+      - name: Report result
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "## ✅ Rollback Tests Passed" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "## ❌ Rollback Tests Failed" >> "$GITHUB_STEP_SUMMARY"
+          fi

@@ -744,121 +744,145 @@ Returns a `Vec<IpAccessGrant>` where each entry has `grantee: Address` and `acce
 
 ---
 
-## Hierarchical Category Assignment (Issue #459)
+## Issue #458 — Batch Verification with ZK Proofs
 
-IP records can be organized into hierarchical categories (e.g., `Software/Cryptography/ZK-Proofs`) for discoverability and filtering. Categories use a path-based hierarchy with up to 5 levels of nesting.
+### `batch_verify_commitments`
 
-### Storage Schema
-
-| Key | Type | Description |
-|---|---|---|
-| `CategoryIps(BytesN<32>)` | `Vec<u64>` | Maps a category hash → all IP IDs assigned to that category |
-| `OwnerCategories(Address)` | `Vec<BytesN<32>>` | Maps an owner → category hashes they've used |
-| `IpCategories(u64)` | `Vec<BytesN<32>>` | Maps an IP ID → category hashes assigned to it |
-
----
-
-### `validate_category_path`
-
-Validates a UTF-8 category path string and returns its SHA-256 hash. Use this off-chain to compute a `category_hash` before calling `assign_ip_to_category`.
+Verify multiple IP commitments in a single call. Each request recomputes `sha256(secret || blinding_factor)` and checks it against the stored commitment hash — the same zero-knowledge proof used by `verify_commitment`.
 
 ```rust
-pub fn validate_category_path(env: Env, path: Bytes) -> BytesN<32>
+pub fn batch_verify_commitments(env: Env, requests: Vec<VerifyRequest>) -> Vec<VerifyResult>
 ```
 
-**Parameters:**
+#### `VerifyRequest`
 
-| Parameter | Type | Description |
+| Field | Type | Description |
 |---|---|---|
-| `path` | `Bytes` | UTF-8 encoded category path (e.g., `b"Software/Cryptography/ZK-Proofs"`) |
+| `ip_id` | `u64` | The IP ID to verify |
+| `secret` | `BytesN<32>` | The secret used when committing |
+| `blinding_factor` | `BytesN<32>` | The blinding factor used when committing |
 
-**Validation rules:**
-- Max **5 levels** (segments separated by `/`). `a/b/c/d/e` is valid; `a/b/c/d/e/f` panics.
-- No empty segments: leading `/`, trailing `/`, or `//` are rejected.
-- No path traversal: `..` segments are rejected.
-- Path length must be between 1 and 512 bytes.
+#### `VerifyResult`
 
-**Returns:** `BytesN<32>` — `sha256(path)` to use as the category hash in `assign_ip_to_category`.
-
-**Panics:**
-
-| Error | Code | Condition |
+| Field | Type | Description |
 |---|---|---|
-| `CategoryDepthExceeded` | 30 | More than 5 levels |
-| `CategoryPathTraversal` | 31 | Contains `..`, empty segments, or invalid format |
+| `ip_id` | `u64` | The IP ID that was verified |
+| `valid` | `bool` | `true` if the proof is correct |
+
+#### Panics
+
+Panics with `IpNotFound` (code 1) if any `ip_id` does not exist.
+
+#### Example
 
 ```rust
-let cat_hash = registry.validate_category_path(&Bytes::from_slice(&env, b"Cryptography/ZK-Proofs"));
+let requests = vec![
+    VerifyRequest { ip_id: 1, secret: s1, blinding_factor: b1 },
+    VerifyRequest { ip_id: 2, secret: s2, blinding_factor: b2 },
+];
+let results = client.batch_verify_commitments(&requests);
+// results[0].valid == true/false
 ```
 
 ---
+
+## Issue #462 — Batch Staking for IP Commitments
+
+### `batch_stake_commitments`
+
+Stake XLM against multiple IP commitments in a single contract call. Each `ip_ids[i]` is paired with `amounts[i]` and requires the corresponding IP owner to authorize the transaction.
+
+```rust
+pub fn batch_stake_commitments(env: Env, ip_ids: Vec<u64>, amounts: Vec<i128>)
+```
+
+#### Panics
+
+- `BatchSizeMismatch` if `ip_ids.len() != amounts.len()`
+- `AlreadyStaked` if any IP already has an active stake
+- `StakeNotFound` is not returned by this call; it only operates on existing IPs
+
+#### Example
+
+```rust
+let ip_ids = vec![1u64, 2u64];
+let amounts = vec![100i128, 200i128];
+client.batch_stake_commitments(&ip_ids, &amounts);
+```
+
+---
+
+## Issue #463 — Batch Reputation Update for Multiple Commitments
+
+### `batch_update_reputation`
+
+Update reputation scores for multiple IP commitments in one call. Each `ip_ids[i]` is used to resolve the owner, and `score_deltas[i]` is applied to that owner's reputation record.
+
+```rust
+pub fn batch_update_reputation(env: Env, ip_ids: Vec<u64>, score_deltas: Vec<i64>)
+```
+
+#### Panics
+
+- `BatchSizeMismatch` if `ip_ids.len() != score_deltas.len()`
+- `Unauthorized` if the caller is not the configured admin
+- `IpNotFound` if any IP ID does not exist
+
+#### Example
+
+```rust
+let ip_ids = vec![1u64, 2u64];
+let score_deltas = vec![10i64, -5i64];
+client.batch_update_reputation(&ip_ids, &score_deltas);
+```
+
+---
+
+## Issue #459 — Hierarchical Storage for Commitments
+
+Organises IP commitments in a two-level hierarchy: `owner → category → ip_ids`. This enables O(1) category-scoped lookups without scanning the full owner index.
 
 ### `assign_ip_to_category`
 
-Assign an IP record to a category. Only the IP owner can assign.
+Assign an IP to a category within the owner's hierarchy. Only the IP owner may call this.
 
 ```rust
 pub fn assign_ip_to_category(env: Env, ip_id: u64, category_hash: BytesN<32>)
 ```
 
-**Parameters:**
-
 | Parameter | Type | Description |
 |---|---|---|
-| `ip_id` | `u64` | The IP record to categorize |
-| `category_hash` | `BytesN<32>` | 32-byte SHA-256 hash of the category path (use `validate_category_path`) |
+| `ip_id` | `u64` | The IP to categorise |
+| `category_hash` | `BytesN<32>` | 32-byte hash identifying the category (e.g. `sha256(label)`) |
 
-**Panics:**
-
-| Error | Code | Condition |
-|---|---|---|
-| `IpNotFound` | 1 | No record for `ip_id` |
-| `IpAlreadyRevoked` | 4 | The IP has been revoked |
-| `Unauthorized` | 6 | Caller is not the IP owner |
-| `InvalidCategoryHash` | 29 | `category_hash` is all zeros |
-
-**Event:** `(symbol_short!("ip_cat"), owner: Address)` → `(ip_id: u64, category_hash: BytesN<32>)`
-
-```rust
-let cat_hash = registry.validate_category_path(&Bytes::from_slice(&env, b"Software/Cryptography/ZK-Proofs"));
-registry.assign_ip_to_category(&ip_id, &cat_hash);
-```
-
----
+Panics with `IpNotFound` if the IP does not exist, or auth error if caller is not the owner. Duplicate assignments are silently ignored.
 
 ### `list_ip_by_category`
 
-Return all IP IDs in a category that belong to the given owner.
+List all IP IDs for an owner within a specific category.
 
 ```rust
 pub fn list_ip_by_category(env: Env, owner: Address, category_hash: BytesN<32>) -> Vec<u64>
 ```
 
-**Parameters:**
-
-| Parameter | Type | Description |
-|---|---|---|
-| `owner` | `Address` | Filter results to this owner's IPs |
-| `category_hash` | `BytesN<32>` | The category to query |
-
-**Returns:** `Vec<u64>` — IP IDs owned by `owner` in this category, or empty.
-
-```rust
-let ips = registry.list_ip_by_category(&owner, &cat_hash);
-```
-
----
+Returns an empty vector if the owner has no IPs in that category.
 
 ### `list_owner_categories`
 
-Return all category hashes used by a given owner.
+List all category hashes registered for an owner.
 
 ```rust
 pub fn list_owner_categories(env: Env, owner: Address) -> Vec<BytesN<32>>
 ```
 
-**Returns:** `Vec<BytesN<32>>` — all category hashes the owner has ever assigned IPs to.
+Returns an empty vector if the owner has no categories.
+
+#### Example
 
 ```rust
-let cats = registry.list_owner_categories(&owner);
+let category = env.crypto().sha256(&Bytes::from_slice(&env, b"patents"));
+client.assign_ip_to_category(&ip_id, &category);
+
+let ids = client.list_ip_by_category(&owner, &category);
+let cats = client.list_owner_categories(&owner);
 ```

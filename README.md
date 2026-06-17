@@ -51,37 +51,6 @@ This Soroban implementation makes Atomic Patent:
 ./scripts/test.sh
 ```
 
-### Setup Environment
-
-Copy the example environment file:
-
-```bash
-cp .env.example .env
-```
-
-Configure your environment variables in `.env`:
-
-```env
-# Network configuration
-STELLAR_NETWORK=testnet
-STELLAR_RPC_URL=https://soroban-testnet.stellar.org
-
-# Contract addresses (after deployment)
-CONTRACT_IP_REGISTRY=<your-contract-id>
-CONTRACT_ATOMIC_SWAP=<your-contract-id>
-
-# Frontend configuration
-VITE_STELLAR_NETWORK=testnet
-VITE_STELLAR_RPC_URL=https://soroban-testnet.stellar.org
-```
-
-Network configurations are defined in `environments.toml`:
-
-- `testnet` — Stellar testnet
-- `mainnet` — Stellar mainnet
-- `futurenet` — Stellar futurenet
-- `standalone` — Local development
-
 ### Deploy to Testnet
 
 ```bash
@@ -92,10 +61,6 @@ stellar keys generate deployer --network testnet
 ./scripts/deploy_testnet.sh
 ```
 
-### Run Demo
-
-Follow the step-by-step guide in `demo/demo-script.md`
-
 ## 🌐 Testnet Deployment Status
 
 [![Deploy to Testnet](https://github.com/AtomicIP/AtomicIP-/actions/workflows/deploy-testnet.yml/badge.svg)](https://github.com/AtomicIP/AtomicIP-/actions/workflows/deploy-testnet.yml)
@@ -104,20 +69,20 @@ Latest testnet deployment addresses are published in GitHub Actions deployment s
 
 ## 📖 Documentation
 
+### Core Documentation
 - [Architecture Overview](docs/architecture.md)
 - [Commitment Scheme](docs/commitment-scheme.md)
-- [Changelog Format](docs/changelog-format.md)
 - [Atomic Swap Flow](docs/atomic-swap.md)
 - [Threat Model & Security](docs/threat-model.md)
 - [Integration Guide for Wallet Providers](docs/integration-guide.md)
+
+### Additional Resources
+- [API Reference](docs/api-reference.md)
 - [Security Policy](SECURITY.md)
-- [Roadmap](docs/roadmap.md)
 
 ## 📦 Release Notes and Changelog
 
-- Release notes are generated automatically from commit messages and PR metadata.
-- Push a tag in the format `v*` (for example, `v1.2.0`) to trigger the release workflow.
-- The release workflow uses `git-cliff` with configuration in `cliff.toml`.
+Release notes are generated automatically from commit messages and PR metadata. Push a tag in the format `v*` (e.g., `v1.2.0`) to trigger the release workflow.
 
 ## 🎓 Smart Contract API
 
@@ -128,6 +93,21 @@ commit_ip(owner, commitment_hash) -> u64          // Timestamp a new IP commitme
 get_ip(ip_id) -> IpRecord                         // Retrieve an IP record
 verify_commitment(ip_id, secret) -> bool          // Verify a commitment against a secret
 list_ip_by_owner(owner) -> Vec<u64>               // List all IP IDs for an owner
+batch_verify_commitments(requests) -> Vec<VerifyResult>  // #458: Verify multiple commitments with ZK proofs
+assign_ip_to_category(ip_id, category_hash)       // #459: Assign IP to a hierarchical category
+list_ip_by_category(owner, category_hash) -> Vec<u64>    // #459: List IPs in a category
+list_owner_categories(owner) -> Vec<BytesN<32>>   // #459: List all categories for an owner
+
+// #464: Anonymous Batch Commitments
+batch_commit_ip_anonymous(blinded_owner, commitment_hashes) -> Vec<u64>  // Register commitments without revealing submitter
+get_anonymous_owner(commitment_hash) -> Option<BytesN<32>>               // Retrieve blinded owner for anonymous commitment
+get_blinded_owner_batch(commitment_hashes) -> Vec<Option<BytesN<32>>>   // Batch lookup of blinded owners
+
+// #465: Batch Escrow
+batch_escrow_commitments(depositor, ip_ids, release_to, timeout) -> BytesN<32>  // Escrow multiple IPs for conditional release
+get_batch_escrow(escrow_id) -> Option<EscrowRecord>                              // Retrieve escrow record
+release_batch_escrow(escrow_id)                                                  // Release escrowed IPs to beneficiary
+cancel_batch_escrow(escrow_id)                                                   // Cancel escrow after timeout
 ```
 
 ### Atomic Swap
@@ -137,6 +117,12 @@ initiate_swap(ip_id, price, buyer) -> u64         // Seller initiates a patent s
 accept_swap(swap_id, payment)                     // Buyer accepts and sends payment
 reveal_key(swap_id, decryption_key)               // Seller reveals key; payment releases
 cancel_swap(swap_id)                              // Cancel if key is invalid or timeout
+
+// #470: Price Oracle Integration
+set_oracle(caller, oracle_address, enabled)       // Admin sets the price oracle contract
+get_oracle_config() -> Option<OracleConfig>       // Query current oracle configuration
+get_oracle_price(token) -> i128                   // Fetch current price from oracle
+initiate_swap_with_oracle_price(...)  -> u64      // Initiate swap at oracle-determined price
 ```
 
 ## 🧪 Testing
@@ -182,8 +168,6 @@ Target Users:
 - v3.0: Frontend UI with wallet integration
 - v4.0: Mobile app, legal document generation
 
-See [docs/roadmap.md](docs/roadmap.md) for details.
-
 ## 🤝 Contributing
 
 We welcome contributions! Please:
@@ -193,22 +177,6 @@ We welcome contributions! Please:
 3. Commit your changes (`git commit -m 'Add amazing feature'`)
 4. Push to the branch (`git push origin feature/amazing-feature`)
 5. Open a Pull Request
-
-See our [Code of Conduct](CODE_OF_CONDUCT.md) and [Contributing Guidelines](CONTRIBUTING.md).
-
-## 🌊 Drips Wave Contributors
-
-This project participates in Drips Wave — a contributor funding program! Check out:
-
-- [Wave Contributor Guide](docs/wave-guide.md) — How to earn funding for contributions
-- [Wave-Ready Issues](https://github.com/issues?q=label%3Awave-ready) — Funded issues ready to tackle
-- GitHub Issues labeled with `wave-ready` — Earn 100–200 points per issue
-
-Issues are categorized as:
-
-- `trivial` (100 points) — Documentation, simple tests, minor fixes
-- `medium` (150 points) — Helper functions, validation logic, moderate features
-- `high` (200 points) — Core features, complex integrations, security enhancements
 
 ## 📄 License
 

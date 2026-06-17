@@ -1,0 +1,46 @@
+# Dependabot configuration (#554)
+#
+# Keeps Cargo dependencies and GitHub Actions up to date, which is the
+# front line of dependency-vulnerability management: most advisories are
+# resolved by upgrading to a patched release.
+version: 2
+updates:
+  # Rust workspace (contracts + path deps resolve via the root lockfile).
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    labels:
+      - dependencies
+      - rust
+    commit-message:
+      prefix: "deps"
+      include: scope
+
+  # Standalone api-server crate (its own lockfile).
+  - package-ecosystem: cargo
+    directory: "/api-server"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    labels:
+      - dependencies
+      - rust
+    commit-message:
+      prefix: "deps(api-server)"
+      include: scope
+
+  # GitHub Actions used across the workflows.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    labels:
+      - dependencies
+      - ci
+    commit-message:
+      prefix: "ci"

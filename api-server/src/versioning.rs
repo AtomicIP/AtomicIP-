@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 pub const CURRENT_VERSION: &str = "1.0.0";
 
 /// Supported API versions
-pub const SUPPORTED_VERSIONS: &[&str] = &["1.0.0"];
+pub const SUPPORTED_VERSIONS: &[&str] = &["1.0.0", "1.1.0"];
 
 /// API version information
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -24,6 +24,7 @@ pub struct VersionInfo {
     pub status: String,
     pub supported_versions: Vec<String>,
     pub deprecation_date: Option<String>,
+    pub features: Vec<String>,
 }
 
 /// Middleware to handle API versioning via Accept-Version header
@@ -64,7 +65,7 @@ pub async fn version_negotiation(
         );
         response.headers_mut().insert(
             "Sunset",
-            "Sun, 31 Dec 2026 23:59:59 GMT".parse().unwrap(),
+            "Sun, 31 Dec 2027 23:59:59 GMT".parse().unwrap(),
         );
     }
 
@@ -78,6 +79,12 @@ pub async fn get_version_info() -> axum::Json<VersionInfo> {
         status: "stable".to_string(),
         supported_versions: SUPPORTED_VERSIONS.iter().map(|v| v.to_string()).collect(),
         deprecation_date: None,
+        features: vec![
+            "api-versioning".to_string(),
+            "compression".to_string(),
+            "request-signing".to_string(),
+            "circuit-breaker".to_string(),
+        ],
     })
 }
 
@@ -103,6 +110,7 @@ mod tests {
             status: "stable".to_string(),
             supported_versions: SUPPORTED_VERSIONS.iter().map(|v| v.to_string()).collect(),
             deprecation_date: None,
+            features: vec![],
         };
         assert_eq!(info.version, "1.0.0");
         assert_eq!(info.status, "stable");
@@ -116,5 +124,12 @@ mod tests {
             current: "1.0.0".to_string(),
         };
         assert_eq!(version.requested, version.current);
+    }
+
+    #[test]
+    fn test_multiple_versions_supported() {
+        assert!(SUPPORTED_VERSIONS.len() >= 2);
+        assert!(SUPPORTED_VERSIONS.contains(&"1.0.0"));
+        assert!(SUPPORTED_VERSIONS.contains(&"1.1.0"));
     }
 }

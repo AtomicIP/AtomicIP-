@@ -6,7 +6,6 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SignaturePayload {
@@ -53,6 +52,11 @@ pub fn verify_signature(
     expected_sig == signature
 }
 
+/// Verify Stellar keypair format (starts with 'G' and is 56 characters)
+pub fn is_valid_stellar_public_key(key: &str) -> bool {
+    key.starts_with('G') && key.len() == 56 && key.chars().all(|c| c.is_alphanumeric())
+}
+
 /// Middleware to verify request signatures
 pub async fn verify_request_signature(
     req: Request,
@@ -90,6 +94,11 @@ pub async fn verify_request_signature(
         .get("X-Public-Key")
         .and_then(|v| v.to_str().ok())
         .ok_or(axum::http::StatusCode::UNAUTHORIZED)?;
+
+    // Validate Stellar public key format
+    if !is_valid_stellar_public_key(public_key) {
+        return Err(axum::http::StatusCode::UNAUTHORIZED);
+    }
 
     let method = req.method().to_string();
     let path = req.uri().path().to_string();
@@ -151,5 +160,43 @@ mod tests {
         let body = b"test body";
         let hash = hash_body(body);
         assert_eq!(hash.len(), 64); // SHA256 hex string length
+    }
+
+    #[test]
+    fn test_valid_stellar_public_key() {
+        let valid_key = "GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBQ5ECVVF7C3XVQCRWGSGA";
+        assert!(is_valid_stellar_public_key(valid_key));
+    }
+
+    #[test]
+    fn test_invalid_stellar_public_key_wrong_prefix() {
+        let invalid_key = "ABRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBQ5ECVVF7C3XVQCRWGSGA";
+        assert!(!is_valid_stellar_public_key(invalid_key));
+    }
+
+    #[test]
+    fn test_invalid_stellar_public_key_wrong_length() {
+        let invalid_key = "GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBQ5ECVVF7C3XVQCRWGS";
+        assert!(!is_valid_stellar_public_key(invalid_key));
+    }
+
+    #[test]
+    fn test_signature_mismatch() {
+        let signature = generate_signature(
+            "POST",
+            "/ip/commit",
+            1234567890,
+            "body_hash",
+            "secret_key"
+        );
+        
+        assert!(!verify_signature(
+            "POST",
+            "/ip/commit",
+            1234567890,
+            "different_hash",
+            &signature,
+            "secret_key"
+        ));
     }
 }

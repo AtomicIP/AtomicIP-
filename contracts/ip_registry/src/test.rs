@@ -22,6 +22,7 @@ mod tests {
             blinding_factor: BytesN<32>,
         ) -> bool;
         fn list_ip_by_owner(env: Env, owner: Address) -> Vec<u64>;
+        fn get_stake(env: Env, ip_id: u64) -> Option<StakeRecord>;
         fn transfer_ip(env: Env, ip_id: u64, new_owner: Address);
         fn transfer_ip_ownership(env: Env, ip_id: u64, new_owner: Address);
         fn revoke_ip(env: Env, ip_id: u64);
@@ -40,6 +41,17 @@ mod tests {
         fn renew_ip(env: Env, ip_id: u64);
         fn get_renewal_count(env: Env, ip_id: u64) -> u32;
         fn delegate_commitment_authority(env: Env, root_owner: Address, delegator: Address, delegate_address: Address);
+        fn initiate_dispute(env: Env, ip_id: u64, challenger: Address, evidence_hash: BytesN<32>) -> u64;
+        fn submit_dispute_evidence(env: Env, dispute_id: u64, submitter: Address, evidence_hash: BytesN<32>);
+        fn resolve_dispute(env: Env, dispute_id: u64, winner: Address);
+        fn get_dispute(env: Env, dispute_id: u64) -> crate::DisputeRecord;
+        fn set_batch_metadata(env: Env, ip_id: u64, batch_id: BytesN<32>, description: soroban_sdk::Bytes);
+        fn get_batch_metadata(env: Env, ip_id: u64) -> Option<crate::BatchMetadata>;
+        fn get_commitment_compression(env: Env, ip_id: u64) -> crate::CompressionAlgo;
+        fn set_commitment_compression(env: Env, ip_id: u64, algorithm: crate::CompressionAlgo);
+        fn get_compressed_bytes(env: Env, ip_id: u64) -> soroban_sdk::Bytes;
+        fn encrypt_commitment(env: Env, ip_id: u64, encrypted_hash: soroban_sdk::Bytes, key_hint: BytesN<32>);
+        fn get_encrypted_commitment(env: Env, ip_id: u64) -> Option<crate::EncryptedCommitmentRecord>;
         fn revoke_delegation(env: Env, owner: Address, delegate_address: Address);
         fn is_delegate(env: Env, owner: Address, delegate_address: Address) -> bool;
         fn commit_ip_delegated(env: Env, owner: Address, commitment_hash: BytesN<32>, pow_difficulty: u32) -> u64;
@@ -51,7 +63,17 @@ mod tests {
         // Issue #432
         fn batch_verify_commitments(env: Env, verifications: Vec<(u64, BytesN<32>, BytesN<32>)>) -> Vec<bool>;
         fn batch_commit_ip_anonymous(env: Env, blinded_owner: BytesN<32>, commitment_hashes: Vec<BytesN<32>>) -> Vec<u64>;
+        fn batch_stake_commitments(env: Env, ip_ids: Vec<u64>, amounts: Vec<i128>);
+        fn batch_update_reputation(env: Env, ip_ids: Vec<u64>, score_deltas: Vec<i64>);
+        fn get_reputation(env: Env, owner: Address) -> crate::ReputationRecord;
         fn get_anonymous_owner(env: Env, commitment_hash: BytesN<32>) -> Option<BytesN<32>>;
+        // Issue #464: Batch anonymity accessor
+        fn get_blinded_owner_batch(env: Env, commitment_hashes: Vec<BytesN<32>>) -> Vec<Option<BytesN<32>>>;
+        // Issue #465: Batch escrow
+        fn batch_escrow_commitments(env: Env, depositor: Address, ip_ids: Vec<u64>, release_to: Address, timeout: u64) -> BytesN<32>;
+        fn get_batch_escrow(env: Env, escrow_id: BytesN<32>) -> Option<crate::EscrowRecord>;
+        fn release_batch_escrow(env: Env, escrow_id: BytesN<32>);
+        fn cancel_batch_escrow(env: Env, escrow_id: BytesN<32>);
         // Issue #433
         fn issue_ownership_challenge(env: Env, ip_id: u64, challenger: Address, nonce: BytesN<32>) -> u64;
         fn respond_to_ownership_challenge(env: Env, challenge_id: u64, response_hash: BytesN<32>);
@@ -163,6 +185,123 @@ mod tests {
         assert_eq!(record.commitment_hash, commitment);
         assert_eq!(record.ip_id, ip_id);
         assert_eq!(observed_data.1, record.timestamp);
+    }
+
+    #[test]
+    fn test_batch_stake_commitments_success() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner1 = <Address as TestAddress>::generate(&env);
+        let owner2 = <Address as TestAddress>::generate(&env);
+        let commitment1 = BytesN::from_array(&env, &[11u8; 32]);
+        let commitment2 = BytesN::from_array(&env, &[12u8; 32]);
+
+        env.mock_all_auths();
+        let ip_id1 = client.commit_ip(&owner1, &commitment1, &0u32);
+        let ip_id2 = client.commit_ip(&owner2, &commitment2, &0u32);
+
+        let mut ip_ids = Vec::new(&env);
+        ip_ids.push_back(ip_id1);
+        ip_ids.push_back(ip_id2);
+
+        let mut amounts = Vec::new(&env);
+        amounts.push_back(100i128);
+        amounts.push_back(200i128);
+
+        client.batch_stake_commitments(&ip_ids, &amounts);
+
+        let stake1 = client.get_stake(&ip_id1).unwrap();
+        let stake2 = client.get_stake(&ip_id2).unwrap();
+
+        assert_eq!(stake1.ip_id, ip_id1);
+        assert_eq!(stake1.owner, owner1);
+        assert_eq!(stake1.amount, 100i128);
+        assert!(!stake1.slashed);
+
+        assert_eq!(stake2.ip_id, ip_id2);
+        assert_eq!(stake2.owner, owner2);
+        assert_eq!(stake2.amount, 200i128);
+        assert!(!stake2.slashed);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_batch_stake_commitments_mismatched_lengths_panics() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let commitment = BytesN::from_array(&env, &[13u8; 32]);
+
+        env.mock_all_auths();
+        let ip_id = client.commit_ip(&owner, &commitment, &0u32);
+
+        let mut ip_ids = Vec::new(&env);
+        ip_ids.push_back(ip_id);
+
+        let mut amounts = Vec::new(&env);
+        amounts.push_back(100i128);
+        amounts.push_back(200i128);
+
+        client.batch_stake_commitments(&ip_ids, &amounts);
+    }
+
+    #[test]
+    fn test_batch_update_reputation_for_multiple_commitments() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner1 = <Address as TestAddress>::generate(&env);
+        let owner2 = <Address as TestAddress>::generate(&env);
+        let commitment1 = BytesN::from_array(&env, &[14u8; 32]);
+        let commitment2 = BytesN::from_array(&env, &[15u8; 32]);
+
+        env.mock_all_auths();
+        let ip_id1 = client.commit_ip(&owner1, &commitment1, &0u32);
+        let ip_id2 = client.commit_ip(&owner2, &commitment2, &0u32);
+
+        let mut ip_ids = Vec::new(&env);
+        ip_ids.push_back(ip_id1);
+        ip_ids.push_back(ip_id2);
+
+        let mut deltas = Vec::new(&env);
+        deltas.push_back(10i64);
+        deltas.push_back(-5i64);
+
+        client.batch_update_reputation(&ip_ids, &deltas);
+
+        let rep1 = client.get_reputation(&owner1);
+        let rep2 = client.get_reputation(&owner2);
+
+        assert_eq!(rep1.score, 10);
+        assert_eq!(rep2.score, -5);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_batch_update_reputation_mismatched_lengths_panics() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let commitment = BytesN::from_array(&env, &[16u8; 32]);
+
+        env.mock_all_auths();
+        let ip_id = client.commit_ip(&owner, &commitment, &0u32);
+
+        let mut ip_ids = Vec::new(&env);
+        ip_ids.push_back(ip_id);
+
+        let mut deltas = Vec::new(&env);
+        deltas.push_back(10i64);
+        deltas.push_back(20i64);
+
+        client.batch_update_reputation(&ip_ids, &deltas);
     }
 
     #[test]
@@ -920,14 +1059,22 @@ mod tests {
         let client = IpRegistryClient::new(&env, &contract_id);
 
         let owner = <Address as TestAddress>::generate(&env);
-        // 32 unique bytes → entropy_score = 50
-        // pow_difficulty = 32 → pow_score = 50
-        // total = 100
-        let hash_bytes: [u8; 32] = core::array::from_fn(|i| i as u8);
+        // Use a hash with 29 unique bytes and 32 leading zero bits.
+        // entropy_score = (29 * 50) / 32 = 45
+        // pow_score = (32 * 50) / 32 = 50
+        // total = 95
+        let mut hash_bytes = [0u8; 32];
+        for i in 0..32 {
+            hash_bytes[i] = i as u8;
+        }
+        hash_bytes[0] = 0;
+        hash_bytes[1] = 0;
+        hash_bytes[2] = 0;
+        hash_bytes[3] = 0;
         let hash = BytesN::from_array(&env, &hash_bytes);
         let ip_id = client.commit_ip(&owner, &hash, &32u32);
         let strength = client.get_ip_strength(&ip_id);
-        assert_eq!(strength, 100u32);
+        assert_eq!(strength, 95u32);
     }
 
     #[test]
@@ -938,12 +1085,22 @@ mod tests {
         let client = IpRegistryClient::new(&env, &contract_id);
 
         let owner = <Address as TestAddress>::generate(&env);
-        // 32 unique bytes (50) + pow_difficulty=64 → pow_score capped at 50 → total = 100
-        let hash_bytes: [u8; 32] = core::array::from_fn(|i| i as u8);
+        // A hash that satisfies the PoW requirement can still score below 100.
+        // With 25 unique bytes and 64 leading zero bits:
+        // entropy_score = (25 * 50) / 32 = 39
+        // pow_score = 50
+        // total = 89
+        let mut hash_bytes = [0u8; 32];
+        for i in 0..32 {
+            hash_bytes[i] = i as u8;
+        }
+        for i in 0..8 {
+            hash_bytes[i] = 0;
+        }
         let hash = BytesN::from_array(&env, &hash_bytes);
         let ip_id = client.commit_ip(&owner, &hash, &64u32);
         let strength = client.get_ip_strength(&ip_id);
-        assert_eq!(strength, 100u32);
+        assert_eq!(strength, 89u32);
     }
 
     #[test]
@@ -954,10 +1111,16 @@ mod tests {
         let client = IpRegistryClient::new(&env, &contract_id);
 
         let owner = <Address as TestAddress>::generate(&env);
-        // 16 unique bytes → entropy_score = (16*50)/32 = 25
-        // pow_difficulty = 16 → pow_score = (16*50)/32 = 25
+        // A hash with 16 unique bytes and 16 leading zero bits gives:
+        // entropy_score = (16 * 50) / 32 = 25
+        // pow_score = (16 * 50) / 32 = 25
         // total = 50
-        let hash_bytes: [u8; 32] = core::array::from_fn(|i| (i % 16) as u8);
+        let mut hash_bytes = [0u8; 32];
+        for i in 0..32 {
+            hash_bytes[i] = (i % 16) as u8;
+        }
+        hash_bytes[0] = 0;
+        hash_bytes[1] = 0;
         let hash = BytesN::from_array(&env, &hash_bytes);
         let ip_id = client.commit_ip(&owner, &hash, &16u32);
         let strength = client.get_ip_strength(&ip_id);
@@ -977,7 +1140,7 @@ mod tests {
         let owner = <Address as TestAddress>::generate(&env);
         let delegate = <Address as TestAddress>::generate(&env);
 
-        client.delegate_commitment_authority(&owner, &delegate);
+        client.delegate_commitment_authority(&owner, &owner, &delegate);
 
         let is_delegate = client.is_delegate(&owner, &delegate);
         assert!(is_delegate);
@@ -994,7 +1157,7 @@ mod tests {
         let owner = <Address as TestAddress>::generate(&env);
         let delegate = <Address as TestAddress>::generate(&env);
 
-        client.delegate_commitment_authority(&owner, &delegate);
+        client.delegate_commitment_authority(&owner, &owner, &delegate);
         assert!(client.is_delegate(&owner, &delegate));
 
         client.revoke_delegation(&owner, &delegate);
@@ -1013,7 +1176,7 @@ mod tests {
         let delegate = <Address as TestAddress>::generate(&env);
         let hash = BytesN::from_array(&env, &[1u8; 32]);
 
-        client.delegate_commitment_authority(&owner, &delegate);
+        client.delegate_commitment_authority(&owner, &owner, &delegate);
         let ip_id = client.commit_ip_delegated(&owner, &hash, &0u32);
 
         let record = client.get_ip(&ip_id);
@@ -1368,7 +1531,7 @@ mod tests {
     // ── Tests for Issue #428: Commitment Timestamp Notarization (continued) ──
 
     #[test]
-    fn test_notarize_ip_timestamp_with_valid_signature() {
+    fn test_notarize_ip_timestamp_with_valid_signature_continued() {
         use ed25519_dalek::{Signer, SigningKey};
 
         let env = Env::default();
@@ -2030,7 +2193,7 @@ mod tests {
         assert_eq!(client.get_anonymous_owner(&h), None);
     }
 
-    /// Each commitment emits an "ip_commit_anon" event with (id, timestamp, blinded_owner).
+    /// Each commitment emits an "ip_commit_a" event with (id, timestamp, blinded_owner).
     #[test]
     fn test_anon_batch_emits_event_per_commitment() {
         let env = Env::default();
@@ -2046,16 +2209,18 @@ mod tests {
         );
 
         let all_events = env.events().all();
-        // Exactly two ip_commit_anon events (one per hash).
+        // Exactly two ip_commit_a events (one per hash).
         let anon_events: soroban_sdk::Vec<_> = {
             let mut v = soroban_sdk::Vec::new(&env);
             for e in all_events.iter() {
-                let (_, topics, _) = e;
+                let topic = e.0.clone();
+                let topics = e.1.clone();
+                let data = e.2.clone();
                 if let Ok(t) = soroban_sdk::Vec::<soroban_sdk::Val>::try_from_val(&env, &topics) {
                     if let Some(first) = t.get(0) {
                         if let Ok(s) = soroban_sdk::Symbol::try_from_val(&env, &first) {
-                            if s == symbol_short!("ip_commit_anon") {
-                                v.push_back(e);
+                            if s == symbol_short!("ip_cmt_a") {
+                                v.push_back((topic, topics, data));
                             }
                         }
                     }
@@ -2419,5 +2584,369 @@ mod tests {
         let owner2_ips = client.list_ip_by_category(&owner2, &cat);
         assert_eq!(owner2_ips.len(), 1);
         assert_eq!(owner2_ips.get(0).unwrap(), ip2);
+    }
+}
+
+// ── Expiry & Grace Period Tests ───────────────────────────────────────────────
+
+#[cfg(test)]
+mod expiry_tests {
+    use super::*;
+    use soroban_sdk::{testutils::{Address as _, Ledger}, BytesN, Env, Vec};
+
+    fn setup() -> (Env, IpRegistryClient<'static>, Address, u64) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[0xAAu8; 32]);
+        let ip_id = client.commit_ip(&owner, &hash, &0u32);
+        (env, client, owner, ip_id)
+    }
+
+    #[test]
+    fn test_set_ip_expiry_stores_fields() {
+        let (env, client, _owner, ip_id) = setup();
+        let now = env.ledger().timestamp();
+        client.set_ip_expiry(&ip_id, &(now + 1000), &300);
+        let record = client.get_ip(&ip_id);
+        assert_eq!(record.expiry_timestamp, now + 1000);
+        assert_eq!(record.grace_period_seconds, 300);
+    }
+
+    #[test]
+    fn test_renew_ip_commitment_extends_expiry() {
+        let (env, client, _owner, ip_id) = setup();
+        let now = env.ledger().timestamp();
+        client.set_ip_expiry(&ip_id, &(now + 1000), &300);
+        let result = client.renew_ip_commitment(&ip_id, &(now + 2000));
+        assert!(result);
+        assert_eq!(client.get_ip(&ip_id).expiry_timestamp, now + 2000);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_renew_ip_commitment_lower_expiry_panics() {
+        let (env, client, _owner, ip_id) = setup();
+        let now = env.ledger().timestamp();
+        client.set_ip_expiry(&ip_id, &(now + 1000), &300);
+        // new_expiry <= current expiry → must panic
+        client.renew_ip_commitment(&ip_id, &(now + 500));
+    }
+
+    #[test]
+    fn test_cleanup_removes_ip_past_grace_period() {
+        let (env, client, _owner, ip_id) = setup();
+        let now = env.ledger().timestamp();
+        client.set_ip_expiry(&ip_id, &(now + 100), &50);
+
+        // Advance time past expiry + grace
+        env.ledger().with_mut(|l| l.timestamp = now + 200);
+
+        let mut ids = Vec::new(&env);
+        ids.push_back(ip_id);
+        client.cleanup_expired_ips(&ids);
+
+        // Record should be gone
+        assert!(client.try_get_ip(&ip_id).is_err());
+    }
+
+    #[test]
+    fn test_cleanup_skips_ip_within_grace_period() {
+        let (env, client, _owner, ip_id) = setup();
+        let now = env.ledger().timestamp();
+        client.set_ip_expiry(&ip_id, &(now + 100), &200);
+
+        // Advance past expiry but still within grace
+        env.ledger().with_mut(|l| l.timestamp = now + 150);
+
+        let mut ids = Vec::new(&env);
+        ids.push_back(ip_id);
+        client.cleanup_expired_ips(&ids);
+
+        // Record should still exist
+        assert_eq!(client.get_ip(&ip_id).ip_id, ip_id);
+    }
+
+    #[test]
+    fn test_cleanup_skips_ip_with_no_expiry() {
+        let (env, client, _owner, ip_id) = setup();
+        // No expiry set (expiry_timestamp == 0)
+        env.ledger().with_mut(|l| l.timestamp = 9_999_999);
+
+        let mut ids = Vec::new(&env);
+        ids.push_back(ip_id);
+        client.cleanup_expired_ips(&ids);
+
+        // Record must still exist
+        assert_eq!(client.get_ip(&ip_id).ip_id, ip_id);
+    }
+
+    #[test]
+    fn test_renew_emits_event() {
+        let (env, client, _owner, ip_id) = setup();
+        let now = env.ledger().timestamp();
+        client.set_ip_expiry(&ip_id, &(now + 1000), &0);
+        client.renew_ip_commitment(&ip_id, &(now + 2000));
+
+        let events = env.events().all();
+        let found = events.iter().any(|(_, topics, _)| {
+            if let Ok(t) = soroban_sdk::Vec::<soroban_sdk::Val>::try_from_val(&env, &topics) {
+                if let Some(v) = t.get(0) {
+                    if let Ok(s) = soroban_sdk::Symbol::try_from_val(&env, &v) {
+                        return s == soroban_sdk::symbol_short!("ip_renew");
+                    }
+                }
+            }
+            false
+        });
+        assert!(found, "ip_renew event must be emitted");
+    }
+
+    #[test]
+    fn test_cleanup_emits_event() {
+        let (env, client, _owner, ip_id) = setup();
+        let now = env.ledger().timestamp();
+        client.set_ip_expiry(&ip_id, &(now + 100), &0);
+        env.ledger().with_mut(|l| l.timestamp = now + 200);
+
+        let mut ids = Vec::new(&env);
+        ids.push_back(ip_id);
+        client.cleanup_expired_ips(&ids);
+
+        let events = env.events().all();
+        let found = events.iter().any(|(_, topics, _)| {
+            if let Ok(t) = soroban_sdk::Vec::<soroban_sdk::Val>::try_from_val(&env, &topics) {
+                if let Some(v) = t.get(0) {
+                    if let Ok(s) = soroban_sdk::Symbol::try_from_val(&env, &v) {
+                        return s == soroban_sdk::symbol_short!("ip_clean");
+                    }
+                }
+            }
+            false
+        });
+        assert!(found, "ip_clean event must be emitted");
+    }
+}
+
+// ── #464: get_blinded_owner_batch tests ──────────────────────────────────────
+
+#[cfg(test)]
+mod blinded_owner_batch_tests {
+    use super::tests::{IpRegistry, IpRegistryClient};
+    use soroban_sdk::{contractclient, testutils::Address as _, Address, BytesN, Env, Vec};
+
+    fn setup() -> (Env, IpRegistryClient<'static>) {
+        let env = Env::default();
+        let id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &id);
+        (env, client)
+    }
+
+    #[test]
+    fn test_get_blinded_owner_batch_returns_stored_values() {
+        let (env, client) = setup();
+        let blinded = BytesN::from_array(&env, &[0xABu8; 32]);
+        let h1 = BytesN::from_array(&env, &[0x11u8; 32]);
+        let h2 = BytesN::from_array(&env, &[0x22u8; 32]);
+        client.batch_commit_ip_anonymous(&blinded, &Vec::from_array(&env, [h1.clone(), h2.clone()]));
+
+        let results = client.get_blinded_owner_batch(&Vec::from_array(&env, [h1, h2]));
+        assert_eq!(results.len(), 2);
+        assert_eq!(results.get(0).unwrap(), Some(blinded.clone()));
+        assert_eq!(results.get(1).unwrap(), Some(blinded));
+    }
+
+    #[test]
+    fn test_get_blinded_owner_batch_returns_none_for_non_anonymous() {
+        let (env, client) = setup();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let h = BytesN::from_array(&env, &[0x33u8; 32]);
+        client.commit_ip(&owner, &h, &0u32);
+
+        let results = client.get_blinded_owner_batch(&Vec::from_array(&env, [h]));
+        assert_eq!(results.get(0).unwrap(), None);
+    }
+
+    #[test]
+    fn test_get_blinded_owner_batch_empty_input() {
+        let (env, client) = setup();
+        let empty: Vec<BytesN<32>> = Vec::new(&env);
+        let results = client.get_blinded_owner_batch(&empty);
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn test_get_blinded_owner_batch_mixed_results() {
+        let (env, client) = setup();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let h_regular = BytesN::from_array(&env, &[0x44u8; 32]);
+        client.commit_ip(&owner, &h_regular, &0u32);
+
+        let blinded = BytesN::from_array(&env, &[0xCCu8; 32]);
+        let h_anon = BytesN::from_array(&env, &[0x55u8; 32]);
+        client.batch_commit_ip_anonymous(&blinded, &Vec::from_array(&env, [h_anon.clone()]));
+
+        let results = client.get_blinded_owner_batch(&Vec::from_array(&env, [h_regular, h_anon]));
+        assert_eq!(results.len(), 2);
+        assert_eq!(results.get(0).unwrap(), None);
+        assert_eq!(results.get(1).unwrap(), Some(blinded));
+    }
+}
+
+// ── #465: Batch Escrow tests ──────────────────────────────────────────────────
+
+#[cfg(test)]
+mod batch_escrow_tests {
+    use super::tests::IpRegistryClient;
+    use crate::EscrowStatus;
+    use soroban_sdk::{testutils::{Address as _, Ledger}, Address, BytesN, Env, Vec};
+
+    fn setup_with_ips(n: u64) -> (Env, IpRegistryClient<'static>, Address, Vec<u64>) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &id);
+        let owner = Address::generate(&env);
+        let mut ids = Vec::new(&env);
+        for i in 0..n {
+            let mut hash = [0u8; 32];
+            hash[0] = (i + 1) as u8;
+            let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &hash), &0u32);
+            ids.push_back(ip_id);
+        }
+        (env, client, owner, ids)
+    }
+
+    #[test]
+    fn test_batch_escrow_created_and_retrievable() {
+        let (env, client, owner, ip_ids) = setup_with_ips(2);
+        let beneficiary = Address::generate(&env);
+        let timeout = env.ledger().timestamp() + 1000;
+
+        let escrow_id = client.batch_escrow_commitments(&owner, &ip_ids, &beneficiary, &timeout);
+
+        let escrow = client.get_batch_escrow(&escrow_id).expect("escrow should exist");
+        assert_eq!(escrow.status, EscrowStatus::Active);
+        assert_eq!(escrow.depositor, owner);
+        assert_eq!(escrow.release_to, beneficiary);
+        assert_eq!(escrow.ip_ids.len(), 2);
+    }
+
+    #[test]
+    fn test_release_batch_escrow_transfers_ownership() {
+        let (env, client, owner, ip_ids) = setup_with_ips(2);
+        let beneficiary = Address::generate(&env);
+        let timeout = env.ledger().timestamp() + 1000;
+
+        let escrow_id = client.batch_escrow_commitments(&owner, &ip_ids, &beneficiary, &timeout);
+        client.release_batch_escrow(&escrow_id);
+
+        let escrow = client.get_batch_escrow(&escrow_id).unwrap();
+        assert_eq!(escrow.status, EscrowStatus::Released);
+
+        // IPs now owned by beneficiary
+        for ip_id in ip_ids.iter() {
+            let record = client.get_ip(&ip_id);
+            assert_eq!(record.owner, beneficiary);
+        }
+    }
+
+    #[test]
+    fn test_cancel_batch_escrow_after_timeout() {
+        let (env, client, owner, ip_ids) = setup_with_ips(1);
+        let beneficiary = Address::generate(&env);
+        let timeout = env.ledger().timestamp() + 100;
+
+        let escrow_id = client.batch_escrow_commitments(&owner, &ip_ids, &beneficiary, &timeout);
+
+        // Advance past timeout
+        env.ledger().with_mut(|l| l.timestamp = timeout + 1);
+        client.cancel_batch_escrow(&escrow_id);
+
+        let escrow = client.get_batch_escrow(&escrow_id).unwrap();
+        assert_eq!(escrow.status, EscrowStatus::Cancelled);
+
+        // IPs still owned by owner (no transfer on cancel)
+        let record = client.get_ip(&ip_ids.get(0).unwrap());
+        assert_eq!(record.owner, owner);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_cancel_before_timeout_panics() {
+        let (env, client, owner, ip_ids) = setup_with_ips(1);
+        let beneficiary = Address::generate(&env);
+        let timeout = env.ledger().timestamp() + 9999;
+
+        let escrow_id = client.batch_escrow_commitments(&owner, &ip_ids, &beneficiary, &timeout);
+        // Timeout not reached — must panic
+        client.cancel_batch_escrow(&escrow_id);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_release_already_released_panics() {
+        let (env, client, owner, ip_ids) = setup_with_ips(1);
+        let beneficiary = Address::generate(&env);
+        let timeout = env.ledger().timestamp() + 1000;
+
+        let escrow_id = client.batch_escrow_commitments(&owner, &ip_ids, &beneficiary, &timeout);
+        client.release_batch_escrow(&escrow_id);
+        // Second release — must panic
+        client.release_batch_escrow(&escrow_id);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_escrow_non_owner_ip_panics() {
+        let (env, client, _owner, ip_ids) = setup_with_ips(1);
+        let attacker = Address::generate(&env);
+        let beneficiary = Address::generate(&env);
+        let timeout = env.ledger().timestamp() + 1000;
+
+        // attacker does not own ip_ids — must panic
+        client.batch_escrow_commitments(&attacker, &ip_ids, &beneficiary, &timeout);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_get_batch_escrow_unknown_id_returns_none_not_panic() {
+        // Accessing nonexistent escrow via release should panic
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &id);
+        let fake_id = BytesN::from_array(&env, &[0xFFu8; 32]);
+        client.release_batch_escrow(&fake_id);
+    }
+
+    #[test]
+    fn test_get_batch_escrow_unknown_returns_none() {
+        let env = Env::default();
+        let id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &id);
+        let fake_id = BytesN::from_array(&env, &[0xFFu8; 32]);
+        assert_eq!(client.get_batch_escrow(&fake_id), None);
+    }
+
+    #[test]
+    fn test_batch_escrow_unique_ids_per_call() {
+        let (env, client, owner, ip_ids) = setup_with_ips(2);
+        let beneficiary = Address::generate(&env);
+        let timeout = env.ledger().timestamp() + 1000;
+
+        // Two separate escrow calls on different IPs should produce different IDs
+        let mut ids1_vec = Vec::new(&env);
+        ids1_vec.push_back(ip_ids.get(0).unwrap());
+        let mut ids2_vec = Vec::new(&env);
+        ids2_vec.push_back(ip_ids.get(1).unwrap());
+
+        let eid1 = client.batch_escrow_commitments(&owner, &ids1_vec, &beneficiary, &timeout);
+        let eid2 = client.batch_escrow_commitments(&owner, &ids2_vec, &beneficiary, &timeout);
+        assert_ne!(eid1, eid2);
     }
 }

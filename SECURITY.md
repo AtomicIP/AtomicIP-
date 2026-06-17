@@ -96,6 +96,21 @@ When reporting a vulnerability, please include:
 - 🔄 Time-locked commitments
 - 🔄 Partial disclosure proofs
 
+## Automated Security Scanning
+
+Every push and pull request is scanned automatically in CI/CD:
+
+- **Security scanning** — supply-chain policy (cargo-deny), secret detection
+  (gitleaks), and static analysis. See [Security Scanning](docs/security-scanning.md).
+- **Dependency vulnerability scanning** — cargo-audit + cargo-deny against the
+  RustSec advisory database, plus Dependabot. See [Dependency Scanning](docs/dependency-scanning.md).
+- **Code coverage enforcement** — a minimum coverage threshold is enforced in
+  CI. See [Code Coverage](docs/code-coverage.md).
+- **Mutation testing** — verifies the test suite catches logic errors. See
+  [Mutation Testing](docs/mutation-testing.md).
+
+Run all gates locally with `./scripts/security-checks.sh`.
+
 ## Security Audits
 
 ### Audit Status

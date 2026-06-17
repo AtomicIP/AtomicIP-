@@ -5,12 +5,15 @@ target/
 
 # Environment secrets
 .env
+.env.local
+.env.*.local
 
 # Editor/IDE
 .vscode/
 .idea/
 *.swp
 *.swo
+*.orig
 
 # OS
 .DS_Store
@@ -19,3 +22,6 @@ Thumbs.db
 # Fuzz artifacts
 fuzz/artifacts/
 fuzz/corpus/*/crashes/
+
+# Project issues file
+vrickish.md

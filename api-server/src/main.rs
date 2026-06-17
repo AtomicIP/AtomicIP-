@@ -12,6 +12,7 @@ use std::sync::Arc;
 mod auth;
 mod batch;
 mod cache;
+mod circuit_breaker;
 mod deduplication;
 mod events;
 mod graphql;
@@ -26,6 +27,10 @@ mod request_signing;
 mod invariants;
 mod health;
 mod compression;
+mod fallback;
+mod distributed_tracing;
+mod error_recovery;
+mod request_queue;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -128,13 +133,18 @@ async fn require_json_content_type(req: Request<Body>, next: Next) -> Result<Res
 async fn main() {
     metrics::init();
 
-    let schema = graphql::build_schema();
+    let subscription_broadcaster = Arc::new(graphql::SubscriptionBroadcaster::new());
+    let schema = graphql::build_schema_with_broadcaster(
+        Arc::new(graphql::MockSorobanRpcClient::default()),
+        subscription_broadcaster.clone(),
+    );
     let broadcaster = Arc::new(websocket::EventBroadcaster::new());
     let health_checker = Arc::new(health::HealthChecker::new());
 
     let app = Router::new()
         .merge(SwaggerUi::new("/docs").url("/openapi.json", ApiDoc::openapi()))
         .route("/health", get(health::health_handler))
+        .route("/health/detailed", get(health::detailed_health_handler))
         .route("/metrics", get(metrics::metrics_handler))
         .route("/graphql", post(graphql_handler))
         .route("/ws", get(ws_handler))
@@ -153,7 +163,8 @@ async fn main() {
         .route("/swap/{swap_id}/cancel-expired", post(handlers::cancel_expired_swap))
         .route("/swap/{swap_id}", get(handlers::get_swap))
         .with_state((schema, broadcaster.clone(), health_checker.clone()))
-        .layer(middleware::from_fn(metrics::track));
+        .layer(middleware::from_fn(metrics::track))
+        .layer(middleware::from_fn(middleware_pipeline::cors_middleware));
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
     println!("Swagger UI   -> http://localhost:8080/docs");
@@ -163,6 +174,7 @@ async fn main() {
     println!("WebSocket    -> ws://localhost:8080/ws");
     println!("Events SSE   -> http://localhost:8080/events");
     println!("Batch API    -> http://localhost:8080/batch");
+    println!("GraphQL      -> http://localhost:8080/graphql");
     axum::serve(listener, app).await.unwrap();
 }
 
@@ -176,6 +188,10 @@ async fn ws_handler(
 fn build_app() -> Router {
     let schema = graphql::build_schema();
     let health_checker = Arc::new(health::HealthChecker::new());
+    let circuit_breaker = Arc::new(circuit_breaker::CircuitBreaker::new(
+        circuit_breaker::CircuitBreakerConfig::default(),
+    ));
+    
     Router::new()
         .route("/health", get(health::health_handler))
         .route("/version", get(versioning::get_version_info))

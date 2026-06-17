@@ -6,6 +6,7 @@ use axum::{
     response::Response,
 };
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompressionConfig {
@@ -21,6 +22,33 @@ impl Default for CompressionConfig {
             brotli_enabled: true,
             min_size_bytes: 1024,
         }
+    }
+}
+
+/// Compress data using gzip
+pub fn compress_gzip(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(data)?;
+    encoder.finish()
+}
+
+/// Compress data using brotli
+pub fn compress_brotli(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+    let mut output = Vec::new();
+    brotli::BrotliEncoderOperation::Finish;
+    match brotli::enc::BrotliEncoderCompress(
+        11,
+        22,
+        brotli::enc::BrotliEncoderMode::default(),
+        data.len(),
+        data,
+        &mut brotli::enc::StandardOut::new(&mut output),
+    ) {
+        Ok(_) => Ok(output),
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "Brotli compression failed",
+        )),
     }
 }
 
