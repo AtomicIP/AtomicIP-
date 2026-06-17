@@ -67,6 +67,12 @@ pub enum ContractError {
     BatchMetadataTooLarge = 27,
     /// #457: Encrypted data too large.
     EncryptedDataTooLarge = 28,
+    /// #459: Category hash is invalid (all zeros or malformed).
+    InvalidCategoryHash = 29,
+    /// #459: Category hierarchy depth exceeds maximum allowed (5 levels).
+    CategoryDepthExceeded = 30,
+    /// #459: Category path contains traversal or empty segments.
+    CategoryPathTraversal = 31,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -85,6 +91,9 @@ pub const NOTARY_PUBLIC_KEY: &[u8] = b"notary_public_key_placeholder";
 /// Issue #437: Number of storage shards for commitment distribution.
 pub const NUM_SHARDS: u32 = 16;
 
+/// Issue #459: Maximum category hierarchy depth (e.g., "a/b/c" = 3 levels).
+pub const MAX_CATEGORY_DEPTH: u32 = 5;
+
 
 // ── Storage Keys ────────────────────────────────────────────────────────────
 
@@ -101,6 +110,8 @@ pub enum DataKey {
     PartialDisclosure(u64), // stores partial_hash for a given ip_id after reveal
     IpLicenses(u64),        // stores license entries for a given ip_id
     CategoryIps(BytesN<32>), // maps category hash -> Vec<u64> of IP IDs
+    OwnerCategories(Address), // maps owner -> Vec<BytesN<32>> of category hashes they use
+    IpCategories(u64),       // maps ip_id -> Vec<BytesN<32>> of assigned category hashes
     PowDifficulty,          // stores the current PoW difficulty (leading zero bits required)
     IpVersions(u64),        // stores Vec<u64> of all version IDs for a given IP
     SuggestedPrice(u64),    // stores suggested price for an IP
@@ -1008,6 +1019,166 @@ impl IpRegistry {
         env.storage()
             .persistent()
             .get(&DataKey::OwnerIps(owner))
+            .unwrap_or(Vec::new(&env))
+    }
+
+    // ── Category Methods (Issue #459) ────────────────────────────────────────
+
+    /// Validates a category path string and returns its SHA-256 hash.
+    ///
+    /// The path must be UTF-8 segments separated by `/`, with max depth of 5 levels.
+    /// Path traversal (`..`) and empty segments are rejected.
+    ///
+    /// Callers should use this off-chain to compute the `category_hash` to pass
+    /// to `assign_ip_to_category`.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `path` - The category path as UTF-8 bytes (e.g., `b"Software/Cryptography/ZK-Proofs"`)
+    ///
+    /// # Returns
+    ///
+    /// `BytesN<32>` — `sha256(path)` to use as the category hash.
+    ///
+    /// # Panics
+    ///
+    /// * `CategoryDepthExceeded` (30) — path has more than 5 levels
+    /// * `CategoryPathTraversal` (31) — path contains `..` or empty segments
+    pub fn validate_category_path(env: Env, path: Bytes) -> BytesN<32> {
+        validate_category_path(&env, &path)
+    }
+
+    /// Assigns an IP record to a category. Only the IP owner can assign.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `ip_id` - The IP record ID to categorize
+    /// * `category_hash` - 32-byte SHA-256 hash of the category path (see `validate_category_path`)
+    ///
+    /// # Panics
+    ///
+    /// * `IpNotFound` (1) — no record for `ip_id`
+    /// * `IpAlreadyRevoked` (4) — the IP has been revoked
+    /// * `Unauthorized` (6) — caller is not the IP owner
+    /// * `InvalidCategoryHash` (29) — `category_hash` is all zeros
+    ///
+    /// # Event
+    ///
+    /// Emits `(symbol_short!("ip_cat"), owner)` → `(ip_id, category_hash)`.
+    pub fn assign_ip_to_category(env: Env, ip_id: u64, category_hash: BytesN<32>) {
+        require_valid_category_hash(&env, &category_hash);
+
+        let record = require_ip_exists(&env, ip_id);
+        require_not_revoked(&env, &record);
+        record.owner.require_auth();
+
+        // Add to global category index
+        let mut cat_ips: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CategoryIps(category_hash.clone()))
+            .unwrap_or(Vec::new(&env));
+        if !cat_ips.iter().any(|x| x == ip_id) {
+            cat_ips.push_back(ip_id);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::CategoryIps(category_hash.clone()), &cat_ips);
+        env.storage().persistent().extend_ttl(
+            &DataKey::CategoryIps(category_hash.clone()),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        // Track category usage per owner
+        let mut owner_cats: Vec<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OwnerCategories(record.owner.clone()))
+            .unwrap_or(Vec::new(&env));
+        if !owner_cats.iter().any(|c| c == category_hash) {
+            owner_cats.push_back(category_hash.clone());
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::OwnerCategories(record.owner.clone()), &owner_cats);
+        env.storage().persistent().extend_ttl(
+            &DataKey::OwnerCategories(record.owner.clone()),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        // Track categories per IP (for cleanup on transfer/revoke)
+        let mut ip_cats: Vec<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IpCategories(ip_id))
+            .unwrap_or(Vec::new(&env));
+        if !ip_cats.iter().any(|c| c == category_hash) {
+            ip_cats.push_back(category_hash.clone());
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::IpCategories(ip_id), &ip_cats);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::IpCategories(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish(
+            (symbol_short!("ip_cat"), record.owner.clone()),
+            (ip_id, category_hash),
+        );
+    }
+
+    /// Returns all IP IDs within a category that belong to the given owner.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `owner` - The owner to filter by
+    /// * `category_hash` - The 32-byte category hash
+    ///
+    /// # Returns
+    ///
+    /// `Vec<u64>` of IP IDs owned by `owner` in this category, or empty if none.
+    pub fn list_ip_by_category(env: Env, owner: Address, category_hash: BytesN<32>) -> Vec<u64> {
+        let all_ips: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CategoryIps(category_hash))
+            .unwrap_or(Vec::new(&env));
+
+        let mut result: Vec<u64> = Vec::new(&env);
+        for ip_id in all_ips.iter() {
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, IpRecord>(&DataKey::IpRecord(ip_id))
+            {
+                if record.owner == owner {
+                    result.push_back(ip_id);
+                }
+            }
+        }
+        result
+    }
+
+    /// Returns all category hashes used by the given owner.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `owner` - The address to list categories for
+    ///
+    /// # Returns
+    ///
+    /// `Vec<BytesN<32>>` — all category hashes this owner has ever assigned IPs to.
+    pub fn list_owner_categories(env: Env, owner: Address) -> Vec<BytesN<32>> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::OwnerCategories(owner))
             .unwrap_or(Vec::new(&env))
     }
 
