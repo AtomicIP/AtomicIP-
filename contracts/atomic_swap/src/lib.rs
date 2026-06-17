@@ -1258,20 +1258,26 @@ impl AtomicSwap {
         );
     }
 
-    fn store_protocol_config(_env: &Env, _config: &ProtocolConfig) {
-        // ProtocolConfig storage temporarily disabled due to trait generation issues
-        // env.storage().persistent().set(&DataKey::ProtocolConfig, config);
-        // env.storage().persistent().extend_ttl(&DataKey::ProtocolConfig, LEDGER_BUMP, LEDGER_BUMP);
+    fn store_protocol_config(env: &Env, config: &ProtocolConfig) {
+        env.storage()
+            .persistent()
+            .set(&DataKey::ProtocolConfig, config);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::ProtocolConfig, LEDGER_BUMP, LEDGER_BUMP);
     }
 
     fn protocol_config(env: &Env) -> ProtocolConfig {
-        // Return default config since storage is disabled
+        if let Some(config) = env
+            .storage()
+            .persistent()
+            .get::<_, ProtocolConfig>(&DataKey::ProtocolConfig)
+        {
+            return config;
+        }
         ProtocolConfig {
             protocol_fee_bps: 250,
-            treasury: Address::from_string(&soroban_sdk::String::from_str(
-                env,
-                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
-            )),
+            treasury: env.current_contract_address(),
             dispute_window_seconds: 86400,
             dispute_timeout_secs: 604800,
             referral_fee_bps: 100,
