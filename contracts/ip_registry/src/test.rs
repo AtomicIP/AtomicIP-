@@ -4,7 +4,7 @@ mod tests {
     use soroban_sdk::contractclient;
     use soroban_sdk::testutils::Address as TestAddress;
     use soroban_sdk::testutils::Events;
-    use soroban_sdk::{symbol_short, Address, BytesN, Env, IntoVal, TryFromVal, Vec};
+    use soroban_sdk::{symbol_short, Address, Bytes, BytesN, Env, IntoVal, TryFromVal, Vec};
 
     use crate::types::REVOKE_TOPIC;
     use crate::types::TRANSFER_TOPIC;
@@ -76,6 +76,11 @@ mod tests {
         fn revoke_ip_access(env: Env, ip_id: u64, grantee: Address);
         fn get_ip_access_grants(env: Env, ip_id: u64) -> Vec<crate::IpAccessGrant>;
         fn check_ip_access(env: Env, ip_id: u64, grantee: Address, required_level: u32) -> bool;
+        // Issue #459: Category methods
+        fn validate_category_path(env: Env, path: Bytes) -> BytesN<32>;
+        fn assign_ip_to_category(env: Env, ip_id: u64, category_hash: BytesN<32>);
+        fn list_ip_by_category(env: Env, owner: Address, category_hash: BytesN<32>) -> Vec<u64>;
+        fn list_owner_categories(env: Env, owner: Address) -> Vec<BytesN<32>>;
     }
 
     #[test]
@@ -2151,5 +2156,268 @@ mod tests {
         assert_eq!(anon_ids.get(0).unwrap(), 2);
         assert_eq!(anon_ids.get(1).unwrap(), 3);
         assert_eq!(id4, 4);
+    }
+
+    // ── Category Tests (Issue #459) ──────────────────────────────────────────
+
+    /// Basic assign and list within a category.
+    #[test]
+    fn test_assign_ip_to_category_basic() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[1u8; 32]), &0u32);
+        let cat = BytesN::from_array(&env, &[2u8; 32]);
+
+        client.assign_ip_to_category(&ip_id, &cat);
+
+        let ips = client.list_ip_by_category(&owner, &cat);
+        assert_eq!(ips.len(), 1);
+        assert_eq!(ips.get(0).unwrap(), ip_id);
+    }
+
+    /// Access control: `assign_ip_to_category` calls `record.owner.require_auth()`,
+    /// which the Soroban host enforces at the protocol level. In test environments
+    /// with `mock_all_auths()` the check is bypassed, so the effective security
+    /// guarantee is the `require_auth()` call in the contract — not this test.
+
+    /// Assigning the same category twice is idempotent.
+    #[test]
+    fn test_assign_ip_to_category_idempotent() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[1u8; 32]), &0u32);
+        let cat = BytesN::from_array(&env, &[2u8; 32]);
+
+        client.assign_ip_to_category(&ip_id, &cat);
+        client.assign_ip_to_category(&ip_id, &cat); // second time — no-op
+
+        let ips = client.list_ip_by_category(&owner, &cat);
+        assert_eq!(ips.len(), 1);
+    }
+
+    /// Multiple IPs can be assigned to the same category.
+    #[test]
+    fn test_multiple_ips_same_category() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let id1 = client.commit_ip(&owner, &BytesN::from_array(&env, &[1u8; 32]), &0u32);
+        let id2 = client.commit_ip(&owner, &BytesN::from_array(&env, &[2u8; 32]), &0u32);
+        let id3 = client.commit_ip(&owner, &BytesN::from_array(&env, &[3u8; 32]), &0u32);
+        let cat = BytesN::from_array(&env, &[0xCu8; 32]);
+
+        client.assign_ip_to_category(&id1, &cat);
+        client.assign_ip_to_category(&id2, &cat);
+        client.assign_ip_to_category(&id3, &cat);
+
+        let ips = client.list_ip_by_category(&owner, &cat);
+        assert_eq!(ips.len(), 3);
+
+        let mut ids: Vec<u64> = Vec::new(&env);
+        ids.push_back(id1);
+        ids.push_back(id2);
+        ids.push_back(id3);
+        for id in ids.iter() {
+            assert!(ips.iter().any(|x| x == id));
+        }
+    }
+
+    /// list_ip_by_category returns empty for unknown category.
+    #[test]
+    fn test_list_ip_by_category_empty() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let cat = BytesN::from_array(&env, &[0x99u8; 32]);
+
+        let ips = client.list_ip_by_category(&owner, &cat);
+        assert_eq!(ips.len(), 0);
+    }
+
+    /// list_owner_categories returns all categories used by the owner.
+    #[test]
+    fn test_list_owner_categories() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let cat1 = BytesN::from_array(&env, &[0x10u8; 32]);
+        let cat2 = BytesN::from_array(&env, &[0x20u8; 32]);
+        let cat3 = BytesN::from_array(&env, &[0x30u8; 32]);
+
+        let ip1 = client.commit_ip(&owner, &BytesN::from_array(&env, &[1u8; 32]), &0u32);
+        let ip2 = client.commit_ip(&owner, &BytesN::from_array(&env, &[2u8; 32]), &0u32);
+
+        client.assign_ip_to_category(&ip1, &cat1);
+        client.assign_ip_to_category(&ip1, &cat2);
+        client.assign_ip_to_category(&ip2, &cat3);
+
+        let cats = client.list_owner_categories(&owner);
+        assert_eq!(cats.len(), 3);
+        assert!(cats.iter().any(|c| c == cat1));
+        assert!(cats.iter().any(|c| c == cat2));
+        assert!(cats.iter().any(|c| c == cat3));
+    }
+
+    /// list_owner_categories returns empty for unknown owner.
+    #[test]
+    fn test_list_owner_categories_empty() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let stranger = <Address as TestAddress>::generate(&env);
+        let cats = client.list_owner_categories(&stranger);
+        assert_eq!(cats.len(), 0);
+    }
+
+    /// Category hierarchy depth: 5 levels is allowed.
+    #[test]
+    fn test_validate_category_path_max_depth_allowed() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        // 5 levels: a/b/c/d/e
+        let path = Bytes::from_array(&env, &[b'a', b'/', b'b', b'/', b'c', b'/', b'd', b'/', b'e']);
+        let hash = client.validate_category_path(&path);
+        // Should not panic; hash should be non-zero
+        assert_ne!(hash, BytesN::from_array(&env, &[0u8; 32]));
+    }
+
+    /// Category hierarchy depth: 6 levels panics.
+    #[test]
+    #[should_panic(expected = "CategoryDepthExceeded")]
+    fn test_validate_category_path_depth_exceeded() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        // 6 levels: a/b/c/d/e/f
+        let path = Bytes::from_array(
+            &env,
+            &[b'a', b'/', b'b', b'/', b'c', b'/', b'd', b'/', b'e', b'/', b'f'],
+        );
+        client.validate_category_path(&path);
+    }
+
+    /// Path traversal ".." is rejected.
+    #[test]
+    #[should_panic(expected = "CategoryPathTraversal")]
+    fn test_validate_category_path_traversal_dotdot() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let path = Bytes::from_array(&env, &[b'a', b'/', b'.', b'.']);
+        client.validate_category_path(&path);
+    }
+
+    /// Leading slash is rejected.
+    #[test]
+    #[should_panic(expected = "CategoryPathTraversal")]
+    fn test_validate_category_path_leading_slash() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let path = Bytes::from_array(&env, &[b'/', b'a', b'/', b'b']);
+        client.validate_category_path(&path);
+    }
+
+    /// Trailing slash is rejected.
+    #[test]
+    #[should_panic(expected = "CategoryPathTraversal")]
+    fn test_validate_category_path_trailing_slash() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let path = Bytes::from_array(&env, &[b'a', b'/', b'b', b'/']);
+        client.validate_category_path(&path);
+    }
+
+    /// Double slash is rejected.
+    #[test]
+    #[should_panic(expected = "CategoryPathTraversal")]
+    fn test_validate_category_path_double_slash() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let path = Bytes::from_array(&env, &[b'a', b'/', b'/', b'b']);
+        client.validate_category_path(&path);
+    }
+
+    /// Empty path is rejected.
+    #[test]
+    #[should_panic(expected = "CategoryPathTraversal")]
+    fn test_validate_category_path_empty() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let path = Bytes::new(&env);
+        client.validate_category_path(&path);
+    }
+
+    /// Zero category hash is rejected on assign.
+    #[test]
+    #[should_panic(expected = "InvalidCategoryHash")]
+    fn test_assign_ip_to_category_zero_hash() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[1u8; 32]), &0u32);
+        let zero_hash = BytesN::from_array(&env, &[0u8; 32]);
+
+        client.assign_ip_to_category(&ip_id, &zero_hash);
+    }
+
+    /// Category queries filter by owner correctly.
+    #[test]
+    fn test_list_ip_by_category_filters_by_owner() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner1 = <Address as TestAddress>::generate(&env);
+        let owner2 = <Address as TestAddress>::generate(&env);
+        let cat = BytesN::from_array(&env, &[0xCu8; 32]);
+
+        let ip1 = client.commit_ip(&owner1, &BytesN::from_array(&env, &[1u8; 32]), &0u32);
+        let ip2 = client.commit_ip(&owner2, &BytesN::from_array(&env, &[2u8; 32]), &0u32);
+
+        client.assign_ip_to_category(&ip1, &cat);
+        client.assign_ip_to_category(&ip2, &cat);
+
+        let owner1_ips = client.list_ip_by_category(&owner1, &cat);
+        assert_eq!(owner1_ips.len(), 1);
+        assert_eq!(owner1_ips.get(0).unwrap(), ip1);
+
+        let owner2_ips = client.list_ip_by_category(&owner2, &cat);
+        assert_eq!(owner2_ips.len(), 1);
+        assert_eq!(owner2_ips.get(0).unwrap(), ip2);
     }
 }

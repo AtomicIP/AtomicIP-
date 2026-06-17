@@ -38,6 +38,8 @@ pub enum DataKey {
     CommitmentOwner(BytesN<32>), // tracks which owner already holds a commitment hash
     Admin,
     CategoryIps(BytesN<32>), // maps category hash -> Vec<u64> of IP IDs
+    OwnerCategories(Address), // maps owner -> Vec<BytesN<32>> of category hashes they use
+    IpCategories(u64),       // maps ip_id -> Vec<BytesN<32>> of assigned category hashes
     IpLineage(u64),          // stores parent_ip_id for versioning
     IpVersions(u64),         // stores Vec<u64> of all version IDs for a given IP
     IpCommitmentChecksum,    // Issue #346: stores hash of all commitments for rollback protection

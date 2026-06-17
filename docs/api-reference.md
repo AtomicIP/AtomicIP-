@@ -600,6 +600,9 @@ if registry.is_ip_owner(&ip_id, &address) {
 | `CommitmentAlreadyRegistered` | 3 | Commitment hash already registered |
 | `IpAlreadyRevoked` | 4 | IP is already revoked |
 | `UnauthorizedUpgrade` | 5 | Caller is not admin (upgrade only) |
+| `InvalidCategoryHash` | 29 | Category hash is all zeros or malformed |
+| `CategoryDepthExceeded` | 30 | Category path exceeds 5 levels |
+| `CategoryPathTraversal` | 31 | Category path contains traversal or empty segments |
 
 ---
 
@@ -614,6 +617,15 @@ Emitted when a new IP is committed.
 
 ---
 
+### `ip_cat`
+
+Emitted when an IP is assigned to a category (Issue #459).
+
+**Topics:** `(symbol_short!("ip_cat"), owner: Address)`  
+**Data:** `(ip_id: u64, category_hash: BytesN<32>)`
+
+---
+
 ## Storage Keys
 
 | Key | Type | Description |
@@ -623,6 +635,9 @@ Emitted when a new IP is committed.
 | `NextId` | Persistent | Next available IP ID (monotonic counter) |
 | `CommitmentOwner(BytesN<32>)` | Persistent | Maps commitment hash → owner (duplicate detection) |
 | `Admin` | Persistent | Admin address for upgrades |
+| `CategoryIps(BytesN<32>)` | Persistent | Maps category hash → Vec of IP IDs |
+| `OwnerCategories(Address)` | Persistent | Maps owner → Vec of category hashes they use |
+| `IpCategories(u64)` | Persistent | Maps IP ID → Vec of assigned category hashes |
 
 ---
 
@@ -726,3 +741,124 @@ pub fn get_ip_access_grants(env: Env, ip_id: u64) -> Vec<IpAccessGrant>
 ```
 
 Returns a `Vec<IpAccessGrant>` where each entry has `grantee: Address` and `access_level: u32`.
+
+---
+
+## Hierarchical Category Assignment (Issue #459)
+
+IP records can be organized into hierarchical categories (e.g., `Software/Cryptography/ZK-Proofs`) for discoverability and filtering. Categories use a path-based hierarchy with up to 5 levels of nesting.
+
+### Storage Schema
+
+| Key | Type | Description |
+|---|---|---|
+| `CategoryIps(BytesN<32>)` | `Vec<u64>` | Maps a category hash → all IP IDs assigned to that category |
+| `OwnerCategories(Address)` | `Vec<BytesN<32>>` | Maps an owner → category hashes they've used |
+| `IpCategories(u64)` | `Vec<BytesN<32>>` | Maps an IP ID → category hashes assigned to it |
+
+---
+
+### `validate_category_path`
+
+Validates a UTF-8 category path string and returns its SHA-256 hash. Use this off-chain to compute a `category_hash` before calling `assign_ip_to_category`.
+
+```rust
+pub fn validate_category_path(env: Env, path: Bytes) -> BytesN<32>
+```
+
+**Parameters:**
+
+| Parameter | Type | Description |
+|---|---|---|
+| `path` | `Bytes` | UTF-8 encoded category path (e.g., `b"Software/Cryptography/ZK-Proofs"`) |
+
+**Validation rules:**
+- Max **5 levels** (segments separated by `/`). `a/b/c/d/e` is valid; `a/b/c/d/e/f` panics.
+- No empty segments: leading `/`, trailing `/`, or `//` are rejected.
+- No path traversal: `..` segments are rejected.
+- Path length must be between 1 and 512 bytes.
+
+**Returns:** `BytesN<32>` — `sha256(path)` to use as the category hash in `assign_ip_to_category`.
+
+**Panics:**
+
+| Error | Code | Condition |
+|---|---|---|
+| `CategoryDepthExceeded` | 30 | More than 5 levels |
+| `CategoryPathTraversal` | 31 | Contains `..`, empty segments, or invalid format |
+
+```rust
+let cat_hash = registry.validate_category_path(&Bytes::from_slice(&env, b"Cryptography/ZK-Proofs"));
+```
+
+---
+
+### `assign_ip_to_category`
+
+Assign an IP record to a category. Only the IP owner can assign.
+
+```rust
+pub fn assign_ip_to_category(env: Env, ip_id: u64, category_hash: BytesN<32>)
+```
+
+**Parameters:**
+
+| Parameter | Type | Description |
+|---|---|---|
+| `ip_id` | `u64` | The IP record to categorize |
+| `category_hash` | `BytesN<32>` | 32-byte SHA-256 hash of the category path (use `validate_category_path`) |
+
+**Panics:**
+
+| Error | Code | Condition |
+|---|---|---|
+| `IpNotFound` | 1 | No record for `ip_id` |
+| `IpAlreadyRevoked` | 4 | The IP has been revoked |
+| `Unauthorized` | 6 | Caller is not the IP owner |
+| `InvalidCategoryHash` | 29 | `category_hash` is all zeros |
+
+**Event:** `(symbol_short!("ip_cat"), owner: Address)` → `(ip_id: u64, category_hash: BytesN<32>)`
+
+```rust
+let cat_hash = registry.validate_category_path(&Bytes::from_slice(&env, b"Software/Cryptography/ZK-Proofs"));
+registry.assign_ip_to_category(&ip_id, &cat_hash);
+```
+
+---
+
+### `list_ip_by_category`
+
+Return all IP IDs in a category that belong to the given owner.
+
+```rust
+pub fn list_ip_by_category(env: Env, owner: Address, category_hash: BytesN<32>) -> Vec<u64>
+```
+
+**Parameters:**
+
+| Parameter | Type | Description |
+|---|---|---|
+| `owner` | `Address` | Filter results to this owner's IPs |
+| `category_hash` | `BytesN<32>` | The category to query |
+
+**Returns:** `Vec<u64>` — IP IDs owned by `owner` in this category, or empty.
+
+```rust
+let ips = registry.list_ip_by_category(&owner, &cat_hash);
+```
+
+---
+
+### `list_owner_categories`
+
+Return all category hashes used by a given owner.
+
+```rust
+pub fn list_owner_categories(env: Env, owner: Address) -> Vec<BytesN<32>>
+```
+
+**Returns:** `Vec<BytesN<32>>` — all category hashes the owner has ever assigned IPs to.
+
+```rust
+let cats = registry.list_owner_categories(&owner);
+```
