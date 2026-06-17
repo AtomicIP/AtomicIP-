@@ -4,7 +4,7 @@
 //! and ensure consistent error handling across the contract.
 
 use crate::{ContractError, DataKey, IpRecord};
-use soroban_sdk::{symbol_short, Address, BytesN, Env, Error};
+use soroban_sdk::{symbol_short, Address, Bytes, BytesN, Env, Error};
 
 /// Retrieves an IP record by ID, panicking if not found.
 ///
@@ -167,6 +167,96 @@ pub fn require_pow(env: &Env, commitment_hash: &BytesN<32>, difficulty: u32) {
         }
         remaining = remaining.saturating_sub(8);
     }
+}
+
+/// Validates that a category hash is non-zero.
+///
+/// # Panics
+///
+/// Panics with `InvalidCategoryHash` if the hash is all zeros.
+pub fn require_valid_category_hash(env: &Env, category_hash: &BytesN<32>) {
+    if category_hash == &BytesN::from_array(env, &[0u8; 32]) {
+        env.panic_with_error(Error::from_contract_error(
+            ContractError::InvalidCategoryHash as u32,
+        ));
+    }
+}
+
+/// Validates a UTF-8 category path string for max depth and path traversal.
+///
+/// Rules:
+/// - Max depth is `MAX_CATEGORY_DEPTH` segments separated by `/`.
+/// - No empty segments (e.g., `//`, leading/trailing `/`).
+/// - No `..` path traversal segments.
+/// - Path length must be between 1 and 512 bytes.
+///
+/// # Returns
+///
+/// `sha256(path)` to use as the category_hash for storage.
+///
+/// # Panics
+///
+/// Panics with `CategoryDepthExceeded` or `CategoryPathTraversal` on validation failure.
+pub fn validate_category_path(env: &Env, path: &Bytes) -> BytesN<32> {
+    let len = path.len();
+    if len == 0 || len > 512 {
+        env.panic_with_error(Error::from_contract_error(
+            ContractError::CategoryPathTraversal as u32,
+        ));
+    }
+
+    let mut depth: u32 = 0;
+    let mut seg_start: u32 = 0;
+
+    for i in 0..len {
+        if path.get(i).unwrap() == b'/' {
+            // Empty segment (leading slash, double slash)
+            if i == seg_start {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::CategoryPathTraversal as u32,
+                ));
+            }
+            // Check for ".." segment
+            let seg_len = i - seg_start;
+            if seg_len == 2
+                && path.get(seg_start).unwrap() == b'.'
+                && path.get(seg_start + 1).unwrap() == b'.'
+            {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::CategoryPathTraversal as u32,
+                ));
+            }
+            depth += 1;
+            seg_start = i + 1;
+        }
+    }
+
+    // Validate last segment
+    if seg_start >= len {
+        // Trailing slash
+        env.panic_with_error(Error::from_contract_error(
+            ContractError::CategoryPathTraversal as u32,
+        ));
+    }
+    let last_seg_len = len - seg_start;
+    if last_seg_len == 2
+        && path.get(seg_start).unwrap() == b'.'
+        && path.get(seg_start + 1).unwrap() == b'.'
+    {
+        env.panic_with_error(Error::from_contract_error(
+            ContractError::CategoryPathTraversal as u32,
+        ));
+    }
+
+    // depth = number of separators, so total segments = depth + 1
+    let total_segments = depth + 1;
+    if total_segments > crate::MAX_CATEGORY_DEPTH {
+        env.panic_with_error(Error::from_contract_error(
+            ContractError::CategoryDepthExceeded as u32,
+        ));
+    }
+
+    env.crypto().sha256(path).into()
 }
 
 /// Calculate commitment strength (0-100 scale) based on secret length and PoW difficulty.

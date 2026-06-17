@@ -600,6 +600,9 @@ if registry.is_ip_owner(&ip_id, &address) {
 | `CommitmentAlreadyRegistered` | 3 | Commitment hash already registered |
 | `IpAlreadyRevoked` | 4 | IP is already revoked |
 | `UnauthorizedUpgrade` | 5 | Caller is not admin (upgrade only) |
+| `InvalidCategoryHash` | 29 | Category hash is all zeros or malformed |
+| `CategoryDepthExceeded` | 30 | Category path exceeds 5 levels |
+| `CategoryPathTraversal` | 31 | Category path contains traversal or empty segments |
 
 ---
 
@@ -614,6 +617,15 @@ Emitted when a new IP is committed.
 
 ---
 
+### `ip_cat`
+
+Emitted when an IP is assigned to a category (Issue #459).
+
+**Topics:** `(symbol_short!("ip_cat"), owner: Address)`  
+**Data:** `(ip_id: u64, category_hash: BytesN<32>)`
+
+---
+
 ## Storage Keys
 
 | Key | Type | Description |
@@ -623,6 +635,9 @@ Emitted when a new IP is committed.
 | `NextId` | Persistent | Next available IP ID (monotonic counter) |
 | `CommitmentOwner(BytesN<32>)` | Persistent | Maps commitment hash → owner (duplicate detection) |
 | `Admin` | Persistent | Admin address for upgrades |
+| `CategoryIps(BytesN<32>)` | Persistent | Maps category hash → Vec of IP IDs |
+| `OwnerCategories(Address)` | Persistent | Maps owner → Vec of category hashes they use |
+| `IpCategories(u64)` | Persistent | Maps IP ID → Vec of assigned category hashes |
 
 ---
 
