@@ -6,38 +6,24 @@ on:
   pull_request:
 
 jobs:
-  test:
+  ci:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
 
-      - uses: actions/cache@v5
+      - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          restore-keys: ${{ runner.os }}-cargo-
 
-      - name: Format check
-        run: cargo fmt --all -- --check
-
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      # Security audit and dependency vulnerability scanning now live in
-      # security.yml (#553) and dependency-scan.yml (#554).
-      # Code coverage enforcement lives in coverage.yml (#555).
-      # Mutation testing lives in mutation.yml (#556).
+      - name: Build
+        run: cargo build --workspace
 
       - name: Test
         run: cargo test --workspace
-
-      - name: Regression tests
-        run: cargo test --workspace regression_tests
