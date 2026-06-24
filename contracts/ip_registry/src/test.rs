@@ -654,6 +654,103 @@ mod tests {
         assert!(client.verify_commitment(&ip_id, &secret, &blinding));
     }
 
+    /// #662: Only the IP owner can call verify_commitment.
+    #[test]
+    #[should_panic]
+    fn test_verify_commitment_requires_owner_auth() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let attacker = <Address as TestAddress>::generate(&env);
+        let secret = BytesN::from_array(&env, &[10u8; 32]);
+        let blinding = BytesN::from_array(&env, &[20u8; 32]);
+
+        let mut preimage = soroban_sdk::Bytes::new(&env);
+        preimage.append(&soroban_sdk::Bytes::from(secret.clone()));
+        preimage.append(&soroban_sdk::Bytes::from(blinding.clone()));
+        let commitment_hash: BytesN<32> = env.crypto().sha256(&preimage).into();
+        let ip_id = client.commit_ip(&owner, &commitment_hash, &0u32);
+
+        // Clone for the mock auth invocation since we reuse them after
+        let secret_for_auth = secret.clone();
+        let blinding_for_auth = blinding.clone();
+
+        // Only mock attacker's auth — owner's auth absent, must panic
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &attacker,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "verify_commitment",
+                args: (ip_id, secret_for_auth, blinding_for_auth).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.verify_commitment(&ip_id, &secret, &blinding);
+    }
+
+    /// #661: verify_commitment emits verify_ok event on success, nothing on failure.
+    #[test]
+    fn test_verify_commitment_emits_event_on_success() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let secret = BytesN::from_array(&env, &[30u8; 32]);
+        let blinding = BytesN::from_array(&env, &[40u8; 32]);
+
+        let mut preimage = soroban_sdk::Bytes::new(&env);
+        preimage.append(&soroban_sdk::Bytes::from(secret.clone()));
+        preimage.append(&soroban_sdk::Bytes::from(blinding.clone()));
+        let commitment_hash: BytesN<32> = env.crypto().sha256(&preimage).into();
+        let ip_id = client.commit_ip(&owner, &commitment_hash, &0u32);
+
+        // Clear events from commit_ip
+        let _ = env.events().all();
+
+        // Successful verification should emit a verify_ok event
+        assert!(client.verify_commitment(&ip_id, &secret, &blinding));
+        let events = env.events().all();
+        let event_count = events.events().len();
+        assert!(event_count > 0, "verify_ok event should be emitted on success");
+    }
+
+    /// #661: On failed verification, no event is emitted.
+    #[test]
+    fn test_verify_commitment_no_event_on_failure() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let secret = BytesN::from_array(&env, &[30u8; 32]);
+        let blinding = BytesN::from_array(&env, &[40u8; 32]);
+
+        let mut preimage = soroban_sdk::Bytes::new(&env);
+        preimage.append(&soroban_sdk::Bytes::from(secret.clone()));
+        preimage.append(&soroban_sdk::Bytes::from(blinding.clone()));
+        let commitment_hash: BytesN<32> = env.crypto().sha256(&preimage).into();
+        let ip_id = client.commit_ip(&owner, &commitment_hash, &0u32);
+
+        // Clear events from commit_ip
+        let _ = env.events().all();
+
+        // Wrong secret — verification fails and no event should be emitted
+        let wrong_secret = BytesN::from_array(&env, &[99u8; 32]);
+        assert!(!client.verify_commitment(&ip_id, &wrong_secret, &blinding));
+        let events = env.events().all();
+        assert_eq!(
+            events.events().len(),
+            0,
+            "no event should be emitted on failed verification"
+        );
+    }
+
     /// Issue: list_ip_by_owner returns all IDs committed by an owner in order.
     #[test]
     fn test_list_ip_by_owner_returns_all_ids() {
@@ -3153,5 +3250,57 @@ mod batch_escrow_tests {
         let attacker = Address::generate(&env);
         let listed = client.list_ip_by_owner(&attacker);
         assert_eq!(listed.len(), 0);
+    }
+}
+
+// ── #659: Maximum IPs Per Owner Boundary Tests ────────────────────────────────
+
+#[cfg(test)]
+mod max_ips_per_owner_tests {
+    use super::tests::IpRegistryClient;
+    use soroban_sdk::{
+        testutils::Address as _,
+        Address, BytesN, Env,
+    };
+
+    /// #659: The 10,000th commit_ip succeeds.
+    #[test]
+    fn test_max_ips_limit_boundary_succeeds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+
+        // Commit MAX_IPS_PER_OWNER (10,000) IPs — all should succeed.
+        for i in 0..crate::MAX_IPS_PER_OWNER {
+            let hash = BytesN::from_array(&env, &[(i % 256) as u8; 32]);
+            client.commit_ip(&owner, &hash, &0u32);
+        }
+
+        // Verify the owner has exactly MAX_IPS_PER_OWNER IPs
+        let ids = client.list_ip_by_owner(&owner);
+        assert_eq!(ids.len(), crate::MAX_IPS_PER_OWNER as u32);
+    }
+
+    /// #659: The 10,001st commit_ip panics with OwnerLimitExceeded.
+    #[test]
+    #[should_panic]
+    fn test_max_ips_limit_boundary_exceeded_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+
+        // Commit MAX_IPS_PER_OWNER IPs first.
+        for i in 0..crate::MAX_IPS_PER_OWNER {
+            let hash = BytesN::from_array(&env, &[(i % 256) as u8; 32]);
+            client.commit_ip(&owner, &hash, &0u32);
+        }
+
+        // The next commit must panic with OwnerLimitExceeded.
+        let overflow_hash = BytesN::from_array(&env, &[0xFFu8; 32]);
+        client.commit_ip(&owner, &overflow_hash, &0u32);
     }
 }

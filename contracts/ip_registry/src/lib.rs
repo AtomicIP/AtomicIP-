@@ -16,9 +16,8 @@ use types::*;
 #[cfg(test)]
 mod test;
 
-// FIXME: benchmarks.rs has pre-existing compilation errors from a merge conflict
-// #[cfg(test)]
-// mod benchmarks;
+#[cfg(test)]
+mod benchmarks;
 
 #[cfg(test)]
 mod mutation_tests;
@@ -92,6 +91,8 @@ pub enum ContractError {
     CategoryNotFound = 34,
     /// Batch operation size mismatch.
     BatchSizeMismatch = 35,
+    /// #659: Owner has reached maximum number of IP commitments.
+    OwnerLimitExceeded = 36,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -102,6 +103,9 @@ pub const LEDGER_BUMP: u32 = 6_307_200;
 
 /// Maximum metadata size: 1 KB
 pub const MAX_METADATA_BYTES: u32 = 1024;
+
+/// #659: Maximum number of IP commitments per owner to prevent storage-bloat attacks.
+pub const MAX_IPS_PER_OWNER: u32 = 10_000;
 
 /// Trusted notary public key for timestamp notarization (Issue #345)
 /// This is a placeholder - should be set during contract initialization
@@ -519,6 +523,16 @@ impl IpRegistry {
                 .extend_ttl(&DataKey::Admin, 50000, 50000);
         }
 
+        // #659: Enforce per-owner IP commitment limit
+        let existing_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OwnerIps(owner.clone()))
+            .unwrap_or(Vec::new(&env));
+        if existing_ids.len() >= MAX_IPS_PER_OWNER {
+            panic_with_error!(&env, ContractError::OwnerLimitExceeded);
+        }
+
         // Reject zero-byte commitment hash (Issue #40)
         require_non_zero_commitment(&env, &commitment_hash);
 
@@ -676,6 +690,18 @@ impl IpRegistry {
 
         let mut ids = Vec::new(&env);
         let timestamp = env.ledger().timestamp();
+
+        // #659: Pre-check owner IP count before processing the batch
+        let existing_count: u32 = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Vec<u64>>(&DataKey::OwnerIps(owner.clone()))
+            .map(|v| v.len())
+            .unwrap_or(0);
+        let batch_size = commitment_hashes.len();
+        if existing_count + batch_size > MAX_IPS_PER_OWNER {
+            panic_with_error!(&env, ContractError::OwnerLimitExceeded);
+        }
 
         for commitment_hash in commitment_hashes.iter() {
             // Reject zero-byte commitment hash
@@ -1584,6 +1610,9 @@ impl IpRegistry {
         // Reject if expired
         // Expiry check removed - field not in types
 
+        // Only the IP owner may call this function (prevents brute-force probing)
+        record.owner.require_auth();
+
         // Concatenate secret || blinding_factor into Bytes, then SHA256
         let mut preimage = soroban_sdk::Bytes::new(&env);
         preimage.append(&secret.into());
@@ -1591,7 +1620,18 @@ impl IpRegistry {
         let computed_hash: BytesN<32> = env.crypto().sha256(&preimage).into();
 
         // Constant-time comparison to prevent timing side-channel attacks
-        constant_time_bytes_32_eq(&record.commitment_hash, &computed_hash)
+        let valid = constant_time_bytes_32_eq(&record.commitment_hash, &computed_hash);
+
+        if valid {
+            // #661: Emit event on successful verification so external systems
+            // can detect on-chain verification proofs without re-running the call.
+            env.events().publish(
+                (symbol_short!("verify_ok"), record.owner.clone()),
+                (ip_id, record.owner),
+            );
+        }
+
+        valid
     }
 
     /// List all IP IDs owned by an address.

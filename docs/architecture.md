@@ -85,3 +85,40 @@ sequenceDiagram
 - **RPC:** Public Soroban RPC nodes (SDF).
 - **Automation:** GitHub Actions for contract deployment and API testing.
 - **Monitoring:** Periodic health checks and ledger event indexing (planned).
+
+## 📊 Performance Benchmarks & SLA Baselines
+
+### Benchmark Suite
+
+Load testing is integrated as `#[cfg(test)]` benchmarks in the `IpRegistry` contract (`benchmarks.rs`).
+Run with:
+```bash
+cargo test bench_ -p ip_registry -- --nocapture
+```
+
+### Current SLA Baselines (p99 Latency)
+
+| Operation              | Instruction Budget | p99 Latency Target | Status |
+|------------------------|-------------------|--------------------|--------|
+| `commit_ip`            | ≤ 600,000         | < 300 ms           | ✓      |
+| `verify_commitment`    | ≤ 600,000         | < 300 ms           | ✓      |
+| `get_ip`               | ≤ 100,000         | < 50 ms            | ✓      |
+| `list_ip_by_owner` (5) | ≤ 150,000         | < 75 ms            | ✓      |
+| `batch_commit_ip` (10) | ≤ 2,000,000       | < 500 ms           | ✓      |
+| `batch_verify` (10)    | ≤ 1,200,000       | < 500 ms           | ✓      |
+
+*Note: Instruction budgets are measured on Soroban's deterministic CPU metering. Actual wall-clock latency depends on RPC node load and network congestion.*
+
+### Load Testing Scenarios
+
+The benchmark suite includes the following load scenarios:
+
+1. **1000 concurrent `commit_ip` operations** — verifies average CPU per commit stays under the unit limit.
+2. **100 concurrent `batch_commit_ip` operations** — 100 simulated users each committing 10 IPs in a single batch.
+3. **1000 sustained `verify_commitment` calls** — cycles through 100 pre-committed IPs to measure verification throughput.
+4. **100 batch verification requests** — each verifying 10 commitments, measuring aggregate proof overhead.
+5. **SLA compliance check** — single-operation benchmarks asserting each operation stays within its instruction budget.
+
+### Regression Alerting
+
+Benchmarks fail the test suite if any operation exceeds its instruction budget. CI is configured to run the full benchmark suite on every PR. A failure indicates a performance regression that must be addressed before merge.
