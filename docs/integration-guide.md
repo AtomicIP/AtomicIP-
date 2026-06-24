@@ -523,3 +523,133 @@ OTEL_ENABLED=false cargo run -p api-server
 When disabled, the server falls back to structured JSON logs via
 `tracing-subscriber` without any OTLP export. All `tracing::info!/warn!/error!`
 calls still work normally.
+
+---
+
+## Blue-Green Deployment Guide
+
+Atomic Patent API supports zero-downtime deployments using a blue-green deployment
+strategy. Two identical environments (blue and green) are maintained, with traffic
+routed to the active slot. Deployments target the inactive slot, then switch traffic
+after validation.
+
+### Architecture
+
+```
+                        ┌──────────────┐
+                        │   Load       │
+                        │   Balancer   │
+                        └──────┬───────┘
+                               │
+                ┌──────────────┼──────────────┐
+                ▼              ▼              ▼
+        ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+        │   Active     │ │   Inactive   │ │   Previous   │
+        │   Slot      │ │   Slot      │ │   Slot      │
+        └──────────────┘ └──────────────┘ └──────────────┘
+```
+
+### Deployment Script
+
+```bash
+# Deploy version v1.2.3 to production
+./scripts/deploy-bluegreen.sh \
+    --env production \
+    --version v1.2.3 \
+    --health-url https://api.atomicip.io/health \
+    --smoke-test \
+    --rollback \
+    --timeout 120
+```
+
+### Options
+
+| Option | Default | Description |
+|---|---|---|
+| `--env NAME` | `production` | Target environment |
+| `--version TAG` | (required) | Docker image tag or version identifier |
+| `--health-url URL` | `http://localhost:8080/health` | Health check endpoint |
+| `--smoke-test` | off | Run smoke tests after traffic switch |
+| `--rollback` | off | Auto-rollback on smoke test failure or error spike |
+| `--timeout SECS` | `120` | Health check timeout |
+| `--verbose` | off | Verbose output |
+
+### Deployment Flow
+
+1. **Provision** — Create or verify the inactive slot environment
+2. **Deploy** — Deploy the new version to the inactive slot
+3. **Health Check** — Wait for health endpoint to return `healthy`
+4. **Traffic Switch** — Route traffic to the new slot
+5. **Smoke Tests** — Validate critical endpoints (optional)
+6. **Monitor** — Observe error rates for 60 seconds post-deployment
+7. **Rollback** — Auto-revert if error rate exceeds 5% threshold (optional)
+
+### Health Check Endpoints
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /health` | Overall health (healthy/degraded) |
+| `GET /health/detailed` | Per-component health with latency |
+| `GET /metrics` | Prometheus metrics for monitoring |
+
+### Health Check Script
+
+```bash
+# Quick health check
+./scripts/health-check.sh http://localhost:8080
+
+# Detailed component-level check
+./scripts/health-check.sh http://localhost:8080 --detailed
+```
+
+### Smoke Test Suite
+
+Post-deployment smoke tests validate:
+- Health endpoint returns 200
+- Metrics endpoint is accessible
+- Version endpoint returns version info
+- API responds to requests (expected 404s are acceptable)
+- WebSocket upgrade handshake succeeds
+
+```bash
+# Run smoke tests manually
+./scripts/smoke-test.sh
+```
+
+### Automatic Rollback
+
+Rollback triggers activate when:
+- **Health check timeout** — New slot fails to become healthy within timeout
+- **Smoke test failure** — Post-switch validation fails
+- **Error rate spike** — HTTP 5xx rate exceeds 5% threshold during monitoring window
+
+Rollback reverts traffic to the previous slot using symlink atomically:
+
+```bash
+# The rollback mechanism:
+# 1. Detects failure (health/smoke/error-rate)
+# 2. Reads PREVIOUS_SYMLINK to find last known good slot
+# 3. Atomically switches ACTIVE_SYMLINK back
+# 4. Re-runs health check on rolled-back slot
+
+# Manual rollback if needed:
+./scripts/rollback.sh --url http://localhost:8080 --threshold 0.05 --duration 60
+```
+
+### Rollback Monitor Script
+
+```bash
+# Monitor error rate and auto-rollback on threshold breach
+./scripts/rollback.sh \
+    --url https://api.atomicip.io \
+    --threshold 0.05 \
+    --duration 120
+```
+
+### Zero-Downtime Guarantee
+
+The deployment ensures zero data loss through:
+- In-flight requests complete on the old slot before traffic switch
+- New requests route to the new slot after switch
+- Rollback restores previous slot within seconds
+- Database schema changes are backward-compatible for one release cycle

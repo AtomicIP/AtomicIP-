@@ -1157,3 +1157,176 @@ The TCP peer address is used by default, and `X-Forwarded-For` is ignored to
 prevent clients from evading IP limits by spoofing headers. Set
 `RateLimitConfig::trust_proxy_headers` only when the API is reachable solely
 through a trusted reverse proxy that replaces `X-Forwarded-For`.
+
+---
+
+## Request Deduplication & Idempotency
+
+The API supports idempotent request processing to prevent duplicate operations
+(e.g., retried IP commits) from being processed more than once.
+
+### Idempotency Key Header
+
+Include an `x-idempotency-key` header on write requests (`POST`, `PUT`, `PATCH`, `DELETE`):
+
+```
+POST /v1/ip/commit
+x-idempotency-key: 550e8400-e29b-41d4-a716-446655440000
+Content-Type: application/json
+
+{
+  "owner": "GABC...",
+  "commitment_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+}
+```
+
+### Response Caching
+
+- Successful responses are cached for **24 hours** using the idempotency key
+- Subsequent requests with the same key return the cached response immediately
+- The `x-idempotency-replayed: true` header indicates a cached response
+- Expired entries are garbage-collected automatically every hour
+
+### Request ID Header
+
+The `x-request-id` header can be used as an alternative to `x-idempotency-key`.
+If both are provided, `x-request-id` takes precedence:
+
+```
+x-request-id: 550e8400-e29b-41d4-a716-446655440000
+```
+
+### Concurrent Request Deduplication
+
+Identical concurrent requests are deduplicated at the application layer:
+- The first request proceeds; subsequent identical requests wait for the first to complete
+- All waiters receive the same response
+- This prevents duplicate processing without blocking for extended periods
+
+### Response Headers
+
+| Header | Description |
+|---|---|
+| `x-idempotency-replayed` | `true` if this is a replayed (cached) response |
+| `x-request-id` | Echoes the request ID if provided |
+
+### Idempotency Guarantees
+
+| Operation | Idempotent? | Notes |
+|---|---|---|
+| `POST /v1/ip/commit` | Yes | Same commitment hash rejected by contract |
+| `POST /v1/ip/transfer` | Yes | Idempotency key prevents double transfer |
+| `POST /v1/swap/initiate` | Yes | Prevents duplicate swap creation |
+| `POST /v1/swap/{id}/accept` | Yes | Contract enforces single acceptance |
+| `GET` requests | N/A | Read operations are naturally idempotent |
+
+---
+
+## Error Handling & Retry Strategy
+
+The API provides structured error responses with retry hints to help clients
+handle failures intelligently.
+
+### Error Classification
+
+Errors are classified as either **transient** (retryable) or **permanent**:
+
+| Classification | Meaning | Action |
+|---|---|---|
+| **Transient** | Temporary failure (network, timeout, rate limit) | Retry with exponential backoff |
+| **Permanent** | Request error (bad input, auth failure) | Fix request, do not retry |
+
+### Transient Error HTTP Status Codes
+
+| Status | Description | Retry Strategy |
+|---|---|---|
+| `408 Request Timeout` | Server timed out waiting for request | Retry after short delay |
+| `429 Too Many Requests` | Rate limit exceeded | Retry after `Retry-After` header |
+| `502 Bad Gateway` | Upstream service error | Retry with backoff |
+| `503 Service Unavailable` | Server temporarily overloaded | Retry with backoff |
+| `504 Gateway Timeout` | Upstream timed out | Retry with backoff |
+
+### Structured Error Response
+
+All errors return a structured JSON body with retry hints:
+
+```json
+{
+  "error": "service temporarily unavailable",
+  "error_code": "503",
+  "classification": "Transient",
+  "retryable": true,
+  "retry_after_ms": 5000,
+  "retry_hint": "Retry with exponential backoff. See Retry-After header."
+}
+```
+
+### Exponential Backoff
+
+The recommended client-side retry strategy uses exponential backoff with jitter:
+
+| Attempt | Backoff (default) | Range with jitter |
+|---|---|---|
+| 1st retry | 100ms | 90-110ms |
+| 2nd retry | 200ms | 180-220ms |
+| 3rd retry | 400ms | 360-440ms |
+| 4th retry | 800ms | 720-880ms |
+| 5th+ retry | 1600ms (capped) | 1440-1760ms |
+
+Maximum retries: **3** by default (configurable server-side).
+
+### Error Classifier
+
+The server-side `ErrorClassifier` determines retryability based on:
+- HTTP status code (5xx = transient, 4xx = permanent)
+- Error message content (keywords: "timeout", "rate limit", "unavailable", etc.)
+
+### Fallback Provider
+
+When a primary service degrades, the FallbackProvider returns cached or degraded
+responses after a configurable threshold of consecutive failures:
+
+```rust
+use api_server::error_recovery::{FallbackProvider, Fallbackable};
+
+struct PrimaryService;
+#[async_trait::async_trait]
+impl Fallbackable<String> for PrimaryService {
+    async fn execute(&self) -> Result<String, String> { /* ... */ }
+    fn degraded_response(&self) -> String { "cached_value".to_string() }
+}
+```
+
+### Client Retry Example
+
+```typescript
+async function fetchWithRetry(url: string, options: RequestInit, maxRetries = 3): Promise<Response> {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const response = await fetch(url, options);
+
+    if (response.ok) return response;
+
+    if (response.status === 429) {
+      const retryAfter = parseInt(response.headers.get('Retry-After') || '1');
+      await sleep(retryAfter * 1000);
+      continue;
+    }
+
+    if (response.status >= 500) {
+      const backoff = Math.min(100 * Math.pow(2, attempt), 10000);
+      const jitter = Math.random() * backoff * 0.1;
+      await sleep(backoff + jitter);
+      continue;
+    }
+
+    throw new Error(`Non-retryable error: ${response.status}`);
+  }
+  throw new Error('Max retries exceeded');
+}
+```
+
+### Monitoring Error Rates
+
+The API exposes error rate metrics via the `/metrics` endpoint. Deployments
+automatically roll back if the error rate exceeds 5% during the monitoring
+window (see [Blue-Green Deployment Guide](integration-guide.md) for details).
