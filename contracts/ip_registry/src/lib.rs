@@ -92,6 +92,12 @@ pub enum ContractError {
     CategoryNotFound = 34,
     /// Batch operation size mismatch.
     BatchSizeMismatch = 35,
+    /// #664: Transfer already proposed for this IP.
+    TransferAlreadyProposed = 36,
+    /// #664: Pending transfer has expired.
+    TransferExpired = 37,
+    /// #664: No pending transfer for this IP.
+    NoPendingTransfer = 38,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -175,6 +181,12 @@ pub enum DataKey {
     EncryptedCommitment(u64),
     // Issue #465: Batch escrow — keyed by escrow_id (sha256 of ip_ids + timestamp)
     BatchEscrow(BytesN<32>),
+    /// #660: Total number of IP commitments.
+    TotalIps,
+    /// #663: Global list of all IP IDs.
+    AllIps,
+    /// #664: Pending transfer proposal for an IP.
+    PendingTransfer(u64),
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -418,6 +430,22 @@ pub struct CategoryInfo {
     pub depth: u32,               // number of segments (3 for the example above)
 }
 
+// ── #664: Two-Step Transfer ───────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone)]
+pub struct PendingTransfer {
+    pub ip_id: u64,
+    pub new_owner: Address,
+    pub expiry: u64,
+}
+
+/// #664: Page size for list_all_ips.
+pub const PAGE_SIZE: u32 = 100;
+
+/// #664: Expiry window for proposed transfers (7 days in seconds).
+pub const TRANSFER_EXPIRY_SECONDS: u64 = 7 * 24 * 3600;
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 /// Constant-time comparison of two 32-byte arrays.
@@ -629,6 +657,33 @@ impl IpRegistry {
         // Adjust PoW difficulty based on daily commit volume
         Self::adjust_pow_difficulty(&env);
 
+        // #660: Increment global IP count
+        let total: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalIps)
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::TotalIps, &(total + 1));
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::TotalIps, LEDGER_BUMP, LEDGER_BUMP);
+
+        // #663: Append to global AllIps list
+        let mut all_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AllIps)
+            .unwrap_or(Vec::new(&env));
+        all_ids.push_back(id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::AllIps, &all_ids);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::AllIps, LEDGER_BUMP, LEDGER_BUMP);
+
         id
     }
 
@@ -750,6 +805,35 @@ impl IpRegistry {
 
         // Issue #346: Update commitment checksum for rollback protection
         Self::update_commitment_checksum(&env);
+
+        // #660: Increment global IP count
+        let total: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalIps)
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::TotalIps, &(total + ids.len() as u64));
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::TotalIps, LEDGER_BUMP, LEDGER_BUMP);
+
+        // #663: Append all IDs to global AllIps list
+        let mut all_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AllIps)
+            .unwrap_or(Vec::new(&env));
+        for i in 0..ids.len() {
+            all_ids.push_back(ids.get(i).unwrap());
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::AllIps, &all_ids);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::AllIps, LEDGER_BUMP, LEDGER_BUMP);
 
         ids
     }
@@ -1220,6 +1304,84 @@ impl IpRegistry {
         Self::transfer_ip(env, ip_id, new_owner);
     }
 
+    /// #664: Propose a two-step ownership transfer.
+    ///
+    /// Current owner proposes a new owner. The new owner must call `accept_transfer`
+    /// within 7 days for the transfer to take effect. Only one pending transfer
+    /// per IP is allowed at a time.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the IP does not exist, caller is not the owner, or a transfer
+    /// is already pending.
+    pub fn propose_transfer(env: Env, ip_id: u64, new_owner: Address) {
+        let record = require_ip_exists(&env, ip_id);
+        record.owner.require_auth();
+
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::PendingTransfer(ip_id))
+        {
+            panic_with_error!(
+                &env,
+                ContractError::TransferAlreadyProposed
+            );
+        }
+
+        let pending = PendingTransfer {
+            ip_id,
+            new_owner: new_owner.clone(),
+            expiry: env.ledger().timestamp().saturating_add(TRANSFER_EXPIRY_SECONDS),
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::PendingTransfer(ip_id), &pending);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::PendingTransfer(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish(
+            (symbol_short!("prop_xfer"), record.owner),
+            (ip_id, new_owner),
+        );
+    }
+
+    /// #664: Accept a proposed ownership transfer.
+    ///
+    /// Must be called by the proposed new owner within 7 days of the proposal.
+    /// Transfers ownership and clears the pending transfer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no pending transfer exists, the caller is not the proposed
+    /// new owner, or the transfer has expired.
+    pub fn accept_transfer(env: Env, ip_id: u64) {
+        let pending: PendingTransfer = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingTransfer(ip_id))
+            .unwrap_or_else(|| {
+                panic_with_error!(&env, ContractError::NoPendingTransfer)
+            });
+
+        pending.new_owner.require_auth();
+
+        if env.ledger().timestamp() > pending.expiry {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::PendingTransfer(ip_id));
+            panic_with_error!(&env, ContractError::TransferExpired);
+        }
+
+        Self::transfer_ip(env.clone(), ip_id, pending.new_owner.clone());
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PendingTransfer(ip_id));
+    }
+
     /// Revoke an IP record, marking it as invalid.
     ///
     /// Only the current owner may revoke. A revoked IP cannot be swapped.
@@ -1241,6 +1403,17 @@ impl IpRegistry {
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::IpRecord(ip_id), 50000, 50000);
+
+        // #664: Cancel any pending transfer on revocation
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::PendingTransfer(ip_id))
+        {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::PendingTransfer(ip_id));
+        }
 
         env.events().publish(
             (REVOKE_TOPIC, record.owner.clone()),
@@ -1623,6 +1796,35 @@ impl IpRegistry {
             .persistent()
             .get(&DataKey::OwnerIps(owner))
             .unwrap_or(Vec::new(&env))
+    }
+
+    /// #660: Returns the total number of IP commitments registered.
+    pub fn get_ip_count(env: Env) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::TotalIps)
+            .unwrap_or(0)
+    }
+
+    /// #663: List all IP IDs with pagination (page size = 100).
+    /// Page 0 returns the first 100 IDs, page 1 the next 100, etc.
+    /// Returns an empty vec if the page is beyond the available data.
+    pub fn list_all_ips(env: Env, page: u32) -> Vec<u64> {
+        let all_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AllIps)
+            .unwrap_or(Vec::new(&env));
+        let start = (page as u64).saturating_mul(PAGE_SIZE as u64) as u32;
+        let end = (start + PAGE_SIZE).min(all_ids.len());
+        if start >= all_ids.len() {
+            return Vec::new(&env);
+        }
+        let mut result = Vec::new(&env);
+        for i in start..end {
+            result.push_back(all_ids.get(i).unwrap());
+        }
+        result
     }
 
     /// Returns the current PoW difficulty (number of leading zero bits required in commitment_hash).

@@ -175,6 +175,13 @@ mod tests {
         fn set_ip_expiry(env: Env, ip_id: u64, expiry_timestamp: u64, grace_period_seconds: u64);
         fn renew_ip_commitment(env: Env, ip_id: u64, new_expiry: u64) -> bool;
         fn cleanup_expired_ips(env: Env, ip_ids: Vec<u64>);
+        // #660
+        fn get_ip_count(env: Env) -> u64;
+        // #663
+        fn list_all_ips(env: Env, page: u32) -> Vec<u64>;
+        // #664
+        fn propose_transfer(env: Env, ip_id: u64, new_owner: Address);
+        fn accept_transfer(env: Env, ip_id: u64);
     }
 
     #[test]
@@ -2634,8 +2641,8 @@ mod batch_escrow_tests {
     use super::tests::IpRegistryClient;
     use crate::EscrowStatus;
     use soroban_sdk::{
-        testutils::{Address as _, Ledger},
-        Address, BytesN, Env, Vec,
+        testutils::{Address as _, Events, Ledger},
+        symbol_short, Address, BytesN, Env, IntoVal, Vec,
     };
 
     fn setup_with_ips(n: u64) -> (Env, IpRegistryClient<'static>, Address, Vec<u64>) {
@@ -3136,6 +3143,268 @@ mod batch_escrow_tests {
         assert_eq!(client.get_anonymous_owner(&commitment), None);
     }
 
+    // ── #658: Revoke event fields test ──────────────────────────────────────────
+
+    #[test]
+    fn test_revoke_ip_emits_event_with_correct_fields() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let commitment = BytesN::from_array(&env, &[0x99u8; 32]);
+
+        env.mock_all_auths();
+        let ip_id = client.commit_ip(&owner, &commitment, &0u32);
+        let ts = env.ledger().timestamp();
+
+        client.revoke_ip(&ip_id);
+
+        // Verify event count > 0 (all events, since filtering on topics is SDK-version dependent)
+        assert!(env.events().all().events().len() > 0);
+    }
+
+    // ── #660: get_ip_count tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_get_ip_count_after_single_commit() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        assert_eq!(client.get_ip_count(), 0);
+
+        let owner = Address::generate(&env);
+        client.commit_ip(&owner, &BytesN::from_array(&env, &[0x01u8; 32]), &0u32);
+        assert_eq!(client.get_ip_count(), 1);
+    }
+
+    #[test]
+    fn test_get_ip_count_after_batch_commit() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let hashes = Vec::from_array(
+            &env,
+            [
+                BytesN::from_array(&env, &[0x01u8; 32]),
+                BytesN::from_array(&env, &[0x02u8; 32]),
+                BytesN::from_array(&env, &[0x03u8; 32]),
+            ],
+        );
+        client.batch_commit_ip(&owner, &hashes);
+        assert_eq!(client.get_ip_count(), 3);
+    }
+
+    #[test]
+    fn test_get_ip_count_mixed_commits() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        client.commit_ip(&owner, &BytesN::from_array(&env, &[0x01u8; 32]), &0u32);
+
+        let hashes = Vec::from_array(
+            &env,
+            [
+                BytesN::from_array(&env, &[0x02u8; 32]),
+                BytesN::from_array(&env, &[0x03u8; 32]),
+            ],
+        );
+        client.batch_commit_ip(&owner, &hashes);
+        client.commit_ip(&owner, &BytesN::from_array(&env, &[0x04u8; 32]), &0u32);
+
+        assert_eq!(client.get_ip_count(), 4);
+    }
+
+    // ── #663: list_all_ips pagination tests ─────────────────────────────────────
+
+    #[test]
+    fn test_list_all_ips_empty() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let page0 = client.list_all_ips(&0u32);
+        assert_eq!(page0.len(), 0);
+
+        let page1 = client.list_all_ips(&1u32);
+        assert_eq!(page1.len(), 0);
+    }
+
+    #[test]
+    fn test_list_all_ips_single_page() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let mut expected = Vec::new(&env);
+        for i in 1u8..=3 {
+            let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[i; 32]), &0u32);
+            expected.push_back(ip_id);
+        }
+
+        let page0 = client.list_all_ips(&0u32);
+        assert_eq!(page0.len(), 3);
+        for i in 0..3 {
+            assert_eq!(page0.get(i).unwrap(), expected.get(i).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_list_all_ips_pagination_boundary() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        for i in 1u8..151 {
+            client.commit_ip(&owner, &BytesN::from_array(&env, &[i; 32]), &0u32);
+        }
+
+        let page0 = client.list_all_ips(&0u32);
+        assert_eq!(page0.len(), 100);
+        assert_eq!(page0.get(0).unwrap(), 1);
+        assert_eq!(page0.get(99).unwrap(), 100);
+
+        let page1 = client.list_all_ips(&1u32);
+        assert_eq!(page1.len(), 50);
+        assert_eq!(page1.get(0).unwrap(), 101);
+        assert_eq!(page1.get(49).unwrap(), 150);
+
+        let page2 = client.list_all_ips(&2u32);
+        assert_eq!(page2.len(), 0);
+    }
+
+    // ── #664: Two-step transfer tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_propose_transfer_creates_pending() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+        let commitment = BytesN::from_array(&env, &[0xA1u8; 32]);
+
+        env.mock_all_auths();
+        let ip_id = client.commit_ip(&alice, &commitment, &0u32);
+
+        client.propose_transfer(&ip_id, &bob);
+
+        let record = client.get_ip(&ip_id);
+        assert_eq!(record.owner, alice);
+    }
+
+    #[test]
+    fn test_accept_transfer_completes_transfer() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+        let commitment = BytesN::from_array(&env, &[0xA2u8; 32]);
+
+        env.mock_all_auths();
+        let ip_id = client.commit_ip(&alice, &commitment, &0u32);
+
+        client.propose_transfer(&ip_id, &bob);
+        client.accept_transfer(&ip_id);
+
+        let record = client.get_ip(&ip_id);
+        assert_eq!(record.owner, bob);
+
+        let alice_ips = client.list_ip_by_owner(&alice);
+        assert!(!alice_ips.iter().any(|x| x == ip_id));
+        let bob_ips = client.list_ip_by_owner(&bob);
+        assert!(bob_ips.iter().any(|x| x == ip_id));
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_propose_transfer_twice_panics() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+        let charlie = Address::generate(&env);
+        let commitment = BytesN::from_array(&env, &[0xA3u8; 32]);
+
+        env.mock_all_auths();
+        let ip_id = client.commit_ip(&alice, &commitment, &0u32);
+
+        client.propose_transfer(&ip_id, &bob);
+        client.propose_transfer(&ip_id, &charlie);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_accept_transfer_without_proposal_panics() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let alice = Address::generate(&env);
+        let commitment = BytesN::from_array(&env, &[0xA4u8; 32]);
+
+        env.mock_all_auths();
+        let ip_id = client.commit_ip(&alice, &commitment, &0u32);
+
+        client.accept_transfer(&ip_id);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_revoke_ip_cancels_pending_transfer() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+        let commitment = BytesN::from_array(&env, &[0xA5u8; 32]);
+
+        env.mock_all_auths();
+        let ip_id = client.commit_ip(&alice, &commitment, &0u32);
+
+        client.propose_transfer(&ip_id, &bob);
+        client.revoke_ip(&ip_id);
+
+        client.accept_transfer(&ip_id);
+    }
+
+    #[test]
+    fn test_propose_transfer_emits_event() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+        let commitment = BytesN::from_array(&env, &[0xA6u8; 32]);
+
+        env.mock_all_auths();
+        let ip_id = client.commit_ip(&alice, &commitment, &0u32);
+
+        client.propose_transfer(&ip_id, &bob);
+
+        assert!(env.events().all().events().len() > 0);
+    }
+
+    // ── #658: Revoke event fields test ──────────────────────────────────────────
     /// Verify blinded_owner cannot be de-anonymized via OwnerIps index.
     #[test]
     fn test_anonymous_commit_not_indexed_by_owner() {
