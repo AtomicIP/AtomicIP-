@@ -95,6 +95,13 @@ pub struct CoOwnerRemovedEvent {
     pub co_owner: Address,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum CommitmentState {
+    Active(Address),
+    Revoked,
+}
+
 /// Issue #433: Challenge record for ownership proof challenge-response.
 #[contracttype]
 #[derive(Clone)]

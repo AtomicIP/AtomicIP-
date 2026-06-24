@@ -86,6 +86,7 @@ pub enum ContractError {
     BatchTooLarge = 51,
     BatchSizeMismatch = 52,
     ConditionNotMet = 53,
+    SellerSwapLimitExceeded = 54,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -96,6 +97,9 @@ pub const LEDGER_BUMP: u32 = 6_307_200;
 
 /// Maximum number of items allowed in a single batch operation.
 pub const MAX_BATCH_SIZE: u32 = 50;
+
+/// Maximum number of open (Pending/Accepted) swaps a single seller may have.
+pub const MAX_SWAPS_PER_SELLER: u32 = 100;
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
 
@@ -179,6 +183,10 @@ pub enum DataKey {
     SwapArbitrator(u64),
     /// #313: Maps swap_id → Vec<BytesN<32>> of dispute evidence hashes.
     DisputeEvidence(u64),
+    /// #674: Global counter incremented on every initiated swap.
+    TotalSwaps,
+    /// #675: Tracks the number of open (Pending/Accepted) swaps per seller Address.
+    OpenSwapCount(Address),
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -429,6 +437,17 @@ impl AtomicSwap {
         // Guard: price must be positive.
         require_positive_price(&env, price);
 
+        // #675: Reject if seller already has the maximum number of active swaps
+        let open: u32 = env.storage()
+            .persistent()
+            .get(&DataKey::OpenSwapCount(seller.clone()))
+            .unwrap_or(0);
+        if open >= MAX_SWAPS_PER_SELLER {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::SellerSwapLimitExceeded as u32,
+            ));
+        }
+
         // Verify seller owns the IP and it's not revoked
         registry::ensure_seller_owns_active_ip(&env, ip_id, &seller);
 
@@ -509,6 +528,20 @@ impl AtomicSwap {
         Self::append_history(&env, id, SwapStatus::Pending);
 
         env.storage().instance().set(&DataKey::NextId, &(id + 1));
+
+        // #674: Increment global swap counter
+        let total: u64 = env.storage().instance().get(&DataKey::TotalSwaps).unwrap_or(0);
+        env.storage().instance().set(&DataKey::TotalSwaps, &(total + 1));
+
+        // #675: Increment seller's open-swap counter
+        env.storage()
+            .persistent()
+            .set(&DataKey::OpenSwapCount(seller.clone()), &(open + 1));
+        env.storage().persistent().extend_ttl(
+            &DataKey::OpenSwapCount(seller.clone()),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
 
         env.events().publish(
             (soroban_sdk::symbol_short!("swap_init"),),
@@ -797,6 +830,9 @@ impl AtomicSwap {
         swap.status = SwapStatus::Completed;
         swap::save_swap(&env, swap_id, &swap);
 
+        // #675: Decrement seller's open-swap counter
+        swap::decrement_open_swap_count(&env, &swap.seller);
+
         // Record completion timestamp for rollback window
         let completion_ts = env.ledger().timestamp();
         env.storage()
@@ -964,6 +1000,7 @@ impl AtomicSwap {
             env.storage()
                 .persistent()
                 .remove(&DataKey::ActiveSwap(swap.ip_id));
+            swap::decrement_open_swap_count(&env, &swap.seller);
             token_client.transfer(&env.current_contract_address(), &swap.buyer, &swap.price);
             env.storage().persistent().set(
                 &DataKey::CancelReason(swap_id),
@@ -975,6 +1012,7 @@ impl AtomicSwap {
             env.storage()
                 .persistent()
                 .remove(&DataKey::ActiveSwap(swap.ip_id));
+            swap::decrement_open_swap_count(&env, &swap.seller);
             let config = Self::protocol_config(&env);
             let fee_amount = if config.protocol_fee_bps > 0 {
                 (swap.price * config.protocol_fee_bps as i128) / 10000
@@ -1066,6 +1104,9 @@ impl AtomicSwap {
         env.storage()
             .persistent()
             .remove(&DataKey::ActiveSwap(swap.ip_id));
+
+        // #675: Decrement seller's open-swap counter
+        swap::decrement_open_swap_count(&env, &swap.seller);
 
         // Store rollback reason
         env.storage()
@@ -1576,6 +1617,9 @@ impl AtomicSwap {
             .persistent()
             .remove(&DataKey::ActiveSwap(swap.ip_id));
 
+        // #675: Decrement seller's open-swap counter
+        swap::decrement_open_swap_count(&env, &swap.seller);
+
         // #253: Log history entry
         Self::append_history(&env, swap_id, SwapStatus::Cancelled);
 
@@ -1606,6 +1650,9 @@ impl AtomicSwap {
         env.storage()
             .persistent()
             .remove(&DataKey::ActiveSwap(swap.ip_id));
+
+        // #675: Decrement seller's open-swap counter
+        swap::decrement_open_swap_count(&env, &swap.seller);
 
         let token_client = token::Client::new(&env, &swap.token);
 
@@ -1961,6 +2008,11 @@ impl AtomicSwap {
         env.storage().instance().get(&DataKey::NextId).unwrap_or(0)
     }
 
+    /// Returns the total number of swaps ever initiated (via TotalSwaps counter).
+    pub fn get_swap_count(env: Env) -> u64 {
+        env.storage().instance().get(&DataKey::TotalSwaps).unwrap_or(0)
+    }
+
     // ── #251: Buyer cancel pending swap on timeout ────────────────────────────
 
     /// Buyer cancels a Pending swap after its expiry. No funds are escrowed at
@@ -1983,6 +2035,9 @@ impl AtomicSwap {
         env.storage()
             .persistent()
             .remove(&DataKey::ActiveSwap(swap.ip_id));
+
+        // #675: Decrement seller's open-swap counter
+        swap::decrement_open_swap_count(&env, &swap.seller);
 
         Self::append_history(&env, swap_id, SwapStatus::Cancelled);
 

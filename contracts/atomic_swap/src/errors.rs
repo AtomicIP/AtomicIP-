@@ -51,6 +51,8 @@ pub enum ContractError {
     NoArbitratorSet                       = 37,
     // #313: Dispute evidence errors
     UnauthorizedEvidenceSubmitter         = 38,
+    /// #675: Seller has reached the maximum number of active swaps.
+    SellerSwapLimitExceeded               = 54,
     // Partial quantity swap errors
     InvalidQuantity                       = 39,
     InvalidReferralFeeBps                 = 61,

@@ -3,7 +3,7 @@
 //! This module provides reusable validation functions to reduce code duplication
 //! and ensure consistent error handling across the contract.
 
-use crate::{ContractError, DataKey, IpRecord};
+use crate::{CommitmentState, ContractError, DataKey, IpRecord};
 use soroban_sdk::{symbol_short, Address, BytesN, Env, Error};
 
 /// Retrieves an IP record by ID, panicking if not found.
@@ -60,16 +60,20 @@ pub fn require_non_zero_commitment(env: &Env, commitment_hash: &BytesN<32>) {
 ///
 /// Panics with `CommitmentAlreadyRegistered` error if the hash is already registered.
 pub fn require_unique_commitment(env: &Env, commitment_hash: &BytesN<32>) {
-    if let Some(existing_owner) = env
+    if let Some(state) = env
         .storage()
         .persistent()
-        .get::<DataKey, Address>(&DataKey::CommitmentOwner(commitment_hash.clone()))
+        .get::<DataKey, CommitmentState>(&DataKey::CommitmentOwner(commitment_hash.clone()))
     {
         // Emit event so callers can identify the existing owner
+        let owner = match &state {
+            CommitmentState::Active(addr) => addr.clone(),
+            CommitmentState::Revoked => env.current_contract_address(),
+        };
         #[allow(deprecated)]
         env.events().publish(
             (symbol_short!("collision"), commitment_hash.clone()),
-            existing_owner,
+            owner,
         );
         env.panic_with_error(Error::from_contract_error(
             ContractError::CommitmentAlreadyRegistered as u32,

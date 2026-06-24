@@ -7,6 +7,10 @@ use soroban_sdk::{contracttype, Address, BytesN, Vec};
 #[allow(dead_code)]
 pub const LEDGER_BUMP: u32 = 6_307_200;
 
+/// Maximum number of active (Pending/Accepted) swaps a single seller may have open.
+#[allow(dead_code)]
+pub const MAX_SWAPS_PER_SELLER: u32 = 100;
+
 // ── Storage Keys ──────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -65,6 +69,10 @@ pub enum DataKey {
     TimeoutExtension(u64),
     /// #523: Maps batch fingerprint → Vec<u64> of swap IDs for idempotent batch results.
     BatchSwapResult(BytesN<32>),
+    /// Global counter incremented on every initiated swap.
+    TotalSwaps,
+    /// #675: Tracks the number of open (Pending/Accepted) swaps per seller Address.
+    OpenSwapCount(Address),
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────

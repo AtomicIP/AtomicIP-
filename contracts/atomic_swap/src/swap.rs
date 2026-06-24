@@ -50,3 +50,22 @@ pub fn append_swap_for_party(env: &Env, seller: &Address, buyer: &Address, swap_
         LEDGER_BUMP,
     );
 }
+
+/// Decrement the seller's open-swap counter when a swap reaches a terminal state.
+/// Clamped to zero to guard against underflow in edge cases.
+pub fn decrement_open_swap_count(env: &Env, seller: &Address) {
+    let count: u32 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::OpenSwapCount(seller.clone()))
+        .unwrap_or(0);
+    let new_count = count.saturating_sub(1);
+    env.storage()
+        .persistent()
+        .set(&DataKey::OpenSwapCount(seller.clone()), &new_count);
+    env.storage().persistent().extend_ttl(
+        &DataKey::OpenSwapCount(seller.clone()),
+        LEDGER_BUMP,
+        LEDGER_BUMP,
+    );
+}

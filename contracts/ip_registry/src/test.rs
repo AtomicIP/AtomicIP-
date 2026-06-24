@@ -174,7 +174,7 @@ mod tests {
         fn check_ip_access(env: Env, ip_id: u64, grantee: Address, required_level: u32) -> bool;
         fn set_ip_expiry(env: Env, ip_id: u64, expiry_timestamp: u64, grace_period_seconds: u64);
         fn renew_ip_commitment(env: Env, ip_id: u64, new_expiry: u64) -> bool;
-        fn cleanup_expired_ips(env: Env, ip_ids: Vec<u64>);
+        fn cleanup_expired_ips(env: Env, start_id: u64, limit: u32) -> (u32, u64);
     }
 
     #[test]
@@ -2490,12 +2490,12 @@ mod expiry_tests {
         // Advance time past expiry + grace
         env.ledger().with_mut(|l| l.timestamp = now + 200);
 
-        let mut ids = Vec::new(&env);
-        ids.push_back(ip_id);
-        client.cleanup_expired_ips(&ids);
+        let (cleaned, next) = client.cleanup_expired_ips(&ip_id, &1);
 
         // Record should be gone
         assert!(client.try_get_ip(&ip_id).is_err());
+        assert_eq!(cleaned, 1);
+        assert_eq!(next, ip_id + 1);
     }
 
     #[test]
@@ -2507,12 +2507,12 @@ mod expiry_tests {
         // Advance past expiry but still within grace
         env.ledger().with_mut(|l| l.timestamp = now + 150);
 
-        let mut ids = Vec::new(&env);
-        ids.push_back(ip_id);
-        client.cleanup_expired_ips(&ids);
+        let (cleaned, next) = client.cleanup_expired_ips(&ip_id, &1);
 
         // Record should still exist
         assert_eq!(client.get_ip(&ip_id).ip_id, ip_id);
+        assert_eq!(cleaned, 0);
+        assert_eq!(next, ip_id + 1);
     }
 
     #[test]
@@ -2521,12 +2521,12 @@ mod expiry_tests {
         // No expiry set (expiry_timestamp == 0)
         env.ledger().with_mut(|l| l.timestamp = 9_999_999);
 
-        let mut ids = Vec::new(&env);
-        ids.push_back(ip_id);
-        client.cleanup_expired_ips(&ids);
+        let (cleaned, next) = client.cleanup_expired_ips(&ip_id, &1);
 
         // Record must still exist
         assert_eq!(client.get_ip(&ip_id).ip_id, ip_id);
+        assert_eq!(cleaned, 0);
+        assert_eq!(next, ip_id + 1);
     }
 
     #[test]
@@ -2549,13 +2549,52 @@ mod expiry_tests {
         client.set_ip_expiry(&ip_id, &(now + 100), &0);
         env.ledger().with_mut(|l| l.timestamp = now + 200);
 
-        let mut ids = Vec::new(&env);
-        ids.push_back(ip_id);
-        client.cleanup_expired_ips(&ids);
+        client.cleanup_expired_ips(&ip_id, &1);
 
         // Verify at least one event was emitted (set_ip_expiry + cleanup_expired_ips).
         let events = env.events().all();
         assert!(events.events().len() >= 1, "ip_clean event must be emitted");
+    }
+
+    #[test]
+    fn test_cleanup_partial_range() {
+        let (env, client, owner, _) = setup();
+        let now = env.ledger().timestamp();
+
+        // Create 3 IPs with expiry
+        let hash1 = BytesN::from_array(&env, &[1u8; 32]);
+        let id1 = client.commit_ip(&owner, &hash1, &0);
+        client.set_ip_expiry(&id1, &(now + 100), &0);
+
+        let hash2 = BytesN::from_array(&env, &[2u8; 32]);
+        let id2 = client.commit_ip(&owner, &hash2, &0);
+        client.set_ip_expiry(&id2, &(now + 100), &0);
+
+        let hash3 = BytesN::from_array(&env, &[3u8; 32]);
+        let id3 = client.commit_ip(&owner, &hash3, &0);
+        client.set_ip_expiry(&id3, &(now + 100), &0);
+
+        // Advance past expiry
+        env.ledger().with_mut(|l| l.timestamp = now + 200);
+
+        // Clean only 2 starting from id1
+        let (cleaned, next) = client.cleanup_expired_ips(&id1, &2);
+        assert_eq!(cleaned, 2);
+        assert_eq!(next, id1 + 2);
+
+        // First 2 should be gone, third should remain
+        assert!(client.try_get_ip(&id1).is_err());
+        assert!(client.try_get_ip(&id2).is_err());
+        assert_eq!(client.get_ip(&id3).ip_id, id3);
+    }
+
+    #[test]
+    fn test_cleanup_empty_range() {
+        let (env, client, _owner, _) = setup();
+        // No IPs exist at high IDs
+        let (cleaned, next) = client.cleanup_expired_ips(&999_999, &10);
+        assert_eq!(cleaned, 0);
+        assert_eq!(next, 999_999 + 10);
     }
 }
 

@@ -585,29 +585,20 @@ impl IpRegistry {
         );
 
         // Track commitment hash ownership and extend TTL
+        let commitment_state = CommitmentState::Active(owner.clone());
         env.storage()
             .persistent()
-            .set(&DataKey::CommitmentOwner(commitment_hash.clone()), &owner);
+            .set(&DataKey::CommitmentOwner(commitment_hash.clone()), &commitment_state);
         env.storage().persistent().extend_ttl(
             &DataKey::CommitmentOwner(commitment_hash.clone()),
-            50000,
-            50000,
+            LEDGER_BUMP,
+            LEDGER_BUMP,
         );
 
         env.storage().persistent().set(&DataKey::NextId, &(id + 1));
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::NextId, LEDGER_BUMP, LEDGER_BUMP);
-
-        // Track commitment → owner mapping (for duplicate detection and transfer)
-        env.storage()
-            .persistent()
-            .set(&DataKey::CommitmentOwner(commitment_hash.clone()), &owner);
-        env.storage().persistent().extend_ttl(
-            &DataKey::CommitmentOwner(commitment_hash.clone()),
-            LEDGER_BUMP,
-            LEDGER_BUMP,
-        );
 
         env.events().publish(
             (symbol_short!("ip_commit"), owner.clone()),
@@ -1241,6 +1232,17 @@ impl IpRegistry {
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::IpRecord(ip_id), 50000, 50000);
+
+        // Permanently lock the commitment hash — revoked hashes cannot be re-registered
+        let commitment_state = CommitmentState::Revoked;
+        env.storage()
+            .persistent()
+            .set(&DataKey::CommitmentOwner(record.commitment_hash.clone()), &commitment_state);
+        env.storage().persistent().extend_ttl(
+            &DataKey::CommitmentOwner(record.commitment_hash.clone()),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
 
         env.events().publish(
             (REVOKE_TOPIC, record.owner.clone()),
@@ -4633,28 +4635,34 @@ impl IpRegistry {
         true
     }
 
-    /// Remove expired IPs that are past their grace period. Anyone can call.
-    /// Skips IPs with expiry_timestamp == 0 (no expiry set).
-    pub fn cleanup_expired_ips(env: Env, ip_ids: Vec<u64>) {
+    /// Scan a range of IP IDs starting from `start_id`, cleaning up those past
+    /// their grace period.  Returns `(count_cleaned, next_start_id)`.
+    /// `next_start_id` is the next ID to scan (0 means exhaust the range).
+    /// Anyone can call.
+    pub fn cleanup_expired_ips(env: Env, start_id: u64, limit: u32) -> (u32, u64) {
         let now = env.ledger().timestamp();
-        for ip_id in ip_ids.iter() {
+        let mut cleaned: u32 = 0;
+        let mut next: u64 = start_id;
+        let end = start_id.saturating_add(limit as u64);
+        while next < end {
             let record: Option<IpRecord> =
-                env.storage().persistent().get(&DataKey::IpRecord(ip_id));
+                env.storage().persistent().get(&DataKey::IpRecord(next));
             if let Some(rec) = record {
-                if rec.expiry_timestamp == 0 {
-                    continue;
-                }
-                if now
-                    >= rec
-                        .expiry_timestamp
-                        .saturating_add(rec.grace_period_seconds)
+                if rec.expiry_timestamp != 0
+                    && now
+                        >= rec
+                            .expiry_timestamp
+                            .saturating_add(rec.grace_period_seconds)
                 {
-                    env.storage().persistent().remove(&DataKey::IpRecord(ip_id));
+                    env.storage().persistent().remove(&DataKey::IpRecord(next));
                     env.events()
-                        .publish((symbol_short!("ip_clean"),), (ip_id, now));
+                        .publish((symbol_short!("ip_clean"),), (next, now));
+                    cleaned += 1;
                 }
             }
+            next += 1;
         }
+        (cleaned, next)
     }
 }
 
