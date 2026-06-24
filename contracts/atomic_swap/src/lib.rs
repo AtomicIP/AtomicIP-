@@ -4837,7 +4837,7 @@ impl AtomicSwap {
 // mod benchmarks;
 
 // #[cfg(test)]
-// mod mutation_tests;
+mod mutation_tests;
 
 // #[cfg(test)]
 // mod snapshot_tests;

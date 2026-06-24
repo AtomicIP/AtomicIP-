@@ -59,5 +59,8 @@ pub mod versioning;
 pub mod webhook;
 pub mod websocket;
 pub mod dependency_injection;
+pub mod error_recovery;
+pub mod fallback;
+pub mod response;
 pub mod validation;
 pub mod validation_middleware;

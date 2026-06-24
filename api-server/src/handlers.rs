@@ -320,10 +320,13 @@ pub async fn batch_initiate_swap(Json(body): Json<BatchInitiateSwapRequest>) -> 
     // #523: Return cached result if the caller supplied a matching idempotency key.
     if let Some(ref key) = body.idempotency_key {
         if let Some(entry) = BATCH_SWAP_IDEMPOTENCY.get(key.as_str()) {
-            let cached: &serde_json::Value = &entry.0;
-            let ts: &tokio::time::Instant = &entry.1;
-            if ts.elapsed() < Duration::from_secs(3600) {
-                if let Ok(response) = serde_json::from_value::<BatchInitiateSwapResponse>(cached.clone()) {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let age = now.saturating_sub(entry.cached_at);
+            if age < 24 * 60 * 60 {
+                if let Ok(response) = serde_json::from_value::<BatchInitiateSwapResponse>(entry.body.clone()) {
                     return Ok(Json(response));
                 }
             } else {
@@ -334,7 +337,8 @@ pub async fn batch_initiate_swap(Json(body): Json<BatchInitiateSwapRequest>) -> 
     }
 
     // TODO: Call Soroban RPC to invoke atomic_swap.batch_initiate_swap
-    // On success, cache the result: BATCH_SWAP_IDEMPOTENCY.insert(key, (json_value, Instant::now()));
+    // On success, cache the result: let cached = deduplication::CachedResponse { body: json_value, status_code: 200, headers: vec![], cached_at: now };
+    // BATCH_SWAP_IDEMPOTENCY.insert(key.clone(), cached);
     Err((
         StatusCode::BAD_REQUEST,
         Json(ErrorResponse {
