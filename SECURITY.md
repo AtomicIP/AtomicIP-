@@ -142,11 +142,134 @@ We plan to launch a bug bounty program after mainnet launch. Rewards will be bas
 
 Details will be published at [bugbounty.atomicip.io](https://bugbounty.atomicip.io) when the program launches.
 
+## Compliance and Data Protection (#634)
+
+### GDPR Compliance
+
+AtomicIP is designed to comply with the General Data Protection Regulation (GDPR) requirements for user data protection.
+
+#### Data Controller and Processor
+
+- **Data Controller**: AtomicIP Foundation (contact@atomicip.io)
+- **Data Processor**: Stellar Network (for on-chain data)
+- **Data Protection Officer**: dpo@atomicip.io
+
+#### Data Collected
+
+| Data Type | Purpose | Retention Period | Storage Location |
+|-----------|---------|-----------------|-----------------|
+| Stellar Public Address | IP ownership, swap identification | 90 days (off-chain cache) | In-memory cache + Stellar ledger |
+| Commitment Hash | IP timestamping proof | Indefinite (on-chain) | Stellar ledger |
+| Swap Records | Patent sale execution | 365 days (off-chain cache) | In-memory cache + Stellar ledger |
+| Audit Logs | Security monitoring | 365 days | In-memory audit store |
+| IP Address (HTTP) | Rate limiting, abuse prevention | Session only | Runtime memory |
+| Request Signatures | Request authentication | Session only | Runtime memory |
+
+#### GDPR Rights Implementation
+
+| GDPR Article | Right | Implementation | Endpoint |
+|---|---|---|---|
+| Art. 15 | Right of Access | Data export endpoint returns all user data | `POST /v1/gdpr/export` |
+| Art. 16 | Right to Rectification | User can update commitment metadata | Via Stellar transaction |
+| Art. 17 | Right to Erasure | Data deletion cascade for user records | `POST /v1/gdpr/delete` |
+| Art. 18 | Right to Restrict Processing | Opt-out of non-essential processing | Contact DPO |
+| Art. 20 | Right to Data Portability | Machine-readable JSON export | `POST /v1/gdpr/export` |
+| Art. 21 | Right to Object | Object to data processing | Contact DPO |
+| Art. 22 | Automated Decision-Making | Atomic swaps are user-initiated | N/A |
+
+#### Data Retention Policy
+
+| Data Category | Retention Period | Rationale |
+|---|---|---|
+| IP Records (on-chain) | Indefinite (ledger) | Immutable blockchain requirement |
+| IP Records (cache) | 60 seconds | Cache TTL for performance |
+| Swap Records (on-chain) | Indefinite (ledger) | Immutable blockchain requirement |
+| Swap Records (cache) | 30 seconds | Cache TTL for performance |
+| Audit Logs | 365 days | Security monitoring compliance |
+| Webhook Event Records | 7 days | Delivery tracking and debugging |
+| Rate Limiter State | 15 minutes | Abuse prevention |
+| Idempotency Keys | 1 hour | Duplicate request prevention |
+
+#### Data Deletion Cascade
+
+When a user requests data deletion (`POST /v1/gdpr/delete`), the following actions occur:
+
+1. **Cache Invalidation**: All cached IP lists, swap lists, and reputation data for the user are immediately invalidated
+2. **On-Chain Data**: Smart contract data (IP records, swaps) cannot be deleted from the immutable ledger, but IP records can be revoked
+3. **Audit Log**: Audit events linked to the user are anonymized
+4. **Webhook Events**: Pending webhook deliveries for the user are cancelled
+5. **Confirmation Required**: The request must include a `confirmation: "DELETE"` field to prevent accidental deletions
+
+#### Data Export Format
+
+Data export responses (`POST /v1/gdpr/export`) include:
+- User's Stellar address
+- All IP records owned by the user
+- All swap records involving the user
+- All audit events linked to the user
+- Export timestamp and data retention period
+
+### Accessibility Compliance
+
+API responses are designed to be accessible to all clients:
+
+- **JSON Schema Consistency**: All responses use snake_case field names, consistent pagination structure, and machine-readable data types
+- **Error Format Consistency**: All errors return `{"error": "message"}` JSON format
+- **Content-Type**: All responses use `application/json` content type
+- **Version Negotiation**: Clients can specify API version via `Accept-Version` or `X-API-Version` headers
+- **Public Endpoints**: Health, docs, and version endpoints require no authentication
+- **Minimal Payloads**: All mutation endpoints accept minimal payloads with only required fields
+- **Machine-Readable Timestamps**: All timestamps use Unix epoch (u64 seconds)
+- **Nullable Fields**: Nullable fields use explicit `null` instead of field absence
+
+### WCAG Compliance for API
+
+While WCAG (Web Content Accessibility Guidelines) primarily applies to user interfaces, our API follows accessibility best practices:
+
+1. **Perceivable**: JSON responses are machine-readable and parseable by any HTTP client
+2. **Operable**: All endpoints are navigable via URI patterns; pagination prevents timeout
+3. **Understandable**: Consistent error formats, snake_case naming, and semantic versioning
+4. **Robust**: Responses include all required fields even when empty; content negotiation via Accept header
+
+### Data Protection Impact Assessment (DPIA)
+
+A Data Protection Impact Assessment has been conducted for the following processing activities:
+
+- IP commitment and ownership tracking (on-chain)
+- Atomic swap execution (on-chain)
+- API request logging and audit trails
+- Webhook event delivery
+
+**Risk Level**: Medium — The system primarily processes cryptographic hashes and Stellar addresses, not personal identifiable information (PII). The immutable nature of blockchain data is mitigated by the use of commitment hashes rather than raw content.
+
+### Breach Notification Procedure
+
+In the event of a data breach:
+
+1. Internal detection and verification (within 24 hours)
+2. Containment measures applied
+3. Supervisory authority notification (within 72 hours per GDPR Art. 33)
+4. Affected users notified (without undue delay per GDPR Art. 34)
+5. Post-incident review and remediation
+
+### Compliance Testing
+
+Automated compliance tests run in CI/CD to verify:
+
+- Error response format compliance
+- Health endpoint required fields
+- API versioning enforcement
+- GDPR data export and deletion request validation
+- Data retention policy declaration
+- Cache invalidation on data deletion
+- JSON schema consistency
+- Webhook delivery status tracking
+
 ## Legal
 
 This security policy is subject to our [Terms of Service](https://atomicip.io/terms) and [Privacy Policy](https://atomicip.io/privacy).
 
 ---
 
-**Last Updated**: 2026-03-27
-**Version**: 1.0.0
+**Last Updated**: 2026-06-24
+**Version**: 2.0.0

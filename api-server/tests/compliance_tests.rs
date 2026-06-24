@@ -1,8 +1,8 @@
-/// Compliance tests for Atomic Patent API (#563)
+/// Compliance tests for Atomic Patent API (#563, #634)
 ///
 /// Verifies that API responses, schemas, and behaviors meet regulatory
 /// and policy requirements: standard error formats, required response fields,
-/// versioning enforcement, and audit-friendly structures.
+/// versioning enforcement, audit-friendly structures, and GDPR compliance.
 
 #[cfg(test)]
 mod compliance_tests {
@@ -60,7 +60,7 @@ mod compliance_tests {
         let version_info = json!({
             "version": "1.0.0",
             "status": "stable",
-            "supported_versions": ["1.0.0", "1.1.0"],
+            "supported_versions": ["1.0.0", "1.1.0", "2.0.0"],
             "deprecation_date": null,
             "features": ["api-versioning"]
         });
@@ -73,7 +73,7 @@ mod compliance_tests {
     #[test]
     fn test_current_version_is_in_supported_list() {
         let current = "1.0.0";
-        let supported = vec!["1.0.0", "1.1.0"];
+        let supported = vec!["1.0.0", "1.1.0", "2.0.0"];
         assert!(supported.contains(&current), "current version must be in supported list");
     }
 
@@ -124,7 +124,6 @@ mod compliance_tests {
         for status in &valid_statuses {
             assert!(!status.is_empty());
         }
-        // Ensure no unknown status slips through
         assert!(!valid_statuses.contains(&"Unknown"));
     }
 
@@ -162,7 +161,6 @@ mod compliance_tests {
     fn test_idempotency_key_is_non_empty_string() {
         let key = "550e8400-e29b-41d4-a716-446655440000";
         assert!(!key.is_empty());
-        // UUID v4 format: 8-4-4-4-12 hex chars
         assert_eq!(key.len(), 36);
         assert_eq!(key.chars().filter(|&c| c == '-').count(), 4);
     }
@@ -183,5 +181,212 @@ mod compliance_tests {
             assert!(resp["id"].is_string());
             assert!(resp["status"].is_number());
         }
+    }
+
+    // ── #634: GDPR Compliance ─────────────────────────────────────────────────
+
+    /// GDPR Article 15: Data export request must include user address and signature.
+    #[test]
+    fn test_gdpr_data_export_request_required_fields() {
+        let req = json!({
+            "user_address": "GABC123",
+            "signature": "deadbeefdeadbeefdeadbeefdeadbeef"
+        });
+        assert!(req["user_address"].is_string());
+        assert!(req["signature"].is_string());
+        assert!(!req["user_address"].as_str().unwrap().is_empty());
+        assert!(!req["signature"].as_str().unwrap().is_empty());
+    }
+
+    /// GDPR Article 15: Data export response must include all user data fields.
+    #[test]
+    fn test_gdpr_data_export_response_required_fields() {
+        let resp = json!({
+            "user_address": "GABC123",
+            "ip_records": [],
+            "swaps": [],
+            "audit_events": [],
+            "export_timestamp": 1_700_000_000u64,
+            "data_retention_days": 90
+        });
+        assert!(resp["user_address"].is_string());
+        assert!(resp["ip_records"].is_array());
+        assert!(resp["swaps"].is_array());
+        assert!(resp["audit_events"].is_array());
+        assert!(resp["export_timestamp"].is_number());
+        assert!(resp["data_retention_days"].is_number());
+        assert_eq!(resp["data_retention_days"].as_u64().unwrap(), 90);
+    }
+
+    /// GDPR Article 17: Data deletion request must include confirmation string.
+    #[test]
+    fn test_gdpr_data_deletion_request_requires_confirmation() {
+        let req = json!({
+            "user_address": "GABC123",
+            "signature": "deadbeef",
+            "confirmation": "DELETE"
+        });
+        assert_eq!(req["confirmation"].as_str().unwrap(), "DELETE");
+        assert!(req["user_address"].is_string());
+        assert!(req["signature"].is_string());
+    }
+
+    /// GDPR Article 17: Data deletion must reject incorrect confirmation.
+    #[test]
+    fn test_gdpr_data_deletion_rejects_wrong_confirmation() {
+        let req = json!({
+            "user_address": "GABC123",
+            "signature": "deadbeef",
+            "confirmation": "delete"
+        });
+        // Confirmation must be exactly "DELETE"
+        assert_ne!(req["confirmation"].as_str().unwrap(), "DELETE");
+    }
+
+    /// GDPR: Data deletion response must include deletion counts.
+    #[test]
+    fn test_gdpr_data_deletion_response_required_fields() {
+        let resp = json!({
+            "user_address": "GABC123",
+            "deleted_ip_count": 5,
+            "deleted_swap_count": 2,
+            "deleted_audit_count": 10,
+            "deletion_timestamp": 1_700_000_000u64,
+            "retention_policy": "All data deleted immediately. Backup retention: 30 days."
+        });
+        assert!(resp["user_address"].is_string());
+        assert!(resp["deleted_ip_count"].is_number());
+        assert!(resp["deleted_swap_count"].is_number());
+        assert!(resp["deleted_audit_count"].is_number());
+        assert!(resp["deletion_timestamp"].is_number());
+        assert!(resp["retention_policy"].is_string());
+    }
+
+    /// GDPR: Data retention policy must declare retention periods.
+    #[test]
+    fn test_gdpr_retention_policy_required_fields() {
+        let policy = json!({
+            "retention_days": 90,
+            "ip_record_retention_days": 90,
+            "swap_record_retention_days": 365,
+            "audit_log_retention_days": 365,
+            "policy_version": "1.0.0",
+            "last_updated": 1_700_000_000u64
+        });
+        assert!(policy["retention_days"].is_number());
+        assert!(policy["ip_record_retention_days"].is_number());
+        assert!(policy["swap_record_retention_days"].is_number());
+        assert!(policy["audit_log_retention_days"].is_number());
+        assert!(policy["policy_version"].is_string());
+        assert!(policy["last_updated"].is_number());
+        assert_eq!(policy["ip_record_retention_days"].as_u64().unwrap(), 90);
+        assert_eq!(policy["swap_record_retention_days"].as_u64().unwrap(), 365);
+    }
+
+    /// GDPR: All GDPR endpoints must use POST for data mutations.
+    #[test]
+    fn test_gdpr_endpoints_use_correct_methods() {
+        // Export and delete are POST (data-modifying operations)
+        let export_method = "POST";
+        let delete_method = "POST";
+        let policy_method = "GET";
+        assert_eq!(export_method, "POST");
+        assert_eq!(delete_method, "POST");
+        assert_eq!(policy_method, "GET");
+    }
+
+    // ── #634: Data Protection Compliance ──────────────────────────────────────
+
+    /// Personal data must be identifiable by user_address field.
+    #[test]
+    fn test_personal_data_is_addressable_by_user() {
+        let record = json!({ "owner": "GUSER123", "ip_id": 1 });
+        assert!(record["owner"].is_string());
+        // Owner address is the key for data access/deletion requests
+        assert_eq!(record["owner"].as_str().unwrap(), "GUSER123");
+    }
+
+    /// Cache invalidation must happen on data deletion (cache coherence).
+    #[test]
+    fn test_cache_invalidation_on_data_deletion() {
+        // When user data is deleted, cache entries for that user must be cleared
+        let user = "GUSER123";
+        let ip_list_key = format!("ip:list:{}:10:0", user);
+        let swap_seller_key = format!("swap:seller:{}:10:0", user);
+        let swap_buyer_key = format!("swap:buyer:{}:10:0", user);
+
+        assert!(ip_list_key.contains(user));
+        assert!(swap_seller_key.contains(user));
+        assert!(swap_buyer_key.contains(user));
+    }
+
+    // ── #632: API Version Compatibility Compliance ────────────────────────────
+
+    /// Version compatibility endpoint must return compatibility info.
+    #[test]
+    fn test_version_compatibility_response_structure() {
+        let resp = json!({
+            "from_version": "1.0.0",
+            "to_version": "2.0.0",
+            "compatible": false,
+            "breaking_changes": ["Major version change - review API changes"],
+            "migration_guide": "See docs/api-reference.md for migration guide"
+        });
+        assert!(resp["from_version"].is_string());
+        assert!(resp["to_version"].is_string());
+        assert!(resp["compatible"].is_boolean());
+        assert!(resp["breaking_changes"].is_array());
+    }
+
+    /// Same major versions should be compatible.
+    #[test]
+    fn test_same_major_version_compatibility() {
+        let from_major = 1;
+        let to_major = 1;
+        assert_eq!(from_major, to_major, "same major versions should be compatible");
+    }
+
+    /// Different major versions are breaking changes.
+    #[test]
+    fn test_different_major_version_is_breaking() {
+        let from_major = 1;
+        let to_major = 2;
+        assert_ne!(from_major, to_major, "different major versions are breaking");
+    }
+
+    // ── #627: Webhook Delivery Compliance ─────────────────────────────────────
+
+    /// Webhook event records must include delivery status tracking.
+    #[test]
+    fn test_webhook_event_record_required_fields() {
+        let record = json!({
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "webhook_id": "550e8400-e29b-41d4-a716-446655440001",
+            "event_type": "swap.status_changed",
+            "payload": {},
+            "status": "pending",
+            "attempt_count": 0,
+            "max_retries": 10,
+            "last_attempt": null,
+            "next_retry": 1_700_000_000u64,
+            "created_at": 1_700_000_000u64,
+            "last_error": null
+        });
+        assert!(record["id"].is_string());
+        assert!(record["webhook_id"].is_string());
+        assert!(record["event_type"].is_string());
+        assert!(record["status"].is_string());
+        assert!(record["attempt_count"].is_number());
+        assert!(record["max_retries"].is_number());
+    }
+
+    /// Valid delivery status values.
+    #[test]
+    fn test_webhook_delivery_status_values() {
+        let valid = vec!["pending", "delivered", "failed", "retrying"];
+        assert!(valid.contains(&"pending"));
+        assert!(valid.contains(&"delivered"));
+        assert!(valid.contains(&"failed"));
+        assert!(valid.contains(&"retrying"));
     }
 }

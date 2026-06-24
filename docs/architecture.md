@@ -79,6 +79,92 @@ sequenceDiagram
 ### Atomic Swap Contract
 - **SwapRecord (u64):** Stores details of an active/completed swap (seller, buyer, price, status, escrowed token).
 
+## 🗄️ Caching Architecture (#629)
+
+The API server implements a multi-layer caching strategy for performance optimization.
+
+### Cache Layers
+
+| Layer | Technology | Purpose | TTL |
+|---|---|---|---|
+| L1 (In-Memory) | DashMap + LRU | Hot IP/Swap data | 30-60s |
+| L2 (Distributed) | Redis (optional) | Shared cache across instances | Configurable |
+| L3 (CDN) | Cache-Control headers | Browser/reverse-proxy caching | Public max-age |
+
+### LRU Eviction Policy (#629)
+
+When the in-memory cache exceeds 10,000 entries, the **least recently used** entries are evicted first. This ensures the cache retains the most frequently accessed data while bounding memory usage.
+
+- **Max Entries**: 10,000
+- **Eviction Strategy**: LRU (Least Recently Used)
+- **Access Tracking**: Every `get()` and `set()` operation promotes the key to MRU (Most Recently Used) position
+- **Eviction Counters**: Tracked via `LRU_EVICTIONS` metric
+
+### TTL-Based Eviction
+
+TTLs are tailored to data volatility:
+
+| Data Type | Default TTL | Rationale |
+|---|---|---|
+| IP Records | 60s | Relatively stable — changes only on transfer/revocation |
+| Swap Records | 30s | State changes frequent during active swaps |
+| Reputation Scores | 300s (5 min) | Slow-changing — updated after completed swaps |
+| Commitments (#629) | 3600s (1h) | Commitments are immutable once written |
+| Prices (#629) | 900s (15min) | Price data changes periodically |
+
+### Redis Integration (#629)
+
+When `REDIS_URL` environment variable is set, the cache layer attempts to use Redis for distributed caching:
+
+```rust
+// Cache degrades gracefully when Redis is unavailable
+static REDIS_CLIENT: Lazy<Option<String>> = Lazy::new(|| {
+    std::env::var("REDIS_URL").ok()
+});
+```
+
+- **Graceful Degradation**: Falls back to in-memory DashMap cache when Redis is unreachable
+- **Configuration**: Set `REDIS_URL` environment variable
+- **Use Case**: Multi-instance deployments where cache coherence across instances is required
+
+### Cache Invalidation
+
+Cache entries are invalidated on the following events:
+
+| Event | Invalidated Keys |
+|---|---|
+| IP Transferred | Individual IP + IP list prefix |
+| IP Revoked | Individual IP + IP list prefix |
+| Swap Started | Swap + seller/buyer lists |
+| Swap Accepted | Swap + seller/buyer lists |
+| Swap Completed | Swap + seller/buyer lists + reputation |
+| Swap Cancelled | Swap + seller/buyer lists |
+| Data Deletion (GDPR) | All user IP lists, swap lists, reputation |
+| Unknown Event | All swap and IP prefixes (broad) |
+
+### Cache Prewarming (#629)
+
+Hot data keys can be registered for automatic cache prewarming at startup:
+
+```rust
+// Register a key to be prewarmed on server start
+cache::register_prewarm_key("ip:popular:1");
+```
+
+### Cache Statistics
+
+Extended statistics are available:
+
+| Metric | Description |
+|---|---|
+| `total_entries` | Current number of cached entries |
+| `hits` | Total cache hits since startup |
+| `misses` | Total cache misses since startup |
+| `hit_rate` | Hit rate as a ratio (0.0 - 1.0) |
+| `lru_evictions` | Number of LRU evictions performed |
+| `ttl_evictions` | Number of TTL expiry evictions |
+| `memory_estimate_bytes` | Estimated memory usage |
+
 ## 🌍 Infrastructure
 
 - **Network:** Stellar Testnet & Mainnet.

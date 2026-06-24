@@ -188,6 +188,15 @@ async fn main() {
         .route("/swap/{swap_id}/cancel",          post(handlers::cancel_swap))
         .route("/swap/{swap_id}/cancel-expired",  post(handlers::cancel_expired_swap))
         .route("/swap/{swap_id}",                 get(handlers::get_swap))
+        // #634: GDPR Compliance endpoints
+        .route("/gdpr/export",                    post(handlers::data_export))
+        .route("/gdpr/delete",                    post(handlers::data_deletion))
+        .route("/gdpr/retention-policy",          get(handlers::retention_policy))
+        // #632: API Versioning endpoints
+        .route("/version/compatibility",          get(handlers::version_compatibility))
+        // #627: Webhook event tracking endpoints
+        .route("/webhooks/events",               get(handlers::list_webhook_events))
+        .route("/webhooks/events/{event_id}",    get(handlers::get_webhook_event_status))
         .route("/openapi.json", get(openapi_handler))
         .with_state(state)
         .layer(middleware::from_fn_with_state(rate_limiter, rate_limit::rate_limit_middleware))
@@ -254,6 +263,7 @@ fn build_app() -> Router {
     Router::new()
         .route("/health", get(health::health_handler))
         .route("/version", get(versioning::get_version_info))
+        // #632: URL-based versioning under /v1/
         .route("/v1/graphql", post(graphql_handler))
         .route("/v1/ip/commit", post(handlers::commit_ip))
         .route("/v1/ip/{ip_id}", get(handlers::get_ip))
@@ -269,6 +279,17 @@ fn build_app() -> Router {
         .route("/v1/swap/{swap_id}", get(handlers::get_swap))
         .route("/v1/bulk/commit-ip", post(handlers::bulk_commit_ip))
         .route("/v1/bulk/initiate-swap", post(handlers::bulk_initiate_swap))
+        // #634: GDPR Compliance routes under /v1/
+        .route("/v1/gdpr/export", post(handlers::data_export))
+        .route("/v1/gdpr/delete", post(handlers::data_deletion))
+        .route("/v1/gdpr/retention-policy", get(handlers::retention_policy))
+        // #632: Version compatibility endpoint
+        .route("/v1/version/compatibility", get(handlers::version_compatibility))
+        // #627: Webhook event tracking
+        .route("/v1/webhooks", get(handlers::list_webhook_events))
+        .route("/v1/webhooks/{id}", axum::routing::delete(handlers::unregister_webhook))
+        .route("/v1/webhooks/events", get(handlers::list_webhook_events))
+        .route("/v1/webhooks/events/{event_id}", get(handlers::get_webhook_event_status))
         .with_state(state)
         .layer(middleware::from_fn_with_state(rate_limiter, rate_limit::rate_limit_middleware))
         .layer(middleware::from_fn(tracing_middleware::trace_requests))
