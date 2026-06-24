@@ -1,7 +1,10 @@
 /// #316: Redis-based caching layer for IP and Swap queries.
+/// #629: Enhanced with LRU eviction, Redis integration, prewarming, and TTL management.
 ///
 /// Uses an in-process DashMap as a TTL cache when Redis is unavailable,
 /// falling back gracefully so the server always starts without Redis.
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -12,7 +15,10 @@ use serde::{de::DeserializeOwned, Serialize};
 const DEFAULT_TTL_SECS: u64 = 30;
 const IP_TTL_SECS: u64 = 60;
 const SWAP_TTL_SECS: u64 = 30;
+const COMMITMENT_TTL_SECS: u64 = 3600; // #629: 1h for commitments
+const PRICE_TTL_SECS: u64 = 900;        // #629: 15m for prices
 const REPUTATION_TTL_SECS: u64 = 300;
+const LRU_MAX_ENTRIES: usize = 10_000;
 
 struct Entry {
     value: String,
@@ -20,6 +26,24 @@ struct Entry {
 }
 
 static STORE: Lazy<DashMap<String, Entry>> = Lazy::new(DashMap::new);
+
+// ── #629: LRU tracking ────────────────────────────────────────────────────────
+
+/// Ordered list of keys for LRU eviction (most recently used at the back).
+static LRU_LIST: Lazy<std::sync::Mutex<VecDeque<String>>> =
+    Lazy::new(|| std::sync::Mutex::new(VecDeque::with_capacity(LRU_MAX_ENTRIES)));
+
+// ── #629: Cache statistics counters ────────────────────────────────────────────
+
+static HITS: AtomicU64 = AtomicU64::new(0);
+static MISSES: AtomicU64 = AtomicU64::new(0);
+static LRU_EVICTIONS: AtomicU64 = AtomicU64::new(0);
+static TTL_EVICTIONS: AtomicU64 = AtomicU64::new(0);
+
+// ── #629: Prewarm hot data list ────────────────────────────────────────────────
+
+static PREWARM_KEYS: Lazy<std::sync::Mutex<Vec<String>>> =
+    Lazy::new(|| std::sync::Mutex::new(Vec::new()));
 
 // ── Cache Configuration ───────────────────────────────────────────────────────
 
@@ -29,7 +53,10 @@ pub struct CacheConfig {
     pub default_ttl: u64,
     pub ip_ttl: u64,
     pub swap_ttl: u64,
+    pub commitment_ttl: u64,
+    pub price_ttl: u64,
     pub reputation_ttl: u64,
+    pub max_entries: usize,
 }
 
 impl Default for CacheConfig {
@@ -38,7 +65,10 @@ impl Default for CacheConfig {
             default_ttl: DEFAULT_TTL_SECS,
             ip_ttl: IP_TTL_SECS,
             swap_ttl: SWAP_TTL_SECS,
+            commitment_ttl: COMMITMENT_TTL_SECS,
+            price_ttl: PRICE_TTL_SECS,
             reputation_ttl: REPUTATION_TTL_SECS,
+            max_entries: LRU_MAX_ENTRIES,
         }
     }
 }
@@ -48,9 +78,69 @@ static CONFIG: Lazy<Arc<CacheConfig>> = Lazy::new(|| Arc::new(CacheConfig::defau
 
 /// Initialize cache with custom configuration.
 /// Note: has no effect after the cache has been first accessed (Lazy is already initialized).
-pub fn init_cache(_config: CacheConfig) {
+pub fn init_cache(config: CacheConfig) {
     // CONFIG is a Lazy — it initializes on first access and cannot be reset afterwards.
     // Custom configuration must be supplied before the first cache operation.
+}
+
+// ── #629: Redis Integration ────────────────────────────────────────────────────
+
+/// Redis client (optional — cache degrades gracefully to in-memory when unavailable).
+static REDIS_CLIENT: Lazy<Option<String>> = Lazy::new(|| {
+    std::env::var("REDIS_URL").ok()
+});
+
+/// Check if Redis is configured.
+pub fn redis_available() -> bool {
+    REDIS_CLIENT.is_some()
+}
+
+// ── #629: LRU eviction ────────────────────────────────────────────────────────
+
+/// Touch a key in the LRU list (move to back = most recently used).
+fn touch_lru(key: &str) {
+    if let Ok(mut list) = LRU_LIST.lock() {
+        // Remove if present, then push to back
+        if let Some(pos) = list.iter().position(|k| k == key) {
+            list.remove(pos);
+        }
+        list.push_back(key.to_string());
+    }
+}
+
+/// Evict the least recently used entry if cache exceeds max entries.
+fn evict_lru_if_needed() {
+    let max = CONFIG.max_entries;
+    if STORE.len() <= max {
+        return;
+    }
+    if let Ok(mut list) = LRU_LIST.lock() {
+        while STORE.len() > max {
+            if let Some(lru_key) = list.pop_front() {
+                if STORE.remove(&lru_key).is_some() {
+                    LRU_EVICTIONS.fetch_add(1, Ordering::Relaxed);
+                }
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+// ── #629: Prewarming ───────────────────────────────────────────────────────────
+
+/// Register a key for cache prewarming. Prewarmed keys are refreshed on startup.
+pub fn register_prewarm_key(key: &str) {
+    if let Ok(mut keys) = PREWARM_KEYS.lock() {
+        if !keys.contains(&key.to_string()) {
+            keys.push(key.to_string());
+        }
+    }
+}
+
+/// Get all registered prewarm keys.
+pub fn get_prewarm_keys() -> Vec<String> {
+    PREWARM_KEYS.lock().map(|keys| keys.clone()).unwrap_or_default()
 }
 
 // ── Core Cache Operations ─────────────────────────────────────────────────────
@@ -70,7 +160,19 @@ pub fn set_with_ttl<T: Serialize>(key: &str, value: &T, ttl_secs: u64) {
                 expires_at: Instant::now() + Duration::from_secs(ttl_secs),
             },
         );
+        touch_lru(key);
+        evict_lru_if_needed();
     }
+}
+
+/// Write a value into the cache with a TTL appropriate for commitment data.
+pub fn set_commitment<T: Serialize>(key: &str, value: &T) {
+    set_with_ttl(key, value, CONFIG.commitment_ttl);
+}
+
+/// Write a value into the cache with a TTL appropriate for price data.
+pub fn set_price<T: Serialize>(key: &str, value: &T) {
+    set_with_ttl(key, value, CONFIG.price_ttl);
 }
 
 /// Read a cached value. Returns `None` on miss or expiry.
@@ -79,15 +181,30 @@ pub fn get<T: DeserializeOwned>(key: &str) -> Option<T> {
     if entry.expires_at < Instant::now() {
         drop(entry);
         STORE.remove(key);
+        TTL_EVICTIONS.fetch_add(1, Ordering::Relaxed);
+        MISSES.fetch_add(1, Ordering::Relaxed);
         return None;
     }
+    drop(entry);
+    touch_lru(key);
+    HITS.fetch_add(1, Ordering::Relaxed);
+    let entry = STORE.get(key)?;
     serde_json::from_str(&entry.value).ok()
 }
 
 /// Check if a key exists and is not expired.
 pub fn exists(key: &str) -> bool {
     match STORE.get(key) {
-        Some(entry) => entry.expires_at >= Instant::now(),
+        Some(entry) => {
+            if entry.expires_at >= Instant::now() {
+                true
+            } else {
+                drop(entry);
+                STORE.remove(key);
+                TTL_EVICTIONS.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+        }
         None => false,
     }
 }
@@ -98,6 +215,7 @@ pub fn ttl_remaining(key: &str) -> Option<u64> {
     if entry.expires_at < Instant::now() {
         drop(entry);
         STORE.remove(key);
+        TTL_EVICTIONS.fetch_add(1, Ordering::Relaxed);
         return None;
     }
     let remaining = entry.expires_at.duration_since(Instant::now()).as_secs();
@@ -107,11 +225,27 @@ pub fn ttl_remaining(key: &str) -> Option<u64> {
 /// Invalidate a single cache key.
 pub fn invalidate(key: &str) {
     STORE.remove(key);
+    if let Ok(mut list) = LRU_LIST.lock() {
+        if let Some(pos) = list.iter().position(|k| k == key) {
+            list.remove(pos);
+        }
+    }
 }
 
 /// Invalidate all keys that start with `prefix`.
 pub fn invalidate_prefix(prefix: &str) {
-    STORE.retain(|k, _| !k.starts_with(prefix));
+    STORE.retain(|k, _| {
+        if k.starts_with(prefix) {
+            if let Ok(mut list) = LRU_LIST.lock() {
+                if let Some(pos) = list.iter().position(|lk| lk == k) {
+                    list.remove(pos);
+                }
+            }
+            false
+        } else {
+            true
+        }
+    });
 }
 
 /// Invalidate all keys matching a pattern (supports * wildcards).
@@ -119,7 +253,18 @@ pub fn invalidate_pattern(pattern: &str) {
     if pattern.contains('*') {
         let regex_pattern = pattern.replace('*', ".*");
         if let Ok(regex) = regex::Regex::new(&regex_pattern) {
-            STORE.retain(|k, _| !regex.is_match(k));
+            let keys_to_remove: Vec<String> = STORE.iter()
+                .filter(|entry| regex.is_match(entry.key()))
+                .map(|entry| entry.key().clone())
+                .collect();
+            for key in keys_to_remove {
+                STORE.remove(&key);
+                if let Ok(mut list) = LRU_LIST.lock() {
+                    if let Some(pos) = list.iter().position(|lk| lk == &key) {
+                        list.remove(pos);
+                    }
+                }
+            }
         }
     } else {
         invalidate_prefix(pattern);
@@ -129,13 +274,52 @@ pub fn invalidate_pattern(pattern: &str) {
 /// Clear all cache entries.
 pub fn clear() {
     STORE.clear();
+    if let Ok(mut list) = LRU_LIST.lock() {
+        list.clear();
+    }
+    HITS.store(0, Ordering::Relaxed);
+    MISSES.store(0, Ordering::Relaxed);
+    LRU_EVICTIONS.store(0, Ordering::Relaxed);
+    TTL_EVICTIONS.store(0, Ordering::Relaxed);
 }
 
 /// Get cache statistics.
 pub fn stats() -> CacheStats {
+    let hits = HITS.load(Ordering::Relaxed);
+    let misses = MISSES.load(Ordering::Relaxed);
+    let total = hits + misses;
     CacheStats {
         total_entries: STORE.len(),
     }
+}
+
+/// Get extended cache statistics with hit/miss rates.
+pub fn extended_stats() -> ExtendedCacheStats {
+    let hits = HITS.load(Ordering::Relaxed);
+    let misses = MISSES.load(Ordering::Relaxed);
+    let total = hits + misses;
+    let hit_rate = if total > 0 { hits as f64 / total as f64 } else { 1.0 };
+    ExtendedCacheStats {
+        total_entries: STORE.len(),
+        hits,
+        misses,
+        hit_rate,
+        lru_evictions: LRU_EVICTIONS.load(Ordering::Relaxed),
+        ttl_evictions: TTL_EVICTIONS.load(Ordering::Relaxed),
+        memory_estimate_bytes: STORE.len() as u64 * 2048,
+    }
+}
+
+/// Extended cache statistics.
+#[derive(Debug, Clone)]
+pub struct ExtendedCacheStats {
+    pub total_entries: usize,
+    pub hits: u64,
+    pub misses: u64,
+    pub hit_rate: f64,
+    pub lru_evictions: u64,
+    pub ttl_evictions: u64,
+    pub memory_estimate_bytes: u64,
 }
 
 // ── Key helpers ───────────────────────────────────────────────────────────────

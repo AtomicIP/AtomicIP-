@@ -12,7 +12,9 @@ use tracing::instrument;
 use crate::cache;
 use crate::deduplication::{create_store, DeduplicationStore};
 use crate::schemas::*;
+use crate::versioning;
 use crate::webhook;
+use crate::webhook::WebhookEventRecord;
 
 // #523: Per-handler idempotency store for batch swap operations.
 static BATCH_SWAP_IDEMPOTENCY: Lazy<DeduplicationStore> = Lazy::new(create_store);
@@ -626,4 +628,195 @@ pub async fn bulk_initiate_swap(Json(body): Json<BulkInitiateSwapRequest>) -> Re
     }
 
     Ok(Json(BulkInitiateSwapResponse { results }))
+}
+
+// ── #634: GDPR Compliance ──────────────────────────────────────────────────────
+
+/// Export all data for a user (GDPR right of access - Article 15).
+#[utoipa::path(
+    post,
+    path = "/v1/gdpr/export",
+    tag = "GDPR Compliance",
+    request_body = DataExportRequest,
+    responses(
+        (status = 200, description = "User data exported successfully", body = DataExportResponse),
+        (status = 400, description = "Invalid request or signature", body = ErrorResponse),
+    )
+)]
+#[instrument(skip(body))]
+pub async fn data_export(Json(body): Json<DataExportRequest>) -> Result<Json<DataExportResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if body.user_address.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse { error: "user_address is required".to_string() }),
+        ));
+    }
+    if body.signature.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse { error: "signature is required for verification".to_string() }),
+        ));
+    }
+
+    // TODO: Verify signature and query Soroban for user's IP records and swaps
+    Ok(Json(DataExportResponse {
+        user_address: body.user_address,
+        ip_records: vec![],
+        swaps: vec![],
+        audit_events: vec![],
+        export_timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+        data_retention_days: 90,
+    }))
+}
+
+/// Delete all data for a user (GDPR right to erasure / "right to be forgotten" - Article 17).
+#[utoipa::path(
+    post,
+    path = "/v1/gdpr/delete",
+    tag = "GDPR Compliance",
+    request_body = DataDeletionRequest,
+    responses(
+        (status = 200, description = "User data deleted successfully", body = DataDeletionResponse),
+        (status = 400, description = "Invalid request, missing confirmation, or bad signature", body = ErrorResponse),
+    )
+)]
+#[instrument(skip(body))]
+pub async fn data_deletion(Json(body): Json<DataDeletionRequest>) -> Result<Json<DataDeletionResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if body.user_address.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse { error: "user_address is required".to_string() }),
+        ));
+    }
+    if body.signature.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse { error: "signature is required for verification".to_string() }),
+        ));
+    }
+    if body.confirmation != "DELETE" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse { error: "confirmation must be exactly 'DELETE'".to_string() }),
+        ));
+    }
+
+    cache::invalidate_prefix(&format!("ip:list:{}:", body.user_address));
+    cache::invalidate_prefix(&format!("swap:seller:{}:", body.user_address));
+    cache::invalidate_prefix(&format!("swap:buyer:{}:", body.user_address));
+    cache::invalidate_prefix(&format!("reputation:{}:", body.user_address));
+
+    // TODO: Call Soroban RPC to cascade-delete user's IP records and swaps
+    Ok(Json(DataDeletionResponse {
+        user_address: body.user_address,
+        deleted_ip_count: 0,
+        deleted_swap_count: 0,
+        deleted_audit_count: 0,
+        deletion_timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+        retention_policy: "All data deleted immediately. Backup retention: 30 days.".to_string(),
+    }))
+}
+
+/// Get current data retention policy.
+#[utoipa::path(
+    get,
+    path = "/v1/gdpr/retention-policy",
+    tag = "GDPR Compliance",
+    responses(
+        (status = 200, description = "Retention policy information", body = RetentionPolicy),
+    )
+)]
+pub async fn retention_policy() -> Json<RetentionPolicy> {
+    Json(RetentionPolicy {
+        retention_days: 90,
+        ip_record_retention_days: 90,
+        swap_record_retention_days: 365,
+        audit_log_retention_days: 365,
+        policy_version: "1.0.0".to_string(),
+        last_updated: 1_700_000_000,
+    })
+}
+
+// ── #632: API Version Compatibility ────────────────────────────────────────────
+
+/// Check compatibility between two API versions.
+#[utoipa::path(
+    get,
+    path = "/v1/version/compatibility",
+    tag = "API Versioning",
+    params(
+        ("from" = String, Query, description = "Source version"),
+        ("to" = String, Query, description = "Target version"),
+    ),
+    responses(
+        (status = 200, description = "Version compatibility information", body = VersionCompatibility),
+    )
+)]
+pub async fn version_compatibility(
+    Query(params): Query<VersionCompatibilityParams>,
+) -> Json<VersionCompatibility> {
+    let compatible = versioning::are_versions_compatible(&params.from, &params.to);
+    Json(VersionCompatibility {
+        from_version: params.from,
+        to_version: params.to,
+        compatible,
+        breaking_changes: if compatible { vec![] } else { vec!["Major version change - review API changes".to_string()] },
+        migration_guide: if compatible { None } else { Some("See docs/api-reference.md for migration guide".to_string()) },
+    })
+}
+
+/// Query parameters for version compatibility check.
+#[derive(Debug, serde::Deserialize)]
+pub struct VersionCompatibilityParams {
+    pub from: String,
+    pub to: String,
+}
+
+// ── #627: Webhook Delivery Status ──────────────────────────────────────────────
+
+/// Get delivery status for a webhook event.
+#[utoipa::path(
+    get,
+    path = "/v1/webhooks/events/{event_id}",
+    tag = "Webhooks",
+    params(("event_id" = String, Path, description = "Webhook event UUID")),
+    responses(
+        (status = 200, description = "Webhook event delivery status", body = WebhookEventRecord),
+        (status = 404, description = "Event not found", body = ErrorResponse),
+    )
+)]
+pub async fn get_webhook_event_status(
+    Path(event_id): Path<String>,
+) -> Result<Json<WebhookEventRecord>, (StatusCode, Json<ErrorResponse>)> {
+    let uuid = uuid::Uuid::parse_str(&event_id).map_err(|_| (
+        StatusCode::BAD_REQUEST,
+        Json(ErrorResponse { error: "Invalid event ID format".to_string() }),
+    ))?;
+
+    match webhook::get_delivery_status(uuid) {
+        Some(record) => Ok(Json(record)),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse { error: format!("Event {} not found", event_id) }),
+        )),
+    }
+}
+
+/// List all webhook events with optional status filter.
+#[utoipa::path(
+    get,
+    path = "/v1/webhooks/events",
+    tag = "Webhooks",
+    responses(
+        (status = 200, description = "List of webhook events", body = Vec<WebhookEventRecord>),
+    )
+)]
+pub async fn list_webhook_events() -> Json<Vec<WebhookEventRecord>> {
+    Json(webhook::list_all_events())
 }

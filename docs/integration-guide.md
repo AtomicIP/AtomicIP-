@@ -367,6 +367,154 @@ rate(circuit_breaker_calls_rejected_total[1m])
 rate(circuit_breaker_state_transitions_total[1m]) > 3
 ```
 
+## Webhook Delivery Reliability (#627)
+
+Webhooks provide real-time notifications for swap status changes with guaranteed delivery guarantees.
+
+### Webhook Registration
+
+Register a webhook URL to receive event notifications:
+
+```json
+POST /v1/webhooks
+{
+  "url": "https://your-service.com/webhook",
+  "events": ["swap.status_changed"]
+}
+```
+
+Supported event types:
+- `swap.status_changed` — Fired when a swap transitions between states
+- `*` — Wildcard, receives all events
+
+### Delivery Guarantees
+
+| Guarantee | Implementation |
+|---|---|
+| **At-Least-Once Delivery** | Events are retried until successful delivery or max retries exhausted |
+| **Ordering** | Events are delivered in order per webhook; concurrent events may interleave |
+| **Persistence** | Event records are stored in-memory for the duration of retry attempts |
+| **Expiry** | Event records are retained for 7 days after creation |
+
+### Retry Strategy
+
+Webhook delivery uses **exponential backoff with jitter** for retries:
+
+| Attempt | Delay (with jitter) |
+|---|---|
+| 1 | ~0.75–1.25s |
+| 2 | ~1.5–2.5s |
+| 3 | ~3–5s |
+| 4 | ~6–10s |
+| 5 | ~12–20s |
+| 6 | ~24–40s |
+| 7 | ~48–80s |
+| 8 | ~96–160s |
+| 9 | ~192–320s |
+| 10 | ~384–640s |
+
+- **Max Retries**: 10 attempts
+- **Max Total Time**: ~12 minutes (before exponential slowdown), up to 24 hours
+- **Jitter**: Random multiplier between 0.75–1.25x to prevent thundering herd
+- **Backoff Cap**: 24 hours maximum delay between retries
+
+### HMAC-SHA256 Signature Verification (#627)
+
+When a webhook is registered with a secret, payloads are signed using HMAC-SHA256:
+
+```json
+{
+  "event": "swap.status_changed",
+  "swap_id": 42,
+  "old_status": "Pending",
+  "new_status": "Accepted",
+  "timestamp": 1700000000,
+  "signature": "a1b2c3d4e5f6..."
+}
+```
+
+#### Verifying Signatures (Receiver Side)
+
+```rust
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+
+fn verify_webhook_signature(secret: &str, payload: &str, signature: &str) -> bool {
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
+        .expect("HMAC accepts keys of any length");
+    mac.update(payload.as_bytes());
+    let expected = hex::encode(mac.finalize().into_bytes());
+    // Constant-time comparison
+    expected.len() == signature.len()
+        && expected.bytes().zip(signature.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+}
+```
+
+```typescript
+import { createHmac, timingSafeEqual } from 'crypto';
+
+function verifyWebhookSignature(
+  secret: string,
+  payload: string,
+  signature: string
+): boolean {
+  const expected = createHmac('sha256', secret)
+    .update(payload)
+    .digest('hex');
+  
+  const expectedBuf = Buffer.from(expected, 'hex');
+  const signatureBuf = Buffer.from(signature, 'hex');
+  
+  if (expectedBuf.length !== signatureBuf.length) return false;
+  return timingSafeEqual(expectedBuf, signatureBuf);
+}
+```
+
+### Delivery Status Tracking (#627)
+
+Track the delivery status of webhook events:
+
+```json
+GET /v1/webhooks/events/{event_id}
+
+{
+  "id": "550e8400-e29b-41d4-a716-446655440000",
+  "webhook_id": "550e8400-e29b-41d4-a716-446655440001",
+  "event_type": "swap.status_changed",
+  "payload": { ... },
+  "status": "delivered",
+  "attempt_count": 1,
+  "max_retries": 10,
+  "last_attempt": 1700000000,
+  "next_retry": null,
+  "created_at": 1700000000,
+  "last_error": null
+}
+```
+
+Possible delivery statuses:
+
+| Status | Description |
+|---|---|
+| `pending` | Event created, waiting for delivery |
+| `delivered` | Successfully delivered and acknowledged (HTTP 2xx) |
+| `failed` | Delivery failed after all retries exhausted |
+| `retrying` | Delivery failed, scheduled for retry |
+
+List all webhook events:
+
+```json
+GET /v1/webhooks/events
+```
+
+### Best Practices for Webhook Receivers
+
+1. **Respond Quickly**: Return HTTP 2xx as soon as you receive the payload (process asynchronously)
+2. **Idempotency**: Handle duplicate deliveries gracefully (use `event_id` for deduplication)
+3. **Verify Signatures**: Always verify HMAC signatures when a secret is configured
+4. **Monitor Failures**: Track delivery status and alert on repeated failures
+5. **Retry Logic**: Your endpoint should be idempotent since webhooks may be delivered more than once
+
 ## Support
 
 - GitHub Issues: https://github.com/AtomicIP/AtomicIP-/issues

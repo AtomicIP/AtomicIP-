@@ -1098,6 +1098,102 @@ All validation failures are logged for monitoring and audit purposes.
 
 ---
 
+## API Versioning Policy (#632)
+
+### Version Scheme
+
+The API uses **semantic versioning** (MAJOR.MINOR.PATCH):
+
+- **MAJOR**: Breaking changes (incompatible API changes)
+- **MINOR**: Backward-compatible functionality additions
+- **PATCH**: Backward-compatible bug fixes
+
+### Supported Versions
+
+| Version | Status | Released | Deprecation Date | Sunset Date |
+|---|---|---|---|---|
+| `1.0.0` | Current (Stable) | 2026-03-27 | — | — |
+| `1.1.0` | Stable | 2026-04-15 | — | — |
+| `2.0.0` | Beta | 2026-06-24 | TBD | TBD |
+
+### Version Negotiation
+
+Clients can specify the desired API version in two ways:
+
+#### 1. Header-Based (Recommended)
+
+Use the `X-API-Version` or `Accept-Version` header:
+
+```
+X-API-Version: 1.0.0
+Accept-Version: 1.0.0
+```
+
+If no version header is provided, the latest stable version is used.
+
+#### 2. URL-Based
+
+Use the version prefix in the URL path:
+
+```
+/v1/ip/commit     → version 1.0.0
+/v2/ip/commit     → version 2.0.0
+```
+
+### Response Headers
+
+Every API response includes version information headers:
+
+| Header | Description | Example |
+|---|---|---|
+| `API-Version` | Current API version | `1.0.0` |
+| `X-API-Version` | Current API version | `1.0.0` |
+| `Deprecation` | Whether this version is deprecated | `true` |
+| `Sunset` | When deprecated versions will be removed | `Sun, 31 Dec 2027 23:59:59 GMT` |
+
+### Deprecation Warnings (#632)
+
+Requests using a deprecated version receive the following headers:
+
+- `Deprecation: true` — warns clients that the version is deprecated
+- `Sunset: <RFC 1123 date>` — indicates when the version will be removed
+
+Clients should monitor these headers and migrate to newer versions before the sunset date.
+
+### Version Compatibility
+
+Use the `/v1/version/compatibility` endpoint to check compatibility between versions:
+
+```json
+GET /v1/version/compatibility?from=1.0.0&to=2.0.0
+
+{
+  "from_version": "1.0.0",
+  "to_version": "2.0.0",
+  "compatible": false,
+  "breaking_changes": ["Major version change - review API changes"],
+  "migration_guide": "See docs/api-reference.md for migration guide"
+}
+```
+
+### Compatibility Rules
+
+- Same MAJOR version → compatible (e.g., `1.0.0` → `1.1.0`)
+- Different MAJOR version → incompatible (e.g., `1.x` → `2.x`)
+- Breaking changes trigger a MAJOR version bump
+- New features trigger a MINOR version bump
+- Bug fixes trigger a PATCH version bump
+
+### Migration Guide
+
+When migrating between major versions:
+
+1. **Check compatibility**: Use the `/v1/version/compatibility` endpoint
+2. **Update headers**: Set `X-API-Version` header to the new version
+3. **Test in staging**: Verify your integration against the new version
+4. **Monitor deprecation headers**: Watch for `Deprecation` and `Sunset` headers
+5. **Migrate before sunset**: Complete migration before the sunset date
+
 ## Rate limiting
 
 The HTTP API uses token buckets to allow short bursts while recovering quota

@@ -3,12 +3,21 @@ use axum::middleware::Next;
 use axum::response::Response;
 use axum::extract::Request;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Current API version
 pub const CURRENT_VERSION: &str = "1.0.0";
 
 /// Supported API versions
-pub const SUPPORTED_VERSIONS: &[&str] = &["1.0.0", "1.1.0"];
+pub const SUPPORTED_VERSIONS: &[&str] = &["1.0.0", "1.1.0", "2.0.0"];
+
+/// Deprecated versions that should trigger warnings
+pub const DEPRECATED_VERSIONS: &[&str] = &[];
+
+/// Version status labels
+pub const VERSION_STATUS_STABLE: &str = "stable";
+pub const VERSION_STATUS_DEPRECATED: &str = "deprecated";
+pub const VERSION_STATUS_BETA: &str = "beta";
 
 /// API version information
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -27,15 +36,62 @@ pub struct VersionInfo {
     pub features: Vec<String>,
 }
 
-/// Middleware to handle API versioning via Accept-Version header
+/// Version compatibility map: (from, to) -> compatible
+static VERSION_COMPATIBILITY: once_cell::sync::Lazy<HashMap<(&'static str, &'static str), bool>> =
+    once_cell::sync::Lazy::new(|| {
+        let mut m = HashMap::new();
+        // 1.0.0 is compatible with 1.0.0 and 1.1.0
+        m.insert(("1.0.0", "1.0.0"), true);
+        m.insert(("1.0.0", "1.1.0"), true);
+        m.insert(("1.1.0", "1.0.0"), true);
+        m.insert(("1.1.0", "1.1.0"), true);
+        // 2.0.0 has breaking changes from 1.x
+        m.insert(("1.0.0", "2.0.0"), false);
+        m.insert(("1.1.0", "2.0.0"), false);
+        m.insert(("2.0.0", "2.0.0"), true);
+        m.insert(("2.0.0", "1.0.0"), false);
+        m.insert(("2.0.0", "1.1.0"), false);
+        m
+    });
+
+/// Check if two versions are compatible (same major version).
+pub fn are_versions_compatible(from: &str, to: &str) -> bool {
+    VERSION_COMPATIBILITY
+        .get(&(from, to))
+        .copied()
+        .unwrap_or_else(|| {
+            let from_major = from.split('.').next().and_then(|s| s.parse::<u32>().ok());
+            let to_major = to.split('.').next().and_then(|s| s.parse::<u32>().ok());
+            from_major == to_major
+        })
+}
+
+/// Extract version from URL path (e.g., /v1/...).
+pub fn extract_version_from_path(path: &str) -> Option<&'static str> {
+    if path.starts_with("/v1/") || path == "/v1" {
+        Some("1.0.0")
+    } else if path.starts_with("/v2/") || path == "/v2" {
+        Some("2.0.0")
+    } else {
+        None
+    }
+}
+
+/// Middleware to handle API versioning via Accept-Version or X-API-Version header.
 pub async fn version_negotiation(
     headers: HeaderMap,
     mut req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
+    // Check X-API-Version header first (more explicit), then fall back to Accept-Version
     let requested_version = headers
-        .get("Accept-Version")
+        .get("X-API-Version")
         .and_then(|v| v.to_str().ok())
+        .or_else(|| {
+            headers
+                .get("Accept-Version")
+                .and_then(|v| v.to_str().ok())
+        })
         .unwrap_or(CURRENT_VERSION);
 
     // Check if requested version is supported
@@ -51,14 +107,18 @@ pub async fn version_negotiation(
 
     let mut response = next.run(req).await;
 
-    // Add API version to response headers
+    // Add API version headers
     response.headers_mut().insert(
         "API-Version",
         CURRENT_VERSION.parse().unwrap(),
     );
+    response.headers_mut().insert(
+        "X-API-Version",
+        CURRENT_VERSION.parse().unwrap(),
+    );
 
-    // Add deprecation warning if requesting old version
-    if requested_version != CURRENT_VERSION {
+    // Add deprecation warning if requesting old version or deprecated version
+    if requested_version != CURRENT_VERSION || DEPRECATED_VERSIONS.contains(&requested_version) {
         response.headers_mut().insert(
             "Deprecation",
             "true".parse().unwrap(),
@@ -99,7 +159,7 @@ mod tests {
 
     #[test]
     fn test_unsupported_version_rejected() {
-        let unsupported = "2.0.0";
+        let unsupported = "99.0.0";
         assert!(!SUPPORTED_VERSIONS.contains(&unsupported));
     }
 
@@ -128,8 +188,39 @@ mod tests {
 
     #[test]
     fn test_multiple_versions_supported() {
-        assert!(SUPPORTED_VERSIONS.len() >= 2);
+        assert!(SUPPORTED_VERSIONS.len() >= 3);
         assert!(SUPPORTED_VERSIONS.contains(&"1.0.0"));
         assert!(SUPPORTED_VERSIONS.contains(&"1.1.0"));
+        assert!(SUPPORTED_VERSIONS.contains(&"2.0.0"));
+    }
+
+    #[test]
+    fn test_are_versions_compatible_same_major() {
+        assert!(are_versions_compatible("1.0.0", "1.1.0"));
+        assert!(are_versions_compatible("1.1.0", "1.0.0"));
+    }
+
+    #[test]
+    fn test_are_versions_compatible_different_major() {
+        assert!(!are_versions_compatible("1.0.0", "2.0.0"));
+        assert!(!are_versions_compatible("2.0.0", "1.0.0"));
+    }
+
+    #[test]
+    fn test_extract_version_from_path_v1() {
+        assert_eq!(extract_version_from_path("/v1/ip/1"), Some("1.0.0"));
+        assert_eq!(extract_version_from_path("/v1"), Some("1.0.0"));
+    }
+
+    #[test]
+    fn test_extract_version_from_path_v2() {
+        assert_eq!(extract_version_from_path("/v2/ip/1"), Some("2.0.0"));
+        assert_eq!(extract_version_from_path("/v2"), Some("2.0.0"));
+    }
+
+    #[test]
+    fn test_extract_version_from_path_no_match() {
+        assert_eq!(extract_version_from_path("/health"), None);
+        assert_eq!(extract_version_from_path("/v3/ip/1"), None);
     }
 }

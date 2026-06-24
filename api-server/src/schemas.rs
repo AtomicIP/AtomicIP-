@@ -300,3 +300,88 @@ pub struct BulkOperationResult<T> {
     pub data: Option<T>,
     pub error: Option<String>,
 }
+
+// ── #634: GDPR Compliance ──────────────────────────────────────────────────────
+
+/// Request to export all data for a user (GDPR right of access).
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct DataExportRequest {
+    /// Stellar address of the user requesting data export
+    pub user_address: String,
+    /// Verification signature to prove ownership
+    pub signature: String,
+}
+
+/// Response containing all user data for GDPR export.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct DataExportResponse {
+    pub user_address: String,
+    pub ip_records: Vec<IpRecord>,
+    pub swaps: Vec<SwapRecord>,
+    pub audit_events: Vec<crate::audit::AuditEvent>,
+    pub export_timestamp: u64,
+    pub data_retention_days: u64,
+}
+
+/// Request to delete all data for a user (GDPR right to erasure).
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct DataDeletionRequest {
+    /// Stellar address of the user requesting deletion
+    pub user_address: String,
+    /// Verification signature to prove ownership
+    pub signature: String,
+    /// Confirmation string "DELETE" to prevent accidental deletion
+    pub confirmation: String,
+}
+
+/// Response confirming data deletion.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct DataDeletionResponse {
+    pub user_address: String,
+    pub deleted_ip_count: u64,
+    pub deleted_swap_count: u64,
+    pub deleted_audit_count: u64,
+    pub deletion_timestamp: u64,
+    pub retention_policy: String,
+}
+
+/// GDPR data retention policy information.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct RetentionPolicy {
+    pub retention_days: u64,
+    pub ip_record_retention_days: u64,
+    pub swap_record_retention_days: u64,
+    pub audit_log_retention_days: u64,
+    pub policy_version: String,
+    pub last_updated: u64,
+}
+
+// ── #632: API Version Compatibility ────────────────────────────────────────────
+
+/// Describes compatibility between two API versions.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct VersionCompatibility {
+    pub from_version: String,
+    pub to_version: String,
+    pub compatible: bool,
+    pub breaking_changes: Vec<String>,
+    pub migration_guide: Option<String>,
+}
+
+// ── #627: Webhook Delivery Status (re-exported from webhook module) ────────────
+
+// WebhookEventRecord and DeliveryStatus are defined in the webhook module.
+
+// ── #629: Cache Statistics Extension ───────────────────────────────────────────
+
+/// Extended cache statistics with hit/miss rates.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ExtendedCacheStats {
+    pub total_entries: usize,
+    pub hits: u64,
+    pub misses: u64,
+    pub hit_rate: f64,
+    pub lru_evictions: u64,
+    pub ttl_evictions: u64,
+    pub memory_estimate_bytes: u64,
+}
