@@ -1,44 +1,107 @@
-/// Tests for #470 & #622: Price Oracle Integration with Staleness Validation
+/// Tests for #470, #622 & #784: Price Oracle Integration with Cryptographic
+/// Attestation, Staleness Validation, and Deviation Bounds.
 ///
 /// Tests cover:
-/// - set_oracle: admin-only, stores config, emits event, initializes timestamp and cached price
-/// - get_oracle_config: returns stored config with staleness info
-/// - get_oracle_price: delegates to oracle contract with staleness checks
-/// - initiate_swap_with_oracle_price: uses oracle price with staleness validation, respects slippage bounds
-/// - Staleness validation: detects stale prices (>5 min), falls back to cached price
+/// - set_oracle: admin-only, stores config (address + pubkey + deviation bound), emits event
+/// - get_oracle_config: returns stored config
+/// - get_oracle_price: delegates to oracle contract with signature verification + staleness checks
+/// - initiate_swap_with_oracle_price: uses oracle price, respects slippage bounds
+/// - Signature verification: a well-formed, positive, but unsigned/forged/wrong-key price is rejected
+/// - Deviation bound: a validly signed price that moves too far from the last accepted price is rejected
+/// - Staleness validation: detects stale prices (>5 min), falls back to the (already-verified) cached price
 /// - Error cases: oracle not configured, price invalid, price out of bounds, stale data with no cache
 #[cfg(test)]
 mod oracle_tests {
+    use ed25519_dalek::{Signer, SigningKey};
     use ip_registry::{IpRegistry, IpRegistryClient};
     use soroban_sdk::{
         contract, contractimpl,
-        testutils::Address as _,
+        testutils::{Address as _, Ledger},
         token::StellarAssetClient,
+        xdr::ToXdr,
         Address, Bytes, BytesN, Env, Symbol,
     };
 
+    use crate::price_oracle::{PriceAttestation, SignedPrice};
     use crate::{AtomicSwap, AtomicSwapClient, ContractError, SwapStatus};
 
     // ── Mock Oracle Contract ──────────────────────────────────────────────────
 
-    /// A minimal mock oracle that returns a configurable price for any token.
+    /// A minimal mock oracle that returns a configurable signed price
+    /// attestation for any token. The signature over `(token, price,
+    /// timestamp)` is produced off-chain by the test via `sign_price` (which
+    /// stands in for an oracle publisher's private key) and pushed in via
+    /// `set_signed_price`.
     #[contract]
     pub struct MockOracle;
 
     #[contractimpl]
     impl MockOracle {
-        pub fn get_price(env: Env, _token: Address) -> i128 {
+        pub fn get_price_attestation(env: Env, _token: Address) -> SignedPrice {
             env.storage()
                 .instance()
-                .get::<Symbol, i128>(&Symbol::new(&env, "price"))
-                .unwrap_or(1_000_000)
+                .get::<Symbol, SignedPrice>(&Symbol::new(&env, "signed"))
+                .unwrap_or(SignedPrice {
+                    price: 1_000_000,
+                    timestamp: 0,
+                    signature: BytesN::from_array(&env, &[0u8; 64]),
+                })
         }
 
-        pub fn set_price(env: Env, price: i128) {
-            env.storage()
-                .instance()
-                .set(&Symbol::new(&env, "price"), &price);
+        pub fn set_signed_price(env: Env, price: i128, timestamp: u64, signature: BytesN<64>) {
+            env.storage().instance().set(
+                &Symbol::new(&env, "signed"),
+                &SignedPrice {
+                    price,
+                    timestamp,
+                    signature,
+                },
+            );
         }
+    }
+
+    // ── Signing Helpers (simulate an off-chain oracle publisher) ──────────────
+
+    /// Deterministic test-only Ed25519 keypair standing in for the oracle
+    /// publisher's real off-chain key. Not for production use.
+    fn test_signing_key() -> SigningKey {
+        SigningKey::from_bytes(&[0x42u8; 32])
+    }
+
+    /// A second, unrelated keypair used to simulate a forged/wrong-key signature.
+    fn wrong_signing_key() -> SigningKey {
+        SigningKey::from_bytes(&[0x99u8; 32])
+    }
+
+    fn pubkey_bytes(env: &Env, sk: &SigningKey) -> BytesN<32> {
+        BytesN::from_array(env, &sk.verifying_key().to_bytes())
+    }
+
+    /// Signs `(token, price, timestamp)` with `sk`, matching the XDR encoding
+    /// `verify_attestation` reconstructs on the contract side.
+    fn sign_price(
+        env: &Env,
+        sk: &SigningKey,
+        token: &Address,
+        price: i128,
+        timestamp: u64,
+    ) -> BytesN<64> {
+        let attestation = PriceAttestation {
+            token: token.clone(),
+            price,
+            timestamp,
+        };
+        let payload: Bytes = attestation.to_xdr(env);
+        let sig = sk.sign(&payload.to_alloc_vec());
+        BytesN::from_array(env, &sig.to_bytes())
+    }
+
+    /// Signs `price` for `token` (with the current ledger timestamp) using the
+    /// canonical test key and pushes it into the mock oracle.
+    fn publish_price(env: &Env, oracle: &MockOracleClient, token: &Address, price: i128) {
+        let ts = env.ledger().timestamp();
+        let sig = sign_price(env, &test_signing_key(), token, price, ts);
+        oracle.set_signed_price(&price, &ts, &sig);
     }
 
     // ── Test Helpers ──────────────────────────────────────────────────────────
@@ -53,13 +116,15 @@ mod oracle_tests {
         preimage.append(&Bytes::from(secret.clone()));
         preimage.append(&Bytes::from(blinding.clone()));
         let hash: BytesN<32> = env.crypto().sha256(&preimage).into();
-        let ip_id = registry.commit_ip(owner, &hash);
+        let ip_id = registry.commit_ip(owner, &hash, &0u32);
         (registry_id, ip_id, secret, blinding)
     }
 
     /// Registers a token and mints `amount` to `recipient`.
     fn setup_token(env: &Env, admin: &Address, recipient: &Address, amount: i128) -> Address {
-        let token_id = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        let token_id = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
         StellarAssetClient::new(env, &token_id).mint(recipient, &amount);
         token_id
     }
@@ -79,12 +144,30 @@ mod oracle_tests {
         client.initialize(registry_id);
         // Seed admin: first initiate_swap sets admin = seller
         client.initiate_swap(
-            token_id, &ip_id, seller, &500_i128, buyer,
-            &0_u32, &None, &0_i128, &false,
+            token_id, &ip_id, seller, &500_i128, buyer, &0_u32, &None, &0_i128, &false,
         );
         // Cancel the seeding swap so the IP is free for oracle tests
         client.cancel_swap(&0_u64, seller);
         (client, seller.clone())
+    }
+
+    /// Enables the oracle with the canonical test pubkey and no deviation
+    /// bound (matching the historical, permissive default most tests want),
+    /// then publishes a signed price for `token_id` so the very next fetch
+    /// (which lands on the fresh path, since `set_oracle` seeds
+    /// `last_update_timestamp` to now) is properly verifiable.
+    fn enable_oracle(
+        env: &Env,
+        client: &AtomicSwapClient,
+        admin: &Address,
+        oracle_id: &Address,
+        oracle: &MockOracleClient,
+        token_id: &Address,
+        price: i128,
+    ) {
+        let pubkey = pubkey_bytes(env, &test_signing_key());
+        client.set_oracle(admin, oracle_id, &pubkey, &true, &0_u32);
+        publish_price(env, oracle, token_id, price);
     }
 
     // ── set_oracle tests ──────────────────────────────────────────────────────
@@ -99,13 +182,37 @@ mod oracle_tests {
         let (registry_id, ip_id, _, _) = setup_registry(&env, &seller);
         let token_id = setup_token(&env, &admin, &buyer, 10_000_000);
         let oracle_id = env.register(MockOracle, ());
-        let (client, admin_addr) = setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
+        let (client, admin_addr) =
+            setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
+        let pubkey = pubkey_bytes(&env, &test_signing_key());
 
-        client.set_oracle(&admin_addr, &oracle_id, &true);
+        client.set_oracle(&admin_addr, &oracle_id, &pubkey, &true, &0_u32);
 
         let config = client.get_oracle_config().unwrap();
         assert_eq!(config.oracle_address, oracle_id);
+        assert_eq!(config.oracle_pubkey, pubkey);
         assert!(config.enabled);
+        assert_eq!(config.max_deviation_bps, 0);
+    }
+
+    #[test]
+    fn test_set_oracle_stores_deviation_bound() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (registry_id, ip_id, _, _) = setup_registry(&env, &seller);
+        let token_id = setup_token(&env, &admin, &buyer, 10_000_000);
+        let oracle_id = env.register(MockOracle, ());
+        let (client, admin_addr) =
+            setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
+        let pubkey = pubkey_bytes(&env, &test_signing_key());
+
+        client.set_oracle(&admin_addr, &oracle_id, &pubkey, &true, &500_u32);
+
+        let config = client.get_oracle_config().unwrap();
+        assert_eq!(config.max_deviation_bps, 500);
     }
 
     #[test]
@@ -118,10 +225,12 @@ mod oracle_tests {
         let (registry_id, ip_id, _, _) = setup_registry(&env, &seller);
         let token_id = setup_token(&env, &admin, &buyer, 10_000_000);
         let oracle_id = env.register(MockOracle, ());
-        let (client, admin_addr) = setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
+        let (client, admin_addr) =
+            setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
+        let pubkey = pubkey_bytes(&env, &test_signing_key());
 
-        client.set_oracle(&admin_addr, &oracle_id, &true);
-        client.set_oracle(&admin_addr, &oracle_id, &false);
+        client.set_oracle(&admin_addr, &oracle_id, &pubkey, &true, &0_u32);
+        client.set_oracle(&admin_addr, &oracle_id, &pubkey, &false, &0_u32);
 
         let config = client.get_oracle_config().unwrap();
         assert!(!config.enabled);
@@ -138,10 +247,15 @@ mod oracle_tests {
         let (registry_id, ip_id, _, _) = setup_registry(&env, &seller);
         let token_id = setup_token(&env, &admin, &buyer, 10_000_000);
         let oracle_id = env.register(MockOracle, ());
-        let (client, _) = setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
+        let (client, _) =
+            setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
+        let pubkey = pubkey_bytes(&env, &test_signing_key());
 
-        let result = client.try_set_oracle(&attacker, &oracle_id, &true);
-        assert_eq!(result.unwrap_err().unwrap(), ContractError::Unauthorized);
+        let result = client.try_set_oracle(&attacker, &oracle_id, &pubkey, &true, &0_u32);
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            ContractError::Unauthorized.into()
+        );
     }
 
     // ── get_oracle_config tests ───────────────────────────────────────────────
@@ -171,10 +285,17 @@ mod oracle_tests {
         let token_id = setup_token(&env, &admin, &buyer, 10_000_000);
         let oracle_id = env.register(MockOracle, ());
         let oracle_client = MockOracleClient::new(&env, &oracle_id);
-        oracle_client.set_price(&750_000_i128);
-        let (client, admin_addr) = setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
-
-        client.set_oracle(&admin_addr, &oracle_id, &true);
+        let (client, admin_addr) =
+            setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
+        enable_oracle(
+            &env,
+            &client,
+            &admin_addr,
+            &oracle_id,
+            &oracle_client,
+            &token_id,
+            750_000_i128,
+        );
 
         let price = client.get_oracle_price(&token_id);
         assert_eq!(price, 750_000_i128);
@@ -191,7 +312,10 @@ mod oracle_tests {
         let token = Address::generate(&env);
 
         let result = client.try_get_oracle_price(&token);
-        assert_eq!(result.unwrap_err().unwrap(), ContractError::OracleNotConfigured);
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            ContractError::OracleNotConfigured.into()
+        );
     }
 
     #[test]
@@ -204,12 +328,221 @@ mod oracle_tests {
         let (registry_id, ip_id, _, _) = setup_registry(&env, &seller);
         let token_id = setup_token(&env, &admin, &buyer, 10_000_000);
         let oracle_id = env.register(MockOracle, ());
-        let (client, admin_addr) = setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
+        let (client, admin_addr) =
+            setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
+        let pubkey = pubkey_bytes(&env, &test_signing_key());
 
-        client.set_oracle(&admin_addr, &oracle_id, &false);
+        client.set_oracle(&admin_addr, &oracle_id, &pubkey, &false, &0_u32);
 
         let result = client.try_get_oracle_price(&token_id);
-        assert_eq!(result.unwrap_err().unwrap(), ContractError::OracleNotConfigured);
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            ContractError::OracleNotConfigured.into()
+        );
+    }
+
+    // ── #784: Signature verification tests ────────────────────────────────────
+
+    #[test]
+    fn test_get_oracle_price_rejects_forged_signature() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (registry_id, ip_id, _, _) = setup_registry(&env, &seller);
+        let token_id = setup_token(&env, &admin, &buyer, 10_000_000);
+        let oracle_id = env.register(MockOracle, ());
+        let oracle_client = MockOracleClient::new(&env, &oracle_id);
+        let (client, admin_addr) =
+            setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
+        let pubkey = pubkey_bytes(&env, &test_signing_key());
+        client.set_oracle(&admin_addr, &oracle_id, &pubkey, &true, &0_u32);
+
+        // A well-formed, positive price — but signed with a DIFFERENT key than
+        // the one registered via set_oracle. Simulates a forged/wrong-key
+        // attestation.
+        let ts = env.ledger().timestamp();
+        let forged_sig = sign_price(&env, &wrong_signing_key(), &token_id, 500_000_i128, ts);
+        oracle_client.set_signed_price(&500_000_i128, &ts, &forged_sig);
+
+        let result = client.try_get_oracle_price(&token_id);
+        assert!(result.is_err(), "a forged-signature price must be rejected");
+    }
+
+    #[test]
+    fn test_get_oracle_price_rejects_missing_signature() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (registry_id, ip_id, _, _) = setup_registry(&env, &seller);
+        let token_id = setup_token(&env, &admin, &buyer, 10_000_000);
+        let oracle_id = env.register(MockOracle, ());
+        let oracle_client = MockOracleClient::new(&env, &oracle_id);
+        let (client, admin_addr) =
+            setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
+        let pubkey = pubkey_bytes(&env, &test_signing_key());
+        client.set_oracle(&admin_addr, &oracle_id, &pubkey, &true, &0_u32);
+
+        // Well-formed, positive price with an all-zero (missing) signature.
+        let ts = env.ledger().timestamp();
+        oracle_client.set_signed_price(&500_000_i128, &ts, &BytesN::from_array(&env, &[0u8; 64]));
+
+        let result = client.try_get_oracle_price(&token_id);
+        assert!(
+            result.is_err(),
+            "a missing-signature price must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_get_oracle_price_rejects_tampered_price_under_valid_signature() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (registry_id, ip_id, _, _) = setup_registry(&env, &seller);
+        let token_id = setup_token(&env, &admin, &buyer, 10_000_000);
+        let oracle_id = env.register(MockOracle, ());
+        let oracle_client = MockOracleClient::new(&env, &oracle_id);
+        let (client, admin_addr) =
+            setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
+        let pubkey = pubkey_bytes(&env, &test_signing_key());
+        client.set_oracle(&admin_addr, &oracle_id, &pubkey, &true, &0_u32);
+
+        // Sign 500_000, but publish a different price under that signature —
+        // the signature only verifies the exact attested tuple.
+        let ts = env.ledger().timestamp();
+        let sig = sign_price(&env, &test_signing_key(), &token_id, 500_000_i128, ts);
+        oracle_client.set_signed_price(&999_000_i128, &ts, &sig);
+
+        let result = client.try_get_oracle_price(&token_id);
+        assert!(
+            result.is_err(),
+            "a tampered price under someone else's valid signature must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_initiate_swap_with_oracle_price_rejects_forged_signature() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (registry_id, ip_id, _, _) = setup_registry(&env, &seller);
+        let token_id = setup_token(&env, &admin, &buyer, 10_000_000);
+        let oracle_id = env.register(MockOracle, ());
+        let oracle_client = MockOracleClient::new(&env, &oracle_id);
+        let (client, admin_addr) =
+            setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
+        let pubkey = pubkey_bytes(&env, &test_signing_key());
+        client.set_oracle(&admin_addr, &oracle_id, &pubkey, &true, &0_u32);
+
+        let ts = env.ledger().timestamp();
+        let forged_sig = sign_price(&env, &wrong_signing_key(), &token_id, 500_000_i128, ts);
+        oracle_client.set_signed_price(&500_000_i128, &ts, &forged_sig);
+
+        let result = client.try_initiate_swap_with_oracle_price(
+            &token_id, &ip_id, &seller, &buyer, &0_u32, &None, &0_i128, &false, &0_i128, &0_i128,
+        );
+        assert!(
+            result.is_err(),
+            "a swap must not be initiated from a forged oracle price"
+        );
+        assert!(client.get_swap(&1_u64).is_none());
+    }
+
+    // ── #784: Deviation bound tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_get_oracle_price_rejects_price_beyond_deviation_bound() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (registry_id, ip_id, _, _) = setup_registry(&env, &seller);
+        let token_id = setup_token(&env, &admin, &buyer, 10_000_000);
+        let oracle_id = env.register(MockOracle, ());
+        let oracle_client = MockOracleClient::new(&env, &oracle_id);
+        let (client, admin_addr) =
+            setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
+
+        // 10% (1000 bps) max deviation.
+        let pubkey = pubkey_bytes(&env, &test_signing_key());
+        client.set_oracle(&admin_addr, &oracle_id, &pubkey, &true, &1000_u32);
+        publish_price(&env, &oracle_client, &token_id, 500_000_i128);
+
+        // Establish the baseline accepted price.
+        let price = client.get_oracle_price(&token_id);
+        assert_eq!(price, 500_000_i128);
+
+        // A validly-signed price that moves 40% from the baseline — far
+        // beyond the 10% bound — must be rejected even though the signature
+        // itself is genuine.
+        publish_price(&env, &oracle_client, &token_id, 700_000_i128);
+        let result = client.try_get_oracle_price(&token_id);
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            ContractError::OracleDeviationExceeded.into()
+        );
+    }
+
+    #[test]
+    fn test_get_oracle_price_accepts_price_within_deviation_bound() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (registry_id, ip_id, _, _) = setup_registry(&env, &seller);
+        let token_id = setup_token(&env, &admin, &buyer, 10_000_000);
+        let oracle_id = env.register(MockOracle, ());
+        let oracle_client = MockOracleClient::new(&env, &oracle_id);
+        let (client, admin_addr) =
+            setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
+
+        let pubkey = pubkey_bytes(&env, &test_signing_key());
+        client.set_oracle(&admin_addr, &oracle_id, &pubkey, &true, &1000_u32); // 10%
+        publish_price(&env, &oracle_client, &token_id, 500_000_i128);
+
+        let price = client.get_oracle_price(&token_id);
+        assert_eq!(price, 500_000_i128);
+
+        // A 5% move is within the 10% bound and must be accepted.
+        publish_price(&env, &oracle_client, &token_id, 525_000_i128);
+        let updated = client.get_oracle_price(&token_id);
+        assert_eq!(updated, 525_000_i128);
+    }
+
+    #[test]
+    fn test_zero_deviation_bound_means_unbounded() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (registry_id, ip_id, _, _) = setup_registry(&env, &seller);
+        let token_id = setup_token(&env, &admin, &buyer, 10_000_000);
+        let oracle_id = env.register(MockOracle, ());
+        let oracle_client = MockOracleClient::new(&env, &oracle_id);
+        let (client, admin_addr) =
+            setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
+        let pubkey = pubkey_bytes(&env, &test_signing_key());
+        client.set_oracle(&admin_addr, &oracle_id, &pubkey, &true, &0_u32); // unbounded
+        publish_price(&env, &oracle_client, &token_id, 500_000_i128);
+
+        let price = client.get_oracle_price(&token_id);
+        assert_eq!(price, 500_000_i128);
+
+        // A large swing is allowed when max_deviation_bps is 0.
+        publish_price(&env, &oracle_client, &token_id, 5_000_000_i128);
+        let updated = client.get_oracle_price(&token_id);
+        assert_eq!(updated, 5_000_000_i128);
     }
 
     // ── initiate_swap_with_oracle_price tests ─────────────────────────────────
@@ -225,14 +558,20 @@ mod oracle_tests {
         let token_id = setup_token(&env, &admin, &buyer, 10_000_000);
         let oracle_id = env.register(MockOracle, ());
         let oracle_client = MockOracleClient::new(&env, &oracle_id);
-        oracle_client.set_price(&500_000_i128);
-        let (client, admin_addr) = setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
-        client.set_oracle(&admin_addr, &oracle_id, &true);
+        let (client, admin_addr) =
+            setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
+        enable_oracle(
+            &env,
+            &client,
+            &admin_addr,
+            &oracle_id,
+            &oracle_client,
+            &token_id,
+            500_000_i128,
+        );
 
         let swap_id = client.initiate_swap_with_oracle_price(
-            &token_id, &ip_id, &seller, &buyer,
-            &0_u32, &None, &0_i128, &false,
-            &0_i128, &0_i128,
+            &token_id, &ip_id, &seller, &buyer, &0_u32, &None, &0_i128, &false, &0_i128, &0_i128,
         );
 
         let swap = client.get_swap(&swap_id).unwrap();
@@ -251,16 +590,25 @@ mod oracle_tests {
         let token_id = setup_token(&env, &admin, &buyer, 10_000_000);
         let oracle_id = env.register(MockOracle, ());
         let oracle_client = MockOracleClient::new(&env, &oracle_id);
-        oracle_client.set_price(&100_i128); // below min
-        let (client, admin_addr) = setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
-        client.set_oracle(&admin_addr, &oracle_id, &true);
+        let (client, admin_addr) =
+            setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
+        enable_oracle(
+            &env,
+            &client,
+            &admin_addr,
+            &oracle_id,
+            &oracle_client,
+            &token_id,
+            100_i128,
+        ); // below min
 
         let result = client.try_initiate_swap_with_oracle_price(
-            &token_id, &ip_id, &seller, &buyer,
-            &0_u32, &None, &0_i128, &false,
-            &500_i128, &0_i128,
+            &token_id, &ip_id, &seller, &buyer, &0_u32, &None, &0_i128, &false, &500_i128, &0_i128,
         );
-        assert_eq!(result.unwrap_err().unwrap(), ContractError::OraclePriceBelowMin);
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            ContractError::OraclePriceBelowMin.into()
+        );
     }
 
     #[test]
@@ -274,16 +622,34 @@ mod oracle_tests {
         let token_id = setup_token(&env, &admin, &buyer, 10_000_000);
         let oracle_id = env.register(MockOracle, ());
         let oracle_client = MockOracleClient::new(&env, &oracle_id);
-        oracle_client.set_price(&1_000_000_i128); // above max
-        let (client, admin_addr) = setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
-        client.set_oracle(&admin_addr, &oracle_id, &true);
+        let (client, admin_addr) =
+            setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
+        enable_oracle(
+            &env,
+            &client,
+            &admin_addr,
+            &oracle_id,
+            &oracle_client,
+            &token_id,
+            1_000_000_i128,
+        ); // above max
 
         let result = client.try_initiate_swap_with_oracle_price(
-            &token_id, &ip_id, &seller, &buyer,
-            &0_u32, &None, &0_i128, &false,
-            &0_i128, &500_000_i128,
+            &token_id,
+            &ip_id,
+            &seller,
+            &buyer,
+            &0_u32,
+            &None,
+            &0_i128,
+            &false,
+            &0_i128,
+            &500_000_i128,
         );
-        assert_eq!(result.unwrap_err().unwrap(), ContractError::OraclePriceAboveMax);
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            ContractError::OraclePriceAboveMax.into()
+        );
     }
 
     #[test]
@@ -297,14 +663,29 @@ mod oracle_tests {
         let token_id = setup_token(&env, &admin, &buyer, 10_000_000);
         let oracle_id = env.register(MockOracle, ());
         let oracle_client = MockOracleClient::new(&env, &oracle_id);
-        oracle_client.set_price(&300_000_i128);
-        let (client, admin_addr) = setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
-        client.set_oracle(&admin_addr, &oracle_id, &true);
+        let (client, admin_addr) =
+            setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
+        enable_oracle(
+            &env,
+            &client,
+            &admin_addr,
+            &oracle_id,
+            &oracle_client,
+            &token_id,
+            300_000_i128,
+        );
 
         let swap_id = client.initiate_swap_with_oracle_price(
-            &token_id, &ip_id, &seller, &buyer,
-            &0_u32, &None, &0_i128, &false,
-            &100_000_i128, &500_000_i128,
+            &token_id,
+            &ip_id,
+            &seller,
+            &buyer,
+            &0_u32,
+            &None,
+            &0_i128,
+            &false,
+            &100_000_i128,
+            &500_000_i128,
         );
 
         let swap = client.get_swap(&swap_id).unwrap();
@@ -325,11 +706,12 @@ mod oracle_tests {
         client.initialize(&registry_id);
 
         let result = client.try_initiate_swap_with_oracle_price(
-            &token_id, &ip_id, &seller, &buyer,
-            &0_u32, &None, &0_i128, &false,
-            &0_i128, &0_i128,
+            &token_id, &ip_id, &seller, &buyer, &0_u32, &None, &0_i128, &false, &0_i128, &0_i128,
         );
-        assert_eq!(result.unwrap_err().unwrap(), ContractError::OracleNotConfigured);
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            ContractError::OracleNotConfigured.into()
+        );
     }
 
     #[test]
@@ -343,18 +725,23 @@ mod oracle_tests {
         let token_id = setup_token(&env, &admin, &buyer, 10_000_000);
         let oracle_id = env.register(MockOracle, ());
         let oracle_client = MockOracleClient::new(&env, &oracle_id);
-        oracle_client.set_price(&0_i128); // invalid: zero
-        let (client, admin_addr) = setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
-        client.set_oracle(&admin_addr, &oracle_id, &true);
+        let (client, admin_addr) =
+            setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
+        let pubkey = pubkey_bytes(&env, &test_signing_key());
+        client.set_oracle(&admin_addr, &oracle_id, &pubkey, &true, &0_u32);
+        publish_price(&env, &oracle_client, &token_id, 0_i128); // invalid: zero
 
         let result = client.try_get_oracle_price(&token_id);
-        assert_eq!(result.unwrap_err().unwrap(), ContractError::OraclePriceInvalid);
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            ContractError::OraclePriceInvalid.into()
+        );
     }
 
     // ── #622: Staleness Validation Tests ──────────────────────────────────────
 
     #[test]
-    fn test_oracle_config_stores_timestamp_and_cached_price() {
+    fn test_oracle_config_stores_timestamp() {
         let env = Env::default();
         env.mock_all_auths();
         let seller = Address::generate(&env);
@@ -364,16 +751,26 @@ mod oracle_tests {
         let token_id = setup_token(&env, &admin, &buyer, 10_000_000);
         let oracle_id = env.register(MockOracle, ());
         let oracle_client = MockOracleClient::new(&env, &oracle_id);
-        oracle_client.set_price(&500_000_i128);
-        let (client, admin_addr) = setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
-
-        client.set_oracle(&admin_addr, &oracle_id, &true);
+        let (client, admin_addr) =
+            setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
+        enable_oracle(
+            &env,
+            &client,
+            &admin_addr,
+            &oracle_id,
+            &oracle_client,
+            &token_id,
+            500_000_i128,
+        );
 
         let config = client.get_oracle_config().unwrap();
         assert_eq!(config.oracle_address, oracle_id);
         assert!(config.enabled);
-        assert!(config.last_update_timestamp > 0);
-        assert_eq!(config.cached_price, 500_000_i128);
+
+        let price = client.get_oracle_price(&token_id);
+        assert_eq!(price, 500_000_i128);
+        let config_after = client.get_oracle_config().unwrap();
+        assert_eq!(config_after.cached_price, 500_000_i128);
     }
 
     #[test]
@@ -387,16 +784,24 @@ mod oracle_tests {
         let token_id = setup_token(&env, &admin, &buyer, 10_000_000);
         let oracle_id = env.register(MockOracle, ());
         let oracle_client = MockOracleClient::new(&env, &oracle_id);
-        oracle_client.set_price(&500_000_i128);
-        let (client, admin_addr) = setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
-        client.set_oracle(&admin_addr, &oracle_id, &true);
+        let (client, admin_addr) =
+            setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
+        enable_oracle(
+            &env,
+            &client,
+            &admin_addr,
+            &oracle_id,
+            &oracle_client,
+            &token_id,
+            500_000_i128,
+        );
 
         // Get price (should be fresh and update cache)
         let price = client.get_oracle_price(&token_id);
         assert_eq!(price, 500_000_i128);
 
-        // Change oracle price
-        oracle_client.set_price(&600_000_i128);
+        // Publish (sign + push) a new price
+        publish_price(&env, &oracle_client, &token_id, 600_000_i128);
 
         // Get price again (should fetch new value)
         let new_price = client.get_oracle_price(&token_id);
@@ -418,9 +823,17 @@ mod oracle_tests {
         let token_id = setup_token(&env, &admin, &buyer, 10_000_000);
         let oracle_id = env.register(MockOracle, ());
         let oracle_client = MockOracleClient::new(&env, &oracle_id);
-        oracle_client.set_price(&500_000_i128);
-        let (client, admin_addr) = setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
-        client.set_oracle(&admin_addr, &oracle_id, &true);
+        let (client, admin_addr) =
+            setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
+        enable_oracle(
+            &env,
+            &client,
+            &admin_addr,
+            &oracle_id,
+            &oracle_client,
+            &token_id,
+            500_000_i128,
+        );
 
         // Price is fresh (within 5 min threshold)
         let price = client.get_oracle_price(&token_id);
@@ -438,28 +851,61 @@ mod oracle_tests {
         let token_id = setup_token(&env, &admin, &buyer, 10_000_000);
         let oracle_id = env.register(MockOracle, ());
         let oracle_client = MockOracleClient::new(&env, &oracle_id);
-        oracle_client.set_price(&500_000_i128);
-        let (client, admin_addr) = setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
-        client.set_oracle(&admin_addr, &oracle_id, &true);
+        let (client, admin_addr) =
+            setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
+        enable_oracle(
+            &env,
+            &client,
+            &admin_addr,
+            &oracle_id,
+            &oracle_client,
+            &token_id,
+            500_000_i128,
+        );
 
         // Get price to establish cache
         let initial_price = client.get_oracle_price(&token_id);
         assert_eq!(initial_price, 500_000_i128);
 
         // Simulate time passing beyond staleness threshold (>300 seconds)
-        // We advance the ledger timestamp
         env.ledger().set_timestamp(env.ledger().timestamp() + 301);
 
-        // Change oracle price (but staleness should trigger fallback)
-        oracle_client.set_price(&700_000_i128);
+        // Publish a new price (but staleness should trigger a cache fallback
+        // instead of fetching this one)
+        publish_price(&env, &oracle_client, &token_id, 700_000_i128);
 
-        // Get price - should return cached value due to staleness
-        // (Note: This depends on the staleness check logic in fetch_oracle_price_with_staleness_check)
         let stale_price = client.get_oracle_price(&token_id);
 
-        // Due to staleness, it should use cached price or handle gracefully
-        // The actual behavior depends on oracle implementation staleness tracking
-        assert!(stale_price > 0);
+        // Due to staleness, the cached (pre-lapse) price is used, not the new one.
+        assert_eq!(stale_price, 500_000_i128);
+    }
+
+    #[test]
+    fn test_stale_price_with_no_cache_is_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (registry_id, ip_id, _, _) = setup_registry(&env, &seller);
+        let token_id = setup_token(&env, &admin, &buyer, 10_000_000);
+        let oracle_id = env.register(MockOracle, ());
+        let oracle_client = MockOracleClient::new(&env, &oracle_id);
+        let (client, admin_addr) =
+            setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
+
+        // Enable, but never successfully fetch a price, then let the clock run
+        // past the staleness window: there is no cache to fall back to.
+        let pubkey = pubkey_bytes(&env, &test_signing_key());
+        client.set_oracle(&admin_addr, &oracle_id, &pubkey, &true, &0_u32);
+        env.ledger().set_timestamp(env.ledger().timestamp() + 301);
+        publish_price(&env, &oracle_client, &token_id, 500_000_i128);
+
+        let result = client.try_get_oracle_price(&token_id);
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            ContractError::OraclePriceInvalid.into()
+        );
     }
 
     #[test]
@@ -473,15 +919,21 @@ mod oracle_tests {
         let token_id = setup_token(&env, &admin, &buyer, 10_000_000);
         let oracle_id = env.register(MockOracle, ());
         let oracle_client = MockOracleClient::new(&env, &oracle_id);
-        oracle_client.set_price(&500_000_i128);
-        let (client, admin_addr) = setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
-        client.set_oracle(&admin_addr, &oracle_id, &true);
+        let (client, admin_addr) =
+            setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
+        enable_oracle(
+            &env,
+            &client,
+            &admin_addr,
+            &oracle_id,
+            &oracle_client,
+            &token_id,
+            500_000_i128,
+        );
 
         // Initiate swap with oracle price
         let swap_id = client.initiate_swap_with_oracle_price(
-            &token_id, &ip_id, &seller, &buyer,
-            &0_u32, &None, &0_i128, &false,
-            &0_i128, &0_i128,
+            &token_id, &ip_id, &seller, &buyer, &0_u32, &None, &0_i128, &false, &0_i128, &0_i128,
         );
 
         let swap = client.get_swap(&swap_id).unwrap();
@@ -499,15 +951,30 @@ mod oracle_tests {
         let token_id = setup_token(&env, &admin, &buyer, 10_000_000);
         let oracle_id = env.register(MockOracle, ());
         let oracle_client = MockOracleClient::new(&env, &oracle_id);
-        oracle_client.set_price(&300_000_i128);
-        let (client, admin_addr) = setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
-        client.set_oracle(&admin_addr, &oracle_id, &true);
+        let (client, admin_addr) =
+            setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
+        enable_oracle(
+            &env,
+            &client,
+            &admin_addr,
+            &oracle_id,
+            &oracle_client,
+            &token_id,
+            300_000_i128,
+        );
 
         // Initiate swap with bounds that the cached price respects
         let swap_id = client.initiate_swap_with_oracle_price(
-            &token_id, &ip_id, &seller, &buyer,
-            &0_u32, &None, &0_i128, &false,
-            &100_000_i128, &500_000_i128,
+            &token_id,
+            &ip_id,
+            &seller,
+            &buyer,
+            &0_u32,
+            &None,
+            &0_i128,
+            &false,
+            &100_000_i128,
+            &500_000_i128,
         );
 
         let swap = client.get_swap(&swap_id).unwrap();
@@ -526,16 +993,26 @@ mod oracle_tests {
         let token_id = setup_token(&env, &admin, &buyer, 10_000_000);
         let oracle_id = env.register(MockOracle, ());
         let oracle_client = MockOracleClient::new(&env, &oracle_id);
-        oracle_client.set_price(&500_000_i128);
-        let (client, admin_addr) = setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
+        let (client, admin_addr) =
+            setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
+        enable_oracle(
+            &env,
+            &client,
+            &admin_addr,
+            &oracle_id,
+            &oracle_client,
+            &token_id,
+            500_000_i128,
+        );
+        client.get_oracle_price(&token_id); // populate the cache
 
-        // Enable oracle
-        client.set_oracle(&admin_addr, &oracle_id, &true);
         let config_enabled = client.get_oracle_config().unwrap();
         let cached_price = config_enabled.cached_price;
+        assert_eq!(cached_price, 500_000_i128);
 
         // Disable oracle
-        client.set_oracle(&admin_addr, &oracle_id, &false);
+        let pubkey = pubkey_bytes(&env, &test_signing_key());
+        client.set_oracle(&admin_addr, &oracle_id, &pubkey, &false, &0_u32);
         let config_disabled = client.get_oracle_config().unwrap();
 
         // Verify cache is preserved
@@ -544,7 +1021,7 @@ mod oracle_tests {
     }
 
     #[test]
-    fn test_oracle_mock_failure_handling() {
+    fn test_oracle_disabled_after_enable_rejects_price_fetch() {
         let env = Env::default();
         env.mock_all_auths();
         let seller = Address::generate(&env);
@@ -554,18 +1031,26 @@ mod oracle_tests {
         let token_id = setup_token(&env, &admin, &buyer, 10_000_000);
         let oracle_id = env.register(MockOracle, ());
         let oracle_client = MockOracleClient::new(&env, &oracle_id);
-        oracle_client.set_price(&500_000_i128);
-        let (client, admin_addr) = setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
+        let (client, admin_addr) =
+            setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
+        enable_oracle(
+            &env,
+            &client,
+            &admin_addr,
+            &oracle_id,
+            &oracle_client,
+            &token_id,
+            500_000_i128,
+        );
 
-        // Set oracle with valid price
-        client.set_oracle(&admin_addr, &oracle_id, &true);
+        let pubkey = pubkey_bytes(&env, &test_signing_key());
+        client.set_oracle(&admin_addr, &oracle_id, &pubkey, &false, &0_u32);
 
-        // Try setting oracle to disabled state
-        client.set_oracle(&admin_addr, &oracle_id, &false);
-
-        // Should not be able to fetch price when disabled
         let result = client.try_get_oracle_price(&token_id);
-        assert_eq!(result.unwrap_err().unwrap(), ContractError::OracleNotConfigured);
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            ContractError::OracleNotConfigured.into()
+        );
     }
 
     #[test]
@@ -579,17 +1064,23 @@ mod oracle_tests {
         let token_id = setup_token(&env, &admin, &buyer, 10_000_000);
         let oracle_id = env.register(MockOracle, ());
         let oracle_client = MockOracleClient::new(&env, &oracle_id);
+        let (client, admin_addr) =
+            setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
+        enable_oracle(
+            &env,
+            &client,
+            &admin_addr,
+            &oracle_id,
+            &oracle_client,
+            &token_id,
+            500_000_i128,
+        );
 
-        // Start with a price
-        oracle_client.set_price(&500_000_i128);
-        let (client, admin_addr) = setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
-        client.set_oracle(&admin_addr, &oracle_id, &true);
-
-        // Simulate price volatility by changing oracle price
-        oracle_client.set_price(&480_000_i128);
+        // Simulate price volatility by publishing new signed prices
+        publish_price(&env, &oracle_client, &token_id, 480_000_i128);
         let price1 = client.get_oracle_price(&token_id);
 
-        oracle_client.set_price(&520_000_i128);
+        publish_price(&env, &oracle_client, &token_id, 520_000_i128);
         let price2 = client.get_oracle_price(&token_id);
 
         // Both should be valid
@@ -598,9 +1089,16 @@ mod oracle_tests {
 
         // Initiate swap with tight bounds
         let swap_id = client.initiate_swap_with_oracle_price(
-            &token_id, &ip_id, &seller, &buyer,
-            &0_u32, &None, &0_i128, &false,
-            &500_000_i128, &530_000_i128,
+            &token_id,
+            &ip_id,
+            &seller,
+            &buyer,
+            &0_u32,
+            &None,
+            &0_i128,
+            &false,
+            &500_000_i128,
+            &530_000_i128,
         );
 
         let swap = client.get_swap(&swap_id).unwrap();

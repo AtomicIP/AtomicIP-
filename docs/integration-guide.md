@@ -367,6 +367,45 @@ rate(circuit_breaker_calls_rejected_total[1m])
 rate(circuit_breaker_state_transitions_total[1m]) > 3
 ```
 
+## WebSocket GraphQL Subscriptions
+
+Real-time events (`ipCommitted`, `swapInitiated`, `swapCompleted`, `categoryAssigned`,
+`swapStatusChanged`) are delivered over the `graphql-transport-ws` subprotocol at
+`GET /graphql/ws`. Connect with a standard GraphQL WebSocket client (`graphql-ws` npm package,
+Apollo Client, etc.) — see the example subscription documents on `SubscriptionRoot` in
+`api-server/src/graphql.rs`.
+
+### Multi-Instance Delivery
+
+By default the API server broadcasts subscription events through an in-process channel only: a
+client connected to instance A will **not** see an event whose triggering contract mutation was
+observed solely by instance B. Set the `REDIS_URL` environment variable (e.g.
+`redis://localhost:6379`) to enable cross-instance delivery — every instance pointed at the same
+Redis then fans events out to WebSocket clients connected to any of them. If `REDIS_URL` is set but
+Redis is unreachable at startup, the server logs a warning and falls back to single-instance delivery
+rather than failing to start.
+
+### Reconnect / Backfill Guarantee
+
+Every subscription accepts an optional `since` argument — the `timestamp` of the last event the
+client successfully processed (every event payload already includes `timestamp`). The guarantee:
+
+- **With `REDIS_URL` configured**: events with a later timestamp than `since`, still within the
+  retention window (the last ~500 events per event type), are replayed once before live delivery
+  resumes. This is **at-least-once within the window** — a client that reconnects after a longer gap,
+  or after more than ~500 events of that type occurred, will have a gap with no delivery guarantee.
+- **Without `REDIS_URL`** (single-instance mode): `since` is silently ignored — there is no
+  persisted buffer to replay from, so a reconnecting client only receives events from the moment it
+  resubscribes, exactly as if `since` had been omitted.
+
+```graphql
+subscription {
+  ipCommitted(owner: "GABC123", since: 1735000000000) {
+    ipId owner timestamp
+  }
+}
+```
+
 ## Support
 
 - GitHub Issues: https://github.com/AtomicIP/AtomicIP-/issues
