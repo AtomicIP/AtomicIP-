@@ -1,5 +1,8 @@
 #![no_std]
 #![allow(deprecated)]
+#[cfg(test)]
+extern crate std;
+
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
     Bytes, BytesN, Env, Error, Vec,
@@ -112,6 +115,18 @@ pub const NOTARY_PUBLIC_KEY: &[u8] = b"notary_public_key_placeholder";
 /// Issue #437: Number of storage shards for commitment distribution.
 pub const NUM_SHARDS: u32 = 16;
 
+/// Issue #785: Maximum number of IP IDs held in a single shard sub-index
+/// vector. Once a sub-index reaches this size, further writes roll over to
+/// a fresh sub-index instead of growing the vector, so every shard write
+/// touches a bounded amount of storage regardless of how many commitments
+/// have ever landed in that shard.
+pub const SUB_SHARD_CAPACITY: u32 = 512;
+
+/// Issue #785: Maximum number of legacy (pre-sub-sharding) entries migrated
+/// into the bounded layout per call. Keeps migration cost bounded per
+/// transaction instead of requiring a one-shot admin migration.
+const SHARD_MIGRATION_BATCH: u32 = 64;
+
 /// Issue #459: Maximum allowed category hierarchy depth.
 /// Supports paths like "Software/Cryptography/ZK-Proofs/DLV/AXIOM" (depth 5).
 pub const MAX_CATEGORY_DEPTH: u32 = 10;
@@ -147,18 +162,22 @@ pub enum DataKey {
     CommitmentHashes, // Issue #429: stores Vec<BytesN<32>> of all commitment hashes for rollback protection
     IpPowDifficulty(u64), // stores the pow_difficulty used at commit time for strength scoring
     // Previously missing variants (used in existing code)
-    ShardIps(u32),             // Issue #437: maps shard_id -> Vec<u64> of IP IDs
-    IpAuditTrail(u64),         // Issue #436: stores Vec<AuditEntry> for a given ip_id
-    RenewalCount(u64),         // stores renewal count for a given ip_id
-    Delegates(Address),        // stores Vec<DelegationRecord> for a given owner
-    DelegateDepth(Address),    // stores delegation depth for a given delegate
-    IpDisputes(u64),           // stores DisputeRecord for a given dispute_id
-    NextDisputeId,             // monotonic dispute ID counter
-    IpStake(u64),              // Issue #447: stores StakeRecord for a given ip_id
-    OwnerReputation(Address),  // Issue #448: stores ReputationRecord for a given owner
-    ArbitrationCase(u64),      // Issue #449: stores ArbitrationRecord for a given arbitration_id
-    NextArbitrationId,         // Issue #449: monotonic arbitration ID counter
-    ArbitratorPool,            // Issue #449: stores Vec<Address> of registered arbitrators
+    ShardIps(u32), // Issue #437: legacy unbounded shard vector; Issue #785 migrates entries out of this lazily
+    /// Issue #785: maps (shard_id, sub_index) -> bounded Vec<u64> of IP IDs (capacity SUB_SHARD_CAPACITY)
+    ShardSubIps(u32, u32),
+    /// Issue #785: maps shard_id -> sub_index currently being appended to
+    ShardHead(u32),
+    IpAuditTrail(u64),      // Issue #436: stores Vec<AuditEntry> for a given ip_id
+    RenewalCount(u64),      // stores renewal count for a given ip_id
+    Delegates(Address),     // stores Vec<DelegationRecord> for a given owner
+    DelegateDepth(Address), // stores delegation depth for a given delegate
+    IpDisputes(u64),        // stores DisputeRecord for a given dispute_id
+    NextDisputeId,          // monotonic dispute ID counter
+    IpStake(u64),           // Issue #447: stores StakeRecord for a given ip_id
+    OwnerReputation(Address), // Issue #448: stores ReputationRecord for a given owner
+    ArbitrationCase(u64),   // Issue #449: stores ArbitrationRecord for a given arbitration_id
+    NextArbitrationId,      // Issue #449: monotonic arbitration ID counter
+    ArbitratorPool,         // Issue #449: stores Vec<Address> of registered arbitrators
     CompressedCommitment(u64), // Issue #438: stores compressed commitment bytes for a given ip_id
     // Issue #458: Batch verification result cache
     BatchVerifyResult(BytesN<32>), // maps batch_proof_id -> BatchVerifyResult
@@ -2977,32 +2996,166 @@ impl IpRegistry {
         (bytes[0] as u32) % NUM_SHARDS
     }
 
-    /// Retrieve all IP IDs stored in a given shard.
-    pub fn get_shard_ip_ids(env: Env, shard_id: u32) -> Vec<u64> {
-        env.storage()
+    /// Issue #785: List IP IDs in `shard_id`, paginated across the bounded
+    /// sub-shard layout. Pass `cursor` as `None` to start from the
+    /// beginning; each call returns at most one bounded page (at most
+    /// `SUB_SHARD_CAPACITY` IDs) plus a `next_cursor` to pass back in to
+    /// continue, or `None` once the shard is exhausted. This keeps every
+    /// call's storage read bounded regardless of how large the shard has
+    /// grown over its lifetime.
+    ///
+    /// Replaces the old `get_shard_ip_ids`, which returned an entire shard
+    /// in one call: on a real network a single invocation's resources are
+    /// capped, so a shard with enough history to matter could no longer be
+    /// enumerated in one call anyway. Full enumeration is still possible —
+    /// call this in a loop, following `next_cursor`, across separate calls.
+    pub fn list_ip_by_shard(
+        env: Env,
+        shard_id: u32,
+        cursor: Option<u32>,
+    ) -> (Vec<u64>, Option<u32>) {
+        let legacy_key = DataKey::ShardIps(shard_id);
+        let pos = cursor.unwrap_or_else(|| {
+            if env.storage().persistent().has(&legacy_key) {
+                0
+            } else {
+                1
+            }
+        });
+
+        // Page 0 (only ever reached for shards with a not-yet-fully-migrated
+        // legacy vector) surfaces the remaining legacy entries. This vector
+        // only shrinks after the fix ships (migrate_legacy_shard_batch is
+        // the only writer to it), so its size is bounded by whatever had
+        // already accumulated before deployment, not by ongoing growth.
+        if pos == 0 {
+            let legacy: Vec<u64> = env
+                .storage()
+                .persistent()
+                .get(&legacy_key)
+                .unwrap_or(Vec::new(&env));
+            return (legacy, Some(1));
+        }
+
+        let sub_index = pos - 1;
+        let head: u32 = env
+            .storage()
             .persistent()
-            .get(&DataKey::ShardIps(shard_id))
-            .unwrap_or(Vec::new(&env))
+            .get(&DataKey::ShardHead(shard_id))
+            .unwrap_or(0);
+        let sub_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ShardSubIps(shard_id, sub_index))
+            .unwrap_or(Vec::new(&env));
+
+        let next_cursor = if sub_index < head {
+            Some(pos + 1)
+        } else {
+            None
+        };
+        (sub_ids, next_cursor)
     }
 
     /// Internal: assign an IP to its shard based on its commitment hash.
+    /// Lazily migrates a bounded batch of any pre-existing unbounded shard
+    /// vector before appending, then appends via the bounded sub-shard
+    /// layout so this write's cost never depends on the shard's total
+    /// lifetime volume.
     fn assign_to_shard(env: &Env, ip_id: u64, commitment_hash: &BytesN<32>) {
         let bytes = commitment_hash.to_array();
         let shard_id = (bytes[0] as u32) % NUM_SHARDS;
-        let mut shard_ids: Vec<u64> = env
+
+        Self::migrate_legacy_shard_batch(env, shard_id);
+        Self::append_to_shard_sub_index(env, shard_id, ip_id);
+    }
+
+    /// Issue #785: Migrate up to `SHARD_MIGRATION_BATCH` entries from the
+    /// legacy unbounded `ShardIps(shard_id)` vector (if any) into the
+    /// bounded sub-shard layout. Called on every write to a shard so large
+    /// legacy shards convert incrementally across several transactions
+    /// instead of needing a one-shot admin migration that would have to
+    /// perform every one of those writes atomically in a single invocation.
+    ///
+    /// Note this only bounds the *write* side of migration. Reading the
+    /// legacy vector at all still costs O(remaining legacy size) per call —
+    /// that's an unavoidable consequence of it being stored as one blob
+    /// under one key, the same reason it needs migrating in the first
+    /// place. That read cost strictly shrinks call over call as the batch
+    /// drains it, and drops to zero once the legacy key is removed.
+    fn migrate_legacy_shard_batch(env: &Env, shard_id: u32) {
+        let legacy_key = DataKey::ShardIps(shard_id);
+        let mut legacy: Vec<u64> = match env.storage().persistent().get(&legacy_key) {
+            Some(v) => v,
+            None => return,
+        };
+        if legacy.is_empty() {
+            env.storage().persistent().remove(&legacy_key);
+            return;
+        }
+
+        let batch = core::cmp::min(SHARD_MIGRATION_BATCH, legacy.len());
+        for _ in 0..batch {
+            let ip_id = legacy.get(0).unwrap();
+            legacy.remove(0);
+            Self::append_to_shard_sub_index(env, shard_id, ip_id);
+        }
+
+        if legacy.is_empty() {
+            env.storage().persistent().remove(&legacy_key);
+        } else {
+            env.storage().persistent().set(&legacy_key, &legacy);
+            env.storage()
+                .persistent()
+                .extend_ttl(&legacy_key, LEDGER_BUMP, LEDGER_BUMP);
+        }
+    }
+
+    /// Issue #785: Append `ip_id` to the bounded sub-shard layout for
+    /// `shard_id`, rolling over to a fresh sub-index once the current one
+    /// reaches `SUB_SHARD_CAPACITY`. Every call reads and writes at most one
+    /// sub-shard vector, so cost stays flat no matter how many commitments
+    /// have ever landed in this shard.
+    fn append_to_shard_sub_index(env: &Env, shard_id: u32, ip_id: u64) {
+        let head: u32 = env
             .storage()
             .persistent()
-            .get(&DataKey::ShardIps(shard_id))
+            .get(&DataKey::ShardHead(shard_id))
+            .unwrap_or(0);
+
+        let sub_key = DataKey::ShardSubIps(shard_id, head);
+        let mut sub_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&sub_key)
             .unwrap_or(Vec::new(env));
-        shard_ids.push_back(ip_id);
+
+        if sub_ids.len() >= SUB_SHARD_CAPACITY {
+            let next_head = head + 1;
+            env.storage()
+                .persistent()
+                .set(&DataKey::ShardHead(shard_id), &next_head);
+            env.storage().persistent().extend_ttl(
+                &DataKey::ShardHead(shard_id),
+                LEDGER_BUMP,
+                LEDGER_BUMP,
+            );
+
+            let new_key = DataKey::ShardSubIps(shard_id, next_head);
+            let mut new_sub: Vec<u64> = Vec::new(env);
+            new_sub.push_back(ip_id);
+            env.storage().persistent().set(&new_key, &new_sub);
+            env.storage()
+                .persistent()
+                .extend_ttl(&new_key, LEDGER_BUMP, LEDGER_BUMP);
+            return;
+        }
+
+        sub_ids.push_back(ip_id);
+        env.storage().persistent().set(&sub_key, &sub_ids);
         env.storage()
             .persistent()
-            .set(&DataKey::ShardIps(shard_id), &shard_ids);
-        env.storage().persistent().extend_ttl(
-            &DataKey::ShardIps(shard_id),
-            LEDGER_BUMP,
-            LEDGER_BUMP,
-        );
+            .extend_ttl(&sub_key, LEDGER_BUMP, LEDGER_BUMP);
     }
 
     // ── Issue #436: Audit Trail Immutability ──────────────────────────────────
