@@ -145,6 +145,29 @@ async fn require_json_content_type(req: Request<Body>, next: Next) -> Result<Res
     Ok(next.run(req).await)
 }
 
+/// Builds the GraphQL subscription broadcaster. When `REDIS_URL` is set,
+/// events fan out across every instance pointed at that Redis (#783); on
+/// any connection failure, or when `REDIS_URL` is unset, falls back to the
+/// single-instance in-process broadcaster so the server always starts
+/// without Redis (mirrors `cache::init_cache`'s fallback philosophy).
+async fn init_subscription_broadcaster() -> Arc<graphql::SubscriptionBroadcaster> {
+    match std::env::var("REDIS_URL") {
+        Ok(url) if !url.is_empty() => {
+            match graphql::SubscriptionBroadcaster::new_with_redis(&url).await {
+                Ok(broadcaster) => {
+                    tracing::info!("multi-instance GraphQL subscriptions enabled via REDIS_URL");
+                    broadcaster
+                }
+                Err(e) => {
+                    tracing::warn!("REDIS_URL set but unusable ({e}); falling back to single-instance GraphQL subscriptions");
+                    Arc::new(graphql::SubscriptionBroadcaster::new())
+                }
+            }
+        }
+        _ => Arc::new(graphql::SubscriptionBroadcaster::new()),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // Initialise OpenTelemetry SDK (OTLP exporter) + tracing subscriber.
@@ -153,7 +176,7 @@ async fn main() {
 
     metrics::init();
 
-    let subscription_broadcaster = Arc::new(graphql::SubscriptionBroadcaster::new());
+    let subscription_broadcaster = init_subscription_broadcaster().await;
     let schema = graphql::build_schema_with_broadcaster(
         Arc::new(graphql::MockSorobanRpcClient::default()),
         subscription_broadcaster.clone(),

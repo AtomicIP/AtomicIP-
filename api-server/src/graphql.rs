@@ -3,6 +3,9 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use futures::{Stream, StreamExt};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use redis::AsyncCommands;
+use redis::streams::{StreamMaxlen, StreamReadOptions};
 
 // ── GraphQL Types ─────────────────────────────────────────────────────────────
 
@@ -17,7 +20,7 @@ pub struct IpRecord {
 }
 
 /// Status of an atomic swap.
-#[derive(async_graphql::Enum, Copy, Clone, Eq, PartialEq, Debug)]
+#[derive(async_graphql::Enum, Copy, Clone, Eq, PartialEq, Debug, Serialize, Deserialize)]
 pub enum SwapStatus {
     Pending,
     Accepted,
@@ -81,7 +84,7 @@ pub struct DisputeEvidence {
 
 /// Subscription event emitted when a swap changes status.
 /// Includes `seller` and `buyer` so clients can apply server-side filters.
-#[derive(SimpleObject, Clone, Debug)]
+#[derive(SimpleObject, Clone, Debug, Serialize, Deserialize)]
 pub struct SwapStatusChanged {
     pub swap_id: u64,
     pub seller: String,
@@ -92,7 +95,7 @@ pub struct SwapStatusChanged {
 }
 
 /// Subscription event emitted when an IP commitment is recorded on-chain.
-#[derive(SimpleObject, Clone, Debug)]
+#[derive(SimpleObject, Clone, Debug, Serialize, Deserialize)]
 pub struct IpCommitted {
     pub ip_id: u64,
     pub owner: String,
@@ -100,7 +103,7 @@ pub struct IpCommitted {
 }
 
 /// Subscription event emitted when an atomic swap is initiated.
-#[derive(SimpleObject, Clone, Debug)]
+#[derive(SimpleObject, Clone, Debug, Serialize, Deserialize)]
 pub struct SwapInitiated {
     pub swap_id: u64,
     pub ip_id: u64,
@@ -111,7 +114,7 @@ pub struct SwapInitiated {
 }
 
 /// Subscription event emitted when an atomic swap completes successfully.
-#[derive(SimpleObject, Clone, Debug)]
+#[derive(SimpleObject, Clone, Debug, Serialize, Deserialize)]
 pub struct SwapCompleted {
     pub swap_id: u64,
     pub ip_id: u64,
@@ -122,13 +125,35 @@ pub struct SwapCompleted {
 }
 
 /// Subscription event emitted when an IP is assigned to a category.
-#[derive(SimpleObject, Clone, Debug)]
+#[derive(SimpleObject, Clone, Debug, Serialize, Deserialize)]
 pub struct CategoryAssigned {
     pub ip_id: u64,
     pub owner: String,
     /// Hex-encoded Pedersen hash of the category path.
     pub category_hash: String,
     pub timestamp: u64,
+}
+
+/// Gives the Redis-backed backfill path a uniform way to filter buffered
+/// events by `timestamp` without matching on each concrete event type.
+trait HasTimestamp {
+    fn timestamp(&self) -> u64;
+}
+
+impl HasTimestamp for SwapStatusChanged {
+    fn timestamp(&self) -> u64 { self.timestamp }
+}
+impl HasTimestamp for IpCommitted {
+    fn timestamp(&self) -> u64 { self.timestamp }
+}
+impl HasTimestamp for SwapInitiated {
+    fn timestamp(&self) -> u64 { self.timestamp }
+}
+impl HasTimestamp for SwapCompleted {
+    fn timestamp(&self) -> u64 { self.timestamp }
+}
+impl HasTimestamp for CategoryAssigned {
+    fn timestamp(&self) -> u64 { self.timestamp }
 }
 
 // ── Soroban RPC Client Interface ─────────────────────────────────────────────
@@ -357,6 +382,17 @@ impl QueryRoot {
 // }
 // ```
 
+/// Chains buffered backfill events (oldest first) in front of the live
+/// broadcast stream, wrapping both sides in the same `Result` shape so a
+/// single `filter_map` closure can apply per-connection filters uniformly
+/// to backfilled and live events alike.
+fn combined_stream<T: Clone + Send + Sync + 'static>(
+    backfill: Vec<T>,
+    rx: broadcast::Receiver<T>,
+) -> impl Stream<Item = Result<T, tokio_stream::wrappers::errors::BroadcastStreamRecvError>> {
+    futures::stream::iter(backfill.into_iter().map(Ok)).chain(BroadcastStream::new(rx))
+}
+
 pub struct SubscriptionRoot;
 
 #[Subscription]
@@ -367,6 +403,12 @@ impl SubscriptionRoot {
     /// - `swap_id` — only changes for this specific swap
     /// - `seller`  — only changes where the seller matches
     /// - `buyer`   — only changes where the buyer matches
+    ///
+    /// `since` (optional): the `timestamp` of the last event this client saw.
+    /// When the server is running with `REDIS_URL` set, buffered events with
+    /// a later timestamp are replayed before live delivery resumes — see
+    /// docs/integration-guide.md for the exact guarantee. Ignored (no
+    /// replay) in single-instance mode.
     ///
     /// ```graphql
     /// subscription {
@@ -381,9 +423,12 @@ impl SubscriptionRoot {
         swap_id: Option<u64>,
         seller: Option<String>,
         buyer: Option<String>,
+        since: Option<u64>,
     ) -> impl Stream<Item = SwapStatusChanged> {
-        let rx = get_broadcaster(ctx).subscribe_swap_status();
-        BroadcastStream::new(rx).filter_map(move |r| {
+        let broadcaster = get_broadcaster(ctx);
+        let backfilled = broadcaster.backfill_swap_status_changed(since).await;
+        let rx = broadcaster.subscribe_swap_status();
+        combined_stream(backfilled, rx).filter_map(move |r| {
             let seller = seller.clone();
             let buyer = buyer.clone();
             async move {
@@ -412,9 +457,12 @@ impl SubscriptionRoot {
         &self,
         ctx: &Context<'_>,
         owner: Option<String>,
+        since: Option<u64>,
     ) -> impl Stream<Item = IpCommitted> {
-        let rx = get_broadcaster(ctx).subscribe_ip_committed();
-        BroadcastStream::new(rx).filter_map(move |r| {
+        let broadcaster = get_broadcaster(ctx);
+        let backfilled = broadcaster.backfill_ip_committed(since).await;
+        let rx = broadcaster.subscribe_ip_committed();
+        combined_stream(backfilled, rx).filter_map(move |r| {
             let owner = owner.clone();
             async move {
                 let ev = r.ok()?;
@@ -444,9 +492,12 @@ impl SubscriptionRoot {
         seller: Option<String>,
         buyer: Option<String>,
         ip_id: Option<u64>,
+        since: Option<u64>,
     ) -> impl Stream<Item = SwapInitiated> {
-        let rx = get_broadcaster(ctx).subscribe_swap_initiated();
-        BroadcastStream::new(rx).filter_map(move |r| {
+        let broadcaster = get_broadcaster(ctx);
+        let backfilled = broadcaster.backfill_swap_initiated(since).await;
+        let rx = broadcaster.subscribe_swap_initiated();
+        combined_stream(backfilled, rx).filter_map(move |r| {
             let seller = seller.clone();
             let buyer = buyer.clone();
             async move {
@@ -479,9 +530,12 @@ impl SubscriptionRoot {
         swap_id: Option<u64>,
         seller: Option<String>,
         buyer: Option<String>,
+        since: Option<u64>,
     ) -> impl Stream<Item = SwapCompleted> {
-        let rx = get_broadcaster(ctx).subscribe_swap_completed();
-        BroadcastStream::new(rx).filter_map(move |r| {
+        let broadcaster = get_broadcaster(ctx);
+        let backfilled = broadcaster.backfill_swap_completed(since).await;
+        let rx = broadcaster.subscribe_swap_completed();
+        combined_stream(backfilled, rx).filter_map(move |r| {
             let seller = seller.clone();
             let buyer = buyer.clone();
             async move {
@@ -512,9 +566,12 @@ impl SubscriptionRoot {
         ctx: &Context<'_>,
         owner: Option<String>,
         category_hash: Option<String>,
+        since: Option<u64>,
     ) -> impl Stream<Item = CategoryAssigned> {
-        let rx = get_broadcaster(ctx).subscribe_category_assigned();
-        BroadcastStream::new(rx).filter_map(move |r| {
+        let broadcaster = get_broadcaster(ctx);
+        let backfilled = broadcaster.backfill_category_assigned(since).await;
+        let rx = broadcaster.subscribe_category_assigned();
+        combined_stream(backfilled, rx).filter_map(move |r| {
             let owner = owner.clone();
             let category_hash = category_hash.clone();
             async move {
@@ -539,9 +596,12 @@ impl SubscriptionRoot {
         &self,
         ctx: &Context<'_>,
         seller: String,
+        since: Option<u64>,
     ) -> impl Stream<Item = SwapStatusChanged> {
-        let rx = get_broadcaster(ctx).subscribe_swap_status();
-        BroadcastStream::new(rx).filter_map(move |r| {
+        let broadcaster = get_broadcaster(ctx);
+        let backfilled = broadcaster.backfill_swap_status_changed(since).await;
+        let rx = broadcaster.subscribe_swap_status();
+        combined_stream(backfilled, rx).filter_map(move |r| {
             let seller = seller.clone();
             async move {
                 let ev = r.ok()?;
@@ -553,14 +613,54 @@ impl SubscriptionRoot {
 
 // ── Subscription Broadcaster ──────────────────────────────────────────────────
 
+/// Redis key names backing each event type's stream. Namespaced under
+/// `atomicip:` and capped at `STREAM_MAXLEN` entries so the stream also
+/// serves as the reconnect/backfill buffer (see `backfill_stream`).
+const STREAM_SWAP_STATUS_CHANGED: &str  = "atomicip:swap_status_changed";
+const STREAM_IP_COMMITTED: &str         = "atomicip:ip_committed";
+const STREAM_SWAP_INITIATED: &str       = "atomicip:swap_initiated";
+const STREAM_SWAP_COMPLETED: &str       = "atomicip:swap_completed";
+const STREAM_CATEGORY_ASSIGNED: &str    = "atomicip:category_assigned";
+const ALL_STREAMS: [&str; 5] = [
+    STREAM_SWAP_STATUS_CHANGED,
+    STREAM_IP_COMMITTED,
+    STREAM_SWAP_INITIATED,
+    STREAM_SWAP_COMPLETED,
+    STREAM_CATEGORY_ASSIGNED,
+];
+
+/// Bounds each stream to (approximately) this many entries, trimmed by
+/// Redis on every `XADD`. This is also the effective backfill window.
+const STREAM_MAXLEN: usize = 500;
+
+/// Holds the Redis connection used to fan events out across instances.
+/// Kept as its own struct so `SubscriptionBroadcaster::redis` can stay a
+/// plain `Option`, making the single-instance path (`redis: None`) a
+/// straight passthrough with zero behavior change from before this field
+/// existed.
+struct RedisLink {
+    /// Cheaply `Clone`-able handle used for `XADD` publishes.
+    conn: redis::aio::MultiplexedConnection,
+}
+
 /// Holds the broadcast channels that connect contract-event ingestion to
 /// GraphQL subscription streams.  Wrap in `Arc` and inject via schema data.
+///
+/// In single-instance mode (`redis: None`, via `new()`) `broadcast_*`
+/// methods write directly to the local `tokio::sync::broadcast` channel, as
+/// they always have. When constructed via `new_with_redis`, `broadcast_*`
+/// instead publishes to a shared Redis Stream; a background task owned by
+/// every instance tails that stream and is the *only* thing that feeds the
+/// local channels in that mode — so an event published by any instance
+/// reaches WebSocket clients connected to every instance exactly once,
+/// including the instance that published it.
 pub struct SubscriptionBroadcaster {
     swap_status_tx:      broadcast::Sender<SwapStatusChanged>,
     ip_committed_tx:     broadcast::Sender<IpCommitted>,
     swap_initiated_tx:   broadcast::Sender<SwapInitiated>,
     swap_completed_tx:   broadcast::Sender<SwapCompleted>,
     category_assigned_tx: broadcast::Sender<CategoryAssigned>,
+    redis: Option<RedisLink>,
 }
 
 impl SubscriptionBroadcaster {
@@ -577,29 +677,86 @@ impl SubscriptionBroadcaster {
             swap_initiated_tx,
             swap_completed_tx,
             category_assigned_tx,
+            redis: None,
         }
     }
 
+    /// Builds a broadcaster backed by a shared Redis Stream at `redis_url`,
+    /// so events published on this instance reach WebSocket clients
+    /// connected to every other instance pointed at the same Redis, and
+    /// vice versa. Spawns a background task that tails all five streams for
+    /// the lifetime of the returned `Arc`.
+    pub async fn new_with_redis(redis_url: &str) -> Result<Arc<Self>, String> {
+        let client = redis::Client::open(redis_url).map_err(|e| e.to_string())?;
+        let publish_conn = client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| e.to_string())?;
+        let read_conn = client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let (swap_status_tx, _)       = broadcast::channel(100);
+        let (ip_committed_tx, _)      = broadcast::channel(100);
+        let (swap_initiated_tx, _)    = broadcast::channel(100);
+        let (swap_completed_tx, _)    = broadcast::channel(100);
+        let (category_assigned_tx, _) = broadcast::channel(100);
+
+        let broadcaster = Arc::new(Self {
+            swap_status_tx,
+            ip_committed_tx,
+            swap_initiated_tx,
+            swap_completed_tx,
+            category_assigned_tx,
+            redis: Some(RedisLink { conn: publish_conn }),
+        });
+
+        tokio::spawn(tail_redis_streams(broadcaster.clone(), read_conn));
+
+        Ok(broadcaster)
+    }
+
     // ── Publishers ────────────────────────────────────────────────────────────
+    //
+    // In Redis mode these publish-and-return immediately (the actual XADD
+    // happens on a spawned task) so the method keeps its existing sync
+    // signature; delivery to *this* instance's own local subscribers still
+    // happens, via the background tail task reading the same stream back.
 
     pub fn broadcast_swap_status_changed(&self, event: SwapStatusChanged) {
-        let _ = self.swap_status_tx.send(event);
+        match &self.redis {
+            None => { let _ = self.swap_status_tx.send(event); }
+            Some(link) => publish_to_stream(link, STREAM_SWAP_STATUS_CHANGED, &event),
+        }
     }
 
     pub fn broadcast_ip_committed(&self, event: IpCommitted) {
-        let _ = self.ip_committed_tx.send(event);
+        match &self.redis {
+            None => { let _ = self.ip_committed_tx.send(event); }
+            Some(link) => publish_to_stream(link, STREAM_IP_COMMITTED, &event),
+        }
     }
 
     pub fn broadcast_swap_initiated(&self, event: SwapInitiated) {
-        let _ = self.swap_initiated_tx.send(event);
+        match &self.redis {
+            None => { let _ = self.swap_initiated_tx.send(event); }
+            Some(link) => publish_to_stream(link, STREAM_SWAP_INITIATED, &event),
+        }
     }
 
     pub fn broadcast_swap_completed(&self, event: SwapCompleted) {
-        let _ = self.swap_completed_tx.send(event);
+        match &self.redis {
+            None => { let _ = self.swap_completed_tx.send(event); }
+            Some(link) => publish_to_stream(link, STREAM_SWAP_COMPLETED, &event),
+        }
     }
 
     pub fn broadcast_category_assigned(&self, event: CategoryAssigned) {
-        let _ = self.category_assigned_tx.send(event);
+        match &self.redis {
+            None => { let _ = self.category_assigned_tx.send(event); }
+            Some(link) => publish_to_stream(link, STREAM_CATEGORY_ASSIGNED, &event),
+        }
     }
 
     // ── Subscriber handles ────────────────────────────────────────────────────
@@ -622,6 +779,124 @@ impl SubscriptionBroadcaster {
 
     pub fn subscribe_category_assigned(&self) -> broadcast::Receiver<CategoryAssigned> {
         self.category_assigned_tx.subscribe()
+    }
+
+    // ── Reconnect / backfill ──────────────────────────────────────────────────
+    //
+    // No-ops (empty result) outside Redis mode, or when the caller has no
+    // `since` cursor — see docs/integration-guide.md for the documented
+    // guarantee.
+
+    pub async fn backfill_swap_status_changed(&self, since: Option<u64>) -> Vec<SwapStatusChanged> {
+        self.backfill_stream(STREAM_SWAP_STATUS_CHANGED, since).await
+    }
+
+    pub async fn backfill_ip_committed(&self, since: Option<u64>) -> Vec<IpCommitted> {
+        self.backfill_stream(STREAM_IP_COMMITTED, since).await
+    }
+
+    pub async fn backfill_swap_initiated(&self, since: Option<u64>) -> Vec<SwapInitiated> {
+        self.backfill_stream(STREAM_SWAP_INITIATED, since).await
+    }
+
+    pub async fn backfill_swap_completed(&self, since: Option<u64>) -> Vec<SwapCompleted> {
+        self.backfill_stream(STREAM_SWAP_COMPLETED, since).await
+    }
+
+    pub async fn backfill_category_assigned(&self, since: Option<u64>) -> Vec<CategoryAssigned> {
+        self.backfill_stream(STREAM_CATEGORY_ASSIGNED, since).await
+    }
+
+    async fn backfill_stream<T: DeserializeOwned + HasTimestamp>(
+        &self,
+        stream: &str,
+        since: Option<u64>,
+    ) -> Vec<T> {
+        let (Some(link), Some(since)) = (&self.redis, since) else {
+            return Vec::new();
+        };
+        let mut conn = link.conn.clone();
+        let reply: redis::streams::StreamRangeReply = match conn.xrange_all(stream).await {
+            Ok(reply) => reply,
+            Err(_) => return Vec::new(),
+        };
+        reply
+            .ids
+            .into_iter()
+            .filter_map(|entry| entry.get::<String>("payload"))
+            .filter_map(|payload| serde_json::from_str::<T>(&payload).ok())
+            .filter(|event| event.timestamp() > since)
+            .collect()
+    }
+}
+
+/// Serializes `event` and hands it off to a spawned task that `XADD`s it to
+/// `stream`, trimmed to `STREAM_MAXLEN`. Fire-and-forget, matching the
+/// best-effort delivery semantics `broadcast::Sender::send` already had.
+fn publish_to_stream<T: Serialize>(link: &RedisLink, stream: &'static str, event: &T) {
+    let Ok(payload) = serde_json::to_string(event) else { return };
+    let mut conn = link.conn.clone();
+    tokio::spawn(async move {
+        let _: Result<String, _> = conn
+            .xadd_maxlen(stream, StreamMaxlen::Approx(STREAM_MAXLEN), "*", &[("payload", payload)])
+            .await;
+    });
+}
+
+/// Background task (one per `SubscriptionBroadcaster` built via
+/// `new_with_redis`) that blocks on `XREAD` across all five streams and
+/// republishes each entry into the matching local `broadcast::Sender`. This
+/// is the only path that feeds the local channels in Redis mode, whether
+/// the event originated on this instance or another one.
+async fn tail_redis_streams(broadcaster: Arc<SubscriptionBroadcaster>, mut conn: redis::aio::MultiplexedConnection) {
+    // Indices line up 1:1 with `ALL_STREAMS`. Starting every cursor at `$`
+    // means a freshly-started tail only sees entries added from here on —
+    // history is served separately, on demand, via `backfill_stream`.
+    let mut last_ids: [String; 5] = std::array::from_fn(|_| "$".to_string());
+
+    loop {
+        let ids: Vec<String> = last_ids.to_vec();
+        let options = StreamReadOptions::default().block(5_000);
+        let reply: redis::streams::StreamReadReply =
+            match conn.xread_options(&ALL_STREAMS, &ids, &options).await {
+                Ok(reply) => reply,
+                Err(_) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    continue;
+                }
+            };
+
+        for key in reply.keys {
+            let stream_index = ALL_STREAMS.iter().position(|s| *s == key.key);
+            for entry in key.ids {
+                if let Some(idx) = stream_index {
+                    last_ids[idx] = entry.id.clone();
+                }
+                let Some(payload) = entry.get::<String>("payload") else { continue };
+
+                if key.key == STREAM_SWAP_STATUS_CHANGED {
+                    if let Ok(ev) = serde_json::from_str(&payload) {
+                        let _ = broadcaster.swap_status_tx.send(ev);
+                    }
+                } else if key.key == STREAM_IP_COMMITTED {
+                    if let Ok(ev) = serde_json::from_str(&payload) {
+                        let _ = broadcaster.ip_committed_tx.send(ev);
+                    }
+                } else if key.key == STREAM_SWAP_INITIATED {
+                    if let Ok(ev) = serde_json::from_str(&payload) {
+                        let _ = broadcaster.swap_initiated_tx.send(ev);
+                    }
+                } else if key.key == STREAM_SWAP_COMPLETED {
+                    if let Ok(ev) = serde_json::from_str(&payload) {
+                        let _ = broadcaster.swap_completed_tx.send(ev);
+                    }
+                } else if key.key == STREAM_CATEGORY_ASSIGNED {
+                    if let Ok(ev) = serde_json::from_str(&payload) {
+                        let _ = broadcaster.category_assigned_tx.send(ev);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1075,5 +1350,118 @@ mod tests {
 
         let results = handle.await.unwrap();
         assert_eq!(results.len(), 1);
+    }
+
+    // ── Multi-instance delivery via Redis (#783) ─────────────────────────────
+    //
+    // Gated on `REDIS_URL`: CI's `redis:7-alpine` service container sets it,
+    // so these run for real there. Locally, run e.g.
+    // `docker run --rm -d -p 6379:6379 redis:7-alpine` and export
+    // `REDIS_URL=redis://localhost:6379` to exercise them; otherwise they
+    // skip (never fail) so `cargo test --workspace` still passes without
+    // Redis installed.
+
+    fn redis_url_for_test() -> Option<String> {
+        match std::env::var("REDIS_URL") {
+            Ok(url) if !url.is_empty() => Some(url),
+            _ => {
+                eprintln!("skipping: REDIS_URL not set");
+                None
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_new_with_redis_errors_on_unreachable_url() {
+        // Malformed/unroutable URL — must return Err, not hang or panic,
+        // regardless of whether a real Redis is available in this environment.
+        let result = SubscriptionBroadcaster::new_with_redis("redis://127.0.0.1:1/").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_cross_instance_ip_committed_delivered_via_redis() {
+        let Some(url) = redis_url_for_test() else { return };
+
+        let instance_a = SubscriptionBroadcaster::new_with_redis(&url).await.unwrap();
+        let instance_b = SubscriptionBroadcaster::new_with_redis(&url).await.unwrap();
+
+        let mut rx_b = instance_b.subscribe_ip_committed();
+        // Let both instances' background XREAD tails establish their
+        // blocking read before we publish.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        instance_a.broadcast_ip_committed(IpCommitted {
+            ip_id: 555,
+            owner: "GCROSSINSTANCE".to_string(),
+            timestamp: 1_000,
+        });
+
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(10), rx_b.recv())
+            .await
+            .expect("timed out waiting for cross-instance delivery")
+            .unwrap();
+        assert_eq!(ev.ip_id, 555);
+        assert_eq!(ev.owner, "GCROSSINSTANCE");
+    }
+
+    #[tokio::test]
+    async fn test_cross_instance_publisher_also_receives_its_own_event() {
+        // Regression guard for the self-echo/double-delivery hazard: in
+        // Redis mode, publishing must still deliver back to subscribers on
+        // the SAME instance that published — exactly once.
+        let Some(url) = redis_url_for_test() else { return };
+
+        let instance_a = SubscriptionBroadcaster::new_with_redis(&url).await.unwrap();
+        let mut rx_a = instance_a.subscribe_swap_initiated();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        instance_a.broadcast_swap_initiated(SwapInitiated {
+            swap_id: 777,
+            ip_id: 1,
+            seller: "GSELF".to_string(),
+            buyer: "GBUYER".to_string(),
+            price: "42".to_string(),
+            timestamp: 2_000,
+        });
+
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(10), rx_a.recv())
+            .await
+            .expect("timed out waiting for self-delivery")
+            .unwrap();
+        assert_eq!(ev.swap_id, 777);
+
+        // No second copy should arrive.
+        let second = tokio::time::timeout(std::time::Duration::from_millis(500), rx_a.recv()).await;
+        assert!(second.is_err(), "event was delivered more than once");
+    }
+
+    #[tokio::test]
+    async fn test_backfill_replays_events_after_since_timestamp() {
+        let Some(url) = redis_url_for_test() else { return };
+
+        let instance_a = SubscriptionBroadcaster::new_with_redis(&url).await.unwrap();
+
+        instance_a.broadcast_category_assigned(CategoryAssigned {
+            ip_id: 1, owner: "GBEFORE".into(), category_hash: "aaaa".into(), timestamp: 10_000,
+        });
+        instance_a.broadcast_category_assigned(CategoryAssigned {
+            ip_id: 2, owner: "GAFTER".into(), category_hash: "bbbb".into(), timestamp: 10_050,
+        });
+        // Give the fire-and-forget XADD tasks time to land before XRANGE reads them back.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let replayed = instance_a.backfill_category_assigned(Some(10_000)).await;
+        assert!(replayed.iter().any(|ev| ev.ip_id == 2), "event after `since` must be replayed");
+        assert!(!replayed.iter().any(|ev| ev.ip_id == 1), "event at/before `since` must not be replayed");
+    }
+
+    #[tokio::test]
+    async fn test_backfill_is_noop_in_single_instance_mode() {
+        // No Redis configured — `since` must be silently ignored, not error.
+        let b = SubscriptionBroadcaster::new();
+        b.broadcast_ip_committed(IpCommitted { ip_id: 9, owner: "G".into(), timestamp: 1 });
+        let replayed = b.backfill_ip_committed(Some(0)).await;
+        assert!(replayed.is_empty());
     }
 }
