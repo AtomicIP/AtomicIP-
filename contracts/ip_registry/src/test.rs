@@ -1,5 +1,7 @@
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use crate::IpRecord;
     use crate::StakeRecord;
     use soroban_sdk::contractclient;
@@ -105,9 +107,13 @@ mod tests {
             commitment_hash: BytesN<32>,
             parent_ip_id: u64,
         ) -> u64;
-        fn batch_verify_commitments(
+        fn reveal_and_verify_commitments(
             env: Env,
             requests: Vec<crate::VerifyRequest>,
+        ) -> Vec<crate::VerifyResult>;
+        fn batch_verify_commitments(
+            env: Env,
+            requests: Vec<crate::HidingVerifyRequest>,
         ) -> Vec<crate::VerifyResult>;
         fn batch_commit_ip_anonymous(
             env: Env,
@@ -1452,14 +1458,14 @@ mod tests {
             blinding_factor: bf2,
         });
 
-        let results = client.batch_verify_commitments(&requests);
+        let results = client.reveal_and_verify_commitments(&requests);
         assert_eq!(results.len(), 2);
         assert!(results.get(0).unwrap().valid);
         assert!(results.get(1).unwrap().valid);
     }
 
     #[test]
-    fn test_batch_verify_commitments_invalid_secret() {
+    fn test_reveal_and_verify_commitments_invalid_secret() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(crate::IpRegistry, ());
@@ -1482,13 +1488,13 @@ mod tests {
             blinding_factor: bf,
         });
 
-        let results = client.batch_verify_commitments(&requests);
+        let results = client.reveal_and_verify_commitments(&requests);
         assert!(!results.get(0).unwrap().valid);
     }
 
     #[test]
     #[should_panic]
-    fn test_batch_verify_nonexistent_ip_panics() {
+    fn test_reveal_and_verify_nonexistent_ip_panics() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(crate::IpRegistry, ());
@@ -1503,7 +1509,181 @@ mod tests {
             blinding_factor: bf,
         });
 
-        client.batch_verify_commitments(&requests);
+        client.reveal_and_verify_commitments(&requests);
+    }
+
+    // ── Issue #780: Hiding (Pedersen + Schnorr) Batch Verification ────────────
+
+    #[test]
+    fn test_batch_verify_commitments_hiding_valid_proof() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+
+        let secret = BytesN::from_array(&env, &[0x31u8; 32]);
+        let blinding = BytesN::from_array(&env, &[0x32u8; 32]);
+        let commitment =
+            crate::zk_commitment::test_prover::pedersen_commit(&env, &secret, &blinding);
+
+        let id = client.commit_ip(&owner, &commitment, &0u32);
+
+        let nonce_secret = BytesN::from_array(&env, &[0x41u8; 32]);
+        let nonce_blinding = BytesN::from_array(&env, &[0x42u8; 32]);
+        let proof = crate::zk_commitment::test_prover::prove_hiding(
+            &env,
+            &secret,
+            &blinding,
+            &commitment,
+            &nonce_secret,
+            &nonce_blinding,
+        );
+
+        let mut requests: Vec<crate::HidingVerifyRequest> = Vec::new(&env);
+        requests.push_back(crate::HidingVerifyRequest { ip_id: id, proof });
+
+        let results = client.batch_verify_commitments(&requests);
+        assert_eq!(results.len(), 1);
+        assert!(results.get(0).unwrap().valid);
+    }
+
+    #[test]
+    fn test_batch_verify_commitments_hiding_rejects_unknown_opening() {
+        // Soundness: a proof built from the wrong secret must not verify,
+        // i.e. the hiding path correctly rejects a proof for a commitment
+        // the prover doesn't actually know the opening of.
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+
+        let secret = BytesN::from_array(&env, &[0x51u8; 32]);
+        let blinding = BytesN::from_array(&env, &[0x52u8; 32]);
+        let commitment =
+            crate::zk_commitment::test_prover::pedersen_commit(&env, &secret, &blinding);
+        let id = client.commit_ip(&owner, &commitment, &0u32);
+
+        // Prove knowledge of a *different* secret against the same commitment.
+        let wrong_secret = BytesN::from_array(&env, &[0x99u8; 32]);
+        let nonce_secret = BytesN::from_array(&env, &[0x61u8; 32]);
+        let nonce_blinding = BytesN::from_array(&env, &[0x62u8; 32]);
+        let bogus_proof = crate::zk_commitment::test_prover::prove_hiding(
+            &env,
+            &wrong_secret,
+            &blinding,
+            &commitment,
+            &nonce_secret,
+            &nonce_blinding,
+        );
+
+        let mut requests: Vec<crate::HidingVerifyRequest> = Vec::new(&env);
+        requests.push_back(crate::HidingVerifyRequest {
+            ip_id: id,
+            proof: bogus_proof,
+        });
+
+        let results = client.batch_verify_commitments(&requests);
+        assert!(!results.get(0).unwrap().valid);
+    }
+
+    #[test]
+    fn test_batch_verify_commitments_hiding_rejects_sha256_commitment() {
+        // An IP committed the old (plaintext-reveal) way stores a raw SHA-256
+        // hash, not a Pedersen point. The hiding path must not treat that as
+        // a trivially-valid or panicking case — it just fails to verify.
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let sha256_commitment = BytesN::from_array(&env, &[0x77u8; 32]);
+        let id = client.commit_ip(&owner, &sha256_commitment, &0u32);
+
+        let proof = crate::zk_commitment::test_prover::prove_hiding(
+            &env,
+            &BytesN::from_array(&env, &[1u8; 32]),
+            &BytesN::from_array(&env, &[2u8; 32]),
+            &sha256_commitment,
+            &BytesN::from_array(&env, &[3u8; 32]),
+            &BytesN::from_array(&env, &[4u8; 32]),
+        );
+
+        let mut requests: Vec<crate::HidingVerifyRequest> = Vec::new(&env);
+        requests.push_back(crate::HidingVerifyRequest { ip_id: id, proof });
+
+        let results = client.batch_verify_commitments(&requests);
+        assert!(!results.get(0).unwrap().valid);
+    }
+
+    #[test]
+    fn test_batch_verify_commitments_hiding_leaks_no_plaintext() {
+        // Calling the hiding-verification path must leave no trace of the
+        // plaintext secret/blinding_factor in emitted events or storage.
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+
+        let secret = BytesN::from_array(&env, &[0xC1u8; 32]);
+        let blinding = BytesN::from_array(&env, &[0xC2u8; 32]);
+        let commitment =
+            crate::zk_commitment::test_prover::pedersen_commit(&env, &secret, &blinding);
+        let id = client.commit_ip(&owner, &commitment, &0u32);
+
+        let nonce_secret = BytesN::from_array(&env, &[0xD1u8; 32]);
+        let nonce_blinding = BytesN::from_array(&env, &[0xD2u8; 32]);
+        let proof = crate::zk_commitment::test_prover::prove_hiding(
+            &env,
+            &secret,
+            &blinding,
+            &commitment,
+            &nonce_secret,
+            &nonce_blinding,
+        );
+
+        let mut requests: Vec<crate::HidingVerifyRequest> = Vec::new(&env);
+        requests.push_back(crate::HidingVerifyRequest { ip_id: id, proof });
+
+        let results = client.batch_verify_commitments(&requests);
+        assert!(results.get(0).unwrap().valid);
+
+        // Serialize every emitted event plus the stored IP record, and
+        // assert the raw secret/blinding bytes never appear as a substring
+        // anywhere in that serialized blob.
+        use soroban_sdk::xdr::{Limits, ToXdr, WriteXdr};
+
+        let mut haystack: std::vec::Vec<u8> = std::vec::Vec::new();
+        for evt in env.events().all().events() {
+            haystack.extend_from_slice(&evt.to_xdr(Limits::none()).expect("event serializes"));
+        }
+        let record = client.get_ip(&id);
+        haystack.extend(ToXdr::to_xdr(record, &env).iter());
+
+        let secret_bytes = secret.to_array();
+        let blinding_bytes = blinding.to_array();
+
+        assert!(
+            !contains_subslice(&haystack, &secret_bytes),
+            "raw secret bytes leaked into events/storage"
+        );
+        assert!(
+            !contains_subslice(&haystack, &blinding_bytes),
+            "raw blinding_factor bytes leaked into events/storage"
+        );
+    }
+
+    fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+        if needle.is_empty() || haystack.len() < needle.len() {
+            return false;
+        }
+        haystack.windows(needle.len()).any(|w| w == needle)
     }
 
     // ── Issue #433: IP Ownership Proof Challenge ───────────────────────────────
