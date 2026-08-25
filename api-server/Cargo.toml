@@ -53,3 +53,4 @@ regex = "1"
 base64 = "0.22"
 flate2 = "1.0"
 brotli = "7.0"
+redis = { version = "0.27", features = ["tokio-comp"] }
