@@ -54,15 +54,17 @@ pub enum ContractError {
     // Partial quantity swap errors
     InvalidQuantity                       = 39,
     InvalidReferralFeeBps                 = 61,
+    // #784: Oracle price attestation exceeds the configured max deviation
+    OracleDeviationExceeded               = 54,
     // #781: Arbitrator committee / time-locked ruling / dispute bond errors
-    NotACommitteeSigner                   = 54,
-    DuplicateSigner                       = 55,
-    InsufficientSignatures                = 56,
-    CommitteeSizeTooSmall                 = 57,
-    EvidenceRequired                      = 58,
-    RulingAlreadyPending                  = 59,
-    NoPendingRuling                       = 60,
-    TimelockNotElapsed                    = 62,
-    RulingFinalized                       = 63,
-    BatchArbitrationDisabled              = 64,
+    NotACommitteeSigner                   = 55,
+    DuplicateSigner                       = 56,
+    InsufficientSignatures                = 57,
+    CommitteeSizeTooSmall                 = 58,
+    EvidenceRequired                      = 59,
+    RulingAlreadyPending                  = 60,
+    NoPendingRuling                       = 62,
+    TimelockNotElapsed                    = 63,
+    RulingFinalized                       = 64,
+    BatchArbitrationDisabled              = 65,
 }

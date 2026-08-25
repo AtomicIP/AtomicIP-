@@ -90,6 +90,17 @@ pub enum ContractError {
     /// #784: Oracle price attestation exceeds the configured max deviation
     /// from the last accepted price.
     OracleDeviationExceeded = 54,
+    /// #781: Arbitrator committee / time-locked ruling / dispute bond errors
+    NotACommitteeSigner = 55,
+    DuplicateSigner = 56,
+    InsufficientSignatures = 57,
+    CommitteeSizeTooSmall = 58,
+    EvidenceRequired = 59,
+    RulingAlreadyPending = 60,
+    NoPendingRuling = 62,
+    TimelockNotElapsed = 63,
+    RulingFinalized = 64,
+    BatchArbitrationDisabled = 65,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
