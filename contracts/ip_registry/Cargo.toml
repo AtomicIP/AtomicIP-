@@ -11,6 +11,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 soroban-sdk = { version = "26.0.1", features = ["alloc"] }
+curve25519-dalek = { version = "4", default-features = false, features = ["alloc"] }
 
 [features]
 testutils = ["soroban-sdk/testutils"]

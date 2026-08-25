@@ -93,7 +93,8 @@ commit_ip(owner, commitment_hash) -> u64          // Timestamp a new IP commitme
 get_ip(ip_id) -> IpRecord                         // Retrieve an IP record
 verify_commitment(ip_id, secret) -> bool          // Verify a commitment against a secret
 list_ip_by_owner(owner) -> Vec<u64>               // List all IP IDs for an owner
-batch_verify_commitments(requests) -> Vec<VerifyResult>  // #458: Verify multiple commitments with ZK proofs
+reveal_and_verify_commitments(requests) -> Vec<VerifyResult>  // #458: Verify multiple commitments by revealing secret+blinding_factor (not ZK)
+batch_verify_commitments(requests) -> Vec<VerifyResult>  // #780: Verify multiple commitments with a real ZK (Pedersen+Schnorr) proof
 assign_ip_to_category(ip_id, category_hash)       // #459: Assign IP to a hierarchical category
 list_ip_by_category(owner, category_hash) -> Vec<u64>    // #459: List IPs in a category
 list_owner_categories(owner) -> Vec<BytesN<32>>   // #459: List all categories for an owner

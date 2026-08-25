@@ -729,14 +729,18 @@ Returns a `Vec<IpAccessGrant>` where each entry has `grantee: Address` and `acce
 
 ---
 
-## Issue #458 — Batch Verification with ZK Proofs
+## Issue #458 / #780 — Batch Verification
 
-### `batch_verify_commitments`
+Two batch entry points, named for exactly what they disclose. See
+`docs/commitment-scheme.md` for the full write-up of both, including the
+Fiat-Shamir Schnorr construction behind the hiding path.
 
-Verify multiple IP commitments in a single call. Each request recomputes `sha256(secret || blinding_factor)` and checks it against the stored commitment hash — the same zero-knowledge proof used by `verify_commitment`.
+### `reveal_and_verify_commitments`
+
+Verify multiple IP commitments in a single call by having the caller reveal the `secret` and `blinding_factor` used to create each one. Each request recomputes `sha256(secret || blinding_factor)` and checks it against the stored commitment hash using constant-time comparison. **This discloses both values on-chain — it is not a zero-knowledge proof.** Use it only when the caller intends to disclose; for a proof that discloses nothing, see `batch_verify_commitments` below.
 
 ```rust
-pub fn batch_verify_commitments(env: Env, requests: Vec<VerifyRequest>) -> Vec<VerifyResult>
+pub fn reveal_and_verify_commitments(env: Env, requests: Vec<VerifyRequest>) -> Vec<VerifyResult>
 ```
 
 #### `VerifyRequest`
@@ -744,8 +748,8 @@ pub fn batch_verify_commitments(env: Env, requests: Vec<VerifyRequest>) -> Vec<V
 | Field | Type | Description |
 |---|---|---|
 | `ip_id` | `u64` | The IP ID to verify |
-| `secret` | `BytesN<32>` | The secret used when committing |
-| `blinding_factor` | `BytesN<32>` | The blinding factor used when committing |
+| `secret` | `BytesN<32>` | The secret used when committing — disclosed on-chain |
+| `blinding_factor` | `BytesN<32>` | The blinding factor used when committing — disclosed on-chain |
 
 #### `VerifyResult`
 
@@ -764,6 +768,47 @@ Panics with `IpNotFound` (code 1) if any `ip_id` does not exist.
 let requests = vec![
     VerifyRequest { ip_id: 1, secret: s1, blinding_factor: b1 },
     VerifyRequest { ip_id: 2, secret: s2, blinding_factor: b2 },
+];
+let results = client.reveal_and_verify_commitments(&requests);
+// results[0].valid == true/false
+```
+
+### `batch_verify_commitments`
+
+Verify multiple IP commitments in a single call with a **real zero-knowledge proof**: each request supplies a `HidingCommitmentProof` — a non-interactive Fiat-Shamir Schnorr proof of knowledge of a Pedersen commitment's opening — and never the `secret` or `blinding_factor` itself. Only applies to IPs whose `commitment_hash` was committed as a Pedersen point (`secret·G + blinding_factor·H` over Ristretto255) rather than a SHA-256 hash; a request against a SHA-256-based commitment simply fails to verify (`valid: false`), it does not panic.
+
+```rust
+pub fn batch_verify_commitments(env: Env, requests: Vec<HidingVerifyRequest>) -> Vec<VerifyResult>
+```
+
+#### `HidingCommitmentProof`
+
+| Field | Type | Description |
+|---|---|---|
+| `r` | `BytesN<32>` | Compressed Ristretto255 point `R = k_secret·G + k_blinding·H` |
+| `s_secret` | `BytesN<32>` | Response scalar `s_secret = k_secret + e·secret` (mod L) |
+| `s_blinding` | `BytesN<32>` | Response scalar `s_blinding = k_blinding + e·blinding_factor` (mod L) |
+
+#### `HidingVerifyRequest`
+
+| Field | Type | Description |
+|---|---|---|
+| `ip_id` | `u64` | The IP ID to verify |
+| `proof` | `HidingCommitmentProof` | The zero-knowledge proof of the commitment's opening |
+
+#### Panics
+
+Panics with `IpNotFound` (code 1) if any `ip_id` does not exist. An invalid or malformed proof (or a non-Pedersen `commitment_hash`) does not panic — it yields `valid: false`.
+
+#### Example
+
+```rust
+// Off-chain: compute commitment = secret·G + blinding_factor·H, and a
+// proof of its opening (see docs/commitment-scheme.md). Neither secret
+// nor blinding_factor is ever sent to the contract.
+let requests = vec![
+    HidingVerifyRequest { ip_id: 1, proof: proof1 },
+    HidingVerifyRequest { ip_id: 2, proof: proof2 },
 ];
 let results = client.batch_verify_commitments(&requests);
 // results[0].valid == true/false
@@ -1125,6 +1170,26 @@ Repeated violations apply exponential backoff beginning at one second and
 capped at 60 seconds. A successful request clears the client's violation
 streak. Idle client state expires after 15 minutes, and tracked IP/user counts
 are bounded to prevent a distributed attack from exhausting limiter memory.
+
+### Deployment topology
+
+The quotas above are enforced correctly **only when every replica shares the
+same counter backend**. `RateLimitConfig::backend` controls this:
+
+- `RateLimitBackend::Redis(url)` — token-bucket counters live in Redis, shared
+  by every replica pointed at that instance. **Required** behind a load
+  balancer running more than one replica; otherwise each replica enforces its
+  own independent bucket, and a client whose requests are distributed across
+  N replicas effectively receives up to N times the quota documented above.
+- `RateLimitBackend::InProcess` (the default) — counters live in that
+  process's memory only. Safe for a single-instance deployment and for tests,
+  but **not safe for multi-instance deployment** for the reason above.
+
+Violation backoff tracking, tier assignment (`set_user_tier`), and the
+tracked-identity cardinality bound stay process-local under both backends —
+they are memory-protection heuristics for that replica, not part of the
+enforced quota, so they don't need to be shared for the quota itself to be
+correct.
 
 ### Response headers
 

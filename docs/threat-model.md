@@ -161,6 +161,38 @@ This document analyzes potential attack vectors in the Atomic Patent swap mechan
 
 **Status**: ✅ Mitigated
 
+### 13. Fabricated Oracle Price (#784)
+
+**Scenario**: Whoever controls the `oracle_address` contract set via
+`set_oracle` returns an arbitrary positive `i128` as the price for
+`initiate_swap_with_oracle_price`, with no way for an outside party to verify
+it was authentically produced rather than fabricated on the spot.
+
+**Impact**: A malicious or compromised oracle contract (or whoever can
+redeploy/upgrade it) can settle swaps at a fabricated price, moving value away
+from whichever party the price disadvantages.
+
+**Mitigation**:
+- `set_oracle` records an `oracle_pubkey` (Ed25519) alongside `oracle_address`
+  — the actual cryptographic trust anchor, not just an address.
+- `fetch_oracle_price` / `fetch_oracle_price_with_staleness_check` verify an
+  Ed25519 signature over `(token, price, timestamp)` against `oracle_pubkey`
+  before a price is used for anything. An invalid, missing, or wrong-key
+  signature is rejected, independent of the staleness check.
+- A configurable `max_deviation_bps` bound rejects a validly-signed price that
+  moves too far from the last accepted price, limiting the damage a single
+  bad or compromised update can do.
+- The 5-minute staleness fallback (unchanged) only ever serves a cached price
+  that was itself signature-verified when it was fetched, so it doesn't
+  reintroduce an unverified path.
+- See [atomic-swap.md § Price Oracle Trust Model](atomic-swap.md#784-price-oracle-trust-model)
+  for what remains a governance/operational trust assumption (the admin's
+  choice of which `oracle_pubkey` to register) versus what is cryptographically
+  enforced.
+
+**Status**: ✅ Mitigated (signature + deviation bound); governance trust in the
+registered publisher key remains, by design — see linked doc.
+
 ## Dispute Resolution
 
 ### Overview

@@ -184,6 +184,7 @@ checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 name = "atomic_swap"
 version = "0.1.0"
 dependencies = [
+ "ed25519-dalek",
  "ip_registry",
  "proptest",
  "soroban-sdk",
@@ -853,6 +854,7 @@ checksum = "8e04e2fd2b8188ea827b32ef11de88377086d690286ab35747ef7f9bf3ccb590"
 name = "ip_registry"
 version = "0.1.0"
 dependencies = [
+ "curve25519-dalek",
  "ed25519-dalek",
  "proptest",
  "soroban-sdk",
