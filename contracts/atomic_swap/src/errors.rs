@@ -54,4 +54,15 @@ pub enum ContractError {
     // Partial quantity swap errors
     InvalidQuantity                       = 39,
     InvalidReferralFeeBps                 = 61,
+    // #781: Arbitrator committee / time-locked ruling / dispute bond errors
+    NotACommitteeSigner                   = 54,
+    DuplicateSigner                       = 55,
+    InsufficientSignatures                = 56,
+    CommitteeSizeTooSmall                 = 57,
+    EvidenceRequired                      = 58,
+    RulingAlreadyPending                  = 59,
+    NoPendingRuling                       = 60,
+    TimelockNotElapsed                    = 62,
+    RulingFinalized                       = 63,
+    BatchArbitrationDisabled              = 64,
 }

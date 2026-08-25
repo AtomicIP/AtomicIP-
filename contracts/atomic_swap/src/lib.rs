@@ -86,6 +86,20 @@ pub enum ContractError {
     BatchTooLarge = 51,
     BatchSizeMismatch = 52,
     ConditionNotMet = 53,
+    /// #781: Arbitrator committee / time-locked ruling / dispute bond errors
+    NotACommitteeSigner = 54,
+    DuplicateSigner = 55,
+    InsufficientSignatures = 56,
+    CommitteeSizeTooSmall = 57,
+    EvidenceRequired = 58,
+    RulingAlreadyPending = 59,
+    NoPendingRuling = 60,
+    TimelockNotElapsed = 62,
+    RulingFinalized = 63,
+    /// #781: batch_arbitrate_swaps disabled — never validated the caller
+    /// against any stored arbitrator, bypassing the committee/evidence/
+    /// timelock/bond system entirely. See #781 PR notes.
+    BatchArbitrationDisabled = 64,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -96,6 +110,21 @@ pub const LEDGER_BUMP: u32 = 6_307_200;
 
 /// Maximum number of items allowed in a single batch operation.
 pub const MAX_BATCH_SIZE: u32 = 50;
+
+/// #781: Minimum non-refundable dispute bond, in the swap token's smallest
+/// unit — 1 XLM in stroops, per docs/threat-model.md's stated minimum. The
+/// contract is token-agnostic (no function anywhere does per-token decimal
+/// conversion), so this is a flat literal like every other constant here.
+pub const MIN_DISPUTE_BOND: i128 = 10_000_000;
+
+/// #781: Default delay between a committee ruling being entered and it
+/// becoming executable, per docs/threat-model.md's 48-hour requirement.
+pub const DEFAULT_ARBITRATION_RULING_DELAY_SECONDS: u64 = 48 * 3600;
+
+/// #781: Minimum committee size and threshold for `set_arbitrator`, per
+/// docs/threat-model.md's "minimum 2-of-3 threshold" requirement.
+pub const MIN_COMMITTEE_SIGNERS: u32 = 3;
+pub const MIN_COMMITTEE_THRESHOLD: u32 = 2;
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
 
@@ -176,9 +205,19 @@ pub enum DataKey {
     /// #470: Price oracle configuration (oracle contract address + enabled flag).
     OracleConfig,
     /// #314: Maps swap_id → arbitrator Address for dispute resolution.
+    /// Legacy single-arbitrator key. No longer written by `set_arbitrator`
+    /// (#781 replaced it with `ArbitratorCommittee`); left in place only
+    /// because `arbitrate_swap` still reads it. See #781 PR notes.
     SwapArbitrator(u64),
     /// #313: Maps swap_id → Vec<BytesN<32>> of dispute evidence hashes.
     DisputeEvidence(u64),
+    /// #781: Maps swap_id → ArbitratorCommittee (M-of-N signers + threshold).
+    ArbitratorCommittee(u64),
+    /// #781: Maps swap_id → PendingRuling entered by the committee, awaiting
+    /// the time-lock delay before `execute_ruling` can move funds.
+    PendingRuling(u64),
+    /// #781: Maps swap_id → DisputeBonds deposited by buyer/seller.
+    DisputeBond(u64),
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -203,6 +242,12 @@ pub struct ProtocolConfig {
     /// How long (seconds) after arbitration is requested before auto-refund is allowed.
     /// Default: 14 days = 1_209_600 seconds.
     pub arbitration_timeout_seconds: u64,
+    /// #781: How long (seconds) a committee ruling must wait before
+    /// `execute_ruling` can move funds. Default: 48 hours = 172_800 seconds.
+    /// Note: `store_protocol_config` is a pre-existing no-op stub, so this
+    /// field cannot actually be reconfigured at runtime today — see its
+    /// definition below.
+    pub arbitration_ruling_delay_secs: u64,
 }
 
 #[contracttype]
@@ -996,6 +1041,11 @@ impl AtomicSwap {
             );
         }
 
+        // #781: this admin-direct path bypasses the committee/evidence/
+        // timelock/bond system — refund any bond in flight rather than
+        // orphaning it, since no committee ruling occurred here.
+        Self::release_dispute_bonds_uncontested(&env, swap_id, &swap);
+
         env.events().publish(
             (soroban_sdk::symbol_short!("disp_res"),),
             DisputeResolvedEvent { swap_id, refunded },
@@ -1061,6 +1111,11 @@ impl AtomicSwap {
         // Update swap status
         swap.status = SwapStatus::Cancelled;
         swap::save_swap(&env, swap_id, &swap);
+
+        // #781: this admin path bypasses the committee/evidence/timelock/bond
+        // system — refund any bond in flight rather than orphaning it, since
+        // no committee ruling occurred here.
+        Self::release_dispute_bonds_uncontested(&env, swap_id, &swap);
 
         // Release the IP lock
         env.storage()
@@ -1225,10 +1280,17 @@ impl AtomicSwap {
         );
     }
 
-    // ── #314: Third-Party Arbitration ─────────────────────────────────────────
+    // ── #314/#781: Third-Party Arbitration (M-of-N committee, time-locked) ─────
 
-    /// Admin sets an arbitrator for a disputed swap. Can only be set once.
-    pub fn set_arbitrator(env: Env, swap_id: u64, admin: Address, arbitrator: Address) {
+    /// #781: Admin designates an M-of-N committee to rule on a disputed swap.
+    /// Can only be set once. Minimum 2-of-3, per docs/threat-model.md.
+    pub fn set_arbitrator(
+        env: Env,
+        swap_id: u64,
+        admin: Address,
+        signers: Vec<Address>,
+        threshold: u32,
+    ) {
         admin.require_auth();
         require_admin(&env, &admin);
 
@@ -1243,53 +1305,224 @@ impl AtomicSwap {
         if env
             .storage()
             .persistent()
-            .has(&DataKey::SwapArbitrator(swap_id))
+            .has(&DataKey::ArbitratorCommittee(swap_id))
         {
             env.panic_with_error(Error::from_contract_error(
                 ContractError::ArbitratorAlreadySet as u32,
             ));
         }
 
+        if signers.len() < MIN_COMMITTEE_SIGNERS
+            || threshold < MIN_COMMITTEE_THRESHOLD
+            || threshold > signers.len()
+        {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::CommitteeSizeTooSmall as u32,
+            ));
+        }
+
+        for i in 0..signers.len() {
+            let s = signers.get(i).unwrap();
+            for j in 0..i {
+                if signers.get(j).unwrap() == s {
+                    env.panic_with_error(Error::from_contract_error(
+                        ContractError::DuplicateSigner as u32,
+                    ));
+                }
+            }
+        }
+
+        let committee = ArbitratorCommittee {
+            signers: signers.clone(),
+            threshold,
+        };
         env.storage()
             .persistent()
-            .set(&DataKey::SwapArbitrator(swap_id), &arbitrator);
+            .set(&DataKey::ArbitratorCommittee(swap_id), &committee);
         env.storage().persistent().extend_ttl(
-            &DataKey::SwapArbitrator(swap_id),
+            &DataKey::ArbitratorCommittee(swap_id),
             LEDGER_BUMP,
             LEDGER_BUMP,
         );
 
-        swap.arbitrator = Some(arbitrator.clone());
+        // Informational only — not read for any auth/enforcement decision.
+        swap.arbitrator = signers.get(0);
         swap::save_swap(&env, swap_id, &swap);
 
         env.events().publish(
-            (soroban_sdk::symbol_short!("arb_set"),),
-            ArbitratorSetEvent {
+            (soroban_sdk::symbol_short!("arb_comm"),),
+            ArbitratorCommitteeSetEvent {
                 swap_id,
-                arbitrator,
+                signers,
+                threshold,
             },
         );
     }
 
-    /// Arbitrator resolves a disputed swap. refund=true refunds buyer; false completes to seller.
-    pub fn arbitrate_dispute(env: Env, swap_id: u64, arbitrator: Address, refund: bool) {
-        arbitrator.require_auth();
-
-        let stored_arbitrator: Address = env
+    /// #781: Validates `signers` against the swap's `ArbitratorCommittee` —
+    /// each address must `require_auth()`, be a distinct committee member,
+    /// and together meet the committee's threshold.
+    fn require_committee_threshold(
+        env: &Env,
+        swap_id: u64,
+        signers: &Vec<Address>,
+    ) -> ArbitratorCommittee {
+        let committee: ArbitratorCommittee = env
             .storage()
             .persistent()
-            .get(&DataKey::SwapArbitrator(swap_id))
+            .get(&DataKey::ArbitratorCommittee(swap_id))
             .unwrap_or_else(|| {
                 env.panic_with_error(Error::from_contract_error(
                     ContractError::NoArbitratorSet as u32,
                 ))
             });
 
-        if arbitrator != stored_arbitrator {
+        for i in 0..signers.len() {
+            let signer = signers.get(i).unwrap();
+            signer.require_auth();
+
+            if !committee.signers.contains(signer.clone()) {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::NotACommitteeSigner as u32,
+                ));
+            }
+
+            for j in 0..i {
+                if signers.get(j).unwrap() == signer {
+                    env.panic_with_error(Error::from_contract_error(
+                        ContractError::DuplicateSigner as u32,
+                    ));
+                }
+            }
+        }
+
+        if signers.len() < committee.threshold {
             env.panic_with_error(Error::from_contract_error(
-                ContractError::NotArbitrator as u32,
+                ContractError::InsufficientSignatures as u32,
             ));
         }
+
+        committee
+    }
+
+    /// #781: Committee ruling entry — NOT fund movement. Requires `threshold`
+    /// of the committee's `signers` to jointly authorize this call (each must
+    /// `require_auth()`), requires evidence to have already been submitted
+    /// (read directly from storage, not signer-supplied), and stores the
+    /// ruling as pending for `execute_ruling` to carry out once the time-lock
+    /// delay elapses. refund=true favors the buyer; false favors the seller.
+    pub fn arbitrate_dispute(env: Env, swap_id: u64, signers: Vec<Address>, refund: bool) {
+        let swap = require_swap_exists(&env, swap_id);
+        require_swap_status(
+            &env,
+            &swap,
+            SwapStatus::Disputed,
+            ContractError::NotDisputed,
+        );
+
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::PendingRuling(swap_id))
+        {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::RulingAlreadyPending as u32,
+            ));
+        }
+
+        Self::require_committee_threshold(&env, swap_id, &signers);
+
+        let evidence: Vec<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DisputeEvidence(swap_id))
+            .unwrap_or(Vec::new(&env));
+        if evidence.is_empty() {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::EvidenceRequired as u32,
+            ));
+        }
+
+        let ruled_at = env.ledger().timestamp();
+        let pending = PendingRuling {
+            refund,
+            ruled_at,
+            evidence_hashes: evidence.clone(),
+            ruled_by: signers.clone(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::PendingRuling(swap_id), &pending);
+        env.storage().persistent().extend_ttl(
+            &DataKey::PendingRuling(swap_id),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("rule_ent"),),
+            RulingEnteredEvent {
+                swap_id,
+                refund,
+                ruled_at,
+                evidence_hashes: evidence,
+                ruled_by: signers,
+            },
+        );
+    }
+
+    /// #781: Cancels a pending ruling before the time-lock delay elapses,
+    /// requiring the same committee threshold as ruling entry. Once
+    /// cancelled, `arbitrate_dispute` may be called again to enter a fresh
+    /// ruling.
+    pub fn cancel_pending_ruling(env: Env, swap_id: u64, signers: Vec<Address>) {
+        Self::require_committee_threshold(&env, swap_id, &signers);
+
+        let pending: PendingRuling = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingRuling(swap_id))
+            .unwrap_or_else(|| {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::NoPendingRuling as u32,
+                ))
+            });
+
+        let config = Self::protocol_config(&env);
+        let elapsed = env.ledger().timestamp().saturating_sub(pending.ruled_at);
+        if elapsed >= config.arbitration_ruling_delay_secs {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::RulingFinalized as u32,
+            ));
+        }
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PendingRuling(swap_id));
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("rule_can"),),
+            RulingCancelledEvent {
+                swap_id,
+                cancelled_by: signers,
+            },
+        );
+    }
+
+    /// #781: Executes a committee ruling after the time-lock delay has
+    /// elapsed. Permissionless — anyone may trigger it once the delay has
+    /// passed, matching `auto_refund_timeout`'s convention. Moves funds and
+    /// settles dispute bonds (see `settle_dispute_bonds`).
+    pub fn execute_ruling(env: Env, swap_id: u64) {
+        let pending: PendingRuling = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingRuling(swap_id))
+            .unwrap_or_else(|| {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::NoPendingRuling as u32,
+                ))
+            });
 
         let mut swap = require_swap_exists(&env, swap_id);
         require_swap_status(
@@ -1299,13 +1532,21 @@ impl AtomicSwap {
             ContractError::NotDisputed,
         );
 
+        let config = Self::protocol_config(&env);
+        let elapsed = env.ledger().timestamp().saturating_sub(pending.ruled_at);
+        if elapsed < config.arbitration_ruling_delay_secs {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::TimelockNotElapsed as u32,
+            ));
+        }
+
+        let refund = pending.refund;
         let token_client = token::Client::new(&env, &swap.token);
 
         if refund {
             token_client.transfer(&env.current_contract_address(), &swap.buyer, &swap.price);
             swap.status = SwapStatus::Cancelled;
         } else {
-            let config = Self::protocol_config(&env);
             let fee_amount = if config.protocol_fee_bps > 0 {
                 (swap.price * config.protocol_fee_bps as i128) / 10000
             } else {
@@ -1327,27 +1568,186 @@ impl AtomicSwap {
             swap.status = SwapStatus::Completed;
         }
 
+        Self::settle_dispute_bonds(&env, swap_id, &swap, refund, &token_client);
+
         swap::save_swap(&env, swap_id, &swap);
         env.storage()
             .persistent()
             .remove(&DataKey::ActiveSwap(swap.ip_id));
         env.storage()
             .persistent()
-            .remove(&DataKey::SwapArbitrator(swap_id));
+            .remove(&DataKey::PendingRuling(swap_id));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::ArbitratorCommittee(swap_id));
 
         Self::append_history(&env, swap_id, swap.status.clone());
 
         env.events().publish(
-            (soroban_sdk::symbol_short!("arb_dec"),),
-            ArbitratedEvent {
-                swap_id,
-                arbitrator,
-                refunded: refund,
-            },
+            (soroban_sdk::symbol_short!("rule_exc"),),
+            RulingExecutedEvent { swap_id, refund },
         );
     }
 
-    /// Buyer or seller submits dispute evidence (a hash of off-chain evidence).
+    /// #781: Refunds the winning party's dispute bond and forfeits the
+    /// losing party's bond. Forfeited bonds go to the current `DataKey::Admin`
+    /// address rather than `protocol_config().treasury` — `protocol_config()`
+    /// (below) unconditionally returns a hardcoded placeholder address
+    /// regardless of what's configured (a pre-existing storage bug this PR
+    /// does not fix); routing real forfeited value through it would be a new,
+    /// self-inflicted loss path, so real value is deliberately kept on the
+    /// one admin-storage path that actually round-trips correctly today.
+    fn settle_dispute_bonds(
+        env: &Env,
+        swap_id: u64,
+        swap: &SwapRecord,
+        refund: bool,
+        token_client: &token::Client,
+    ) {
+        let bonds: DisputeBonds = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DisputeBond(swap_id))
+            .unwrap_or(DisputeBonds {
+                buyer_bond: 0,
+                seller_bond: 0,
+            });
+
+        if bonds.buyer_bond == 0 && bonds.seller_bond == 0 {
+            return;
+        }
+
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::NotInitialized as u32,
+                ))
+            });
+
+        if bonds.buyer_bond > 0 {
+            if refund {
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &swap.buyer,
+                    &bonds.buyer_bond,
+                );
+                env.events().publish(
+                    (soroban_sdk::symbol_short!("bond_rfd"),),
+                    DisputeBondRefundedEvent {
+                        swap_id,
+                        submitter: swap.buyer.clone(),
+                        bond_amount: bonds.buyer_bond,
+                    },
+                );
+            } else {
+                token_client.transfer(&env.current_contract_address(), &admin, &bonds.buyer_bond);
+                env.events().publish(
+                    (soroban_sdk::symbol_short!("bond_fft"),),
+                    DisputeBondForfeitedEvent {
+                        swap_id,
+                        submitter: swap.buyer.clone(),
+                        bond_amount: bonds.buyer_bond,
+                    },
+                );
+            }
+        }
+
+        if bonds.seller_bond > 0 {
+            if !refund {
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &swap.seller,
+                    &bonds.seller_bond,
+                );
+                env.events().publish(
+                    (soroban_sdk::symbol_short!("bond_rfd"),),
+                    DisputeBondRefundedEvent {
+                        swap_id,
+                        submitter: swap.seller.clone(),
+                        bond_amount: bonds.seller_bond,
+                    },
+                );
+            } else {
+                token_client.transfer(&env.current_contract_address(), &admin, &bonds.seller_bond);
+                env.events().publish(
+                    (soroban_sdk::symbol_short!("bond_fft"),),
+                    DisputeBondForfeitedEvent {
+                        swap_id,
+                        submitter: swap.seller.clone(),
+                        bond_amount: bonds.seller_bond,
+                    },
+                );
+            }
+        }
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::DisputeBond(swap_id));
+    }
+
+    /// #781: Called by dispute-resolution paths other than the committee
+    /// ruling flow (`resolve_dispute`, `auto_refund_timeout`,
+    /// `admin_rollback_swap`) when they move a swap out of `Disputed`.
+    /// Refunds any deposited dispute bonds in full (no forfeiture — no
+    /// committee ruling occurred) and clears any in-flight committee/pending-
+    /// ruling state, so neither is orphaned in storage.
+    fn release_dispute_bonds_uncontested(env: &Env, swap_id: u64, swap: &SwapRecord) {
+        if let Some(bonds) = env
+            .storage()
+            .persistent()
+            .get::<_, DisputeBonds>(&DataKey::DisputeBond(swap_id))
+        {
+            let token_client = token::Client::new(env, &swap.token);
+            if bonds.buyer_bond > 0 {
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &swap.buyer,
+                    &bonds.buyer_bond,
+                );
+                env.events().publish(
+                    (soroban_sdk::symbol_short!("bond_rfd"),),
+                    DisputeBondRefundedEvent {
+                        swap_id,
+                        submitter: swap.buyer.clone(),
+                        bond_amount: bonds.buyer_bond,
+                    },
+                );
+            }
+            if bonds.seller_bond > 0 {
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &swap.seller,
+                    &bonds.seller_bond,
+                );
+                env.events().publish(
+                    (soroban_sdk::symbol_short!("bond_rfd"),),
+                    DisputeBondRefundedEvent {
+                        swap_id,
+                        submitter: swap.seller.clone(),
+                        bond_amount: bonds.seller_bond,
+                    },
+                );
+            }
+            env.storage()
+                .persistent()
+                .remove(&DataKey::DisputeBond(swap_id));
+        }
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PendingRuling(swap_id));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::ArbitratorCommittee(swap_id));
+    }
+
+    /// Buyer or seller submits dispute evidence (a hash of off-chain
+    /// evidence). #781: charges a non-refundable dispute bond (the greater of
+    /// `MIN_DISPUTE_BOND` or 10% of the swap price) on a submitter's first
+    /// submission; later submissions by the same address don't re-charge.
     pub fn submit_dispute_evidence(
         env: Env,
         swap_id: u64,
@@ -1375,12 +1775,68 @@ impl AtomicSwap {
             .persistent()
             .extend_ttl(&key, LEDGER_BUMP, LEDGER_BUMP);
 
+        Self::charge_dispute_bond(&env, swap_id, &swap, &submitter);
+
         env.events().publish(
             (soroban_sdk::symbol_short!("evid_sub"),),
             DisputeEvidenceSubmittedEvent {
                 swap_id,
                 submitter,
                 evidence_hash,
+            },
+        );
+    }
+
+    fn charge_dispute_bond(env: &Env, swap_id: u64, swap: &SwapRecord, submitter: &Address) {
+        let bond_key = DataKey::DisputeBond(swap_id);
+        let mut bonds: DisputeBonds = env
+            .storage()
+            .persistent()
+            .get(&bond_key)
+            .unwrap_or(DisputeBonds {
+                buyer_bond: 0,
+                seller_bond: 0,
+            });
+
+        let is_buyer = *submitter == swap.buyer;
+        let already_charged = if is_buyer {
+            bonds.buyer_bond > 0
+        } else {
+            bonds.seller_bond > 0
+        };
+        if already_charged {
+            return;
+        }
+
+        let pct_bond = swap.price * 1000 / 10000;
+        let bond_amount = if pct_bond > MIN_DISPUTE_BOND {
+            pct_bond
+        } else {
+            MIN_DISPUTE_BOND
+        };
+
+        token::Client::new(env, &swap.token).transfer(
+            submitter,
+            &env.current_contract_address(),
+            &bond_amount,
+        );
+
+        if is_buyer {
+            bonds.buyer_bond = bond_amount;
+        } else {
+            bonds.seller_bond = bond_amount;
+        }
+        env.storage().persistent().set(&bond_key, &bonds);
+        env.storage()
+            .persistent()
+            .extend_ttl(&bond_key, LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("bond_dep"),),
+            DisputeBondDepositedEvent {
+                swap_id,
+                submitter: submitter.clone(),
+                bond_amount,
             },
         );
     }
@@ -1393,8 +1849,6 @@ impl AtomicSwap {
             .unwrap_or(Vec::new(&env))
     }
 
-    // submit_dispute_evidence removed - DisputeEvidence DataKey variant not defined
-    // get_dispute_evidence removed - DisputeEvidence DataKey variant not defined
     // accept_swap_with_quantity removed - price_tiers field not in SwapRecord
 
     /// Buyer accepts a partial quantity of a bulk swap at a proportional price.
@@ -1747,6 +2201,7 @@ impl AtomicSwap {
                 dispute_timeout_secs,
                 referral_fee_bps,
                 arbitration_timeout_seconds: 1_209_600,
+                arbitration_ruling_delay_secs: DEFAULT_ARBITRATION_RULING_DELAY_SECONDS,
             },
         );
     }
@@ -1769,6 +2224,7 @@ impl AtomicSwap {
             dispute_timeout_secs: 604800,
             referral_fee_bps: 100,
             arbitration_timeout_seconds: 1_209_600, // 14 days
+            arbitration_ruling_delay_secs: DEFAULT_ARBITRATION_RULING_DELAY_SECONDS,
         }
     }
 
@@ -3042,6 +3498,11 @@ impl AtomicSwap {
             .persistent()
             .remove(&DataKey::ArbitrationTimestamp(swap_id));
 
+        // #781: this timeout path bypasses the committee/evidence/timelock/
+        // bond system — refund any bond in flight rather than orphaning it,
+        // since no committee ruling occurred here.
+        Self::release_dispute_bonds_uncontested(&env, swap_id, &swap);
+
         // Refund buyer
         token::Client::new(&env, &swap.token).transfer(
             &env.current_contract_address(),
@@ -3791,99 +4252,24 @@ impl AtomicSwap {
         swap_ids
     }
 
-    /// Arbitrate multiple disputed swaps in one call. Arbitrator-only.
-    /// `refund` applies uniformly to all swaps in the batch.
-    pub fn batch_arbitrate_swaps(env: Env, swap_ids: Vec<u64>, arbitrator: Address, refund: bool) {
-        arbitrator.require_auth();
-
-        for swap_id in swap_ids.iter() {
-            let mut swap = require_swap_exists(&env, swap_id);
-            require_swap_status(
-                &env,
-                &swap,
-                SwapStatus::Disputed,
-                ContractError::NotDisputed,
-            );
-
-            let token_client = token::Client::new(&env, &swap.token);
-
-            if refund {
-                token_client.transfer(&env.current_contract_address(), &swap.buyer, &swap.price);
-
-                if swap.collateral_amount > 0 {
-                    if let Some(collateral) = env
-                        .storage()
-                        .persistent()
-                        .get::<_, i128>(&DataKey::SwapCollateral(swap_id))
-                    {
-                        token_client.transfer(
-                            &env.current_contract_address(),
-                            &swap.buyer,
-                            &collateral,
-                        );
-                        env.storage()
-                            .persistent()
-                            .remove(&DataKey::SwapCollateral(swap_id));
-                    }
-                }
-
-                swap.status = SwapStatus::Cancelled;
-            } else {
-                let config = Self::protocol_config(&env);
-                let fee_amount = if config.protocol_fee_bps > 0 && swap.price > 0 {
-                    (swap.price * config.protocol_fee_bps as i128) / 10000
-                } else {
-                    0
-                };
-                let seller_amount = swap.price - fee_amount;
-                token_client.transfer(
-                    &env.current_contract_address(),
-                    &swap.seller,
-                    &seller_amount,
-                );
-                if fee_amount > 0 {
-                    token_client.transfer(
-                        &env.current_contract_address(),
-                        &config.treasury,
-                        &fee_amount,
-                    );
-                }
-
-                if swap.collateral_amount > 0 {
-                    if let Some(collateral) = env
-                        .storage()
-                        .persistent()
-                        .get::<_, i128>(&DataKey::SwapCollateral(swap_id))
-                    {
-                        token_client.transfer(
-                            &env.current_contract_address(),
-                            &swap.seller,
-                            &collateral,
-                        );
-                        env.storage()
-                            .persistent()
-                            .remove(&DataKey::SwapCollateral(swap_id));
-                    }
-                }
-
-                swap.status = SwapStatus::Completed;
-            }
-
-            swap::save_swap(&env, swap_id, &swap);
-            env.storage()
-                .persistent()
-                .remove(&DataKey::ActiveSwap(swap.ip_id));
-            Self::append_history(&env, swap_id, swap.status.clone());
-
-            env.events().publish(
-                (soroban_sdk::symbol_short!("arb_dec"),),
-                ArbitratedEvent {
-                    swap_id,
-                    arbitrator: arbitrator.clone(),
-                    refunded: refund,
-                },
-            );
-        }
+    /// #781: Disabled. This function never validated `arbitrator` against
+    /// any stored arbitrator/committee — any caller could pass any address
+    /// and drain any disputed swap through it, fully bypassing the
+    /// committee/evidence/timelock/bond system added in #781. Left in place
+    /// (rather than deleted) only to preserve its signature/selector;
+    /// unconditionally rejected pending a follow-up issue to migrate it onto
+    /// the `ArbitratorCommittee` model, at which point it can call
+    /// `arbitrate_dispute`/`execute_ruling` per swap instead of moving funds
+    /// directly.
+    pub fn batch_arbitrate_swaps(
+        env: Env,
+        _swap_ids: Vec<u64>,
+        _arbitrator: Address,
+        _refund: bool,
+    ) {
+        env.panic_with_error(Error::from_contract_error(
+            ContractError::BatchArbitrationDisabled as u32,
+        ));
     }
 
     // ── #358: Swap Timeout Escalation ─────────────────────────────────────────
@@ -4849,14 +5235,20 @@ impl AtomicSwap {
 // #[cfg(test)]
 // mod escrow_tests;
 
-// FIXME: pre-existing compile errors from merge conflict - re-enable after fix
-// #[cfg(test)]
-// mod arbitration_tests;
+// #781: re-enabled — was blocked by 3 pre-existing, unrelated compile errors
+// (a dropped `commit_ip` arg, and two obsolete `accept_swap_with_quantity`
+// calls to a since-removed function; both fixed / removed in this PR).
+#[cfg(test)]
+mod arbitration_tests;
 
 // FIXME: pre-existing compile errors from merge conflict - re-enable after fix
 // include!("multi_signer_tests.rs");
 
 // FIXME: pre-existing compile errors from merge conflict - re-enable after fix
+// (also has pre-existing runtime failures in test_batch_reveal_keys_* unrelated
+// to #781 — a protocol-fee transfer to protocol_config().treasury's hardcoded
+// placeholder address fails for lack of a trustline; same root cause noted in
+// docs/threat-model.md's #781 update, left unfixed here as out of scope).
 // #[cfg(test)]
 // mod batch_swap_features_tests;
 

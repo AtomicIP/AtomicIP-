@@ -178,12 +178,46 @@ The dispute resolution mechanism allows a designated admin to adjudicate contest
 **Impact**: Fraudulent dispute outcomes; direct loss of buyer funds or seller IP.
 
 **Mitigations**:
-- Admin role must be a **multi-sig account** (minimum 2-of-3 threshold; 3-of-5 recommended for high-value deployments)
-- All admin rulings are recorded on-chain with the admin address and ledger timestamp — fully auditable
-- A **48-hour time-lock** between ruling and fund release gives the losing party time to escalate off-chain
-- Admin key rotation is supported via contract upgrade path; rotation procedure must be documented before mainnet
+- Per-swap dispute rulings now require an **M-of-N arbitrator committee**
+  (`set_arbitrator`, minimum 2-of-3 threshold, 3-of-5 or larger supported) —
+  `arbitrate_dispute` requires `threshold` of the committee's `signers` to
+  jointly `require_auth()` a ruling in one call; no single key can rule alone.
+- A ruling is bound to submitted evidence: `arbitrate_dispute` rejects a
+  ruling if `DisputeEvidence` is empty, and the evidence hashes actually
+  considered (read from storage, not signer-supplied) are recorded in
+  `RulingEnteredEvent` for outside audit.
+- A **48-hour time-lock** (`execute_ruling`, `ProtocolConfig.arbitration_ruling_delay_secs`)
+  separates ruling entry from fund release; `cancel_pending_ruling` lets the
+  same committee threshold void a ruling within that window.
+- All transitions are individually auditable: `ArbitratorCommitteeSetEvent`,
+  `RulingEnteredEvent`, `RulingCancelledEvent`, `RulingExecutedEvent`.
+- **Not covered by the above, still open**: the contract's own `Admin` role
+  (`DataKey::Admin`) remains a single `Address` — it alone appoints the
+  arbitrator committee and is unaffected by this mechanism. More directly,
+  `resolve_dispute` still lets that single admin resolve any disputed swap
+  directly, completely bypassing the committee/evidence/timelock/bond system
+  described above — a real, disclosed gap, recommended as a follow-up issue
+  (either remove `resolve_dispute`'s direct fund-movement path or route it
+  through the same committee/timelock). `admin_rollback_swap` and
+  `auto_refund_timeout` are narrower emergency/timeout escape hatches that
+  remain single-admin/permissionless by design, but now correctly refund
+  (never forfeit) any dispute bond in flight if they fire instead of a
+  committee ruling, so they no longer orphan bonded value.
+- `batch_arbitrate_swaps` — previously did not validate its caller against
+  any stored arbitrator at all — is now disabled (always reverts) pending a
+  follow-up migration onto the committee model. `arbitrate_swap`, a
+  collateral-aware duplicate of the old single-key `arbitrate_dispute` that
+  never checked swap status, is now permanently unreachable since nothing
+  populates the legacy `SwapArbitrator` key anymore; this also closes a
+  pre-existing double-payout risk where it could still be called after
+  `resolve_dispute` had already paid out a swap.
+- Admin key rotation is supported via contract upgrade path; rotation
+  procedure must still be documented before mainnet.
 
-**Status**: ⚠️ Partially mitigated — depends on operator deploying multi-sig correctly
+**Status**: ⚠️ Partially mitigated — per-swap arbitration is now committee-gated,
+evidence-bound, and time-locked, but the contract `Admin` role itself is still
+single-key and `resolve_dispute` remains an admin-direct bypass of the new
+safeguards.
 
 ---
 
@@ -194,12 +228,23 @@ The dispute resolution mechanism allows a designated admin to adjudicate contest
 **Impact**: Counterparty funds locked; griefing / DoS against legitimate swap completion.
 
 **Mitigations**:
-- Disputes require an **on-chain evidence hash** (`dispute_evidence` field) submitted at filing time — no evidence, no dispute
-- A **non-refundable dispute bond** (minimum 1 XLM or 10% of swap price, whichever is greater) is forfeited if the dispute is ruled frivolous
+- Disputes require an **on-chain evidence hash** (`submit_dispute_evidence`) —
+  no evidence, no dispute, and (see #13) no evidence means `arbitrate_dispute`
+  cannot enter a ruling at all.
+- A **non-refundable dispute bond** (`MIN_DISPUTE_BOND`, the greater of 1 XLM
+  or 10% of swap price) is charged on a party's first evidence submission and
+  forfeited to the contract admin if the committee's ruling goes against that
+  party; refunded in full if the ruling goes their way, or if the dispute is
+  instead resolved via one of the non-committee paths in #13 (no ruling ⇒ no
+  forfeiture).
 - Disputes must be filed within `dispute_period` ledgers of the triggering event; late filings are rejected by the contract
 - Repeated frivolous filings from the same address are rate-limited by the admin
 
-**Status**: ⚠️ Partially mitigated — bond amount and evidence format must be configured by operator
+**Status**: ⚠️ Partially mitigated — evidence + bond are now enforced in code
+with a fixed minimum; bond forfeiture destination is the contract admin
+address rather than the protocol treasury (`protocol_config().treasury`
+resolves to a hardcoded placeholder today — a pre-existing, separate storage
+bug, not fixed by this change).
 
 ---
 

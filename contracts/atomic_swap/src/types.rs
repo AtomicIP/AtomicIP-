@@ -201,6 +201,97 @@ pub struct ArbitratedEvent {
     pub refunded: bool,
 }
 
+// ── #781: M-of-N Arbitrator Committee, Time-Locked Ruling, Dispute Bond ────────
+
+/// A designated committee of `signers`, `threshold` of whom must jointly
+/// authorize a ruling. Replaces the single trusted `Address` previously stored
+/// under `DataKey::SwapArbitrator`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ArbitratorCommittee {
+    pub signers: Vec<Address>,
+    pub threshold: u32,
+}
+
+/// A ruling entered by the committee but not yet executed. `evidence_hashes` is
+/// a snapshot of `DisputeEvidence` read from storage at ruling-entry time (not
+/// supplied by the signers), so outside observers can verify the ruling
+/// actually references submitted evidence.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingRuling {
+    pub refund: bool,
+    pub ruled_at: u64,
+    pub evidence_hashes: Vec<BytesN<32>>,
+    pub ruled_by: Vec<Address>,
+}
+
+/// Non-refundable dispute bonds deposited by the buyer and/or seller on their
+/// first evidence submission for a swap. Zero means that party has not
+/// submitted evidence (or hasn't been charged yet).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DisputeBonds {
+    pub buyer_bond: i128,
+    pub seller_bond: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ArbitratorCommitteeSetEvent {
+    pub swap_id: u64,
+    pub signers: Vec<Address>,
+    pub threshold: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RulingEnteredEvent {
+    pub swap_id: u64,
+    pub refund: bool,
+    pub ruled_at: u64,
+    pub evidence_hashes: Vec<BytesN<32>>,
+    pub ruled_by: Vec<Address>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RulingCancelledEvent {
+    pub swap_id: u64,
+    pub cancelled_by: Vec<Address>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RulingExecutedEvent {
+    pub swap_id: u64,
+    pub refund: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DisputeBondDepositedEvent {
+    pub swap_id: u64,
+    pub submitter: Address,
+    pub bond_amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DisputeBondForfeitedEvent {
+    pub swap_id: u64,
+    pub submitter: Address,
+    pub bond_amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DisputeBondRefundedEvent {
+    pub swap_id: u64,
+    pub submitter: Address,
+    pub bond_amount: i128,
+}
+
 // ── #360: Admin Rollback Event ───────────────────────────────────────────────
 
 #[contracttype]
