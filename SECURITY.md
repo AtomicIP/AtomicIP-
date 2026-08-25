@@ -96,6 +96,30 @@ When reporting a vulnerability, please include:
 - 🔄 Time-locked commitments
 - 🔄 Partial disclosure proofs
 
+## API Server Audit Log
+
+The API server (`api-server/src/audit.rs`) maintains a hash-chained
+(HMAC-SHA256) audit log of commitment, swap, and admin events.
+
+- **Durability**: every event is appended to a durable, append-only file and
+  fsynced before the write is acknowledged. On startup, the store replays
+  that file to resume the existing chain (`previous_signature` and
+  `sequence`) instead of starting a new one — a process restart does not
+  reset or fork the chain.
+- **Key management**: `AUDIT_HMAC_KEY` must be set from durable
+  configuration/secret storage. If it is absent, the server fails to start
+  rather than silently signing the chain with a randomly generated,
+  unrecoverable key.
+- **Multi-instance safety**: concurrent instances sharing the same backing
+  store coordinate appends through an exclusive file lock and always derive
+  the next sequence number from the store's own current tail, so replicas
+  behind a load balancer cannot assign colliding sequence numbers.
+- **Independent verification**: `audit::verify_persisted_chain` walks the
+  persisted file and confirms every signature matches its
+  `previous_signature` linkage. It only needs read access to the backing
+  file and the HMAC key, so an outside auditor can run it without any
+  cooperation from a live server instance.
+
 ## Automated Security Scanning
 
 Every push and pull request is scanned automatically in CI/CD:
