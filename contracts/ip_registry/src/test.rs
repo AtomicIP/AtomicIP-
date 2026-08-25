@@ -3154,4 +3154,279 @@ mod batch_escrow_tests {
         let listed = client.list_ip_by_owner(&attacker);
         assert_eq!(listed.len(), 0);
     }
+
+    // ── Issue #785: Bounded Shard Sub-Indexing ────────────────────────────────
+
+    /// Writes into a single shard must stay within a flat cost envelope
+    /// regardless of how many commitments have ever landed in that shard.
+    /// Compares the worst (max) CPU cost within the very first
+    /// SUB_SHARD_CAPACITY-sized cycle of writes against the worst cost
+    /// within a cycle several thousand writes later: before #785 this grew
+    /// linearly with total shard history, after the fix it is bounded by
+    /// sub-shard size alone.
+    #[test]
+    fn test_shard_write_cost_stays_bounded_over_thousands_of_writes() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let hash = BytesN::from_array(&env, &[0u8; 32]); // shard 0 for every write
+
+        let write = |ip_id: u64| -> u64 {
+            env.cost_estimate().budget().reset_default();
+            env.as_contract(&contract_id, || {
+                crate::IpRegistry::assign_to_shard(&env, ip_id, &hash);
+            });
+            env.cost_estimate().budget().cpu_instruction_cost()
+        };
+
+        let capacity = crate::SUB_SHARD_CAPACITY as u64;
+
+        // Worst-case cost within the very first bounded cycle.
+        let mut first_cycle_max: u64 = 0;
+        for ip_id in 1..=capacity {
+            first_cycle_max = first_cycle_max.max(write(ip_id));
+        }
+
+        // Advance several thousand more writes into the same shard, crossing
+        // several more sub-shard rollovers.
+        for ip_id in (capacity + 1)..=5_000 {
+            write(ip_id);
+        }
+
+        // Worst-case cost within a cycle far into the shard's history.
+        let mut late_cycle_max: u64 = 0;
+        for ip_id in 5_001..=(5_000 + capacity) {
+            late_cycle_max = late_cycle_max.max(write(ip_id));
+        }
+
+        assert!(
+            late_cycle_max <= first_cycle_max * 2,
+            "shard write cost grew from {} to {} instructions after ~5000 prior writes \
+             into the same shard — write cost must stay bounded by SUB_SHARD_CAPACITY, \
+             not by total shard history",
+            first_cycle_max,
+            late_cycle_max
+        );
+    }
+
+    /// Walks `list_ip_by_shard` a page at a time — each page is its own
+    /// bounded call, exactly how a real caller (an indexer, another
+    /// contract) would enumerate a shard across separate invocations rather
+    /// than in one unboundedly expensive call. Accumulates into a plain
+    /// heap `std::vec::Vec` rather than a `soroban_sdk::Vec`: the
+    /// accumulator lives in the test driver, not inside any contract
+    /// invocation, so there's no reason to route it through the metered
+    /// host object system that page-sized `soroban_sdk::Vec`s above go
+    /// through per call.
+    fn enumerate_shard(
+        env: &Env,
+        client: &crate::IpRegistryClient,
+        shard_id: u32,
+    ) -> std::vec::Vec<u64> {
+        let mut out: std::vec::Vec<u64> = std::vec::Vec::new();
+        let mut cursor: Option<u32> = None;
+        loop {
+            // Each page is its own top-level invocation on a real network
+            // and gets a fresh budget there; the test Env doesn't reset
+            // automatically between successive client calls, so do it here
+            // to mirror real conditions instead of accumulating cost across
+            // pages that a real caller would never pay for in one go.
+            env.cost_estimate().budget().reset_default();
+            let (page, next) = client.list_ip_by_shard(&shard_id, &cursor);
+            for id in page.iter() {
+                out.push(id);
+            }
+            match next {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        out
+    }
+
+    /// A shard's legacy unbounded vector (as it would exist from before
+    /// #785) must migrate into the bounded sub-shard layout lazily, in
+    /// bounded batches per write, without losing or duplicating any IDs and
+    /// without requiring a one-shot admin migration transaction.
+    #[test]
+    fn test_legacy_shard_migrates_lazily_without_losing_ids() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let shard_id: u32 = 5;
+        // First byte 5 % NUM_SHARDS(16) == 5, so every write with this hash lands in shard 5.
+        let hash = BytesN::from_array(&env, &[5u8; 32]);
+
+        const LEGACY_COUNT: u64 = 1_000;
+
+        env.as_contract(&contract_id, || {
+            let mut legacy: soroban_sdk::Vec<u64> = soroban_sdk::Vec::new(&env);
+            for ip_id in 1..=LEGACY_COUNT {
+                legacy.push_back(ip_id);
+            }
+            env.storage()
+                .persistent()
+                .set(&crate::DataKey::ShardIps(shard_id), &legacy);
+        });
+
+        // Each write migrates a bounded batch (SHARD_MIGRATION_BATCH) off the
+        // front of the legacy vector before appending its own id. 40 writes
+        // is comfortably enough to fully drain 1000 legacy entries.
+        for ip_id in (LEGACY_COUNT + 1)..=(LEGACY_COUNT + 40) {
+            env.as_contract(&contract_id, || {
+                crate::IpRegistry::assign_to_shard(&env, ip_id, &hash);
+            });
+        }
+
+        env.as_contract(&contract_id, || {
+            assert!(
+                !env.storage()
+                    .persistent()
+                    .has(&crate::DataKey::ShardIps(shard_id)),
+                "legacy shard vector should be fully drained and removed after migration"
+            );
+        });
+
+        let client = crate::IpRegistryClient::new(&env, &contract_id);
+        let all_ids = enumerate_shard(&env, &client, shard_id);
+        let expected_count = (LEGACY_COUNT + 40) as usize;
+        assert_eq!(all_ids.len(), expected_count);
+
+        for expected in 1..=(LEGACY_COUNT + 40) {
+            assert!(
+                all_ids.contains(&expected),
+                "missing id {} after legacy migration",
+                expected
+            );
+        }
+    }
+
+    /// `list_ip_by_shard` paginated across sub-shards must return exactly
+    /// the same set of IDs that the old unbounded read would have, even
+    /// once a shard spans multiple bounded sub-shards, with every page
+    /// bounded to at most SUB_SHARD_CAPACITY entries.
+    #[test]
+    fn test_list_ip_by_shard_pagination_matches_full_enumeration() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let shard_id: u32 = 9;
+
+        // Spans 4 sub-shards: three full (SUB_SHARD_CAPACITY each) plus a
+        // partial one. Written directly rather than via 1500+ individual
+        // assign_to_shard calls — the append/rollover logic that produces
+        // this layout is already covered by the write-path tests above;
+        // this test is only concerned with the read path.
+        let capacity = crate::SUB_SHARD_CAPACITY as u64;
+        let total: u64 = capacity * 3 + 17;
+
+        env.as_contract(&contract_id, || {
+            for sub_index in 0..3u32 {
+                let mut sub: soroban_sdk::Vec<u64> = soroban_sdk::Vec::new(&env);
+                for j in 0..capacity {
+                    sub.push_back((sub_index as u64) * capacity + j + 1);
+                }
+                env.storage()
+                    .persistent()
+                    .set(&crate::DataKey::ShardSubIps(shard_id, sub_index), &sub);
+            }
+            let mut last: soroban_sdk::Vec<u64> = soroban_sdk::Vec::new(&env);
+            for j in 0..17u64 {
+                last.push_back(capacity * 3 + j + 1);
+            }
+            env.storage()
+                .persistent()
+                .set(&crate::DataKey::ShardSubIps(shard_id, 3u32), &last);
+            env.storage()
+                .persistent()
+                .set(&crate::DataKey::ShardHead(shard_id), &3u32);
+        });
+
+        let client = crate::IpRegistryClient::new(&env, &contract_id);
+
+        // Walk the paginated read path a page at a time, checking every
+        // individual page stays within the bounded envelope along the way.
+        // Accumulate into a plain heap Vec — see enumerate_shard's comment.
+        let mut paginated: std::vec::Vec<u64> = std::vec::Vec::new();
+        let mut cursor: Option<u32> = None;
+        loop {
+            // See enumerate_shard: reset so each page is measured as its own
+            // top-level invocation, matching real network behavior.
+            env.cost_estimate().budget().reset_default();
+            let (page, next) = client.list_ip_by_shard(&shard_id, &cursor);
+            assert!(
+                page.len() <= crate::SUB_SHARD_CAPACITY,
+                "a single page must never exceed SUB_SHARD_CAPACITY entries"
+            );
+            for id in page.iter() {
+                paginated.push(id);
+            }
+            match next {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+
+        assert_eq!(paginated.len(), total as usize);
+        for ip_id in 1..=total {
+            assert!(
+                paginated.contains(&ip_id),
+                "missing id {} from paginated enumeration",
+                ip_id
+            );
+        }
+    }
+
+    /// End-to-end smoke test: committing through the real `commit_ip` entry
+    /// point (a genuine top-level, resource-limited invocation) into a shard
+    /// whose active sub-shard is already one write away from rolling over
+    /// must succeed without tripping any Soroban budget limit — exercising
+    /// the sharding write path, including a rollover, exactly as production
+    /// traffic would. The near-full sub-shard is seeded directly rather than
+    /// via hundreds of preceding real commits, which would be dominated by
+    /// the unrelated O(n) cost of the existing commitment-checksum rollback
+    /// bookkeeping (issue #346/#429) and say nothing more about sharding.
+    #[test]
+    fn test_commit_ip_through_shard_rollover_via_real_entrypoint() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+        let shard_id: u32 = 0;
+        let capacity = crate::SUB_SHARD_CAPACITY as u64;
+
+        env.as_contract(&contract_id, || {
+            let mut sub: soroban_sdk::Vec<u64> = soroban_sdk::Vec::new(&env);
+            for j in 0..(capacity - 1) {
+                sub.push_back(j + 1);
+            }
+            env.storage()
+                .persistent()
+                .set(&crate::DataKey::ShardSubIps(shard_id, 0u32), &sub);
+        });
+
+        // Fix byte 0 so every commitment lands in shard 0; vary the rest so
+        // every hash is unique (required by commit_ip's dedup check).
+        for i in 0u32..3 {
+            let b = (i + 1).to_be_bytes(); // +1 so the first hash isn't all-zero
+            let commitment = BytesN::from_array(
+                &env,
+                &[
+                    0u8, b[0], b[1], b[2], b[3], 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                ],
+            );
+            client.commit_ip(&owner, &commitment, &0u32);
+        }
+
+        let owner_ips = client.list_ip_by_owner(&owner);
+        assert_eq!(owner_ips.len(), 3);
+
+        // The first of the three commits filled sub-shard 0 to capacity; the
+        // other two landed in sub-shard 1 after the rollover.
+        env.as_contract(&contract_id, || {
+            assert!(env
+                .storage()
+                .persistent()
+                .has(&crate::DataKey::ShardSubIps(shard_id, 1u32)));
+        });
+    }
 }
