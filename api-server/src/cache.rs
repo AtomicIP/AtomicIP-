@@ -1,12 +1,26 @@
 /// #316: Redis-based caching layer for IP and Swap queries.
 ///
-/// Uses an in-process DashMap as a TTL cache when Redis is unavailable,
-/// falling back gracefully so the server always starts without Redis.
-use std::sync::Arc;
+/// Backed by Redis when `REDIS_URL` is configured and reachable, so that
+/// invalidations (`invalidate`, `invalidate_prefix`, `invalidate_pattern`)
+/// are visible to every `api-server` instance sharing that Redis, not just
+/// the instance that performed the write.
+///
+/// Falls back to an in-process `DashMap` TTL cache — gracefully, so the
+/// server always starts and serves correct (if not shared) data — whenever
+/// Redis is not configured, not reachable at startup, or becomes
+/// unreachable while running. That degraded state is *not* silent: it is
+/// tracked in [`is_degraded`], logged on each transition, and exposed via
+/// the `cache_backend_degraded_transitions_total` counter. A background
+/// thread pings Redis every [`HEALTH_CHECK_INTERVAL`] and flips the cache
+/// back to shared mode automatically once Redis is reachable again.
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
+use metrics::{counter, describe_counter};
 use once_cell::sync::Lazy;
+use r2d2::Pool;
+use redis::Commands;
 use serde::{de::DeserializeOwned, Serialize};
 
 const DEFAULT_TTL_SECS: u64 = 30;
@@ -14,12 +28,149 @@ const IP_TTL_SECS: u64 = 60;
 const SWAP_TTL_SECS: u64 = 30;
 const REPUTATION_TTL_SECS: u64 = 300;
 
+/// How often the background thread pings Redis to detect recovery from a
+/// degraded state. Cache operations do not retry Redis on every call while
+/// degraded — they defer to this thread — so this interval is also the
+/// worst-case time to resume shared caching after Redis comes back.
+const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(10);
+
 struct Entry {
     value: String,
     expires_at: Instant,
 }
 
 static STORE: Lazy<DashMap<String, Entry>> = Lazy::new(DashMap::new);
+
+/// `true` when the cache is serving from the in-process `DashMap` fallback
+/// instead of the shared Redis store — either because `REDIS_URL` isn't
+/// configured, or because Redis is currently unreachable. Starts `true` and
+/// flips to `false` once a real connection is confirmed.
+static DEGRADED: AtomicBool = AtomicBool::new(true);
+
+/// Connection pool to the shared Redis store, built once from `REDIS_URL`.
+/// `None` when `REDIS_URL` is unset or invalid, in which case the cache
+/// runs in-process only and no health-check thread is started.
+static REDIS_POOL: Lazy<Option<Pool<redis::Client>>> = Lazy::new(|| {
+    describe_counter!(
+        "cache_backend_degraded_transitions_total",
+        "Transitions of the cache between shared Redis mode and degraded in-process mode"
+    );
+
+    let url = match std::env::var("REDIS_URL") {
+        Ok(url) => url,
+        Err(_) => {
+            tracing::warn!("cache: REDIS_URL not set, running in-process memory cache only");
+            return None;
+        }
+    };
+
+    let client = match redis::Client::open(url) {
+        Ok(client) => client,
+        Err(err) => {
+            tracing::warn!(error = %err, "cache: invalid REDIS_URL, running in-process memory cache only");
+            return None;
+        }
+    };
+
+    // `build_unchecked` never fails and never blocks on a live connection —
+    // the server must always start even if Redis is down at boot.
+    let pool = Pool::builder()
+        .max_size(16)
+        .connection_timeout(Duration::from_millis(300))
+        .build_unchecked(client);
+
+    // Establish real reachability synchronously (bounded by the 300ms
+    // connection timeout above) so that the very first cache operation
+    // after startup sees an accurate `DEGRADED` state instead of racing the
+    // background health-check thread's first tick.
+    match ping(&pool) {
+        Ok(()) => mark_healthy(),
+        Err(reason) => mark_degraded(&reason),
+    }
+
+    spawn_health_check(pool.clone());
+    Some(pool)
+});
+
+fn ping(pool: &Pool<redis::Client>) -> Result<(), String> {
+    pool.get()
+        .map_err(|err| err.to_string())
+        .and_then(|mut conn| {
+            redis::cmd("PING")
+                .query::<String>(&mut *conn)
+                .map(|_| ())
+                .map_err(|err| err.to_string())
+        })
+}
+
+fn spawn_health_check(pool: Pool<redis::Client>) {
+    let spawned = std::thread::Builder::new()
+        .name("cache-redis-health".to_string())
+        .spawn(move || loop {
+            std::thread::sleep(HEALTH_CHECK_INTERVAL);
+            match ping(&pool) {
+                Ok(()) => mark_healthy(),
+                Err(reason) => mark_degraded(&reason),
+            }
+        });
+
+    if let Err(err) = spawned {
+        tracing::error!(error = %err, "cache: failed to spawn Redis health-check thread; degraded state will only clear on the next successful cache operation");
+    }
+}
+
+/// Record a Redis failure. Logs and increments the transition counter only
+/// on the edge (healthy -> degraded), not on every failed operation.
+fn mark_degraded(reason: &str) {
+    let was_degraded = DEGRADED.swap(true, Ordering::SeqCst);
+    if !was_degraded {
+        tracing::warn!(
+            reason,
+            "cache: Redis unreachable, falling back to in-process memory cache (degraded mode)"
+        );
+        counter!(
+            "cache_backend_degraded_transitions_total",
+            "direction" => "to_degraded",
+        )
+        .increment(1);
+    }
+}
+
+/// Record a successful Redis health check. Logs and increments the
+/// transition counter only on the edge (degraded -> healthy).
+fn mark_healthy() {
+    let was_degraded = DEGRADED.swap(false, Ordering::SeqCst);
+    if was_degraded {
+        tracing::info!("cache: Redis connection restored, resuming shared cache mode");
+        counter!(
+            "cache_backend_degraded_transitions_total",
+            "direction" => "to_healthy",
+        )
+        .increment(1);
+    }
+}
+
+/// Whether the cache is currently serving from the in-process fallback
+/// rather than shared Redis.
+pub fn is_degraded() -> bool {
+    DEGRADED.load(Ordering::SeqCst)
+}
+
+/// Get a pooled Redis connection, marking the cache degraded on failure.
+/// Returns `None` when Redis isn't configured or is currently unreachable.
+fn redis_conn() -> Option<r2d2::PooledConnection<redis::Client>> {
+    let pool = REDIS_POOL.as_ref()?;
+    if is_degraded() {
+        return None;
+    }
+    match pool.get() {
+        Ok(conn) => Some(conn),
+        Err(err) => {
+            mark_degraded(&err.to_string());
+            None
+        }
+    }
+}
 
 // ── Cache Configuration ───────────────────────────────────────────────────────
 
@@ -44,7 +195,8 @@ impl Default for CacheConfig {
 }
 
 /// Global cache configuration.
-static CONFIG: Lazy<Arc<CacheConfig>> = Lazy::new(|| Arc::new(CacheConfig::default()));
+static CONFIG: Lazy<std::sync::Arc<CacheConfig>> =
+    Lazy::new(|| std::sync::Arc::new(CacheConfig::default()));
 
 /// Initialize cache with custom configuration.
 /// Note: has no effect after the cache has been first accessed (Lazy is already initialized).
@@ -62,19 +214,37 @@ pub fn set<T: Serialize>(key: &str, value: &T) {
 
 /// Write a value into the cache under `key` with custom TTL.
 pub fn set_with_ttl<T: Serialize>(key: &str, value: &T, ttl_secs: u64) {
-    if let Ok(json) = serde_json::to_string(value) {
-        STORE.insert(
-            key.to_string(),
-            Entry {
-                value: json,
-                expires_at: Instant::now() + Duration::from_secs(ttl_secs),
-            },
-        );
+    let Ok(json) = serde_json::to_string(value) else {
+        return;
+    };
+
+    if let Some(mut conn) = redis_conn() {
+        let result: redis::RedisResult<()> = conn.set_ex(key, &json, ttl_secs.max(1));
+        match result {
+            Ok(()) => return,
+            Err(err) => mark_degraded(&err.to_string()),
+        }
     }
+
+    STORE.insert(
+        key.to_string(),
+        Entry {
+            value: json,
+            expires_at: Instant::now() + Duration::from_secs(ttl_secs),
+        },
+    );
 }
 
 /// Read a cached value. Returns `None` on miss or expiry.
 pub fn get<T: DeserializeOwned>(key: &str) -> Option<T> {
+    if let Some(mut conn) = redis_conn() {
+        match conn.get::<_, Option<String>>(key) {
+            Ok(Some(json)) => return serde_json::from_str(&json).ok(),
+            Ok(None) => return None,
+            Err(err) => mark_degraded(&err.to_string()),
+        }
+    }
+
     let entry = STORE.get(key)?;
     if entry.expires_at < Instant::now() {
         drop(entry);
@@ -86,6 +256,13 @@ pub fn get<T: DeserializeOwned>(key: &str) -> Option<T> {
 
 /// Check if a key exists and is not expired.
 pub fn exists(key: &str) -> bool {
+    if let Some(mut conn) = redis_conn() {
+        match conn.exists::<_, bool>(key) {
+            Ok(exists) => return exists,
+            Err(err) => mark_degraded(&err.to_string()),
+        }
+    }
+
     match STORE.get(key) {
         Some(entry) => entry.expires_at >= Instant::now(),
         None => false,
@@ -94,6 +271,14 @@ pub fn exists(key: &str) -> bool {
 
 /// Get TTL remaining for a key in seconds. Returns None if key doesn't exist or is expired.
 pub fn ttl_remaining(key: &str) -> Option<u64> {
+    if let Some(mut conn) = redis_conn() {
+        match conn.ttl::<_, i64>(key) {
+            Ok(ttl) if ttl >= 0 => return Some(ttl as u64),
+            Ok(_) => return None,
+            Err(err) => mark_degraded(&err.to_string()),
+        }
+    }
+
     let entry = STORE.get(key)?;
     if entry.expires_at < Instant::now() {
         drop(entry);
@@ -105,34 +290,86 @@ pub fn ttl_remaining(key: &str) -> Option<u64> {
 }
 
 /// Invalidate a single cache key.
+///
+/// Removes the key from Redis (visible to every instance sharing it) and
+/// from the local fallback store, so a flip between backends around the
+/// time of the call can never leave a stale copy behind.
 pub fn invalidate(key: &str) {
+    if let Some(mut conn) = redis_conn() {
+        let result: redis::RedisResult<()> = conn.del(key);
+        if let Err(err) = result {
+            mark_degraded(&err.to_string());
+        }
+    }
     STORE.remove(key);
 }
 
 /// Invalidate all keys that start with `prefix`.
 pub fn invalidate_prefix(prefix: &str) {
+    if let Some(mut conn) = redis_conn() {
+        match redis_delete_matching(&mut conn, &format!("{prefix}*")) {
+            Ok(()) => {}
+            Err(err) => mark_degraded(&err.to_string()),
+        }
+    }
     STORE.retain(|k, _| !k.starts_with(prefix));
 }
 
 /// Invalidate all keys matching a pattern (supports * wildcards).
 pub fn invalidate_pattern(pattern: &str) {
-    if pattern.contains('*') {
-        let regex_pattern = pattern.replace('*', ".*");
-        if let Ok(regex) = regex::Regex::new(&regex_pattern) {
-            STORE.retain(|k, _| !regex.is_match(k));
-        }
-    } else {
+    if !pattern.contains('*') {
         invalidate_prefix(pattern);
+        return;
+    }
+
+    if let Some(mut conn) = redis_conn() {
+        // Redis glob patterns already use `*`/`?`/`[...]`, so the pattern is
+        // passed through to SCAN MATCH as-is — no regex translation needed.
+        match redis_delete_matching(&mut conn, pattern) {
+            Ok(()) => {}
+            Err(err) => mark_degraded(&err.to_string()),
+        }
+    }
+
+    let regex_pattern = pattern.replace('*', ".*");
+    if let Ok(regex) = regex::Regex::new(&regex_pattern) {
+        STORE.retain(|k, _| !regex.is_match(k));
     }
 }
 
+/// Scan for keys matching a Redis glob `pattern` and delete them.
+fn redis_delete_matching(conn: &mut redis::Connection, pattern: &str) -> redis::RedisResult<()> {
+    let keys: Vec<String> = conn
+        .scan_match::<_, String>(pattern)?
+        .collect::<Result<Vec<String>, redis::RedisError>>()?;
+    if !keys.is_empty() {
+        let _: () = conn.del(keys)?;
+    }
+    Ok(())
+}
+
 /// Clear all cache entries.
+///
+/// When Redis-backed, this flushes the connected Redis database — deployments
+/// that need `clear()` scoped strictly to this cache's keys should point
+/// `REDIS_URL` at a Redis instance/logical DB dedicated to it.
 pub fn clear() {
+    if let Some(mut conn) = redis_conn() {
+        let result: redis::RedisResult<()> = redis::cmd("FLUSHDB").query(&mut *conn);
+        if let Err(err) = result {
+            mark_degraded(&err.to_string());
+        }
+    }
     STORE.clear();
 }
 
 /// Get cache statistics.
 pub fn stats() -> CacheStats {
+    if let Some(mut conn) = redis_conn() {
+        if let Ok(total_entries) = redis::cmd("DBSIZE").query::<usize>(&mut *conn) {
+            return CacheStats { total_entries };
+        }
+    }
     CacheStats {
         total_entries: STORE.len(),
     }
@@ -373,4 +610,21 @@ mod tests {
         assert!(!exists("ip:1"));
         assert!(!exists("ip:list:owner:10:0"));
     }
+
+    #[test]
+    fn test_degraded_by_default_without_redis_url() {
+        // In the test binary REDIS_URL is unset, so the cache runs
+        // in-process only and reports itself as degraded — not silently.
+        assert!(is_degraded());
+    }
 }
+
+// Redis integration tests (real Redis via testcontainers, gated behind the
+// `redis-integration-tests` feature) live in `api-server/tests/`, not here.
+//
+// They must run as separate integration-test binaries — each `tests/*.rs`
+// file gets its own process — because `REDIS_POOL` above is a `Lazy` that
+// reads `REDIS_URL` exactly once per process, on first cache access. A
+// `#[cfg(test)]` module in this file would share a process (and therefore
+// the same already-initialized `REDIS_POOL`) with the in-process unit tests
+// above, which rely on `REDIS_URL` staying unset.
