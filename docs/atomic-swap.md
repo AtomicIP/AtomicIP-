@@ -635,3 +635,78 @@ ip_registry.cancel_batch_escrow(escrow_id);
 ```
 
 In contrast, atomic swaps verify payment and key in the same transaction (fully trustless).
+
+## #784: Price Oracle Trust Model
+
+`AtomicSwap` can price a swap dynamically from an external oracle contract via
+`initiate_swap_with_oracle_price` / `get_oracle_price`, instead of the seller
+naming a fixed price. Because the settlement price directly determines how
+much value changes hands, the oracle integration is designed so that an
+outside party can verify a price was authentically produced by a specific,
+admin-designated publisher — not merely trust whatever `oracle_address`
+happens to return.
+
+### Configuration
+
+`set_oracle(caller, oracle_address, oracle_pubkey, enabled, max_deviation_bps)`
+is admin-only and stores three things together:
+
+- `oracle_address` — the contract to call for price data.
+- `oracle_pubkey` — the Ed25519 public key the oracle *publisher* signs price
+  attestations with. This, not `oracle_address`, is the actual trust anchor.
+- `max_deviation_bps` — the maximum a single accepted update may move from the
+  last accepted price, in basis points (`0` = no bound).
+
+Enabling the oracle does not itself fetch or verify a price (there is no
+specific token to price at configuration time); it seeds
+`last_update_timestamp` to now so the next real per-token fetch is treated as
+fresh.
+
+### Attestation format
+
+An oracle contract used with `AtomicSwap` must expose:
+
+```
+get_price_attestation(token: Address) -> SignedPrice
+// SignedPrice { price: i128, timestamp: u64, signature: BytesN<64> }
+```
+
+`signature` is an Ed25519 signature, produced off-chain by the oracle
+publisher's private key, over the XDR encoding of
+`PriceAttestation { token, price, timestamp }`. `fetch_oracle_price` and
+`fetch_oracle_price_with_staleness_check` verify this signature against the
+`oracle_pubkey` on file before the price is used for anything — an invalid,
+missing, or wrong-key signature is rejected regardless of whether the
+staleness check would otherwise have accepted it.
+
+### What is cryptographically enforced
+
+- **Authenticity** — a price is only ever accepted if it carries a valid
+  Ed25519 signature from the registered `oracle_pubkey`. `oracle_address`
+  alone proves nothing.
+- **Bounded movement** — once a price has been accepted, a subsequent signed
+  update that deviates from it by more than `max_deviation_bps` is rejected,
+  independently of the signature check. This limits the damage a single
+  compromised or buggy publisher update can do.
+- **Freshness with a verified fallback** — prices older than 5 minutes
+  (`ORACLE_STALENESS_THRESHOLD_SECS`) trigger a fallback to the cached price
+  instead of a new oracle call. That cached price was itself signature-checked
+  when it was originally fetched, so the fallback carries the same
+  authenticity guarantee, not a weaker one.
+
+### What is still trusted, not enforced
+
+- **The admin's choice of `oracle_pubkey`/`oracle_address` pair itself.**
+  `set_oracle` is an authorized admin action; nothing on-chain proves the key
+  the admin registered belongs to a reputable, honest price publisher. This is
+  a governance/operational trust assumption, the same way admin-set
+  parameters elsewhere in this contract (fees, dispute windows) are trusted.
+- **The publisher not signing a false-but-plausible price.** Signature
+  verification proves *who* produced a price, not that the price is
+  economically accurate. `max_deviation_bps` limits how much damage a single
+  bad signed update can do, but a publisher who is compromised or malicious
+  over multiple updates can still walk a price away from reality within the
+  bound.
+- **Oracle contract availability.** If `oracle_address` is unreachable or
+  returns malformed data, fetches fail closed (the call panics); there is no
+  automatic failover to a secondary oracle.
