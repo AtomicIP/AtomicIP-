@@ -10,6 +10,8 @@ mod utils;
 pub mod cross_contract;
 #[cfg(test)]
 mod cross_contract_tests;
+#[cfg(test)]
+mod oracle_tests;
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Bytes,
@@ -22,9 +24,8 @@ pub use types::*;
 mod validation;
 use multi_currency::{MultiCurrencyConfig, SupportedToken, TokenMetadata};
 use price_oracle::{
-    fetch_oracle_price, fetch_oracle_price_with_staleness_check, load_oracle_config,
-    store_oracle_config, validate_price_bounds, OracleConfig, OracleConfigSetEvent,
-    OraclePriceUsedEvent, OracleStalePriceEvent, ORACLE_STALENESS_THRESHOLD_SECS,
+    fetch_oracle_price_with_staleness_check, load_oracle_config, store_oracle_config,
+    validate_price_bounds, OracleConfig, OracleConfigSetEvent, OraclePriceUsedEvent,
 };
 use validation::*;
 
@@ -86,6 +87,9 @@ pub enum ContractError {
     BatchTooLarge = 51,
     BatchSizeMismatch = 52,
     ConditionNotMet = 53,
+    /// #784: Oracle price attestation exceeds the configured max deviation
+    /// from the last accepted price.
+    OracleDeviationExceeded = 54,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -281,10 +285,28 @@ impl AtomicSwap {
 
     // ── #470: Price Oracle ────────────────────────────────────────────────────
 
-    /// Admin sets (or updates) the price oracle contract address.
+    /// Admin sets (or updates) the price oracle contract address, together with
+    /// the Ed25519 public key the oracle publisher signs price attestations
+    /// with (the actual cryptographic trust anchor — `oracle_address` alone is
+    /// not sufficient to verify a price wasn't fabricated) and the maximum
+    /// single-update deviation bound (basis points; `0` = no bound).
     /// Pass `enabled = false` to disable oracle-based pricing without removing the address.
-    /// When enabling, initializes with current timestamp and fetches initial cached price.
-    pub fn set_oracle(env: Env, caller: Address, oracle_address: Address, enabled: bool) {
+    ///
+    /// Enabling does not itself fetch a price: there is no specific token to
+    /// attest a price for at configuration time, and any oracle response
+    /// still has to pass the same signature verification as every other
+    /// fetch. Instead it seeds `last_update_timestamp` to now, so the next
+    /// real per-token fetch (via `get_oracle_price` /
+    /// `initiate_swap_with_oracle_price`) is treated as fresh and fetches a
+    /// properly verified price for the token actually being priced.
+    pub fn set_oracle(
+        env: Env,
+        caller: Address,
+        oracle_address: Address,
+        oracle_pubkey: BytesN<32>,
+        enabled: bool,
+        max_deviation_bps: u32,
+    ) {
         caller.require_auth();
         let admin: Address = env
             .storage()
@@ -302,22 +324,7 @@ impl AtomicSwap {
         }
 
         let (initial_timestamp, initial_price) = if enabled {
-            // Try to fetch initial price from the oracle
-            let mut args: soroban_sdk::Vec<Val> = soroban_sdk::Vec::new(&env);
-            args.push_back(oracle_address.clone().into_val(&env));
-            let price: i128 = env.invoke_contract(
-                &oracle_address,
-                &symbol_short!("get_price"),
-                args,
-            );
-
-            if price <= 0 {
-                env.panic_with_error(Error::from_contract_error(
-                    ContractError::OraclePriceInvalid as u32,
-                ));
-            }
-
-            (env.ledger().timestamp(), price)
+            (env.ledger().timestamp(), 0i128)
         } else {
             // When disabling, preserve existing timestamp/price or use defaults
             let existing = load_oracle_config(&env);
@@ -330,15 +337,18 @@ impl AtomicSwap {
 
         let config = OracleConfig {
             oracle_address: oracle_address.clone(),
+            oracle_pubkey: oracle_pubkey.clone(),
             enabled,
             last_update_timestamp: initial_timestamp,
             cached_price: initial_price,
+            max_deviation_bps,
         };
         store_oracle_config(&env, &config);
         env.events().publish(
             (symbol_short!("oracle"),),
             OracleConfigSetEvent {
                 oracle_address,
+                oracle_pubkey,
                 enabled,
             },
         );
