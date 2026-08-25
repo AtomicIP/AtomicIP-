@@ -11,6 +11,8 @@ use validation::*;
 mod types;
 use types::*;
 
+mod zk_commitment;
+
 // FIXME: test.rs has compilation errors from merge conflict - re-enable after fix
 // FIXME: test.rs has pre-existing compilation errors from a merge conflict - fix before enabling
 #[cfg(test)]
@@ -387,6 +389,30 @@ pub struct VerifyRequest {
 pub struct VerifyResult {
     pub ip_id: u64,
     pub valid: bool,
+}
+
+/// A non-interactive Schnorr proof of knowledge of a Pedersen commitment's
+/// opening `(secret, blinding_factor)`, made non-interactive via
+/// Fiat-Shamir. Never contains `secret` or `blinding_factor` themselves.
+/// See `zk_commitment` for the verification math.
+#[contracttype]
+#[derive(Clone)]
+pub struct HidingCommitmentProof {
+    /// Compressed Ristretto255 point `R = k_secret·G + k_blinding·H`.
+    pub r: BytesN<32>,
+    /// Response scalar `s_secret = k_secret + e·secret` (mod L).
+    pub s_secret: BytesN<32>,
+    /// Response scalar `s_blinding = k_blinding + e·blinding_factor` (mod L).
+    pub s_blinding: BytesN<32>,
+}
+
+/// A single hiding-verification request in a batch: which IP's commitment to
+/// check, and the zero-knowledge proof of its opening.
+#[contracttype]
+#[derive(Clone)]
+pub struct HidingVerifyRequest {
+    pub ip_id: u64,
+    pub proof: HidingCommitmentProof,
 }
 
 /// Stored result of a completed batch verification, keyed by the aggregate proof hash.
@@ -4167,9 +4193,32 @@ impl IpRegistry {
         false
     }
 
-    // ── Issue #458: Batch Verification with ZK Proofs ─────────────────────────
+    // ── Issue #458 / #780: Batch Verification ──────────────────────────────────
+    //
+    // Two batch verification entry points, kept deliberately distinct so the
+    // name tells you what it discloses:
+    //
+    // - `reveal_and_verify_commitments` takes the plaintext `secret` and
+    //   `blinding_factor` as call arguments. Every verifier — the execution
+    //   trace, any node, any block explorer — sees them. It is NOT
+    //   zero-knowledge; it exists for callers who intend to disclose.
+    // - `batch_verify_commitments` takes a `HidingCommitmentProof` and never
+    //   sees `secret`/`blinding_factor`. It verifies a Fiat-Shamir Schnorr
+    //   proof of knowledge of a Pedersen commitment's opening (see
+    //   `zk_commitment`), which is what "ZK proof support" actually requires.
+    //   It only applies to IPs whose `commitment_hash` was itself created as
+    //   a Pedersen commitment (`secret·G + blinding_factor·H`) rather than a
+    //   SHA-256 hash — `commit_ip` already stores an opaque 32-byte value, so
+    //   no storage or `commit_ip` change was needed to support this.
 
-    /// Verify multiple IP commitments in a single call with ZK-proof support.
+    /// Verify multiple IP commitments by having the caller reveal the
+    /// `secret` and `blinding_factor` used to create each one.
+    ///
+    /// This discloses both values to every observer of the call (the
+    /// execution trace, any node, any block explorer) — it is a plaintext
+    /// reveal-and-compare, not a zero-knowledge proof. Use this only when the
+    /// caller intends to disclose. For a proof that discloses nothing, see
+    /// [`Self::batch_verify_commitments`].
     ///
     /// For each request, recomputes `sha256(secret || blinding_factor)` and
     /// checks it against the stored commitment hash using constant-time comparison.
@@ -4194,7 +4243,10 @@ impl IpRegistry {
     /// # Panics
     ///
     /// Panics with `IpNotFound` if any `ip_id` does not exist.
-    pub fn batch_verify_commitments(env: Env, requests: Vec<VerifyRequest>) -> Vec<VerifyResult> {
+    pub fn reveal_and_verify_commitments(
+        env: Env,
+        requests: Vec<VerifyRequest>,
+    ) -> Vec<VerifyResult> {
         let total_count = requests.len();
         let mut results = Vec::new(&env);
         let mut valid_hashes: Vec<BytesN<32>> = Vec::new(&env);
@@ -4244,35 +4296,88 @@ impl IpRegistry {
         results
     }
 
-    /// Deterministic hash aggregation for batch proof.
+    /// Verify multiple IP commitments in a single call with **real**
+    /// zero-knowledge proof support: each request supplies a
+    /// [`HidingCommitmentProof`], never the `secret` or `blinding_factor`
+    /// itself.
     ///
-    /// Combines all (ip_id, on-chain commitment_hash, valid) tuples with a
-    /// domain separator into a single SHA-256 hash. The result is used as the
-    /// on-chain proof ID and can be recomputed by anyone with access to the
-    /// same inputs (minus the secrets).
-    fn compute_aggregated_proof(
-        env: &Env,
-        _ip_ids: &Vec<u64>,
-        stored_hashes: &Vec<BytesN<32>>,
-        results: &Vec<VerifyResult>,
-    ) -> BytesN<32> {
-        let mut buf = Bytes::new(env);
-        // Domain separator: "IP_BATCH_PROOF_V1"
-        buf.append(&Bytes::from_array(
-            env,
-            &[0x49, 0x50, 0x42, 0x50, 0x56, 0x31],
-        ));
+    /// Each `commitment_hash` is treated as a compressed Ristretto255 point
+    /// `secret·G + blinding_factor·H` (a Pedersen commitment). The proof is a
+    /// Fiat-Shamir Schnorr proof of knowledge of that opening; see
+    /// `zk_commitment` for the verification equation. A request against an IP
+    /// whose `commitment_hash` was created as a SHA-256 hash instead (see
+    /// [`Self::commit_ip`]) will simply fail to verify — `commitment_hash` is
+    /// an opaque 32-byte value to the contract either way, so no storage
+    /// migration is required to opt an IP into hiding verification; the
+    /// caller just needs to have committed a Pedersen point in the first
+    /// place.
+    ///
+    /// Valid commitments are folded into the same deterministic aggregate
+    /// proof and stored/emitted the same way as
+    /// [`Self::reveal_and_verify_commitments`].
+    ///
+    /// # Arguments
+    ///
+    /// * `requests` — Vec of `HidingVerifyRequest` (ip_id, proof)
+    ///
+    /// # Returns
+    ///
+    /// `Vec<VerifyResult>` — one entry per request with `valid: true/false`.
+    ///
+    /// # Events
+    ///
+    /// Emits a `batch_vfy` event with `(aggregated_hash, count, all_valid)`.
+    ///
+    /// # Panics
+    ///
+    /// Panics with `IpNotFound` if any `ip_id` does not exist.
+    pub fn batch_verify_commitments(
+        env: Env,
+        requests: Vec<HidingVerifyRequest>,
+    ) -> Vec<VerifyResult> {
+        let total_count = requests.len();
+        let mut results = Vec::new(&env);
+        let mut valid_hashes: Vec<BytesN<32>> = Vec::new(&env);
 
-        for i in 0..results.len() {
-            let r = results.get(i).unwrap();
-            let ip_bytes = r.ip_id.to_be_bytes();
-            buf.append(&Bytes::from_array(env, &ip_bytes));
-            buf.append(&stored_hashes.get(i).unwrap().clone().into());
-            let valid_byte: u8 = if r.valid { 1 } else { 0 };
-            buf.append(&Bytes::from_array(env, &[valid_byte]));
+        for req in requests.iter() {
+            let record = require_ip_exists(&env, req.ip_id);
+
+            let valid =
+                zk_commitment::verify_hiding_proof(&env, &record.commitment_hash, &req.proof);
+            results.push_back(VerifyResult {
+                ip_id: req.ip_id,
+                valid,
+            });
+
+            if valid {
+                valid_hashes.push_back(record.commitment_hash);
+            }
         }
 
-        env.crypto().sha256(&buf).into()
+        let valid_count = valid_hashes.len();
+        let aggregate_proof = aggregate_batch_proof(&env, &valid_hashes);
+
+        let stored = BatchVerifyResultStorage {
+            aggregate_proof: aggregate_proof.clone(),
+            total_count,
+            valid_count,
+        };
+        env.storage().persistent().set(
+            &DataKey::BatchVerifyResult(aggregate_proof.clone()),
+            &stored,
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey::BatchVerifyResult(aggregate_proof.clone()),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        env.events().publish(
+            (symbol_short!("b_vfy"),),
+            (aggregate_proof, total_count, valid_count),
+        );
+
+        results
     }
 
     /// Retrieve a stored batch verification proof by its aggregated hash.
@@ -5300,7 +5405,7 @@ mod tests {
             blinding_factor: blind2,
         });
 
-        let results = client.batch_verify_commitments(&requests);
+        let results = client.reveal_and_verify_commitments(&requests);
         assert_eq!(results.len(), 2);
         assert!(results.get(0).unwrap().valid);
         assert!(results.get(1).unwrap().valid);
@@ -5331,7 +5436,7 @@ mod tests {
             blinding_factor: wrong_blind,
         });
 
-        let results = client.batch_verify_commitments(&requests);
+        let results = client.reveal_and_verify_commitments(&requests);
         assert!(!results.get(0).unwrap().valid);
     }
 
@@ -5349,7 +5454,7 @@ mod tests {
             secret: BytesN::from_array(&env, &[0x01u8; 32]),
             blinding_factor: BytesN::from_array(&env, &[0x02u8; 32]),
         });
-        client.batch_verify_commitments(&requests);
+        client.reveal_and_verify_commitments(&requests);
     }
 
     #[test]
@@ -5360,7 +5465,7 @@ mod tests {
         let client = IpRegistryClient::new(&env, &contract_id);
 
         let requests = soroban_sdk::Vec::new(&env);
-        let results = client.batch_verify_commitments(&requests);
+        let results = client.reveal_and_verify_commitments(&requests);
         assert_eq!(results.len(), 0);
     }
 
@@ -5387,7 +5492,7 @@ mod tests {
             blinding_factor: blind,
         });
 
-        let results = client.batch_verify_commitments(&requests);
+        let results = client.reveal_and_verify_commitments(&requests);
         assert_eq!(results.len(), 1);
         assert!(results.get(0).unwrap().valid);
     }
@@ -5415,7 +5520,7 @@ mod tests {
             blinding_factor: blind,
         });
 
-        let _results = client.batch_verify_commitments(&requests);
+        let _results = client.reveal_and_verify_commitments(&requests);
 
         let contract_events = env.events().all();
         let emitted = contract_events.events();

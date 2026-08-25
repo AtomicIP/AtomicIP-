@@ -341,308 +341,98 @@ AtomicIP uses a simpler SHA-256-based scheme because:
 
 The trade-off is that SHA-256 commitments are not homomorphic, but this property isn't needed for IP registration.
 
-## Batch Verification with ZK Proof Support (Issue #458)
+## Batch Verification: Reveal-and-Compare (Issue #458)
 
-AtomicIP supports **batch verification** that aggregates multiple Pedersen commitment checks into a single provable operation. This enables verifiers to confirm the correctness of multiple IP commitments at once while generating an on-chain receipt.
+AtomicIP supports **batch verification** that checks multiple commitments in a single on-chain
+call and folds the results into a deterministic aggregate proof.
 
-### Batch Verification Flow
+There are two batch entry points, named for exactly what they disclose:
 
-```
-                          ┌─────────────────────────────┐
-                          │     Caller submits batch     │
-                          │  Vec<VerifyRequest> with     │
-                          │  (ip_id, secret, blinding)  │
-                          └──────────────┬──────────────┘
-                                         │
-                                         ▼
-                          ┌─────────────────────────────┐
-                          │   For each request:          │
-                          │   1. Look up IpRecord         │
-                          │   2. Compute sha256(s || bf) │
-                          │   3. Constant-time compare    │
-                          │   4. Collect VerifyResult     │
-                          └──────────────┬──────────────┘
-                                         │
-                                         ▼
-                          ┌─────────────────────────────┐
-                          │  Incremental hash aggregate │
-                          │  H("IP_BATCH_PROOF_V1" ||   │
-                          │    ip_id_1 || hash_1 || v_1 │
-                          │    ip_id_2 || hash_2 || v_2 │
-                          │    ...)                     │
-                          └──────────────┬──────────────┘
-                                         │
-                                         ▼
-                          ┌─────────────────────────────┐
-                          │  Store BatchVerifyProof      │
-                          │  on-chain keyed by hash      │
-                          └──────────────┬──────────────┘
-                                         │
-                                         ▼
-                          ┌─────────────────────────────┐
-                          │  Emit batch_vfy event        │
-                          │  (aggregated_hash, count,    │
-                          │   all_valid)                 │
-                          └─────────────────────────────┘
-```
+| Function | Discloses `secret`/`blinding_factor`? | Use when |
+|---|---|---|
+| [`reveal_and_verify_commitments`](#function-signature) | **Yes** — plaintext, in the call arguments | The caller intends to disclose (e.g. publishing prior art) |
+| [`batch_verify_commitments`](#batch-verification-zero-knowledge-hiding-proof-issue-780) | **No** — a zero-knowledge proof only | The caller wants to prove knowledge without revealing anything |
 
-### Key Properties
-
-| Property | Description |
-|---|---|
-| **Constant-time comparison** | Each commitment hash is compared using XOR-based equality that never short-circuits, preventing timing side-channel attacks |
-| **Deterministic aggregation** | Identical input sets produce identical proof hashes — the result is deterministic and reproducible |
-| **On-chain proof storage** | The aggregated `BatchVerifyProof` is stored on-chain keyed by its hash, enabling future retrieval via `verify_batch_proof()` |
-| **Event emission** | A `batch_vfy` event is emitted with the aggregated hash, item count, and overall validity flag for off-chain indexing |
+This section covers `reveal_and_verify_commitments`. See
+[Batch Verification: Zero-Knowledge Hiding Proof](#batch-verification-zero-knowledge-hiding-proof-issue-780)
+below for the ZK path.
 
 ### How It Works
 
-1. **Preparation**: Each request contains an `ip_id`, the `secret`, and the `blinding_factor` used when the commitment was created.
+A single call to `reveal_and_verify_commitments` processes N verification requests and produces:
 
-2. **Individual Verification**: For each request, the contract:
-   - Loads the `IpRecord` for the given `ip_id`
-   - Computes `sha256(secret || blinding_factor)`
-   - Compares the result against the stored commitment hash using **constant-time comparison** (`constant_time_eq_32`)
-   - Appends a `VerifyResult { ip_id, valid }` to the output vector
+- A `Vec<VerifyResult>` — one result per request in input order
+- An **aggregate proof hash** — a single 32-byte value that cryptographically binds all validated commitments
 
-3. **Hash Aggregation**: After all individual checks, an **aggregated proof hash** is computed:
+1. **Individual verification**: for each request, the contract loads the `IpRecord` for `ip_id`,
+   computes `sha256(secret || blinding_factor)`, and compares it against the stored
+   `commitment_hash` using **constant-time comparison** (`constant_time_bytes_32_eq`).
+2. **Aggregate proof construction**: valid commitment hashes are folded into a single proof using
+   **incremental SHA-256 hashing**, skipping invalid entries entirely:
+
    ```
-   aggregated_hash = sha256(
-     domain_separator("IP_BATCH_PROOF_V1") ||
-     ip_id_1 || stored_commitment_hash_1 || valid_1 ||
-     ip_id_2 || stored_commitment_hash_2 || valid_2 ||
-     ...
-   )
-   ```
-   This incremental hashing ensures the proof is bound to:
-   - The specific IP IDs being verified
-   - The on-chain commitment hashes at verification time
-   - The validity outcomes
-
-4. **Storage**: The `BatchVerifyProof` struct is stored with key `DataKey::BatchVerifyResult(aggregated_hash)`:
-   ```rust
-   pub struct BatchVerifyProof {
-       pub ip_ids: Vec<u64>,          // The IP IDs verified
-       pub aggregated_hash: BytesN<32>, // The proof hash
-       pub timestamp: u64,             // Ledger timestamp
-       pub all_valid: bool,            // True if every check passed
-   }
+   proof_0 = 0x0000...0000          (32 zero bytes)
+   proof_1 = sha256(proof_0 || hash_1)   # only if verification 1 is valid
+   proof_2 = sha256(proof_1 || hash_2)   # only if verification 2 is valid
+   ...
+   proof_N = sha256(proof_{N-1} || hash_N)
    ```
 
-5. **Event Emission**: A `batch_vfy` event is emitted with topics `(batch_vfy,)` and data `(aggregated_hash, count, all_valid)`.
+   This produces a deterministic, order-dependent proof: the same requests in a different order
+   yield a different aggregate proof, preventing replay across reordered batches.
+3. **Storage**: the aggregate proof and summary counts are stored under
+   `DataKey::BatchVerifyResult(aggregate_proof)`.
+4. **Event emission**: a `batch_vfy` event is published with the aggregate proof and counts.
 
-### Contract API
+### Function Signature
 
 ```rust
-/// Verify multiple IP commitments with ZK-proof support.
-/// Returns one VerifyResult per request.
-fn batch_verify_commitments(
+pub fn reveal_and_verify_commitments(
     env: Env,
     requests: Vec<VerifyRequest>,
 ) -> Vec<VerifyResult>
 
-/// Retrieve a stored batch verification proof by its aggregated hash.
-fn verify_batch_proof(
+/// Retrieve a stored batch verification proof by its aggregate hash.
+pub fn verify_batch_proof(
     env: Env,
     proof_hash: BytesN<32>,
-) -> Option<BatchVerifyProof>
+) -> Option<BatchVerifyResultStorage>
 ```
 
-### `VerifyRequest`
+#### `VerifyRequest`
 
 | Field | Type | Description |
 |---|---|---|
 | `ip_id` | `u64` | The IP ID to verify |
-| `secret` | `BytesN<32>` | The secret used when committing |
-| `blinding_factor` | `BytesN<32>` | The blinding factor used when committing |
+| `secret` | `BytesN<32>` | The secret used when committing — **disclosed on-chain** |
+| `blinding_factor` | `BytesN<32>` | The blinding factor used when committing — **disclosed on-chain** |
 
-### `VerifyResult`
+#### `VerifyResult`
 
 | Field | Type | Description |
 |---|---|---|
 | `ip_id` | `u64` | The IP ID that was verified |
 | `valid` | `bool` | `true` if the proof is correct |
 
-### `BatchVerifyProof`
+#### `BatchVerifyResultStorage`
 
 | Field | Type | Description |
 |---|---|---|
-| `ip_ids` | `Vec<u64>` | The IP IDs included in this batch |
-| `aggregated_hash` | `BytesN<32>` | The aggregated proof hash |
-| `timestamp` | `u64` | Ledger timestamp when verification ran |
-| `all_valid` | `bool` | `true` if every commitment was valid |
-
-### Security: Constant-Time Comparison
-
-The `batch_verify_commitments` function uses `constant_time_eq_32` instead of `==` for hash comparison:
-
-```rust
-fn constant_time_eq_32(a: &BytesN<32>, b: &BytesN<32>) -> bool {
-    let a_arr = a.to_array();
-    let b_arr = b.to_array();
-    let mut diff: u8 = 0;
-    for i in 0..32 {
-        diff |= a_arr[i] ^ b_arr[i];
-    }
-    diff == 0
-}
-```
-
-This XORs every byte pair and ORs the results together. Unlike `==`, this implementation:
-- **Never short-circuits** on the first mismatch
-- **Always touches all 32 bytes** regardless of the result
-- **Prevents timing side-channel attacks** that could leak information about the secret
-
-### Example Flow
-
-```rust
-use soroban_sdk::{BytesN, Env, Vec};
-
-fn batch_verify_example(env: &Env, client: &IpRegistryClient) {
-    let requests = vec![
-        VerifyRequest { ip_id: 1, secret: s1, blinding_factor: b1 },
-        VerifyRequest { ip_id: 2, secret: s2, blinding_factor: b2 },
-    ];
-
-    // Batch verify all commitments
-    let results: Vec<VerifyResult> = client.batch_verify_commitments(&requests);
-
-    // Check individual results
-    assert!(results.get(0).unwrap().valid);
-    assert!(results.get(1).unwrap().valid);
-
-    // The aggregated proof is stored on-chain.
-    // Retrieve it later by its hash:
-    // let proof = client.verify_batch_proof(&aggregated_hash);
-}
-```
+| `aggregate_proof` | `BytesN<32>` | The aggregate proof hash (also the storage key) |
+| `total_count` | `u32` | Number of requests in the batch |
+| `valid_count` | `u32` | Number of requests that verified successfully |
 
 ### Event: `batch_vfy`
 
-Emitted once per `batch_verify_commitments` call:
-
-| Topic | Data |
-|---|---|
-| `(batch_vfy,)` | `(aggregated_hash: BytesN<32>, count: u64, all_valid: bool)` |
-
-### Off-Chain Indexing
-
-The `batch_vfy` event enables off-chain services to:
-- Track batch verification completion without replaying individual checks
-- Monitor overall validity of verified batches
-- Build verification histories for reputation systems
-
-### Error Cases
-
-| Condition | Behavior |
-|---|---|
-| Empty request vector | Returns empty `Vec<VerifyResult>` — no proof is stored, no event emitted |
-| Nonexistent `ip_id` | Panics with `IpNotFound` |
-| Mismatched secret/blinding | Individual `VerifyResult.valid` is `false`; `all_valid` is `false` |
-| All valid | All results have `valid == true`; `all_valid == true` |
-
-## References
-
-- [SHA-256 Wikipedia](https://en.wikipedia.org/wiki/SHA-2)
-- [Pedersen Commitment Wikipedia](https://en.wikipedia.org/wiki/Pedersen_commitment)
-- [Soroban Cryptography Documentation](https://soroban.stellar.org/docs/reference/environment-functions/crypto)
-- [NIST SHA-2 Standard](https://csrc.nist.gov/publications/detail/fips/180-4/final)
-
-## Batch Verification with ZK-Style Aggregate Proofs
-
-### Overview
-
-Batch verification allows multiple IP commitments to be verified simultaneously in a single on-chain
-call. The implementation combines three advanced features:
-
-1. **Hash aggregation** — validated commitment hashes are folded into a single deterministic proof
-2. **Constant-time comparison** — all 32-byte comparisons execute in fixed time, preventing timing side-channel attacks
-3. **On-chain event** — a `b_vfy` event is emitted with the aggregate proof and summary counts
-
-### How It Works
-
-A single call to `batch_verify_commitments` processes N verification requests and produces:
-
-- A `Vec<VerifyResult>` — one result per request in input order
-- An **aggregate proof hash** — a single 32-byte value that cryptographically binds all validated commitments
-
-#### Aggregate Proof Construction
-
-The aggregate proof is built using **incremental SHA-256 hashing**:
-
-```
-proof_0 = 0x0000...0000          (32 zero bytes)
-proof_1 = sha256(proof_0 || hash_1)   # only if verification 1 is valid
-proof_2 = sha256(proof_1 || hash_2)   # only if verification 2 is valid
-...
-proof_N = sha256(proof_{N-1} || hash_N)
-```
-
-Where `hash_i = sha256(secret_i || blinding_factor_i)` is the on-chain commitment hash.
-
-This produces a deterministic, order-dependent proof. The same set of requests in a different order
-yields a different aggregate proof, preventing replay across reordered batches.
-
-### Function Signature
-
-```rust
-pub fn batch_verify_commitments(
-    env: Env,
-    requests: Vec<VerifyRequest>,
-) -> Vec<VerifyResult>
-```
-
-#### Input
-
-```rust
-pub struct VerifyRequest {
-    pub ip_id: u64,
-    pub secret: BytesN<32>,
-    pub blinding_factor: BytesN<32>,
-}
-```
-
-#### Output
-
-```rust
-pub struct VerifyResult {
-    pub ip_id: u64,
-    pub valid: bool,
-}
-```
-
-### Event
-
-Each call emits a single event with topic `b_vfy` and data `(aggregate_proof, total_count, valid_count)`:
-
 ```
 topic:  (symbol_short!("b_vfy"),)
-data:   (BytesN<32>, u32, u32)  // (aggregate_proof, total, valid)
+data:   (BytesN<32>, u32, u32)  // (aggregate_proof, total_count, valid_count)
 ```
 
-Off-chain listeners can subscribe to this event to track batch verification completion.
+Off-chain listeners can subscribe to this event to track batch verification completion without
+replaying individual checks.
 
-### Storage
-
-The aggregate proof and summary are stored on-chain under `DataKey::BatchVerifyResult(proof_hash)`:
-
-```rust
-pub struct BatchVerifyResultStorage {
-    pub aggregate_proof: BytesN<32>,
-    pub total_count: u32,
-    pub valid_count: u32,
-}
-```
-
-### Gas Efficiency
-
-Batch verification processes all requests in a single contract call, amortising the fixed overhead
-of storage reads and authentication across N verifications. For large batches this can reduce gas
-costs by up to 50% compared to N individual `verify_commitment` calls.
-
-### Constant-Time Security
-
-All commitment hash comparisons use a dedicated constant-time comparator:
+### Security: Constant-Time Comparison
 
 ```rust
 fn constant_time_bytes_32_eq(a: &BytesN<32>, b: &BytesN<32>) -> bool {
@@ -656,40 +446,143 @@ fn constant_time_bytes_32_eq(a: &BytesN<32>, b: &BytesN<32>) -> bool {
 }
 ```
 
-Every code path performs exactly 32 XOR+OR operations, regardless of how many bytes match. This
-prevents timing attacks where an adversary could exploit short-circuit equality checks to
-iteratively guess secret bytes.
+This XORs every byte pair and ORs the results together. Unlike `==`, it never short-circuits and
+always touches all 32 bytes, preventing timing side-channel attacks.
 
 ### Edge Cases
 
 | Scenario | Behaviour |
 |----------|-----------|
-| **Empty batch** | Returns an empty `Vec<VerifyResult>`, aggregate proof is `sha256(0x00..00)`, event emitted with `total=0, valid=0` |
-| **Single item** | Returns one `VerifyResult`, aggregate proof equals the commitment hash if valid, or remains the zero seed if invalid |
-| **Non-existent IP** | Panics with `IpNotFound` — all requests are treated as authoritative; a missing IP is a fatal error |
-| **All invalid** | Aggregate proof remains `0x00..00` (the seed), event shows `valid=0` |
+| **Empty batch** | Returns an empty `Vec<VerifyResult>`, aggregate proof is `sha256(0x00..00)`, event emitted with `total_count=0, valid_count=0` |
+| **Single item** | Returns one `VerifyResult`; aggregate proof equals `sha256(0x00..00 || hash)` if valid, or remains the zero seed if invalid |
+| **Non-existent IP** | Panics with `IpNotFound` — a missing IP is a fatal error, not an invalid result |
+| **All invalid** | Aggregate proof remains `0x00..00` (the seed) |
 | **Mixed valid/invalid** | Only valid hashes contribute to the aggregate proof; invalid entries are skipped |
 
-### Complete Example
+### Example
 
 ```rust
 use soroban_sdk::{BytesN, Vec};
-
-let secret1: BytesN<32> = /* ... */;
-let blind1: BytesN<32>  = /* ... */;
-let secret2: BytesN<32> = /* ... */;
-let blind2: BytesN<32>  = /* ... */;
 
 let mut requests = Vec::new(&env);
 requests.push_back(VerifyRequest { ip_id: 1, secret: secret1, blinding_factor: blind1 });
 requests.push_back(VerifyRequest { ip_id: 2, secret: secret2, blinding_factor: blind2 });
 
-let results: Vec<VerifyResult> = registry.batch_verify_commitments(&requests);
+let results: Vec<VerifyResult> = client.reveal_and_verify_commitments(&requests);
 
 for r in results.iter() {
-    println!("IP {} valid: {}", r.ip_id, r.valid);
+    // r.ip_id, r.valid
 }
+
+// The aggregated proof is stored on-chain and retrievable by its hash:
+// let proof = client.verify_batch_proof(&aggregate_proof);
 ```
+
+## Batch Verification: Zero-Knowledge Hiding Proof (Issue #780)
+
+`batch_verify_commitments` is the genuinely zero-knowledge counterpart to
+`reveal_and_verify_commitments` above: it verifies knowledge of a commitment's opening **without
+the caller ever placing `secret` or `blinding_factor` in a transaction argument, event, or storage
+entry.**
+
+### Why this exists
+
+Earlier revisions of this document (and of `docs/api-reference.md`) described
+`batch_verify_commitments` as having "ZK Proof Support" while its actual behavior was the plaintext
+reveal-and-compare now named `reveal_and_verify_commitments` above — the same SHA-256 scheme
+described in [Why Not True Pedersen Commitments?](#why-not-true-pedersen-commitments), which is
+*not* zero-knowledge by design. `batch_verify_commitments` now does what the old docs claimed:
+a real hiding proof.
+
+### Commitment format
+
+This path only applies to IPs whose `commitment_hash` was created as a genuine **Pedersen
+commitment over Ristretto255** — `commitment = secret·G + blinding_factor·H` — rather than a
+SHA-256 hash. `commit_ip` already stores `commitment_hash` as an opaque 32-byte value, so no
+contract storage change was needed: a caller who wants hiding verification simply computes the
+Pedersen point off-chain and passes its compressed 32-byte encoding to `commit_ip` instead of a
+SHA-256 hash. `secret`/`blinding_factor` are interpreted as Ristretto255 scalars (reduced mod the
+group order), not as raw hash preimage bytes — this is a different encoding from the
+`reveal_and_verify_commitments` path above, so the two are not interchangeable for the same IP.
+
+`G` is the standard Ristretto255 basepoint. `H` is a second, independent "nothing up my sleeve"
+generator with no known discrete log relative to `G`:
+
+```
+H = ristretto255_hash_to_group(SHA512("AtomicIP/PedersenCommitment/H/v1"))
+```
+
+Anyone can independently recompute `H` — see `contracts/ip_registry/src/zk_commitment.rs` for the
+exact derivation and the resulting constant.
+
+### The proof: Fiat-Shamir Schnorr
+
+The proof is a standard Okamoto/Schnorr proof of knowledge of a representation, made
+non-interactive via Fiat-Shamir:
+
+**Prover** (off-chain), given `(secret, blinding_factor)` and fresh random nonces
+`(k_secret, k_blinding)`:
+
+1. `R = k_secret·G + k_blinding·H`
+2. `e = sha256("AtomicIP/HidingCommitmentProof/v1" || commitment || R) mod L` (the Fiat-Shamir challenge)
+3. `s_secret = k_secret + e·secret`, `s_blinding = k_blinding + e·blinding_factor` (mod L)
+4. Submit `HidingCommitmentProof { r: R, s_secret, s_blinding }`
+
+**Verifier** (on-chain), given `commitment` and the proof:
+
+- Recomputes `e` the same way
+- Accepts iff `s_secret·G + s_blinding·H == R + e·commitment`
+
+Neither `secret` nor `blinding_factor` ever appears in the proof, an argument, an event, or
+storage. As with any Schnorr-style proof, **a nonce must never be reused across two different
+proofs** — nonce generation is the prover's responsibility and happens entirely off-chain; the
+contract only verifies.
+
+### Function Signature
+
+```rust
+pub fn batch_verify_commitments(
+    env: Env,
+    requests: Vec<HidingVerifyRequest>,
+) -> Vec<VerifyResult>
+```
+
+#### `HidingCommitmentProof`
+
+| Field | Type | Description |
+|---|---|---|
+| `r` | `BytesN<32>` | Compressed Ristretto255 point `R = k_secret·G + k_blinding·H` |
+| `s_secret` | `BytesN<32>` | Response scalar `s_secret = k_secret + e·secret` (mod L) |
+| `s_blinding` | `BytesN<32>` | Response scalar `s_blinding = k_blinding + e·blinding_factor` (mod L) |
+
+#### `HidingVerifyRequest`
+
+| Field | Type | Description |
+|---|---|---|
+| `ip_id` | `u64` | The IP ID to verify |
+| `proof` | `HidingCommitmentProof` | The zero-knowledge proof of the commitment's opening |
+
+`VerifyResult`, the `batch_vfy` event, aggregate-proof construction, and storage under
+`DataKey::BatchVerifyResult` all work identically to `reveal_and_verify_commitments` above — the
+only difference is how each individual request is verified.
+
+### Failure modes
+
+| Scenario | Behaviour |
+|---|---|
+| `commitment_hash` or `proof.r` is not a valid Ristretto255 point encoding (e.g. it's a SHA-256 hash, not a Pedersen point) | `valid: false` — never panics |
+| Proof built from the wrong `secret`/`blinding_factor` | `valid: false` |
+| Non-existent `ip_id` | Panics with `IpNotFound`, same as `reveal_and_verify_commitments` |
+
+## References
+
+- [SHA-256 Wikipedia](https://en.wikipedia.org/wiki/SHA-2)
+- [Pedersen Commitment Wikipedia](https://en.wikipedia.org/wiki/Pedersen_commitment)
+- [Schnorr Signature / Sigma Protocols Wikipedia](https://en.wikipedia.org/wiki/Schnorr_signature)
+- [Fiat–Shamir Heuristic Wikipedia](https://en.wikipedia.org/wiki/Fiat%E2%80%93Shamir_heuristic)
+- [Ristretto Group](https://ristretto.group/)
+- [Soroban Cryptography Documentation](https://soroban.stellar.org/docs/reference/environment-functions/crypto)
+- [NIST SHA-2 Standard](https://csrc.nist.gov/publications/detail/fips/180-4/final)
 
 ## Questions?
 
