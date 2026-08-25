@@ -1171,6 +1171,26 @@ capped at 60 seconds. A successful request clears the client's violation
 streak. Idle client state expires after 15 minutes, and tracked IP/user counts
 are bounded to prevent a distributed attack from exhausting limiter memory.
 
+### Deployment topology
+
+The quotas above are enforced correctly **only when every replica shares the
+same counter backend**. `RateLimitConfig::backend` controls this:
+
+- `RateLimitBackend::Redis(url)` — token-bucket counters live in Redis, shared
+  by every replica pointed at that instance. **Required** behind a load
+  balancer running more than one replica; otherwise each replica enforces its
+  own independent bucket, and a client whose requests are distributed across
+  N replicas effectively receives up to N times the quota documented above.
+- `RateLimitBackend::InProcess` (the default) — counters live in that
+  process's memory only. Safe for a single-instance deployment and for tests,
+  but **not safe for multi-instance deployment** for the reason above.
+
+Violation backoff tracking, tier assignment (`set_user_tier`), and the
+tracked-identity cardinality bound stay process-local under both backends —
+they are memory-protection heuristics for that replica, not part of the
+enforced quota, so they don't need to be shared for the quota itself to be
+correct.
+
 ### Response headers
 
 All HTTP responses include:
