@@ -53,3 +53,12 @@ regex = "1"
 base64 = "0.22"
 flate2 = "1.0"
 brotli = "7.0"
+redis = { version = "1", features = ["r2d2"] }
+r2d2 = "0.8"
+
+[dev-dependencies]
+testcontainers = { version = "0.27", features = ["blocking"] }
+testcontainers-modules = { version = "0.15", features = ["redis"] }
+
+[features]
+redis-integration-tests = []
