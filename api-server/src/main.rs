@@ -193,7 +193,22 @@ async fn main() {
     let request_queue = Arc::new(request_queue::RequestQueue::new(
         request_queue::QueueConfig::default(),
     ));
+
+    // Mutating endpoints that move or commit IP/swap state require a signed
+    // request (see request_signing.rs) on top of the layers applied below.
+    let signed_routes = Router::new()
+        .route("/ip/commit",                      post(handlers::commit_ip))
+        .route("/ip/transfer",                    post(handlers::transfer_ip))
+        .route("/swap/initiate",                  post(handlers::initiate_swap))
+        .route("/swap/batch-initiate",            post(handlers::batch_initiate_swap))
+        .route("/swap/{swap_id}/accept",          post(handlers::accept_swap))
+        .route("/swap/{swap_id}/reveal",          post(handlers::reveal_key))
+        .route("/swap/{swap_id}/cancel",          post(handlers::cancel_swap))
+        .route("/swap/{swap_id}/cancel-expired",  post(handlers::cancel_expired_swap))
+        .route_layer(middleware::from_fn(request_signing::verify_request_signature));
+
     let app = Router::new()
+        .merge(signed_routes)
         .route("/health",          get(health::health_handler))
         .route("/health/detailed", get(health::detailed_health_handler))
         .route("/metrics",         get(metrics::metrics_handler))
@@ -202,17 +217,9 @@ async fn main() {
         .route("/ws",              get(ws_handler))
         .route("/events",          get(events_handler))
         .route("/batch",           post(batch::batch_handler))
-        .route("/ip/commit",                      post(handlers::commit_ip))
         .route("/ip/{ip_id}",                     get(handlers::get_ip))
-        .route("/ip/transfer",                    post(handlers::transfer_ip))
         .route("/ip/verify",                      post(handlers::verify_commitment))
         .route("/ip/owner/{owner}",               get(handlers::list_ip_by_owner))
-        .route("/swap/initiate",                  post(handlers::initiate_swap))
-        .route("/swap/batch-initiate",            post(handlers::batch_initiate_swap))
-        .route("/swap/{swap_id}/accept",          post(handlers::accept_swap))
-        .route("/swap/{swap_id}/reveal",          post(handlers::reveal_key))
-        .route("/swap/{swap_id}/cancel",          post(handlers::cancel_swap))
-        .route("/swap/{swap_id}/cancel-expired",  post(handlers::cancel_expired_swap))
         .route("/swap/{swap_id}",                 get(handlers::get_swap))
         .route("/openapi.json", get(openapi_handler))
         .with_state(state)
