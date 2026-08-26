@@ -97,6 +97,10 @@ pub enum ContractError {
     CategoryNotFound = 34,
     /// Batch operation size mismatch.
     BatchSizeMismatch = 35,
+    /// #790: Contract has not been initialized with a real admin address yet.
+    NotInitialized = 36,
+    /// #790: `initialize` was called on a contract that already has an admin.
+    AlreadyInitialized = 37,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -505,6 +509,55 @@ pub struct IpRegistry;
 
 #[contractimpl]
 impl IpRegistry {
+    /// Initialize the contract with a real, externally-controlled admin address.
+    ///
+    /// Must be called exactly once, before any admin-gated function is usable.
+    /// Requires the auth of the `admin` address being set, so a caller cannot
+    /// install an admin they do not control.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the contract has already been initialized.
+    pub fn initialize(env: Env, admin: Address) {
+        admin.require_auth();
+
+        if env.storage().persistent().has(&DataKey::Admin) {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::AlreadyInitialized as u32,
+            ));
+        }
+
+        env.storage().persistent().set(&DataKey::Admin, &admin);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Admin, LEDGER_BUMP, LEDGER_BUMP);
+    }
+
+    /// Rotate the admin address. Only the current admin may do this.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the contract has not been initialized or the caller is not
+    /// the current admin.
+    pub fn set_admin(env: Env, new_admin: Address) {
+        let admin = Self::require_admin(&env);
+        admin.require_auth();
+
+        env.storage().persistent().set(&DataKey::Admin, &new_admin);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Admin, LEDGER_BUMP, LEDGER_BUMP);
+    }
+
+    /// Fetch the stored admin address, panicking if the contract has not been
+    /// initialized yet.
+    fn require_admin(env: &Env) -> Address {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(env, ContractError::NotInitialized))
+    }
+
     /// Timestamp a new IP commitment. Returns the assigned IP ID.
     ///
     /// This function creates a new IP record with a cryptographic commitment hash,
@@ -554,15 +607,6 @@ impl IpRegistry {
         // Enforced by the Soroban host: panics if the transaction does not carry
         // a valid authorization for `owner`. This is the correct auth pattern.
         owner.require_auth();
-
-        // Initialize admin on first call if not set
-        if !env.storage().persistent().has(&DataKey::Admin) {
-            let admin = env.current_contract_address();
-            env.storage().persistent().set(&DataKey::Admin, &admin);
-            env.storage()
-                .persistent()
-                .extend_ttl(&DataKey::Admin, 50000, 50000);
-        }
 
         // Reject zero-byte commitment hash (Issue #40)
         require_non_zero_commitment(&env, &commitment_hash);
@@ -709,15 +753,6 @@ impl IpRegistry {
         commitment_hashes: Vec<BytesN<32>>,
     ) -> Vec<u64> {
         owner.require_auth();
-
-        // Initialize admin on first call if not set
-        if !env.storage().persistent().has(&DataKey::Admin) {
-            let admin = env.current_contract_address();
-            env.storage().persistent().set(&DataKey::Admin, &admin);
-            env.storage()
-                .persistent()
-                .extend_ttl(&DataKey::Admin, 50000, 50000);
-        }
 
         let mut ids = Vec::new(&env);
         let timestamp = env.ledger().timestamp();
@@ -877,15 +912,6 @@ impl IpRegistry {
             LEDGER_BUMP,
             LEDGER_BUMP,
         );
-
-        // Initialize admin on first call if not set
-        if !env.storage().persistent().has(&DataKey::Admin) {
-            let admin = env.current_contract_address();
-            env.storage().persistent().set(&DataKey::Admin, &admin);
-            env.storage()
-                .persistent()
-                .extend_ttl(&DataKey::Admin, 50000, 50000);
-        }
 
         let mut ids = Vec::new(&env);
         let timestamp = env.ledger().timestamp();
@@ -1319,8 +1345,6 @@ impl IpRegistry {
     ///
     /// # Panics
     ///
-    /// # Panics
-    ///
     /// Panics if caller is not admin or admin not initialized.
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
         let admin_opt: Option<Address> = env.storage().persistent().get(&DataKey::Admin);
@@ -1330,12 +1354,6 @@ impl IpRegistry {
             ));
         }
         let admin = admin_opt.unwrap();
-        let invoker = env.current_contract_address();
-        if invoker != admin {
-            env.panic_with_error(Error::from_contract_error(
-                ContractError::UnauthorizedUpgrade as u32,
-            ));
-        }
         admin.require_auth();
 
         env.deployer().update_current_contract_wasm(new_wasm_hash);
@@ -2693,11 +2711,7 @@ impl IpRegistry {
     /// Must be called once after deployment to configure the notary public key
     /// used to verify timestamp signatures.
     pub fn set_notary_public_key(env: Env, public_key: BytesN<32>) {
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .unwrap_or_else(|| env.current_contract_address());
+        let admin = Self::require_admin(&env);
         admin.require_auth();
 
         env.storage()
@@ -4923,6 +4937,99 @@ mod tests {
     use super::*;
     use soroban_sdk::testutils::{Address as _, Events};
     use soroban_sdk::{Env, IntoVal};
+
+    /// Issue #790: a caller who is not the initialized admin can never
+    /// successfully call an admin-gated function.
+    #[test]
+    #[should_panic]
+    fn test_non_admin_cannot_call_admin_gated_function() {
+        let env = Env::default();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let not_admin = Address::generate(&env);
+        let arbitrator = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.initialize(&admin);
+
+        // Only `not_admin`'s auth is mocked for this call; the contract
+        // requires `admin`'s auth, which the host cannot satisfy.
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &not_admin,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "nominate_arbitrator",
+                args: (arbitrator.clone(),).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.nominate_arbitrator(&arbitrator);
+    }
+
+    /// Issue #790: the real initialized admin can call admin-gated functions.
+    #[test]
+    fn test_real_admin_can_call_admin_gated_function() {
+        let env = Env::default();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let arbitrator = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.initialize(&admin);
+        client.nominate_arbitrator(&arbitrator);
+    }
+
+    /// Issue #790: admin-gated functions must panic before any real admin is
+    /// initialized — they must never fall back to a self-referential default.
+    #[test]
+    #[should_panic]
+    fn test_admin_gated_function_panics_before_initialize() {
+        let env = Env::default();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        env.mock_all_auths();
+        let arbitrator = Address::generate(&env);
+        client.nominate_arbitrator(&arbitrator);
+    }
+
+    /// Issue #790: `initialize` cannot be called a second time to hijack admin.
+    #[test]
+    #[should_panic]
+    fn test_initialize_cannot_be_called_twice() {
+        let env = Env::default();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let attacker = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.initialize(&admin);
+        client.initialize(&attacker);
+    }
+
+    /// Issue #790: `set_admin` lets the current admin rotate to a new admin,
+    /// after which only the new admin can call admin-gated functions.
+    #[test]
+    fn test_set_admin_rotates_admin() {
+        let env = Env::default();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let new_admin = Address::generate(&env);
+        let arbitrator = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.initialize(&admin);
+        client.set_admin(&new_admin);
+        client.nominate_arbitrator(&arbitrator);
+    }
 
     /// Bug Condition Exploration Test — Property 1
     ///

@@ -333,6 +333,7 @@ mod tests {
         let commitment2 = BytesN::from_array(&env, &[15u8; 32]);
 
         env.mock_all_auths();
+        client.initialize(&owner1);
         let ip_id1 = client.commit_ip(&owner1, &commitment1, &0u32);
         let ip_id2 = client.commit_ip(&owner2, &commitment2, &0u32);
 
@@ -364,6 +365,7 @@ mod tests {
         let commitment = BytesN::from_array(&env, &[16u8; 32]);
 
         env.mock_all_auths();
+        client.initialize(&owner);
         let ip_id = client.commit_ip(&owner, &commitment, &0u32);
 
         let mut ip_ids = Vec::new(&env);
@@ -1805,6 +1807,7 @@ mod tests {
         let client = IpRegistryClient::new(&env, &contract_id);
 
         let owner = <Address as TestAddress>::generate(&env);
+        client.initialize(&owner);
         let commitment = BytesN::from_array(&env, &[50u8; 32]);
         let ip_id = client.commit_ip(&owner, &commitment, &0u32);
 
@@ -1998,6 +2001,7 @@ mod tests {
         let client = IpRegistryClient::new(&env, &contract_id);
 
         let owner = <Address as TestAddress>::generate(&env);
+        client.initialize(&owner);
         let commitment = BytesN::from_array(&env, &[51u8; 32]);
         let ip_id = client.commit_ip(&owner, &commitment, &0u32);
 
@@ -2042,6 +2046,7 @@ mod tests {
         let owner = <Address as TestAddress>::generate(&env);
         let challenger = <Address as TestAddress>::generate(&env);
         env.mock_all_auths();
+        client.initialize(&owner);
 
         let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[5u8; 32]), &0u32);
         let dispute_id = client.initiate_dispute(
@@ -2082,6 +2087,7 @@ mod tests {
         let owner = <Address as TestAddress>::generate(&env);
         let challenger = <Address as TestAddress>::generate(&env);
         env.mock_all_auths();
+        client.initialize(&owner);
 
         let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[6u8; 32]), &0u32);
         let dispute_id = client.initiate_dispute(
@@ -2138,6 +2144,7 @@ mod tests {
         let client = IpRegistryClient::new(&env, &contract_id);
 
         let owner = <Address as TestAddress>::generate(&env);
+        client.initialize(&owner);
         let commitment = BytesN::from_array(&env, &[53u8; 32]);
         let ip_id = client.commit_ip(&owner, &commitment, &0u32);
 
