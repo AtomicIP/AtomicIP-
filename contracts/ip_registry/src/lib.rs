@@ -97,6 +97,14 @@ pub enum ContractError {
     CategoryNotFound = 34,
     /// Batch operation size mismatch.
     BatchSizeMismatch = 35,
+    /// #811: Ownership challenge has expired (TTL elapsed).
+    ChallengeExpired = 36,
+    /// #811: Ownership challenge has already been responded to.
+    ChallengeAlreadyAnswered = 37,
+    /// #812: Merkle root is stale and needs recomputation.
+    MerkleRootStale = 38,
+    /// #814: Notary public key has invalid length or format.
+    InvalidNotaryKey = 39,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -104,6 +112,10 @@ pub enum ContractError {
 /// Minimum ledger TTL bump applied to every persistent storage write.
 /// ~1 year at ~5s per ledger: 365 * 24 * 3600 / 5 ≈ 6_307_200 ledgers.
 pub const LEDGER_BUMP: u32 = 6_307_200;
+
+/// Issue #811: Default TTL for ownership challenges, in seconds (24 hours).
+/// Can be overridden via `set_challenge_ttl`.
+pub const DEFAULT_CHALLENGE_TTL_SECONDS: u64 = 86_400;
 
 /// Maximum metadata size: 1 KB
 pub const MAX_METADATA_BYTES: u32 = 1024;
@@ -196,6 +208,12 @@ pub enum DataKey {
     EncryptedCommitment(u64),
     // Issue #465: Batch escrow — keyed by escrow_id (sha256 of ip_ids + timestamp)
     BatchEscrow(BytesN<32>),
+    // Issue #811: TTL (in seconds) for ownership challenges
+    ChallengeTtl,
+    // Issue #812: Cached Merkle root for an owner's commitment set; None = stale
+    MerkleRoot(Address),
+    // Issue #812: Flag indicating the cached Merkle root for an owner is stale
+    MerkleRootStale(Address),
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -673,6 +691,9 @@ impl IpRegistry {
 
         // Adjust PoW difficulty based on daily commit volume
         Self::adjust_pow_difficulty(&env);
+
+        // Issue #812: Mark cached Merkle root stale for this owner
+        Self::mark_merkle_root_stale(&env, &owner);
 
         id
     }
@@ -1247,10 +1268,14 @@ impl IpRegistry {
 
         // Emit transfer event: (ip_id, old_owner, new_owner)
         env.events()
-            .publish((TRANSFER_TOPIC, ip_id), (old_owner, new_owner.clone()));
+            .publish((TRANSFER_TOPIC, ip_id), (old_owner.clone(), new_owner.clone()));
 
         // Issue #436: Record immutable audit entry for ownership transfer
-        Self::append_audit_entry(&env, ip_id, symbol_short!("xferred"), new_owner);
+        Self::append_audit_entry(&env, ip_id, symbol_short!("xferred"), new_owner.clone());
+
+        // Issue #812: Mark cached Merkle root stale for both old and new owner
+        Self::mark_merkle_root_stale(&env, &old_owner);
+        Self::mark_merkle_root_stale(&env, &new_owner);
     }
 
     /// Transfer IP ownership to a new address (named alias for transfer_ip).
@@ -1293,7 +1318,10 @@ impl IpRegistry {
         );
 
         // Issue #436: Record immutable audit entry for revocation
-        Self::append_audit_entry(&env, ip_id, symbol_short!("revoked"), record.owner);
+        Self::append_audit_entry(&env, ip_id, symbol_short!("revoked"), record.owner.clone());
+
+        // Issue #812: Mark cached Merkle root stale for this owner
+        Self::mark_merkle_root_stale(&env, &record.owner);
     }
 
     /// Validate that a new WASM is compatible for upgrade.
@@ -2353,8 +2381,8 @@ impl IpRegistry {
             })
     }
 
-    // ── Issue #343: Merkle Tree Proof ──────────────────────────────────────────
-    /// This enables proving membership in a set of IPs without full disclosure.
+    // ── Issue #343 / #812: Merkle Tree Proof ─────────────────────────────────
+    /// Recompute the Merkle root from scratch and return it.
     pub fn compute_ip_merkle_root(env: Env, owner: Address) -> BytesN<32> {
         let ip_ids: Vec<u64> = env
             .storage()
@@ -2378,6 +2406,67 @@ impl IpRegistry {
         }
 
         Self::merkle_root(&env, &hashes)
+    }
+
+    /// Issue #812: Return the cached Merkle root for `owner`, recomputing lazily when stale.
+    ///
+    /// The cache is automatically invalidated whenever the owner's commitment set
+    /// changes (new commit, revoke, transfer, or key rotation). If the cache is
+    /// absent or marked stale this call recomputes the root, stores the fresh
+    /// value, and clears the stale flag.
+    ///
+    /// Returns all-zeros `BytesN<32>` when the owner has no IPs.
+    pub fn get_merkle_root(env: Env, owner: Address) -> BytesN<32> {
+        // If stale or no cached value, recompute.
+        let is_stale: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MerkleRootStale(owner.clone()))
+            .unwrap_or(true); // treat missing cache as stale
+
+        let cached: Option<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MerkleRoot(owner.clone()));
+
+        if !is_stale {
+            if let Some(root) = cached {
+                return root;
+            }
+        }
+
+        // Recompute from the owner's current commitment set.
+        let root = Self::compute_ip_merkle_root(env.clone(), owner.clone());
+
+        // Persist the fresh root and clear stale flag.
+        env.storage()
+            .persistent()
+            .set(&DataKey::MerkleRoot(owner.clone()), &root);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::MerkleRoot(owner.clone()), LEDGER_BUMP, LEDGER_BUMP);
+        env.storage()
+            .persistent()
+            .set(&DataKey::MerkleRootStale(owner.clone()), &false);
+        env.storage().persistent().extend_ttl(
+            &DataKey::MerkleRootStale(owner.clone()),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        root
+    }
+
+    /// Issue #812: Internal helper — mark the Merkle root cache stale for `owner`.
+    fn mark_merkle_root_stale(env: &Env, owner: &Address) {
+        env.storage()
+            .persistent()
+            .set(&DataKey::MerkleRootStale(owner.clone()), &true);
+        env.storage().persistent().extend_ttl(
+            &DataKey::MerkleRootStale(owner.clone()),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
     }
 
     /// Verify a Merkle proof for an IP commitment.
@@ -2686,12 +2775,20 @@ impl IpRegistry {
         false
     }
 
-    // ── Issue #345 / #428: Timestamp Notarization ──────────────────────────────
+    // ── Issue #345 / #428 / #814: Timestamp Notarization ─────────────────────
 
     /// Set the trusted notary public key (Ed25519, 32 bytes). Admin-only.
     ///
-    /// Must be called once after deployment to configure the notary public key
-    /// used to verify timestamp signatures.
+    /// Issue #814: Validates that the supplied key is a well-formed Ed25519
+    /// public key:
+    ///   * Exactly 32 bytes (enforced by the `BytesN<32>` type itself).
+    ///   * Not all-zero bytes — a zero key is indistinguishable from "not set"
+    ///     and would silently break all future notarization checks.
+    ///
+    /// # Panics
+    ///
+    /// Panics with `InvalidNotaryKey` if the key is all zeros.
+    /// Panics with `Unauthorized` if the caller is not the admin.
     pub fn set_notary_public_key(env: Env, public_key: BytesN<32>) {
         let admin: Address = env
             .storage()
@@ -2699,6 +2796,15 @@ impl IpRegistry {
             .get(&DataKey::Admin)
             .unwrap_or_else(|| env.current_contract_address());
         admin.require_auth();
+
+        // #814: Reject all-zero key — it is not a valid Ed25519 public key and
+        // would silently accept any signature during notarization.
+        let zero_key = BytesN::from_array(&env, &[0u8; 32]);
+        if public_key == zero_key {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::InvalidNotaryKey as u32,
+            ));
+        }
 
         env.storage()
             .persistent()
@@ -3271,12 +3377,13 @@ impl IpRegistry {
         false
     }
 
-    // ── Issue #433: IP Ownership Proof Challenge ───────────────────────────────
+    // ── Issue #433 / #811: IP Ownership Proof Challenge ──────────────────────────
 
     /// Issue a challenge for an IP ownership proof.
     ///
     /// A third party (challenger) issues a nonce-based challenge to the IP owner.
     /// The owner must respond with sha256(commitment_hash || nonce) to prove ownership.
+    /// The challenge expires after `challenge_ttl_seconds` (default 24 h) have elapsed.
     ///
     /// Returns the challenge_id.
     pub fn issue_ownership_challenge(
@@ -3294,6 +3401,15 @@ impl IpRegistry {
             .get(&DataKey::NextChallengeId)
             .unwrap_or(1u64);
 
+        // Resolve TTL: use admin-configured value or fall back to the default.
+        let ttl_seconds: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ChallengeTtl)
+            .unwrap_or(DEFAULT_CHALLENGE_TTL_SECONDS);
+
+        let now = env.ledger().timestamp();
+
         let challenge = OwnershipChallenge {
             challenge_id,
             ip_id,
@@ -3301,7 +3417,8 @@ impl IpRegistry {
             nonce,
             response_hash: None,
             verified: false,
-            timestamp: env.ledger().timestamp(),
+            timestamp: now,
+            expires_at: now + ttl_seconds,
         };
 
         env.storage()
@@ -3329,7 +3446,8 @@ impl IpRegistry {
     ///
     /// # Panics
     ///
-    /// Panics if the challenge does not exist or the caller is not the IP owner.
+    /// Panics if the challenge does not exist, the caller is not the IP owner,
+    /// the challenge has expired, or a response has already been submitted.
     pub fn respond_to_ownership_challenge(env: Env, challenge_id: u64, response_hash: BytesN<32>) {
         let mut challenge: OwnershipChallenge = env
             .storage()
@@ -3338,6 +3456,20 @@ impl IpRegistry {
             .unwrap_or_else(|| {
                 env.panic_with_error(Error::from_contract_error(ContractError::IpNotFound as u32))
             });
+
+        // #811: Reject if the challenge TTL has elapsed.
+        if env.ledger().timestamp() > challenge.expires_at {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::ChallengeExpired as u32,
+            ));
+        }
+
+        // #811: Reject if a response has already been submitted.
+        if challenge.response_hash.is_some() {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::ChallengeAlreadyAnswered as u32,
+            ));
+        }
 
         let record = require_ip_exists(&env, challenge.ip_id);
         record.owner.require_auth();
@@ -3407,6 +3539,64 @@ impl IpRegistry {
         env.storage()
             .persistent()
             .get(&DataKey::OwnershipChallenge(challenge_id))
+    }
+
+    /// Issue #811: Set the TTL (in seconds) applied to newly-created ownership challenges.
+    ///
+    /// Admin-only. Challenges created before this call are not affected.
+    ///
+    /// # Arguments
+    ///
+    /// * `ttl_seconds` - New TTL in seconds; must be > 0.
+    pub fn set_challenge_ttl(env: Env, ttl_seconds: u64) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| env.current_contract_address());
+        admin.require_auth();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ChallengeTtl, &ttl_seconds);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::ChallengeTtl, LEDGER_BUMP, LEDGER_BUMP);
+    }
+
+    /// Issue #811: Expire an open ownership challenge once its TTL has elapsed.
+    ///
+    /// Callable by anyone once the challenge's `expires_at` timestamp has passed.
+    /// Removes the challenge record from storage, freeing ledger rent.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the challenge does not exist or has not yet expired.
+    pub fn expire_challenge(env: Env, challenge_id: u64) {
+        let challenge: OwnershipChallenge = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OwnershipChallenge(challenge_id))
+            .unwrap_or_else(|| {
+                env.panic_with_error(Error::from_contract_error(ContractError::IpNotFound as u32))
+            });
+
+        // Only allow expiry after the TTL has elapsed.
+        if env.ledger().timestamp() <= challenge.expires_at {
+            // Challenge is still within TTL — caller is not allowed to expire it yet.
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::Unauthorized as u32,
+            ));
+        }
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::OwnershipChallenge(challenge_id));
+
+        env.events().publish(
+            (symbol_short!("ch_exp"), challenge.challenger),
+            (challenge_id, challenge.ip_id),
+        );
     }
 
     // ── Issue #434: Encryption Key Rotation ───────────────────────────────────
@@ -3489,18 +3679,54 @@ impl IpRegistry {
             .extend_ttl(&DataKey::IpRecord(ip_id), LEDGER_BUMP, LEDGER_BUMP);
 
         env.events().publish(
-            (symbol_short!("key_rot"), record.owner),
+            (symbol_short!("key_rot"), record.owner.clone()),
             (ip_id, new_commitment_hash),
         );
+
+        // Issue #812: Mark cached Merkle root stale (commitment hash for this IP changed)
+        Self::mark_merkle_root_stale(&env, &record.owner);
     }
 
-    /// Get the key rotation history for an IP (list of old commitment hashes).
-    pub fn get_key_rotation_history(env: Env, ip_id: u64) -> Vec<BytesN<32>> {
+    /// Issue #813: Get the key rotation history for an IP (list of old commitment hashes).
+    ///
+    /// Returns old commitment hashes in chronological order (oldest first).
+    /// Results are capped at `limit` entries starting from `offset`, enabling
+    /// pagination for IPs with long rotation histories.
+    ///
+    /// * `offset` — number of entries to skip from the beginning of the list.
+    /// * `limit`  — maximum number of entries to return; capped at 64 per call.
+    ///
+    /// Pass `offset = 0, limit = 64` to retrieve the first page.
+    pub fn get_key_rotation_history(
+        env: Env,
+        ip_id: u64,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<BytesN<32>> {
         require_ip_exists(&env, ip_id);
-        env.storage()
+        let history: Vec<BytesN<32>> = env
+            .storage()
             .persistent()
             .get(&DataKey::EncryptionKeyRotation(ip_id))
-            .unwrap_or(Vec::new(&env))
+            .unwrap_or(Vec::new(&env));
+
+        // Cap at 64 entries per call to bound compute cost.
+        let max_per_page: u32 = 64;
+        let effective_limit = if limit == 0 || limit > max_per_page {
+            max_per_page
+        } else {
+            limit
+        };
+
+        let total = history.len();
+        let start = offset.min(total);
+        let end = (start + effective_limit).min(total);
+
+        let mut page: Vec<BytesN<32>> = Vec::new(&env);
+        for i in start..end {
+            page.push_back(history.get(i).unwrap());
+        }
+        page
     }
 
     // ── Dispute Resolution ────────────────────────────────────────────────────
