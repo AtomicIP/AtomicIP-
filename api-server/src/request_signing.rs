@@ -111,7 +111,7 @@ pub async fn verify_request_signature(
         .unwrap()
         .as_secs();
 
-    let skew = (now as i64 - timestamp as i64).abs() as u64;
+    let skew = now.abs_diff(timestamp);
     if skew > timestamp_skew_secs() {
         return Err(axum::http::StatusCode::UNAUTHORIZED);
     }
