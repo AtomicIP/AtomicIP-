@@ -190,6 +190,9 @@ async fn main() {
     };
 
     let rate_limiter = rate_limit::RateLimitMiddleware::new(rate_limit::RateLimitConfig::default());
+    let request_queue = Arc::new(request_queue::RequestQueue::new(
+        request_queue::QueueConfig::default(),
+    ));
     let app = Router::new()
         .route("/health",          get(health::health_handler))
         .route("/health/detailed", get(health::detailed_health_handler))
@@ -213,6 +216,10 @@ async fn main() {
         .route("/swap/{swap_id}",                 get(handlers::get_swap))
         .route("/openapi.json", get(openapi_handler))
         .with_state(state)
+        .layer(middleware::from_fn_with_state(
+            request_queue,
+            request_queue::request_queue_middleware,
+        ))
         .layer(middleware::from_fn_with_state(rate_limiter, rate_limit::rate_limit_middleware))
         .layer(middleware::from_fn(metrics::track))
         .layer(middleware::from_fn(distributed_tracing::distributed_tracing_middleware))
