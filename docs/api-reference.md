@@ -602,6 +602,7 @@ if registry.is_ip_owner(&ip_id, &address) {
 | `UnauthorizedUpgrade` | 5 | Caller is not admin (upgrade only) |
 | `NotInitialized` | 36 | An admin-gated function was called before `initialize` set a real admin |
 | `AlreadyInitialized` | 37 | `initialize` was called on a contract that already has an admin |
+| `IncompatibleUpgrade` | 38 | `validate_upgrade`'s candidate manifest is missing a function/storage key/error code the current contract relies on, or renumbers an existing error code |
 
 ---
 
