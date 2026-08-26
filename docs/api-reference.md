@@ -600,6 +600,8 @@ if registry.is_ip_owner(&ip_id, &address) {
 | `CommitmentAlreadyRegistered` | 3 | Commitment hash already registered |
 | `IpAlreadyRevoked` | 4 | IP is already revoked |
 | `UnauthorizedUpgrade` | 5 | Caller is not admin (upgrade only) |
+| `NotInitialized` | 36 | An admin-gated function was called before `initialize` set a real admin |
+| `AlreadyInitialized` | 37 | `initialize` was called on a contract that already has an admin |
 
 ---
 
@@ -622,7 +624,7 @@ Emitted when a new IP is committed.
 | `OwnerIps(Address)` | Persistent | Maps owner → Vec of IP IDs |
 | `NextId` | Persistent | Next available IP ID (monotonic counter) |
 | `CommitmentOwner(BytesN<32>)` | Persistent | Maps commitment hash → owner (duplicate detection) |
-| `Admin` | Persistent | Admin address for upgrades |
+| `Admin` | Persistent | Admin address gating admin-only functions; set once via `initialize(admin)` (never auto-derived), rotatable via `set_admin(new_admin)` |
 
 ---
 
