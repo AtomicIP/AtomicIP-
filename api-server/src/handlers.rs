@@ -12,6 +12,8 @@ use tracing::instrument;
 use crate::cache;
 use crate::deduplication::{create_store, DeduplicationStore};
 use crate::schemas::*;
+use crate::soroban_rpc;
+use crate::soroban_rpc::SorobanError;
 use crate::webhook;
 
 // #523: Per-handler idempotency store for batch swap operations.
@@ -32,13 +34,65 @@ static BATCH_SWAP_IDEMPOTENCY: Lazy<DeduplicationStore> = Lazy::new(create_store
 )]
 #[instrument(skip(body))]
 pub async fn commit_ip(Json(body): Json<CommitIpRequest>) -> Result<Json<u64>, (StatusCode, Json<ErrorResponse>)> {
-    // TODO: Call Soroban RPC to invoke ip_registry.commit_ip
-    Err((
-        StatusCode::BAD_REQUEST,
-        Json(ErrorResponse {
-            error: "commit_ip not yet implemented".to_string(),
-        }),
-    ))
+    // Call Soroban RPC to invoke ip_registry.commit_ip and map contract
+    // errors to the appropriate HTTP status codes.
+    match soroban_rpc::commit_ip(&body.owner, &body.commitment_hash).await {
+        Ok(ip_id) => Ok(Json(ip_id)),
+        Err(SorobanError::ZeroHash) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Commitment hash must not be all zeroes".to_string(),
+            }),
+        )),
+        Err(SorobanError::DuplicateHash) => Err((
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: "A commitment with this hash is already registered".to_string(),
+            }),
+        )),
+        Err(SorobanError::InvalidOwner) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Invalid owner address".to_string(),
+            }),
+        )),
+        Err(SorobanError::NotFound) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "IP record not found".to_string(),
+            }),
+        )),
+        Err(SorobanError::NotOwner) => Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                error: "Caller is not the IP owner".to_string(),
+            }),
+        )),
+        Err(SorobanError::Revoked) => Err((
+            StatusCode::GONE,
+            Json(ErrorResponse {
+                error: "IP record has been revoked".to_string(),
+            }),
+        )),
+        Err(SorobanError::NotInitialized) => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "Contract is not initialized".to_string(),
+            }),
+        )),
+        Err(SorobanError::RpcFailure(msg)) => Err((
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorResponse {
+                error: format!("Soroban RPC unavailable: {msg}"),
+            }),
+        )),
+        Err(SorobanError::ContractError(msg)) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Contract error: {msg}"),
+            }),
+        )),
+    }
 }
 
 /// Retrieve an IP record by ID.

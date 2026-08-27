@@ -14,14 +14,44 @@ target/
 *.swp
 *.swo
 *.orig
+*.bak
+*.tmp
+.editorconfig.local
 
 # OS
 .DS_Store
 Thumbs.db
+desktop.ini
+ehthumbs.db
 
 # Fuzz artifacts
 fuzz/artifacts/
 fuzz/corpus/*/crashes/
+fuzz/corpus/*/queue/
+fuzz/corpus/*/hangs/
+
+# Soroban / Stellar build outputs
+*.wasm
+*.optimized.wasm
+.stellar/
+
+# Node / JS tooling (src/batch, src/royalty, etc.)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnp.*
+.yarn/
+
+# Coverage reports
+lcov.info
+coverage/
+*.profraw
+*.profdata
+tarpaulin-report.html
+
+# Benchmark outputs
+criterion/
 
 # Project issues file
 vrickish.md

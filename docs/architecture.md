@@ -106,3 +106,42 @@ contents, since that could itself grow without bound.
 - **RPC:** Public Soroban RPC nodes (SDF).
 - **Automation:** GitHub Actions for contract deployment and API testing.
 - **Monitoring:** Periodic health checks and ledger event indexing (planned).
+
+## 🗂️ `registry.rs` — Atomic Swap's Cross-Contract Adapter
+
+`contracts/atomic_swap/src/registry.rs` is a **local adapter module inside the
+Atomic Swap contract**, not a standalone registry.  It bridges the gap between
+Atomic Swap logic and the separately-deployed `ip_registry` contract.
+
+### What it does
+
+| Function | Purpose |
+|---|---|
+| `ip_registry(env)` | Reads the `ip_registry` contract address stored in Atomic Swap's own instance storage (set at initialisation). |
+| `ensure_seller_owns_active_ip(env, ip_id, seller)` | Cross-contract call — fetches the `IpRecord` from `ip_registry` and panics with `ContractError::NotIPOwner` or `ContractError::IpRevoked` if the guard fails. |
+| `verify_commitment(env, ip_id, secret, blinding_factor)` | Cross-contract call — delegates commitment verification to `ip_registry.verify_commitment`. |
+
+### Relationship to `ip_registry`
+
+```
+AtomicSwap contract (atomic_swap/)
+  └── registry.rs  ← this file; a thin adapter, no storage of its own
+        │  cross-contract call via IpRegistryClient
+        ▼
+  ip_registry contract  (ip_registry/)
+        └── owns the canonical IpRecord table
+              (owner, commitment_hash, timestamp, revoked)
+```
+
+`registry.rs` **never stores IP ownership records itself**.  All IP state lives
+in the `ip_registry` contract.  The adapter only provides guarded read helpers
+so the swap logic can verify ownership and commitment validity without repeating
+the contract-address lookup at every call site.
+
+### Why a separate `ip_registry` contract?
+
+Separating IP registration from swap execution keeps each contract's storage
+and upgrade surface small.  The `ip_registry` can be upgraded (or audited) in
+isolation without touching atomic-swap logic, and vice-versa.  `registry.rs`
+is the single seam between the two contracts: if the `ip_registry` interface
+changes, only this file needs to be updated.

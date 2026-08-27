@@ -101,6 +101,8 @@ pub enum ContractError {
     TimelockNotElapsed = 63,
     RulingFinalized = 64,
     BatchArbitrationDisabled = 65,
+    /// #835: Fee paid using an asset that does not match the configured fee asset.
+    InvalidFeeAsset = 66,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
