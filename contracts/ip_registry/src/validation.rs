@@ -3,8 +3,8 @@
 //! This module provides reusable validation functions to reduce code duplication
 //! and ensure consistent error handling across the contract.
 
-use crate::{ContractError, DataKey, IpRecord};
-use soroban_sdk::{symbol_short, Address, BytesN, Env, Error};
+use crate::{ContractError, DataKey, IpRecord, OwnershipShare};
+use soroban_sdk::{symbol_short, Address, BytesN, Env, Error, Vec};
 
 /// Retrieves an IP record by ID, panicking if not found.
 ///
@@ -182,6 +182,25 @@ pub fn calculate_commitment_strength(secret_length: u32, pow_difficulty: u32) ->
     }
 }
 
+/// Validates that a set of `OwnershipShare` percentages sums to exactly 100.
+///
+/// # Arguments
+///
+/// * `env` - The Soroban environment
+/// * `shares` - The full cap table (owner + co-owners) for an IP
+///
+/// # Panics
+///
+/// Panics with `InvalidShareTotal` if the percentages do not sum to exactly 100.
+pub fn require_valid_share_total(env: &Env, shares: &Vec<OwnershipShare>) {
+    let total: u32 = shares.iter().map(|s| s.percentage).sum();
+    if total != 100 {
+        env.panic_with_error(Error::from_contract_error(
+            ContractError::InvalidShareTotal as u32,
+        ));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,5 +324,38 @@ mod tests {
             grace_period_seconds: 0,
         };
         require_owner(&env, &not_owner, &record);
+    }
+
+    fn shares_summing_to(env: &Env, total: u32) -> soroban_sdk::Vec<OwnershipShare> {
+        let mut shares = soroban_sdk::Vec::new(env);
+        shares.push_back(OwnershipShare {
+            address: Address::generate(env),
+            percentage: total,
+        });
+        shares
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_require_valid_share_total_panics_for_99() {
+        let env = Env::default();
+        let shares = shares_summing_to(&env, 99);
+        require_valid_share_total(&env, &shares);
+    }
+
+    #[test]
+    fn test_require_valid_share_total_succeeds_for_100() {
+        let env = Env::default();
+        let shares = shares_summing_to(&env, 100);
+        // Should not panic
+        require_valid_share_total(&env, &shares);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_require_valid_share_total_panics_for_101() {
+        let env = Env::default();
+        let shares = shares_summing_to(&env, 101);
+        require_valid_share_total(&env, &shares);
     }
 }

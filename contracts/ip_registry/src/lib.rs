@@ -95,6 +95,8 @@ pub enum ContractError {
     CategoryNotFound = 34,
     /// Batch operation size mismatch.
     BatchSizeMismatch = 35,
+    /// #809: OwnershipShare percentages for an IP do not sum to exactly 100.
+    InvalidShareTotal = 36,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -196,6 +198,8 @@ pub enum DataKey {
     BatchEscrow(BytesN<32>),
     // Issue #808: tracks whether EXPIRY_TOPIC has already fired for the current expiry_timestamp
     ExpiryNotified(u64),
+    // Issue #809: stores Vec<OwnershipShare> cap table (owner + co-owners) for a given IP
+    OwnershipShares(u64),
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -2012,9 +2016,12 @@ impl IpRegistry {
             .get(&DataKey::SuggestedPrice(ip_id))
     }
 
-    /// Add a co-owner to an IP. Owner-only.
+    /// Add a co-owner to an IP with an explicit ownership percentage. Owner-only.
     /// Co-owners can verify commitments but cannot transfer or revoke the IP.
-    pub fn add_co_owner(env: Env, ip_id: u64, co_owner: Address) {
+    ///
+    /// `percentage` is deducted from the current owner's remaining share, so the
+    /// full cap table (owner + co-owners) always sums to exactly 100.
+    pub fn add_co_owner(env: Env, ip_id: u64, co_owner: Address, percentage: u32) {
         let mut record = require_ip_exists(&env, ip_id);
         record.owner.require_auth();
 
@@ -2025,6 +2032,41 @@ impl IpRegistry {
             }
         }
 
+        let mut shares: Vec<OwnershipShare> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OwnershipShares(ip_id))
+            .unwrap_or_else(|| {
+                let mut v = Vec::new(&env);
+                v.push_back(OwnershipShare {
+                    address: record.owner.clone(),
+                    percentage: 100,
+                });
+                v
+            });
+
+        let owner_idx = shares
+            .iter()
+            .position(|s| s.address == record.owner)
+            .unwrap_or_else(|| {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::InvalidShareTotal as u32,
+                ))
+            }) as u32;
+        let mut owner_share = shares.get(owner_idx).unwrap();
+        if percentage == 0 || percentage > owner_share.percentage {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::InvalidOwnershipPercentage as u32,
+            ));
+        }
+        owner_share.percentage -= percentage;
+        shares.set(owner_idx, owner_share);
+        shares.push_back(OwnershipShare {
+            address: co_owner.clone(),
+            percentage,
+        });
+        require_valid_share_total(&env, &shares);
+
         record.co_owners.push_back(co_owner.clone());
         env.storage()
             .persistent()
@@ -2032,12 +2074,21 @@ impl IpRegistry {
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::IpRecord(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+        env.storage()
+            .persistent()
+            .set(&DataKey::OwnershipShares(ip_id), &shares);
+        env.storage().persistent().extend_ttl(
+            &DataKey::OwnershipShares(ip_id),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
 
         env.events()
             .publish((symbol_short!("co_add"), record.owner), (ip_id, co_owner));
     }
 
     /// Remove a co-owner from an IP. Owner-only.
+    /// The removed co-owner's percentage is returned to the primary owner's share.
     pub fn remove_co_owner(env: Env, ip_id: u64, co_owner: Address) {
         let mut record = require_ip_exists(&env, ip_id);
         record.owner.require_auth();
@@ -2054,9 +2105,45 @@ impl IpRegistry {
                 LEDGER_BUMP,
             );
 
+            if let Some(mut shares) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, Vec<OwnershipShare>>(&DataKey::OwnershipShares(ip_id))
+            {
+                if let Some(share_idx) = shares.iter().position(|s| s.address == co_owner) {
+                    let removed = shares.get(share_idx as u32).unwrap();
+                    shares.remove(share_idx as u32);
+                    if let Some(owner_idx) = shares.iter().position(|s| s.address == record.owner)
+                    {
+                        let mut owner_share = shares.get(owner_idx as u32).unwrap();
+                        owner_share.percentage += removed.percentage;
+                        shares.set(owner_idx as u32, owner_share);
+                    }
+                    require_valid_share_total(&env, &shares);
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::OwnershipShares(ip_id), &shares);
+                    env.storage().persistent().extend_ttl(
+                        &DataKey::OwnershipShares(ip_id),
+                        LEDGER_BUMP,
+                        LEDGER_BUMP,
+                    );
+                }
+            }
+
             env.events()
                 .publish((symbol_short!("co_rem"), record.owner), (ip_id, co_owner));
         }
+    }
+
+    /// Get the current ownership cap table (owner + co-owners) for an IP.
+    /// Returns an empty vector if no co-owners have ever been added.
+    pub fn get_ownership_shares(env: Env, ip_id: u64) -> Vec<OwnershipShare> {
+        require_ip_exists(&env, ip_id);
+        env.storage()
+            .persistent()
+            .get(&DataKey::OwnershipShares(ip_id))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     /// Create a new version of an existing IP commitment.
