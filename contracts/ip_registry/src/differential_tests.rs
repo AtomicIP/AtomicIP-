@@ -14,6 +14,8 @@
 ///   "
 #[cfg(test)]
 mod differential_tests {
+    extern crate std;
+
     use soroban_sdk::{testutils::Address as _, Address, BytesN, Env};
 
     use crate::{IpRegistry, IpRegistryClient};
@@ -157,5 +159,62 @@ mod differential_tests {
             &BytesN::from_array(&e, &[0u8; 32]),
             &0u32,
         );
+    }
+
+    // ── #810: IpVersions vs IpVersionChain cross-check ──────────────────────
+
+    /// Reconstructs the full set of version IDs under `root_id` by walking
+    /// `IpVersions` (direct-children-per-node) top-down, and asserts it
+    /// matches the flattened `IpVersionChain(root_id)` exactly. The two are
+    /// written together in `create_ip_version`; this catches any future
+    /// change that updates one without the other.
+    fn assert_versions_consistent(client: &IpRegistryClient<'_>, root_id: u64) {
+        let chain = client.get_ip_version_chain(&root_id);
+
+        let mut expected: std::vec::Vec<u64> = std::vec::Vec::new();
+        let mut frontier: std::vec::Vec<u64> = std::vec::Vec::new();
+        expected.push(root_id);
+        frontier.push(root_id);
+        while let Some(parent) = frontier.pop() {
+            for child in client.get_ip_versions(&parent).iter() {
+                expected.push(child);
+                frontier.push(child);
+            }
+        }
+
+        let mut chain_ids: std::vec::Vec<u64> = chain.iter().collect();
+        expected.sort_unstable();
+        chain_ids.sort_unstable();
+        assert_eq!(
+            expected, chain_ids,
+            "IpVersions-derived set must match IpVersionChain for root {}",
+            root_id
+        );
+    }
+
+    /// Builds a branching version tree (not just a linear chain — versions
+    /// created from a non-root version too) and checks IpVersions/
+    /// IpVersionChain agreement after every single versioning call.
+    #[test]
+    fn differential_ip_versions_and_chain_agree_across_branching_tree() {
+        let e = env();
+        let c = client(&e);
+        let owner = Address::generate(&e);
+
+        let root = c.commit_ip(&owner, &BytesN::from_array(&e, &[0x50u8; 32]), &0u32);
+        assert_versions_consistent(&c, root);
+
+        let v1 = c.commit_ip_version(&owner, &BytesN::from_array(&e, &[0x51u8; 32]), &root);
+        assert_versions_consistent(&c, root);
+
+        let _v2 = c.commit_ip_version(&owner, &BytesN::from_array(&e, &[0x52u8; 32]), &root);
+        assert_versions_consistent(&c, root);
+
+        // Branch off v1 (a non-root version) to exercise multi-level trees.
+        let v3 = c.commit_ip_version(&owner, &BytesN::from_array(&e, &[0x53u8; 32]), &v1);
+        assert_versions_consistent(&c, root);
+
+        let _v4 = c.commit_ip_version(&owner, &BytesN::from_array(&e, &[0x54u8; 32]), &v3);
+        assert_versions_consistent(&c, root);
     }
 }
