@@ -25,3 +25,8 @@ fuzz/corpus/*/crashes/
 
 # Project issues file
 vrickish.md
+
+# General
+*.log
+*.tmp
+*.pid
