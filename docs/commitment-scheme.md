@@ -614,3 +614,83 @@ fn get_renewal_count(ip_id: u64) -> u32
 ```
 
 Returns how many times the IP has been renewed (0 if never renewed).
+
+---
+
+## #817 — ZK Proof Verification Cost
+
+`batch_verify_commitments` performs a Schnorr proof of knowledge over
+Ristretto255 for each entry.  The dominant cost per proof is:
+
+1. Two `CompressedRistretto::decompress()` calls (commitment + `R`)
+2. Three scalar multiplications: `s_secret·G`, `s_blinding·H`, `e·commitment`
+3. One point addition and one equality check
+
+### Instruction counts (Soroban instruction budget, deterministic)
+
+Benchmarks are in `contracts/ip_registry/src/benchmarks.rs`, tests
+`bench_zk_verify_single_proof` and `bench_zk_verify_batch_10_proofs`.
+
+| Scenario | CPU instruction budget upper bound |
+|---|---|
+| Single ZK proof (typical) | ≤ 5,000,000 instructions |
+| Batch of 10 ZK proofs (worst-case) | ≤ 50,000,000 instructions |
+
+Cost scales **linearly** with batch size (each proof is independent).  There is
+no batch amortisation — callers should size batches according to their ledger
+resource budget.
+
+### Fee estimation guidance
+
+Soroban charges resource fees based on the instruction count consumed per
+transaction.  For a single ZK proof verification the instruction count falls
+well within the default per-transaction limit.  For large batches (>10 entries)
+callers should pre-estimate costs using `cost_estimate().budget()` in a
+simulation call before submitting on-chain.
+
+---
+
+## #818 — Differential Invariant: ZK path vs Full-Reveal Path
+
+`batch_verify_commitments` (ZK Schnorr / Pedersen path) and
+`verify_commitment` (SHA-256 full-reveal path) operate on **different
+commitment types** but must never produce contradictory results for the same
+secret/blinding-factor pair committed to their respective scheme.
+
+### Invariant
+
+> For any `(secret, blinding_factor)` pair, a valid opening that is accepted
+> by one verification path will also be accepted by the other path when applied
+> to a commitment constructed by that path's scheme.  Conversely, an invalid
+> opening is rejected by **both** paths.
+>
+> No case exists where the ZK path accepts while the full-reveal path would
+> reject the same secret/blinding pair, or vice versa.
+
+### Boundary condition — cross-path non-acceptance
+
+Because the two paths use different commitment types (Ristretto255 compressed
+point vs SHA-256 digest), a commitment registered under one scheme cannot be
+verified by the other:
+
+- Applying `batch_verify_commitments` to a SHA-256-committed IP always returns
+  `valid: false` because a SHA-256 digest is not a valid Ristretto255 point
+  (decompression fails).
+- Applying `verify_commitment` to a Pedersen-committed IP always returns
+  `false` because `sha256(secret || blinding)` ≠ `pedersen_commit(secret, blinding)`.
+
+This ensures the two paths are **type-safe** and cannot cross-accept.
+
+### Test coverage
+
+Differential tests are in
+`contracts/ip_registry/src/differential_tests.rs`:
+
+| Test | Invariant verified |
+|---|---|
+| `differential_818_zk_accepts_valid_proof` | ZK path accepts a correct Schnorr proof |
+| `differential_818_zk_rejects_wrong_secret` | ZK path rejects a proof built with the wrong secret |
+| `differential_818_zk_rejects_wrong_blinding` | ZK path rejects a proof built with the wrong blinding factor |
+| `differential_818_full_reveal_accepts_valid_opening` | Full-reveal path accepts a correct SHA-256 opening |
+| `differential_818_paths_do_not_cross_accept` | Neither path accepts the other's commitment type |
+| `differential_818_random_secrets_satisfy_invariant` | 8 pseudo-random (secret, blinding) pairs all satisfy both accept and reject invariants |
