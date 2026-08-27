@@ -16,8 +16,6 @@ use types::*;
 
 mod zk_commitment;
 
-// FIXME: test.rs has compilation errors from merge conflict - re-enable after fix
-// FIXME: test.rs has pre-existing compilation errors from a merge conflict - fix before enabling
 #[cfg(test)]
 mod test;
 
