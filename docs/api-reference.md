@@ -1222,3 +1222,41 @@ The TCP peer address is used by default, and `X-Forwarded-For` is ignored to
 prevent clients from evading IP limits by spoofing headers. Set
 `RateLimitConfig::trust_proxy_headers` only when the API is reachable solely
 through a trusted reverse proxy that replaces `X-Forwarded-For`.
+
+---
+
+## Idempotency
+
+Write endpoints that accept an `x-idempotency-key` header (or an
+`idempotency_key` body field, e.g. `POST /swap/batch-initiate`) deduplicate
+retries: a request replayed with the same key within one hour of the
+original returns the cached result of that original request — including its
+HTTP status and body — instead of executing again, and the response carries
+an `x-idempotency-replayed: true` header.
+
+### Deployment topology
+
+That guarantee is enforced correctly **only when every instance shares the
+same deduplication backend**. `DeduplicationBackend` controls this for both
+the completed-response cache (`DeduplicationStore`) and the in-flight marker
+that stops a duplicate from executing concurrently with the original
+(`ConcurrentDeduplicator`):
+
+- `DeduplicationBackend::Redis(url)` — deduplication state lives in Redis,
+  shared by every instance pointed at that instance/cluster. **Required**
+  behind a load balancer running more than one instance; a client's retry has
+  no guarantee of landing on the same instance that handled the original
+  request, so without a shared backend the retry finds no record of the key
+  on the instance that receives it and the request executes a second time —
+  exactly the outcome an idempotency key exists to prevent. The batch-swap
+  idempotency store (`handlers::BATCH_SWAP_IDEMPOTENCY`) picks this backend
+  automatically when `REDIS_URL` is set.
+- `DeduplicationBackend::InProcess` (the default) — state lives in that
+  process's memory only. Safe for a single-instance deployment and for
+  tests, but **not safe for multi-instance deployment** for the reason
+  above: two instances each running this backend enforce independent state,
+  not a shared one.
+
+The one-hour TTL and the `x-idempotency-key` / `x-idempotency-replayed`
+header contract are the same under both backends — only where the state
+lives changes.
