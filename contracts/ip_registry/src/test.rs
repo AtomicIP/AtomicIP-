@@ -2737,6 +2737,35 @@ mod expiry_tests {
         let events = env.events().all();
         assert!(events.events().len() >= 1, "ip_clean event must be emitted");
     }
+
+    #[test]
+    fn test_verify_commitment_emits_expiry_event_exactly_once() {
+        let (env, client, _owner, ip_id) = setup();
+        let now = env.ledger().timestamp();
+        client.set_ip_expiry(&ip_id, &(now + 100), &500);
+
+        // Advance past expiry but still within the grace period.
+        env.ledger().with_mut(|l| l.timestamp = now + 150);
+
+        let secret = BytesN::from_array(&env, &[1u8; 32]);
+        let blinding = BytesN::from_array(&env, &[2u8; 32]);
+
+        // No events emitted yet (set_ip_expiry does not publish).
+        assert_eq!(env.events().all().events().len(), 0);
+
+        // Calling verify_commitment repeatedly must only fire the expiry
+        // event once for this expiry transition.
+        client.verify_commitment(&ip_id, &secret, &blinding);
+        assert_eq!(env.events().all().events().len(), 1);
+
+        client.verify_commitment(&ip_id, &secret, &blinding);
+        client.verify_commitment(&ip_id, &secret, &blinding);
+        assert_eq!(
+            env.events().all().events().len(),
+            1,
+            "EXPIRY_TOPIC must fire exactly once per expiry transition"
+        );
+    }
 }
 
 // ── #464: get_blinded_owner_batch tests ──────────────────────────────────────

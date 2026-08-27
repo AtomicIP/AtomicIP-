@@ -194,6 +194,8 @@ pub enum DataKey {
     EncryptedCommitment(u64),
     // Issue #465: Batch escrow — keyed by escrow_id (sha256 of ip_ids + timestamp)
     BatchEscrow(BytesN<32>),
+    // Issue #808: tracks whether EXPIRY_TOPIC has already fired for the current expiry_timestamp
+    ExpiryNotified(u64),
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -1624,8 +1626,24 @@ impl IpRegistry {
     ) -> bool {
         let record = require_ip_exists(&env, ip_id);
 
-        // Reject if expired
-        // Expiry check removed - field not in types
+        // Emit EXPIRY_TOPIC exactly once per expiry transition so off-chain
+        // indexers can cheaply detect an IP crossing into its grace period.
+        if record.expiry_timestamp != 0 && env.ledger().timestamp() >= record.expiry_timestamp {
+            let already_notified: bool = env
+                .storage()
+                .persistent()
+                .get(&DataKey::ExpiryNotified(ip_id))
+                .unwrap_or(false);
+            if !already_notified {
+                env.events().publish(
+                    (EXPIRY_TOPIC, ip_id),
+                    (record.owner.clone(), record.expiry_timestamp),
+                );
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::ExpiryNotified(ip_id), &true);
+            }
+        }
 
         // Concatenate secret || blinding_factor into Bytes, then SHA256
         let mut preimage = soroban_sdk::Bytes::new(&env);
@@ -4858,6 +4876,9 @@ impl IpRegistry {
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::IpRecord(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::ExpiryNotified(ip_id));
     }
 
     /// Renew an IP commitment's expiry. Owner-only.
@@ -4880,6 +4901,9 @@ impl IpRegistry {
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::IpRecord(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::ExpiryNotified(ip_id));
 
         env.events().publish(
             (symbol_short!("ip_renew"), record.owner),
