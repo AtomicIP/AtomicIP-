@@ -7,6 +7,7 @@ use axum::{
 use once_cell::sync::Lazy;
 use serde_json::Value;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::time::{Duration, Instant};
 use tracing::instrument;
 use crate::cache;
@@ -18,6 +19,24 @@ use crate::webhook;
 
 // #523: Per-handler idempotency store for batch swap operations.
 static BATCH_SWAP_IDEMPOTENCY: Lazy<DeduplicationStore> = Lazy::new(create_store);
+
+// #520: Mirrors the contract's MAX_BATCH_SIZE cap on a single batch.
+const MAX_BATCH_SIZE: usize = 50;
+
+// #469: Mirrors the contract's ~7-day swap expiry (ledger timestamp + 604800).
+const SWAP_EXPIRY_SECONDS: u64 = 604800;
+
+/// Process-local swap ID counter standing in for the contract's `NextId`
+/// until the handlers are wired to a live Soroban RPC client.
+static NEXT_SWAP_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Current Unix timestamp in seconds (substitute for the ledger timestamp).
+fn now_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
 
 // ── IP Registry ───────────────────────────────────────────────────────────────
 
@@ -307,7 +326,7 @@ pub async fn initiate_swap(Json(body): Json<InitiateSwapRequest>) -> Result<Json
     request_body = BatchInitiateSwapRequest,
     responses(
         (status = 200, description = "Swaps initiated, returns swap_ids", body = BatchInitiateSwapResponse),
-        (status = 400, description = "Validation error (mismatched lengths, invalid IP, etc.)", body = ErrorResponse),
+        (status = 400, description = "Validation error (mismatched lengths, empty/oversized batch, non-positive price, duplicate ip_ids, etc.)", body = ErrorResponse),
     )
 )]
 #[instrument(skip(body))]
@@ -358,14 +377,71 @@ pub async fn batch_initiate_swap(Json(body): Json<BatchInitiateSwapRequest>) -> 
         }
     }
 
-    // TODO: Call Soroban RPC to invoke atomic_swap.batch_initiate_swap
-    // On success, cache the result: BATCH_SWAP_IDEMPOTENCY.insert(key, (json_value, Instant::now()));
-    Err((
-        StatusCode::BAD_REQUEST,
-        Json(ErrorResponse {
-            error: "batch_initiate_swap not yet implemented".to_string(),
-        }),
-    ))
+    // #520: Cap the batch size at the contract's MAX_BATCH_SIZE (50).
+    if body.ip_ids.len() > MAX_BATCH_SIZE {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!(
+                    "batch size {} exceeds maximum of {}",
+                    body.ip_ids.len(),
+                    MAX_BATCH_SIZE
+                ),
+            }),
+        ));
+    }
+
+    // #520: Every price must be positive (contract: require_positive_price).
+    if let Some((&ip_id, _)) = body
+        .ip_ids
+        .iter()
+        .zip(body.prices.iter())
+        .find(|(_, &price)| price <= 0)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("price must be positive for ip_id {}", ip_id),
+            }),
+        ));
+    }
+
+    // Reuse the batch semantics of the contract's `batch_initiate_swap`
+    // (validated in the contract's batch tests): every IP in the batch gets a
+    // fresh Pending swap with a ~7-day expiry, IDs allocated sequentially
+    // (contract NextId). Until the handlers are wired to a live Soroban RPC
+    // client, the records are served back through the #316 cache so
+    // GET /swap/{swap_id} can read them.
+    let expiry = now_timestamp() + SWAP_EXPIRY_SECONDS;
+    let mut swap_ids = Vec::with_capacity(body.ip_ids.len());
+    for (&ip_id, &price) in body.ip_ids.iter().zip(body.prices.iter()) {
+        let swap_id = NEXT_SWAP_ID.fetch_add(1, Ordering::Relaxed);
+        let record = SwapRecord {
+            ip_id,
+            ip_registry_id: body.ip_registry_id.clone(),
+            seller: body.seller.clone(),
+            buyer: body.buyer.clone(),
+            price,
+            token: body.token.clone(),
+            status: SwapStatus::Pending,
+            expiry,
+        };
+        cache::set_with_ttl(&cache::swap_key(swap_id), &record, SWAP_EXPIRY_SECONDS);
+        swap_ids.push(swap_id);
+    }
+
+    let response = BatchInitiateSwapResponse { swap_ids };
+
+    // #523: Cache the result under the idempotency key so replays return the
+    // same swap IDs instead of allocating new ones.
+    if let Some(ref key) = body.idempotency_key {
+        BATCH_SWAP_IDEMPOTENCY.insert(
+            key.clone(),
+            (serde_json::to_value(&response).unwrap(), Instant::now()),
+        );
+    }
+
+    Ok(Json(response))
 }
 
 /// Buyer accepts a pending swap.

@@ -530,6 +530,147 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
+    #[tokio::test]
+    async fn test_batch_initiate_swap_success_returns_pending_swaps() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/swap/bulk/initiate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"ip_registry_id":"C1","ip_ids":[1,2,3],"seller":"G1","prices":[100,200,300],"buyer":"G2","token":"C2"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let swap_ids: Vec<u64> = json["swap_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|id| id.as_u64().unwrap())
+            .collect();
+        assert_eq!(swap_ids.len(), 3);
+        // IDs are allocated sequentially, mirroring the contract's NextId.
+        assert_eq!(swap_ids[0] + 1, swap_ids[1]);
+        assert_eq!(swap_ids[1] + 1, swap_ids[2]);
+
+        // The created swaps are readable via GET /swap/{id} as Pending with a
+        // ~7-day expiry, matching the contract's batch_initiate_swap.
+        for swap_id in swap_ids {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(format!("/v1/swap/{}", swap_id))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let record: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(record["status"], "Pending");
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            assert!(record["expiry"].as_u64().unwrap() > now);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_batch_initiate_swap_too_large_returns_400() {
+        let app = build_app();
+        let ip_ids: Vec<String> = (1..=51).map(|i| i.to_string()).collect();
+        let prices: Vec<String> = (1..=51).map(|i| (i * 100).to_string()).collect();
+        let body = format!(
+            r#"{{"ip_registry_id":"C1","ip_ids":[{}],"seller":"G1","prices":[{}],"buyer":"G2","token":"C2"}}"#,
+            ip_ids.join(","),
+            prices.join(",")
+        );
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/swap/bulk/initiate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["error"].as_str().unwrap().contains("exceeds maximum"));
+    }
+
+    #[tokio::test]
+    async fn test_batch_initiate_swap_non_positive_price_returns_400() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/swap/bulk/initiate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"ip_registry_id":"C1","ip_ids":[1,2],"seller":"G1","prices":[100,0],"buyer":"G2","token":"C2"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["error"].as_str().unwrap().contains("positive"));
+    }
+
+    #[tokio::test]
+    async fn test_batch_initiate_swap_idempotent_replay_returns_same_ids() {
+        let app = build_app();
+        let body = r#"{"ip_registry_id":"C1","ip_ids":[10,11],"seller":"G1","prices":[100,200],"buyer":"G2","token":"C2","idempotency_key":"batch-init-test-key"}"#;
+        let send = || {
+            app.clone().oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/swap/bulk/initiate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+        };
+
+        let first = send().await.unwrap();
+        let second = send().await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(second.status(), StatusCode::OK);
+
+        let parse_ids = |resp: axum::response::Response| {
+            async move {
+                let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+                let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                json["swap_ids"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|id| id.as_u64().unwrap())
+                    .collect::<Vec<u64>>()
+            }
+        };
+
+        let first_ids = parse_ids(first).await;
+        let second_ids = parse_ids(second).await;
+        assert_eq!(first_ids.len(), 2);
+        // #523: replay with the same key must return the cached swap IDs.
+        assert_eq!(first_ids, second_ids);
+    }
+
     // ── #319: API Versioning tests ────────────────────────────────────────────
 
     #[tokio::test]
