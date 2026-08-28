@@ -17,6 +17,10 @@ use opentelemetry_sdk::{runtime, trace as sdktrace};
 use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
+/// Canonical span attributes used by Soroban RPC child spans.
+pub const RPC_SYSTEM: &str = "stellar_soroban";
+pub const RPC_DURATION_MS: &str = "rpc.duration_ms";
+
 /// Initialise the global OTel tracer and set up the `tracing` subscriber.
 ///
 /// Returns a [`sdktrace::TracerProvider`] that **must** be kept alive for the
