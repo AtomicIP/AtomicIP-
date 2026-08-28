@@ -34,6 +34,8 @@ pub enum SwapStatus {
 #[derive(SimpleObject, Clone, Debug)]
 pub struct SwapRecord {
     pub swap_id: u64,
+    /// Contract address of the IP registry the swap's IP belongs to.
+    pub ip_registry_id: String,
     pub ip_id: u64,
     pub seller: String,
     pub buyer: String,

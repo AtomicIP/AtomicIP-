@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, Query},
+    extract::{Path, Query, State},
     http::{header, StatusCode},
     response::IntoResponse,
     Json,
@@ -573,7 +573,10 @@ pub async fn cancel_expired_swap(Path(swap_id): Path<u64>, Json(body): Json<Canc
     )
 )]
 #[instrument]
-pub async fn get_swap(Path(swap_id): Path<u64>) -> impl IntoResponse {
+pub async fn get_swap(
+    State(rpc_client): State<Arc<dyn crate::graphql::SorobanRpcClient>>,
+    Path(swap_id): Path<u64>,
+) -> impl IntoResponse {
     // #316: Check cache first
     let cache_key = cache::swap_key(swap_id);
     if let Some(cached) = cache::get::<SwapRecord>(&cache_key) {
@@ -584,12 +587,49 @@ pub async fn get_swap(Path(swap_id): Path<u64>) -> impl IntoResponse {
         ).into_response();
     }
 
-    // TODO: Call Soroban RPC to invoke atomic_swap.get_swap
-    (
-        StatusCode::NOT_FOUND,
-        [(header::CACHE_CONTROL, cache::no_cache_header())],
-        Json(serde_json::json!({ "error": format!("Swap {} not found", swap_id) })),
-    ).into_response()
+    // #316: On cache miss, read through to the Soroban RPC layer and backfill
+    // the cache so subsequent lookups hit the fast path.
+    match rpc_client.get_swap_record(swap_id).await {
+        Ok(Some(record)) => {
+            let record: SwapRecord = record.into();
+            cache::set(&cache_key, &record);
+            (
+                StatusCode::OK,
+                [(header::CACHE_CONTROL, cache::cache_control_header())],
+                Json(serde_json::to_value(record).unwrap()),
+            ).into_response()
+        }
+        // RPC miss or error: the swap does not exist (or is currently unreadable).
+        _ => (
+            StatusCode::NOT_FOUND,
+            [(header::CACHE_CONTROL, cache::no_cache_header())],
+            Json(serde_json::json!({ "error": format!("Swap {} not found", swap_id) })),
+        ).into_response(),
+    }
+}
+
+/// Bridge the RPC layer's record shape (shared with GraphQL) to the REST
+/// schema returned by `GET /v1/swap/{swap_id}`.
+impl From<crate::graphql::SwapRecord> for SwapRecord {
+    fn from(record: crate::graphql::SwapRecord) -> Self {
+        Self {
+            ip_id: record.ip_id,
+            ip_registry_id: record.ip_registry_id,
+            seller: record.seller,
+            buyer: record.buyer,
+            // GraphQL stringifies i128 prices to stay JSON-safe.
+            price: record.price.parse().unwrap_or(0),
+            token: record.token,
+            status: match record.status {
+                crate::graphql::SwapStatus::Pending => SwapStatus::Pending,
+                crate::graphql::SwapStatus::Accepted => SwapStatus::Accepted,
+                crate::graphql::SwapStatus::Completed => SwapStatus::Completed,
+                crate::graphql::SwapStatus::Disputed => SwapStatus::Disputed,
+                crate::graphql::SwapStatus::Cancelled => SwapStatus::Cancelled,
+            },
+            expiry: record.expiry,
+        }
+    }
 }
 
 // ── Webhooks ──────────────────────────────────────────────────────────────────
