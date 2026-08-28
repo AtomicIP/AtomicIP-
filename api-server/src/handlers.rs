@@ -13,6 +13,7 @@ use crate::cache;
 use crate::deduplication::{create_store, DeduplicationStore};
 use crate::schemas::*;
 use crate::webhook;
+use crate::websocket;
 
 // #523: Per-handler idempotency store for batch swap operations.
 static BATCH_SWAP_IDEMPOTENCY: Lazy<DeduplicationStore> = Lazy::new(create_store);
@@ -362,6 +363,7 @@ pub async fn accept_swap(Path(swap_id): Path<u64>, Json(body): Json<AcceptSwapRe
     cache::invalidate(&cache::swap_key(swap_id));
     // TODO: Call Soroban RPC to invoke atomic_swap.accept_swap
     webhook::trigger_swap_status_changed(swap_id, Some("Pending".to_string()), "Accepted".to_string());
+    websocket::trigger_swap_status_changed(swap_id, Some("Pending".to_string()), "Accepted".to_string());
     Err((
         StatusCode::NOT_FOUND,
         Json(ErrorResponse {
@@ -389,6 +391,7 @@ pub async fn reveal_key(Path(swap_id): Path<u64>, Json(body): Json<RevealKeyRequ
     cache::invalidate(&cache::swap_key(swap_id));
     // TODO: Call Soroban RPC to invoke atomic_swap.reveal_key
     webhook::trigger_swap_status_changed(swap_id, Some("Accepted".to_string()), "Completed".to_string());
+    websocket::trigger_swap_status_changed(swap_id, Some("Accepted".to_string()), "Completed".to_string());
     Err((
         StatusCode::NOT_FOUND,
         Json(ErrorResponse {
@@ -416,6 +419,7 @@ pub async fn cancel_swap(Path(swap_id): Path<u64>, Json(body): Json<CancelSwapRe
     cache::invalidate(&cache::swap_key(swap_id));
     // TODO: Call Soroban RPC to invoke atomic_swap.cancel_swap
     webhook::trigger_swap_status_changed(swap_id, Some("Pending".to_string()), "Cancelled".to_string());
+    websocket::trigger_swap_status_changed(swap_id, Some("Pending".to_string()), "Cancelled".to_string());
     Err((
         StatusCode::NOT_FOUND,
         Json(ErrorResponse {
@@ -443,6 +447,7 @@ pub async fn cancel_expired_swap(Path(swap_id): Path<u64>, Json(body): Json<Canc
     cache::invalidate(&cache::swap_key(swap_id));
     // TODO: Call Soroban RPC to invoke atomic_swap.cancel_expired_swap
     webhook::trigger_swap_status_changed(swap_id, Some("Accepted".to_string()), "Cancelled".to_string());
+    websocket::trigger_swap_status_changed(swap_id, Some("Accepted".to_string()), "Cancelled".to_string());
     Err((
         StatusCode::NOT_FOUND,
         Json(ErrorResponse {

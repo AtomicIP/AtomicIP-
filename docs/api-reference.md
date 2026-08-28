@@ -1222,3 +1222,197 @@ The TCP peer address is used by default, and `X-Forwarded-For` is ignored to
 prevent clients from evading IP limits by spoofing headers. Set
 `RateLimitConfig::trust_proxy_headers` only when the API is reachable solely
 through a trusted reverse proxy that replaces `X-Forwarded-For`.
+
+---
+
+## REST API Specification & OpenAPI Reference (v1)
+
+The API server exposes OpenAPI 3.x specifications at `GET /openapi.json`. All 13 core contract handlers and supplementary endpoints are explicitly attached to the `/v1/` prefix.
+
+### IP Registry Endpoints
+
+#### `POST /v1/ip/commit`
+- **Summary**: Commit and timestamp a new IP record.
+- **Auth**: Required (`X-Signature` or `Bearer`).
+- **Request Body**: `CommitIpRequest` (`owner`: string, `commitment_hash`: string).
+- **Responses**:
+  - `200 OK`: Returns assigned `ip_id` (u64).
+  - `400 Bad Request`: `ErrorResponse`.
+
+#### `GET /v1/ip/{ip_id}`
+- **Summary**: Retrieve IP record by ID.
+- **Path Params**: `ip_id` (u64).
+- **Responses**:
+  - `200 OK`: `IpRecord` (`ip_id`, `owner`, `commitment_hash`, `timestamp`, `revoked`).
+  - `404 Not Found`: `ErrorResponse`.
+
+#### `POST /v1/ip/transfer`
+- **Summary**: Transfer IP ownership.
+- **Auth**: Required (current owner signature).
+- **Request Body**: `TransferIpRequest` (`ip_id`: u64, `new_owner`: string).
+- **Responses**:
+  - `200 OK`: Ownership transferred successfully.
+  - `404 Not Found`: `ErrorResponse`.
+
+#### `POST /v1/ip/verify`
+- **Summary**: Verify Pedersen commitment pre-image against stored hash.
+- **Request Body**: `VerifyCommitmentRequest` (`ip_id`: u64, `secret`: string, `blinding_factor`: string).
+- **Responses**:
+  - `200 OK`: `VerifyCommitmentResponse` (`valid`: boolean).
+  - `404 Not Found`: `ErrorResponse`.
+
+#### `GET /v1/ip/owner/{owner}`
+- **Summary**: List IP IDs owned by an address (offset pagination).
+- **Path Params**: `owner` (string).
+- **Query Params**: `limit` (u64, default 50, max 200), `offset` (u64, default 0).
+- **Responses**:
+  - `200 OK`: `ListIpByOwnerResponse` (`ip_ids`: u64[], `total_count`: u64, `has_more`: bool).
+
+#### `GET /v1/ip/owner/{owner}/cursor`
+- **Summary**: List IP IDs owned by an address (cursor-based pagination).
+- **Path Params**: `owner` (string).
+- **Query Params**: `limit` (u64, default 50, max 200), `cursor` (string, optional).
+- **Responses**:
+  - `200 OK`: `PaginatedResponse<u64>` (`items`: u64[], `next_cursor`: string | null, `has_more`: bool, `total_count`: u64 | null).
+
+#### `POST /v1/bulk/commit-ip`
+- **Summary**: Commit multiple IP records in a single batch request.
+- **Auth**: Required.
+- **Request Body**: `BulkCommitIpRequest` (`owner`: string, `commitment_hashes`: string[]).
+- **Responses**:
+  - `200 OK`: `BulkCommitIpResponse` (`results`: BulkOperationResult[]).
+  - `400 Bad Request`: `ErrorResponse`.
+
+---
+
+### Atomic Swap Endpoints
+
+#### `POST /v1/swap/initiate`
+- **Summary**: Seller initiates an atomic swap for a patent.
+- **Auth**: Required (seller signature).
+- **Request Body**: `InitiateSwapRequest` (`ip_id`: u64, `seller`: string, `price`: u64, `buyer`: string).
+- **Responses**:
+  - `200 OK`: Returns assigned `swap_id` (u64).
+  - `400 Bad Request`: `ErrorResponse`.
+
+#### `POST /v1/swap/batch-initiate`
+- **Summary**: Seller initiates multiple atomic swaps in one batch request.
+- **Alias**: `POST /v1/swap/bulk/initiate`.
+- **Auth**: Required (seller signature, idempotency key supported).
+- **Request Body**: `BatchInitiateSwapRequest` (`ip_registry_id`: string, `ip_ids`: u64[], `seller`: string, `prices`: u64[], `buyer`: string, `token`: string, `idempotency_key`?: string).
+- **Responses**:
+  - `200 OK`: `BatchInitiateSwapResponse` (`swap_ids`: u64[]).
+  - `400 Bad Request`: `ErrorResponse` (e.g. mismatched array lengths or duplicate IDs).
+
+#### `POST /v1/swap/{swap_id}/accept`
+- **Summary**: Buyer accepts pending swap and escrows payment.
+- **Path Params**: `swap_id` (u64).
+- **Request Body**: `AcceptSwapRequest` (`buyer`: string).
+- **Responses**:
+  - `200 OK`: Swap accepted.
+  - `400 Bad Request` / `404 Not Found`: `ErrorResponse`.
+
+#### `POST /v1/swap/{swap_id}/reveal`
+- **Summary**: Seller reveals decryption key, releasing payment and completing the swap.
+- **Path Params**: `swap_id` (u64).
+- **Request Body**: `RevealKeyRequest` (`seller`: string, `decryption_key`: string).
+- **Responses**:
+  - `200 OK`: Key revealed and swap completed.
+  - `400 Bad Request` / `404 Not Found`: `ErrorResponse`.
+
+#### `POST /v1/swap/{swap_id}/cancel`
+- **Summary**: Cancel a pending swap before acceptance (seller or buyer).
+- **Path Params**: `swap_id` (u64).
+- **Request Body**: `CancelSwapRequest` (`caller`: string).
+- **Responses**:
+  - `200 OK`: Swap cancelled.
+  - `400 Bad Request` / `404 Not Found`: `ErrorResponse`.
+
+#### `POST /v1/swap/{swap_id}/cancel-expired`
+- **Summary**: Buyer cancels an accepted swap after timelock expiry.
+- **Path Params**: `swap_id` (u64).
+- **Request Body**: `CancelExpiredSwapRequest` (`buyer`: string).
+- **Responses**:
+  - `200 OK`: Expired swap cancelled and escrow refunded.
+  - `400 Bad Request` / `404 Not Found`: `ErrorResponse`.
+
+#### `GET /v1/swap/{swap_id}`
+- **Summary**: Retrieve atomic swap record by ID.
+- **Path Params**: `swap_id` (u64).
+- **Responses**:
+  - `200 OK`: `SwapRecord` (`swap_id`, `ip_id`, `seller`, `buyer`, `price`, `status`, `created_at`, `expires_at`, `token_address`).
+  - `404 Not Found`: `ErrorResponse`.
+
+#### `POST /v1/bulk/initiate-swap`
+- **Summary**: Bulk initiate atomic swaps with per-item status results.
+- **Request Body**: `BulkInitiateSwapRequest` (`ip_registry_id`: string, `ip_ids`: u64[], `seller`: string, `prices`: u64[], `buyer`: string, `token`: string).
+- **Responses**:
+  - `200 OK`: `BulkInitiateSwapResponse` (`results`: BulkOperationResult[]).
+  - `400 Bad Request`: `ErrorResponse`.
+
+---
+
+### Webhook & Event Endpoints
+
+#### `POST /v1/webhooks`
+- **Summary**: Register HTTP webhook for event notifications.
+- **Request Body**: `RegisterWebhookRequest` (`url`: string, `events`: string[]).
+- **Responses**:
+  - `200 OK`: `WebhookResponse` (`id`: string, `url`: string, `events`: string[], `created_at`: u64).
+  - `400 Bad Request`: `ErrorResponse`.
+
+#### `DELETE /v1/webhooks/{id}`
+- **Summary**: Unregister webhook by UUID.
+- **Path Params**: `id` (UUID).
+- **Responses**:
+  - `200 OK`: Webhook unregistered.
+  - `404 Not Found`: `ErrorResponse`.
+
+#### `POST /batch`
+- **Summary**: Execute arbitrary batched sub-requests in a single HTTP call.
+- **Request Body**: `BatchRequest` (`requests`: BatchOperation[]).
+- **Responses**:
+  - `200 OK`: `BatchResponse` (`responses`: BatchOperationResult[]).
+
+#### `GET /events`
+- **Summary**: Server-Sent Events (SSE) stream for contract events.
+- **Content-Type**: `text/event-stream`.
+
+---
+
+### Real-Time WebSocket Push (`GET /ws`)
+
+The WebSocket endpoint `GET /ws` provides full-duplex event streaming and real-time state change push notifications:
+
+#### Supported Client Actions:
+- `subscribe_ip_events`: Receive all new IP registration events.
+- `subscribe_swap_events`: Receive all new swap lifecycle events.
+- `subscribe_swap_status` (optional `swap_id`): Receive real-time swap state transition pushes (e.g. `Pending` → `Accepted` → `Completed` or `Cancelled`). When `swap_id` is supplied, notifications are filtered specifically to that swap.
+- `unsubscribe_swap_status` (optional `swap_id`): Unsubscribe from swap status change notifications.
+
+#### Pushed Event Format:
+```json
+{
+  "event_type": "swap_status_changed",
+  "swap_id": 42,
+  "old_status": "Pending",
+  "new_status": "Accepted",
+  "timestamp": 1713994200
+}
+```
+
+---
+
+## API Versioning & Deprecation Policy
+
+The Atomic Patent API server implements explicit semantic versioning with URL prefixing and HTTP header negotiation.
+
+### Versioning Rules
+1. **Explicit URL Versioning**: All production API endpoints are mounted under `/v1/...`. Unversioned requests are rejected with `404 Not Found`.
+2. **Accept-Version Negotiation**: Clients may provide the `Accept-Version` request header (e.g. `Accept-Version: 1.0.0`).
+3. **Rejection of Unknown Versions**: Any unsupported version (e.g. `Accept-Version: 2.0.0`) is rejected immediately with `406 Not Acceptable` and a structured error payload detailing supported versions.
+4. **Breaking Change Isolation**: Breaking changes in RPC-mapping or schema representations are strictly introduced in new version prefixes (e.g. `/v2/...`). The `/v1/` mapping layer remains invariant and protected from breaking smart contract SDK upgrades.
+5. **Deprecation Policy**:
+   - **Notice Period**: Minimum 6 months before retirement of any API version.
+   - **Deprecation Headers**: Deprecated versions return `Deprecation: true` and `Sunset: <RFC 2822 Timestamp>`.
+   - **Supported Versions**: `1.0.0` (current stable), `1.1.0`.

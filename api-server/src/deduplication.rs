@@ -93,15 +93,11 @@ impl ConcurrentDeduplicator {
     /// Check if a request is already in flight. If so, wait for it.
     /// Returns true if this is the first request, false if it's a duplicate.
     pub async fn acquire_or_wait(&self, key: &str) -> bool {
-        if let Some(_) = self.pending.get(key) {
-            // Request already in flight, wait for it
-            let notify = self.pending.get(key).unwrap().clone();
-            drop(notify);
-            let notify = self.pending.get(key).unwrap().clone();
+        let notify = self.pending.get(key).map(|entry| entry.value().clone());
+        if let Some(notify) = notify {
             notify.notified().await;
             false
         } else {
-            // First request, mark as in-flight
             self.pending.insert(key.to_string(), Arc::new(tokio::sync::Notify::new()));
             true
         }

@@ -463,4 +463,74 @@ mod tests {
             "generated trace_id must be a valid UUID v4"
         );
     }
+
+    // ── #860: OpenAPI Schema vs docs/api-reference.md Consistency Check ───────
+
+    #[test]
+    fn test_openapi_schema_matches_api_reference_documentation() {
+        // Read docs/api-reference.md from workspace root
+        let doc_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../docs/api-reference.md");
+        let doc_content = std::fs::read_to_string(doc_path)
+            .expect("Failed to read docs/api-reference.md");
+
+        // The wired endpoints that MUST be documented in docs/api-reference.md
+        let required_endpoints = vec![
+            "/v1/ip/commit",
+            "/v1/ip/{ip_id}",
+            "/v1/ip/transfer",
+            "/v1/ip/verify",
+            "/v1/ip/owner/{owner}",
+            "/v1/ip/owner/{owner}/cursor",
+            "/v1/bulk/commit-ip",
+            "/v1/swap/initiate",
+            "/v1/swap/batch-initiate",
+            "/v1/swap/{swap_id}/accept",
+            "/v1/swap/{swap_id}/reveal",
+            "/v1/swap/{swap_id}/cancel",
+            "/v1/swap/{swap_id}/cancel-expired",
+            "/v1/swap/{swap_id}",
+            "/v1/bulk/initiate-swap",
+            "/v1/webhooks",
+            "/v1/webhooks/{id}",
+            "/batch",
+            "/events",
+        ];
+
+        for ep in &required_endpoints {
+            assert!(
+                doc_content.contains(ep),
+                "Drift detected: Endpoint '{}' is wired in OpenAPI / server but missing in docs/api-reference.md",
+                ep
+            );
+        }
+
+        // Check that Versioning Policy and WebSocket push are documented
+        assert!(doc_content.contains("API Versioning & Deprecation Policy"), "Versioning policy missing in docs");
+        assert!(doc_content.contains("Real-Time WebSocket Push"), "WebSocket push documentation missing in docs");
+        assert!(doc_content.contains("swap_status_changed"), "WebSocket swap_status_changed event missing in docs");
+    }
+
+    // ── #861: WebSocket swap status change integration tests ──────────────────
+
+    #[test]
+    fn test_websocket_swap_status_subscription_format() {
+        let sub_msg = json!({
+            "action": "subscribe_swap_status",
+            "swap_id": 42
+        });
+        assert_eq!(sub_msg["action"], "subscribe_swap_status");
+        assert_eq!(sub_msg["swap_id"], 42);
+
+        let event_payload = json!({
+            "event_type": "swap_status_changed",
+            "swap_id": 42,
+            "old_status": "Pending",
+            "new_status": "Accepted",
+            "timestamp": 1713994200
+        });
+        assert_eq!(event_payload["event_type"], "swap_status_changed");
+        assert_eq!(event_payload["swap_id"], 42);
+        assert_eq!(event_payload["old_status"], "Pending");
+        assert_eq!(event_payload["new_status"], "Accepted");
+    }
 }

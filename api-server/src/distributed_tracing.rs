@@ -126,19 +126,21 @@ pub async fn distributed_tracing_middleware(
 
     let cx = Context::current_with_span(span.clone_as_boxed_ref());
     // Attach a compatible context so tracing:: macros pick up the OTel trace-ID.
-    let _guard = cx.clone().attach();
+    {
+        let _guard = cx.clone().attach();
 
-    // Expose trace context to downstream handlers via extensions.
-    req.extensions_mut().insert(trace_ctx.clone());
+        // Expose trace context to downstream handlers via extensions.
+        req.extensions_mut().insert(trace_ctx.clone());
 
-    tracing::info!(
-        trace_id = %trace_ctx.trace_id,
-        span_id  = %trace_ctx.span_id,
-        parent_span_id = ?trace_ctx.parent_span_id,
-        method = %method,
-        uri    = %uri,
-        "request started"
-    );
+        tracing::info!(
+            trace_id = %trace_ctx.trace_id,
+            span_id  = %trace_ctx.span_id,
+            parent_span_id = ?trace_ctx.parent_span_id,
+            method = %method,
+            uri    = %uri,
+            "request started"
+        );
+    }
 
     let mut response = next.run(req).await;
     let duration = trace_ctx.start_time.elapsed();
@@ -289,11 +291,11 @@ pub fn get_trace_context(headers: &HeaderMap) -> DistributedTraceContext {
 // ── Trait to allow span boxing without object-safety constraints ──────────────
 
 trait SpanExt {
-    fn clone_as_boxed_ref(&mut self) -> opentelemetry::trace::BoxedSpan;
+    fn clone_as_boxed_ref(&mut self) -> opentelemetry::global::BoxedSpan;
 }
 
 impl<S: Span> SpanExt for S {
-    fn clone_as_boxed_ref(&mut self) -> opentelemetry::trace::BoxedSpan {
+    fn clone_as_boxed_ref(&mut self) -> opentelemetry::global::BoxedSpan {
         // For the context guard we start a no-op placeholder; the real span
         // lives in `span` and is ended explicitly above.
         opentelemetry::global::tracer("atomic-patent")

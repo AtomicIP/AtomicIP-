@@ -339,9 +339,7 @@ pub fn invalidate_pattern(pattern: &str) {
 
 /// Scan for keys matching a Redis glob `pattern` and delete them.
 fn redis_delete_matching(conn: &mut redis::Connection, pattern: &str) -> redis::RedisResult<()> {
-    let keys: Vec<String> = conn
-        .scan_match::<_, String>(pattern)?
-        .collect::<Result<Vec<String>, redis::RedisError>>()?;
+    let keys: Vec<String> = conn.scan_match::<_, String>(pattern)?.collect();
     if !keys.is_empty() {
         let _: () = conn.del(keys)?;
     }
