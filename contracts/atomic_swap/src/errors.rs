@@ -67,4 +67,7 @@ pub enum ContractError {
     TimelockNotElapsed                    = 63,
     RulingFinalized                       = 64,
     BatchArbitrationDisabled              = 65,
+    // #354: Insurance reservation errors
+    InsuranceNotReserved                  = 66,
+    InsufficientInsuranceReserve          = 67,
 }

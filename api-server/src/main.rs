@@ -12,9 +12,7 @@ use std::sync::Arc;
 #[derive(Clone)]
 struct AppState {
     schema:           graphql::AtomicIpSchema,
-    /// Data-access layer for on-chain reads; the REST read handlers (e.g.
-    /// `get_swap`) consult this on cache miss, mirroring the GraphQL path.
-    rpc_client:       Arc<dyn graphql::SorobanRpcClient>,
+    query_client:     Arc<graphql::SorobanQueryClient>,
     ws_broadcaster:   Arc<websocket::EventBroadcaster>,
     sse_broadcaster:  Arc<events::EventBroadcaster>,
     health_checker:   Arc<health::HealthChecker>,
@@ -186,16 +184,16 @@ async fn main() {
     metrics::init();
 
     let subscription_broadcaster = init_subscription_broadcaster().await;
-    let rpc_client: Arc<dyn graphql::SorobanRpcClient> =
-        Arc::new(graphql::MockSorobanRpcClient::default());
+    let rpc_client: Arc<dyn graphql::SorobanRpcClient> = Arc::new(graphql::MockSorobanRpcClient::default());
+    let query_client = Arc::new(graphql::SorobanQueryClient::new(rpc_client.clone()));
     let schema = graphql::build_schema_with_broadcaster(
-        rpc_client.clone(),
+        rpc_client,
         subscription_broadcaster.clone(),
     );
 
     let state = AppState {
         schema,
-        rpc_client,
+        query_client,
         ws_broadcaster:  Arc::new(websocket::EventBroadcaster::new()),
         sse_broadcaster: Arc::new(events::create_event_broadcaster().0),
         health_checker:  Arc::new(health::HealthChecker::new()),
@@ -216,6 +214,8 @@ async fn main() {
         .route("/ip/transfer",                    post(handlers::transfer_ip))
         .route("/ip/verify",                      post(handlers::verify_commitment))
         .route("/ip/owner/{owner}",               get(handlers::list_ip_by_owner))
+        .route("/ip/owner/{owner}/cursor",        get(handlers::list_ip_by_owner_cursor))
+        .route("/ip/owner/{owner}/cursor",        get(handlers::list_ip_by_owner_cursor))
         .route("/swap/initiate",                  post(handlers::initiate_swap))
         .route("/swap/batch-initiate",            post(handlers::batch_initiate_swap))
         .route("/swap/{swap_id}/accept",          post(handlers::accept_swap))
@@ -278,12 +278,7 @@ async fn events_handler(
 }
 
 fn build_app() -> Router {
-    app_with_rpc_client(Arc::new(graphql::MockSorobanRpcClient::default()))
-}
-
-/// Build the versioned `/v1` router around a specific RPC client (the mock by
-/// default, or a stub in tests) so read handlers can be exercised end-to-end.
-fn app_with_rpc_client(rpc_client: Arc<dyn graphql::SorobanRpcClient>) -> Router {
+    let query_client = Arc::new(graphql::SorobanQueryClient::new(Arc::new(graphql::MockSorobanRpcClient::default())));
     let schema = graphql::build_schema();
     let health_checker = Arc::new(health::HealthChecker::new());
     let circuit_breaker = Arc::new(circuit_breaker::CircuitBreaker::new(
@@ -299,6 +294,14 @@ fn app_with_rpc_client(rpc_client: Arc<dyn graphql::SorobanRpcClient>) -> Router
     };
 
     let rate_limiter = rate_limit::RateLimitMiddleware::new(rate_limit::RateLimitConfig::default());
+    let state = AppState {
+        schema,
+        query_client,
+        ws_broadcaster: Arc::new(websocket::EventBroadcaster::new()),
+        sse_broadcaster: Arc::new(events::create_event_broadcaster().0),
+        health_checker,
+    };
+
     Router::new()
         .route("/health", get(health::health_handler))
         .route("/version", get(versioning::get_version_info))
@@ -308,6 +311,8 @@ fn app_with_rpc_client(rpc_client: Arc<dyn graphql::SorobanRpcClient>) -> Router
         .route("/v1/ip/transfer", post(handlers::transfer_ip))
         .route("/v1/ip/verify", post(handlers::verify_commitment))
         .route("/v1/ip/owner/{owner}", get(handlers::list_ip_by_owner))
+        .route("/v1/ip/owner/{owner}/cursor", get(handlers::list_ip_by_owner_cursor))
+        .route("/v1/ip/owner/{owner}/cursor", get(handlers::list_ip_by_owner_cursor))
         .route("/v1/swap/initiate", post(handlers::initiate_swap))
         .route("/v1/swap/bulk/initiate", post(handlers::batch_initiate_swap))
         .route("/v1/swap/{swap_id}/accept", post(handlers::accept_swap))
@@ -640,6 +645,147 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_batch_initiate_swap_success_returns_pending_swaps() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/swap/bulk/initiate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"ip_registry_id":"C1","ip_ids":[1,2,3],"seller":"G1","prices":[100,200,300],"buyer":"G2","token":"C2"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let swap_ids: Vec<u64> = json["swap_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|id| id.as_u64().unwrap())
+            .collect();
+        assert_eq!(swap_ids.len(), 3);
+        // IDs are allocated sequentially, mirroring the contract's NextId.
+        assert_eq!(swap_ids[0] + 1, swap_ids[1]);
+        assert_eq!(swap_ids[1] + 1, swap_ids[2]);
+
+        // The created swaps are readable via GET /swap/{id} as Pending with a
+        // ~7-day expiry, matching the contract's batch_initiate_swap.
+        for swap_id in swap_ids {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(format!("/v1/swap/{}", swap_id))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let record: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(record["status"], "Pending");
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            assert!(record["expiry"].as_u64().unwrap() > now);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_batch_initiate_swap_too_large_returns_400() {
+        let app = build_app();
+        let ip_ids: Vec<String> = (1..=51).map(|i| i.to_string()).collect();
+        let prices: Vec<String> = (1..=51).map(|i| (i * 100).to_string()).collect();
+        let body = format!(
+            r#"{{"ip_registry_id":"C1","ip_ids":[{}],"seller":"G1","prices":[{}],"buyer":"G2","token":"C2"}}"#,
+            ip_ids.join(","),
+            prices.join(",")
+        );
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/swap/bulk/initiate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["error"].as_str().unwrap().contains("exceeds maximum"));
+    }
+
+    #[tokio::test]
+    async fn test_batch_initiate_swap_non_positive_price_returns_400() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/swap/bulk/initiate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"ip_registry_id":"C1","ip_ids":[1,2],"seller":"G1","prices":[100,0],"buyer":"G2","token":"C2"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["error"].as_str().unwrap().contains("positive"));
+    }
+
+    #[tokio::test]
+    async fn test_batch_initiate_swap_idempotent_replay_returns_same_ids() {
+        let app = build_app();
+        let body = r#"{"ip_registry_id":"C1","ip_ids":[10,11],"seller":"G1","prices":[100,200],"buyer":"G2","token":"C2","idempotency_key":"batch-init-test-key"}"#;
+        let send = || {
+            app.clone().oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/swap/bulk/initiate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+        };
+
+        let first = send().await.unwrap();
+        let second = send().await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(second.status(), StatusCode::OK);
+
+        let parse_ids = |resp: axum::response::Response| {
+            async move {
+                let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+                let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                json["swap_ids"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|id| id.as_u64().unwrap())
+                    .collect::<Vec<u64>>()
+            }
+        };
+
+        let first_ids = parse_ids(first).await;
+        let second_ids = parse_ids(second).await;
+        assert_eq!(first_ids.len(), 2);
+        // #523: replay with the same key must return the cached swap IDs.
+        assert_eq!(first_ids, second_ids);
     }
 
     // ── #319: API Versioning tests ────────────────────────────────────────────

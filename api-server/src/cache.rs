@@ -434,22 +434,51 @@ pub struct CacheStats {
     pub total_entries: usize,
 }
 
+// ── Compound Invalidation ─────────────────────────────────────────────────────
+
+/// Invalidate every cached view that depends on an IP record: the record
+/// itself and all owner list pages.
+///
+/// Call *after* a write that mutates the record (e.g. `transfer_ip`) so a
+/// concurrent read that repopulated the cache with pre-write state during
+/// the write window is cleared instead of served stale for the full TTL.
+pub fn invalidate_ip(ip_id: u64) {
+    invalidate(&ip_key(ip_id));
+    invalidate_prefix("ip:list:");
+}
+
+/// Invalidate every cached view that depends on a swap's state: the swap
+/// record itself and both seller/buyer list pages.
+///
+/// Call *after* a write that mutates the swap (accept, reveal, cancel, ...)
+/// so a concurrent read that repopulated the cache with pre-write state
+/// during the write window is cleared instead of served stale for the full
+/// TTL.
+pub fn invalidate_swap(swap_id: u64) {
+    invalidate(&swap_key(swap_id));
+    invalidate_prefix("swap:seller:");
+    invalidate_prefix("swap:buyer:");
+}
+
 // ── Contract Event Invalidation ───────────────────────────────────────────────
 
 /// Invalidate cache entries based on contract events.
 /// Call this when processing contract events to keep cache consistent.
+///
+/// Event-driven invalidation happens *after* the ledger change commits
+/// (events are emitted by the confirmed transaction), so it is inherently
+/// post-write; the compound helpers above encode the same full key set for
+/// handlers that write directly.
 pub fn invalidate_on_contract_event(event_type: &str, related_id: u64) {
     match event_type {
         "ip_committed" => {
             invalidate(&ip_key(related_id));
         }
         "ip_transferred" => {
-            invalidate(&ip_key(related_id));
-            invalidate_prefix("ip:list:");
+            invalidate_ip(related_id);
         }
         "ip_revoked" => {
-            invalidate(&ip_key(related_id));
-            invalidate_prefix("ip:list:");
+            invalidate_ip(related_id);
         }
         "swap_initiated" => {
             invalidate(&swap_key(related_id));
@@ -458,21 +487,15 @@ pub fn invalidate_on_contract_event(event_type: &str, related_id: u64) {
             invalidate_prefix("swap:ip:");
         }
         "swap_accepted" => {
-            invalidate(&swap_key(related_id));
-            invalidate_prefix("swap:seller:");
-            invalidate_prefix("swap:buyer:");
+            invalidate_swap(related_id);
         }
         "swap_completed" => {
-            invalidate(&swap_key(related_id));
-            invalidate_prefix("swap:seller:");
-            invalidate_prefix("swap:buyer:");
+            invalidate_swap(related_id);
             // Invalidate reputation cache for both parties
             invalidate_prefix("reputation:");
         }
         "swap_cancelled" => {
-            invalidate(&swap_key(related_id));
-            invalidate_prefix("swap:seller:");
-            invalidate_prefix("swap:buyer:");
+            invalidate_swap(related_id);
         }
         "dispute_raised" => {
             invalidate(&swap_key(related_id));
@@ -597,6 +620,40 @@ mod tests {
         assert!(!exists("swap:1"));
         assert!(!exists("swap:seller:abc:10:0"));
         assert!(!exists("reputation:abc"));
+    }
+
+    #[test]
+    fn test_invalidate_ip_clears_record_and_owner_lists() {
+        clear();
+        set("ip:1", &Dummy { val: 1 });
+        set("ip:list:ownerA:10:0", &Dummy { val: 2 });
+        set("ip:list:ownerB:20:5", &Dummy { val: 3 });
+        set("ip:listx:ownerC:10:0", &Dummy { val: 4 });
+
+        invalidate_ip(1);
+
+        assert!(!exists("ip:1"));
+        assert!(!exists("ip:list:ownerA:10:0"));
+        assert!(!exists("ip:list:ownerB:20:5"));
+        // unrelated key survives
+        assert!(exists("ip:listx:ownerC:10:0"));
+    }
+
+    #[test]
+    fn test_invalidate_swap_clears_record_and_lists() {
+        clear();
+        set("swap:1", &Dummy { val: 1 });
+        set("swap:seller:alice:10:0", &Dummy { val: 2 });
+        set("swap:buyer:bob:10:0", &Dummy { val: 3 });
+        set("swap:other:2", &Dummy { val: 4 });
+
+        invalidate_swap(1);
+
+        assert!(!exists("swap:1"));
+        assert!(!exists("swap:seller:alice:10:0"));
+        assert!(!exists("swap:buyer:bob:10:0"));
+        // unrelated swap survives
+        assert!(exists("swap:other:2"));
     }
 
     #[test]

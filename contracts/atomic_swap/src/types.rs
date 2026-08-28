@@ -520,6 +520,34 @@ pub struct InsurancePayoutEvent {
     pub payout_amount: i128,
 }
 
+/// Solvency snapshot for one token's insurance pool.
+///
+/// `collateralized` is the invariant the contract cares about: while it holds,
+/// every outstanding policy can be paid in full regardless of claim order.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct InsurancePoolStatus {
+    /// Token the pool is denominated in.
+    pub token: Address,
+    /// Actual balance credited to the pool.
+    pub balance: i128,
+    /// Sum of coverage reserved by all outstanding policies.
+    pub reserved: i128,
+    /// True while `balance >= reserved`.
+    pub collateralized: bool,
+    /// `reserved - balance` when under-collateralized, else 0.
+    pub shortfall: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct InsurancePoolFundedEvent {
+    pub token: Address,
+    pub funder: Address,
+    pub amount: i128,
+    pub new_balance: i128,
+}
+
 // ── Rollback Event ────────────────────────────────────────────────────────────
 
 #[contracttype]

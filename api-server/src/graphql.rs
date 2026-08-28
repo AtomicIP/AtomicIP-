@@ -6,6 +6,7 @@ use futures::{Stream, StreamExt};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use redis::AsyncCommands;
 use redis::streams::{StreamMaxlen, StreamReadOptions};
+use crate::distributed_tracing::in_soroban_rpc_span;
 
 // ── GraphQL Types ─────────────────────────────────────────────────────────────
 
@@ -165,6 +166,7 @@ impl HasTimestamp for CategoryAssigned {
 #[async_trait::async_trait]
 pub trait SorobanRpcClient: Send + Sync {
     async fn get_ip_record(&self, ip_id: u64) -> Result<Option<IpRecord>, String>;
+    async fn get_ips_by_owner(&self, owner: &str) -> Result<Vec<u64>, String>;
     async fn get_swap_record(&self, swap_id: u64) -> Result<Option<SwapRecord>, String>;
     async fn get_swaps_by_seller(&self, seller: &str, limit: u64, cursor: Option<String>) -> Result<SwapConnection, String>;
     async fn get_swaps_by_buyer(&self, buyer: &str, limit: u64, cursor: Option<String>) -> Result<SwapConnection, String>;
@@ -181,6 +183,10 @@ pub struct MockSorobanRpcClient;
 impl SorobanRpcClient for MockSorobanRpcClient {
     async fn get_ip_record(&self, _ip_id: u64) -> Result<Option<IpRecord>, String> {
         Ok(None)
+    }
+
+    async fn get_ips_by_owner(&self, _owner: &str) -> Result<Vec<u64>, String> {
+        Ok(vec![])
     }
 
     async fn get_swap_record(&self, _swap_id: u64) -> Result<Option<SwapRecord>, String> {
@@ -226,6 +232,22 @@ pub struct GraphQLContext {
     pub rpc_client: Arc<dyn SorobanRpcClient>,
 }
 
+/// Shared contract-query client used by REST handlers as well as GraphQL.
+#[derive(Clone)]
+pub struct SorobanQueryClient {
+    rpc_client: Arc<dyn SorobanRpcClient>,
+}
+
+impl SorobanQueryClient {
+    pub fn new(rpc_client: Arc<dyn SorobanRpcClient>) -> Self {
+        Self { rpc_client }
+    }
+
+    pub async fn list_ip_by_owner(&self, owner: &str) -> Result<Vec<u64>, String> {
+        self.rpc_client.get_ips_by_owner(owner).await
+    }
+}
+
 impl GraphQLContext {
     pub fn new(rpc_client: Arc<dyn SorobanRpcClient>) -> Self {
         Self { rpc_client }
@@ -253,7 +275,7 @@ impl QueryRoot {
     /// Fetch an IP record by its ID.
     async fn ip(&self, ctx: &Context<'_>, ip_id: u64) -> Result<Option<IpRecord>, async_graphql::Error> {
         let rpc_client = get_rpc_client(ctx);
-        rpc_client.get_ip_record(ip_id)
+        in_soroban_rpc_span("get_ip_record", || rpc_client.get_ip_record(ip_id))
             .await
             .map_err(|e| async_graphql::Error::new(e))
     }
@@ -261,7 +283,7 @@ impl QueryRoot {
     /// Fetch a swap record by its ID.
     async fn swap(&self, ctx: &Context<'_>, swap_id: u64) -> Result<Option<SwapRecord>, async_graphql::Error> {
         let rpc_client = get_rpc_client(ctx);
-        rpc_client.get_swap_record(swap_id)
+        in_soroban_rpc_span("get_swap_record", || rpc_client.get_swap_record(swap_id))
             .await
             .map_err(|e| async_graphql::Error::new(e))
     }
@@ -275,7 +297,7 @@ impl QueryRoot {
         cursor: Option<String>,
     ) -> Result<SwapConnection, async_graphql::Error> {
         let rpc_client = get_rpc_client(ctx);
-        rpc_client.get_swaps_by_seller(&seller, limit.unwrap_or(50), cursor)
+        in_soroban_rpc_span("get_swaps_by_seller", || rpc_client.get_swaps_by_seller(&seller, limit.unwrap_or(50), cursor))
             .await
             .map_err(|e| async_graphql::Error::new(e))
     }
@@ -289,7 +311,7 @@ impl QueryRoot {
         cursor: Option<String>,
     ) -> Result<SwapConnection, async_graphql::Error> {
         let rpc_client = get_rpc_client(ctx);
-        rpc_client.get_swaps_by_buyer(&buyer, limit.unwrap_or(50), cursor)
+        in_soroban_rpc_span("get_swaps_by_buyer", || rpc_client.get_swaps_by_buyer(&buyer, limit.unwrap_or(50), cursor))
             .await
             .map_err(|e| async_graphql::Error::new(e))
     }
@@ -303,7 +325,7 @@ impl QueryRoot {
         cursor: Option<String>,
     ) -> Result<SwapConnection, async_graphql::Error> {
         let rpc_client = get_rpc_client(ctx);
-        rpc_client.get_swaps_by_ip(ip_id, limit.unwrap_or(50), cursor)
+        in_soroban_rpc_span("get_swaps_by_ip", || rpc_client.get_swaps_by_ip(ip_id, limit.unwrap_or(50), cursor))
             .await
             .map_err(|e| async_graphql::Error::new(e))
     }
@@ -311,7 +333,7 @@ impl QueryRoot {
     /// Retrieve all dispute evidence hashes for a swap.
     async fn dispute_evidence(&self, ctx: &Context<'_>, swap_id: u64) -> Result<Vec<DisputeEvidence>, async_graphql::Error> {
         let rpc_client = get_rpc_client(ctx);
-        rpc_client.get_dispute_evidence(swap_id)
+        in_soroban_rpc_span("get_dispute_evidence", || rpc_client.get_dispute_evidence(swap_id))
             .await
             .map_err(|e| async_graphql::Error::new(e))
     }
@@ -319,7 +341,7 @@ impl QueryRoot {
     /// Get reputation information for a user.
     async fn reputation(&self, ctx: &Context<'_>, address: String) -> Result<Option<Reputation>, async_graphql::Error> {
         let rpc_client = get_rpc_client(ctx);
-        rpc_client.get_reputation(&address)
+        in_soroban_rpc_span("get_reputation", || rpc_client.get_reputation(&address))
             .await
             .map_err(|e| async_graphql::Error::new(e))
     }
