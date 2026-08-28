@@ -100,6 +100,21 @@ contents, since that could itself grow without bound.
 ### Atomic Swap Contract
 - **SwapRecord (u64):** Stores details of an active/completed swap (seller, buyer, price, status, escrowed token).
 
+## ⚡ Performance Benchmarks
+
+`contracts/ip_registry/src/benchmarks.rs` (`cargo test bench_ -p ip_registry`) tracks CPU-instruction
+budget regressions for the core IP Registry operations against these baseline ceilings:
+
+| Operation | CPU instruction ceiling |
+|---|---|
+| `commit_ip` | 600,000 |
+| `verify_commitment` | 200,000 |
+| `get_ip` | 100,000 |
+| `list_ip_by_owner` (5 IPs) | 150,000 |
+
+These are conservative upper bounds, not measured averages — a benchmark failing past its ceiling
+signals a real regression worth investigating, not just budget churn.
+
 ## 🌍 Infrastructure
 
 - **Network:** Stellar Testnet & Mainnet.

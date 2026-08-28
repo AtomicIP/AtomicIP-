@@ -19,9 +19,8 @@ mod zk_commitment;
 #[cfg(test)]
 mod test;
 
-// FIXME: benchmarks.rs has pre-existing compilation errors from a merge conflict
-// #[cfg(test)]
-// mod benchmarks;
+#[cfg(test)]
+mod benchmarks;
 
 #[cfg(test)]
 mod mutation_tests;

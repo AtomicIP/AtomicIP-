@@ -62,7 +62,7 @@ mod benchmarks {
         let secret = BytesN::from_array(&env, &[0x03u8; 32]);
         let blinding = BytesN::from_array(&env, &[0x04u8; 32]);
         let hash = make_commitment(&env, &secret, &blinding);
-        let ip_id = client.commit_ip(&owner, &hash);
+        let ip_id = client.commit_ip(&owner, &hash, &0u32);
 
         env.cost_estimate().budget().reset_default();
         client.verify_commitment(&ip_id, &secret, &blinding);
