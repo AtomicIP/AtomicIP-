@@ -12,6 +12,9 @@ use std::sync::Arc;
 #[derive(Clone)]
 struct AppState {
     schema:           graphql::AtomicIpSchema,
+    /// Data-access layer for on-chain reads; the REST read handlers (e.g.
+    /// `get_swap`) consult this on cache miss, mirroring the GraphQL path.
+    rpc_client:       Arc<dyn graphql::SorobanRpcClient>,
     ws_broadcaster:   Arc<websocket::EventBroadcaster>,
     sse_broadcaster:  Arc<events::EventBroadcaster>,
     health_checker:   Arc<health::HealthChecker>,
@@ -20,6 +23,12 @@ struct AppState {
 impl FromRef<AppState> for Arc<health::HealthChecker> {
     fn from_ref(state: &AppState) -> Self {
         state.health_checker.clone()
+    }
+}
+
+impl FromRef<AppState> for Arc<dyn graphql::SorobanRpcClient> {
+    fn from_ref(state: &AppState) -> Self {
+        state.rpc_client.clone()
     }
 }
 
@@ -177,13 +186,16 @@ async fn main() {
     metrics::init();
 
     let subscription_broadcaster = init_subscription_broadcaster().await;
+    let rpc_client: Arc<dyn graphql::SorobanRpcClient> =
+        Arc::new(graphql::MockSorobanRpcClient::default());
     let schema = graphql::build_schema_with_broadcaster(
-        Arc::new(graphql::MockSorobanRpcClient::default()),
+        rpc_client.clone(),
         subscription_broadcaster.clone(),
     );
 
     let state = AppState {
         schema,
+        rpc_client,
         ws_broadcaster:  Arc::new(websocket::EventBroadcaster::new()),
         sse_broadcaster: Arc::new(events::create_event_broadcaster().0),
         health_checker:  Arc::new(health::HealthChecker::new()),
@@ -266,13 +278,26 @@ async fn events_handler(
 }
 
 fn build_app() -> Router {
+    app_with_rpc_client(Arc::new(graphql::MockSorobanRpcClient::default()))
+}
+
+/// Build the versioned `/v1` router around a specific RPC client (the mock by
+/// default, or a stub in tests) so read handlers can be exercised end-to-end.
+fn app_with_rpc_client(rpc_client: Arc<dyn graphql::SorobanRpcClient>) -> Router {
     let schema = graphql::build_schema();
     let health_checker = Arc::new(health::HealthChecker::new());
     let circuit_breaker = Arc::new(circuit_breaker::CircuitBreaker::new(
         "default",
         circuit_breaker::CircuitBreakerConfig::default(),
     ));
-    
+    let state = AppState {
+        schema,
+        rpc_client,
+        ws_broadcaster:  Arc::new(websocket::EventBroadcaster::new()),
+        sse_broadcaster: Arc::new(events::create_event_broadcaster().0),
+        health_checker,
+    };
+
     let rate_limiter = rate_limit::RateLimitMiddleware::new(rate_limit::RateLimitConfig::default());
     Router::new()
         .route("/health", get(health::health_handler))
@@ -471,6 +496,110 @@ mod tests {
             )
             .await
             .unwrap();
+        assert!(resp.headers().contains_key("cache-control"));
+    }
+
+    // ── Swap-lookup read path: RPC read-through + cache backfill ────────────
+
+    /// Stub RPC client that returns a single known swap so the read path can
+    /// be exercised without a live Soroban node.
+    struct StubSwapRpcClient;
+
+    #[async_trait::async_trait]
+    impl graphql::SorobanRpcClient for StubSwapRpcClient {
+        async fn get_ip_record(&self, _ip_id: u64) -> Result<Option<graphql::IpRecord>, String> {
+            Ok(None)
+        }
+        async fn get_swap_record(&self, _swap_id: u64) -> Result<Option<graphql::SwapRecord>, String> {
+            Ok(Some(graphql::SwapRecord {
+                swap_id: 42,
+                ip_registry_id: "REG1".to_string(),
+                ip_id: 7,
+                seller: "GSELLER".to_string(),
+                buyer: "GBUYER".to_string(),
+                price: "1000".to_string(),
+                token: "CTOKEN".to_string(),
+                status: graphql::SwapStatus::Pending,
+                expiry: 999,
+                arbitrator: None,
+            }))
+        }
+        async fn get_swaps_by_seller(&self, _seller: &str, _limit: u64, _cursor: Option<String>) -> Result<graphql::SwapConnection, String> {
+            Ok(graphql::SwapConnection { swap_ids: vec![], has_next_page: false, cursor: None })
+        }
+        async fn get_swaps_by_buyer(&self, _buyer: &str, _limit: u64, _cursor: Option<String>) -> Result<graphql::SwapConnection, String> {
+            Ok(graphql::SwapConnection { swap_ids: vec![], has_next_page: false, cursor: None })
+        }
+        async fn get_swaps_by_ip(&self, _ip_id: u64, _limit: u64, _cursor: Option<String>) -> Result<graphql::SwapConnection, String> {
+            Ok(graphql::SwapConnection { swap_ids: vec![], has_next_page: false, cursor: None })
+        }
+        async fn get_dispute_evidence(&self, _swap_id: u64) -> Result<Vec<graphql::DisputeEvidence>, String> {
+            Ok(vec![])
+        }
+        async fn get_reputation(&self, _address: &str) -> Result<Option<graphql::Reputation>, String> {
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_swap_reads_through_rpc_on_cache_miss() {
+        cache::clear();
+        let app = app_with_rpc_client(Arc::new(StubSwapRpcClient));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/swap/42")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().contains_key("cache-control"));
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["ip_id"], 7);
+        assert_eq!(json["status"], "Pending");
+        assert_eq!(json["ip_registry_id"], "REG1");
+        assert_eq!(json["price"], 1000);
+    }
+
+    #[tokio::test]
+    async fn test_get_swap_serves_from_cache_after_rpc_read_through() {
+        cache::clear();
+        let app = app_with_rpc_client(Arc::new(StubSwapRpcClient));
+        // First request populates the cache via the RPC read-through.
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/swap/42")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert!(cache::get::<schemas::SwapRecord>(&cache::swap_key(42)).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_get_swap_returns_404_when_rpc_has_no_record() {
+        cache::clear();
+        let app = build_app(); // MockSorobanRpcClient always returns None
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/swap/999")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         assert!(resp.headers().contains_key("cache-control"));
     }
 
