@@ -43,7 +43,7 @@ mod tests {
             blinding_factor: BytesN<32>,
         ) -> bool;
         fn get_partial_disclosure(env: Env, ip_id: u64) -> Option<BytesN<32>>;
-        fn validate_upgrade(env: Env, new_wasm_hash: BytesN<32>);
+        fn validate_upgrade(env: Env, new_wasm_hash: BytesN<32>, manifest: crate::UpgradeManifest);
         fn upgrade(env: Env, new_wasm_hash: BytesN<32>);
         fn get_pow_difficulty(env: Env) -> u32;
         fn get_ip_strength(env: Env, ip_id: u64) -> u32;
@@ -972,6 +972,14 @@ mod tests {
         assert_eq!(id5, 5);
     }
 
+    fn full_upgrade_manifest(env: &Env) -> crate::UpgradeManifest {
+        crate::UpgradeManifest {
+            exported_functions: crate::IpRegistry::required_exported_functions(env),
+            error_codes: crate::IpRegistry::current_error_codes(env),
+            storage_keys: crate::IpRegistry::current_storage_keys(env),
+        }
+    }
+
     #[test]
     fn test_validate_upgrade_accepts_non_zero_hash() {
         let env = Env::default();
@@ -980,7 +988,7 @@ mod tests {
 
         let valid_hash = BytesN::from_array(&env, &[1u8; 32]);
         // Should not panic
-        client.validate_upgrade(&valid_hash);
+        client.validate_upgrade(&valid_hash, &full_upgrade_manifest(&env));
     }
 
     #[test]
@@ -991,7 +999,7 @@ mod tests {
         let client = IpRegistryClient::new(&env, &contract_id);
 
         let zero_hash = BytesN::from_array(&env, &[0u8; 32]);
-        client.validate_upgrade(&zero_hash);
+        client.validate_upgrade(&zero_hash, &full_upgrade_manifest(&env));
     }
 
     // ── PoW Tests ─────────────────────────────────────────────────────────────

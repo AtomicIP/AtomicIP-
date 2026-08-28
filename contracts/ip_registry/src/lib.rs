@@ -194,6 +194,49 @@ pub enum DataKey {
     BatchEscrow(BytesN<32>),
 }
 
+/// #806: One exported function's (name, signature) pair, as declared by a
+/// candidate WASM's manifest — see [`UpgradeManifest`]. `signature` is a
+/// deterministic encoding of the full argument/return types, e.g.
+/// `"get_ip(ip_id:u64)->IpRecord"`; any change (including argument
+/// reordering) is treated as a breaking change.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct FunctionEntry {
+    pub name: soroban_sdk::Symbol,
+    pub signature: soroban_sdk::String,
+}
+
+/// #806: One `ContractError` variant's (name, discriminant) pair, as
+/// declared by a candidate WASM's manifest — see [`UpgradeManifest`].
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ErrorCodeEntry {
+    pub name: soroban_sdk::Symbol,
+    pub code: u32,
+}
+
+/// #806: Self-attested description of a candidate WASM's public interface,
+/// supplied by the upgrade proposer to [`validate_upgrade`].
+///
+/// A Soroban guest contract has no host API to read the bytecode of another
+/// contract from a WASM hash, so byte-level diffing of exported functions,
+/// storage keys, and error codes cannot happen from inside the contract
+/// itself — that parsing has to run off-chain (e.g. `wasm-tools` inspecting
+/// the candidate `.wasm`'s export section), which is what produces this
+/// manifest. `validate_upgrade` then checks the manifest against the
+/// invariants this contract currently guarantees: no required function,
+/// error code, or storage key may be removed or renumbered.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct UpgradeManifest {
+    /// Every function the candidate WASM exports.
+    pub exported_functions: Vec<FunctionEntry>,
+    /// Every `ContractError` variant the candidate WASM defines.
+    pub error_codes: Vec<ErrorCodeEntry>,
+    /// Name of every storage key variant the candidate WASM defines.
+    pub storage_keys: Vec<soroban_sdk::Symbol>,
+}
+
 // ── Types ────────────────────────────────────────────────────────────────────
 
 /// Delegation chain record: tracks a delegate and the depth at which they were granted authority.
@@ -1294,21 +1337,161 @@ impl IpRegistry {
 
     /// Validate that a new WASM is compatible for upgrade.
     ///
-    /// Checks that the new WASM has the same contract interface,
-    /// does not remove storage keys, and does not change error codes.
+    /// Checks the candidate's self-attested [`UpgradeManifest`] (see its
+    /// docs for why this contract can't diff raw WASM bytes itself) to
+    /// confirm it keeps the same contract interface: every currently
+    /// required exported function must keep the same signature, and every
+    /// error code and storage key must still be present with the same
+    /// name/discriminant. New functions, codes, or keys may be freely added.
     ///
     /// # Panics
     ///
-    /// Panics if the new WASM is not compatible.
-    pub fn validate_upgrade(env: Env, new_wasm_hash: BytesN<32>) {
-        // For now, simple validation: ensure new_wasm_hash is not zero
+    /// Panics if `new_wasm_hash` is zero, or if the manifest shows a
+    /// required function, error code, or storage key was removed, or a
+    /// required function's signature or an error code's discriminant
+    /// changed.
+    pub fn validate_upgrade(env: Env, new_wasm_hash: BytesN<32>, manifest: UpgradeManifest) {
         let zero_hash = BytesN::from_array(&env, &[0u8; 32]);
         if new_wasm_hash == zero_hash {
             env.panic_with_error(Error::from_contract_error(
                 ContractError::UnauthorizedUpgrade as u32,
             ));
         }
-        // TODO: Implement full validation for exported functions, storage keys, error codes
+
+        for required in Self::required_exported_functions(&env).iter() {
+            let still_matches = manifest.exported_functions.iter().any(|candidate| {
+                candidate.name == required.name && candidate.signature == required.signature
+            });
+            if !still_matches {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::UnauthorizedUpgrade as u32,
+                ));
+            }
+        }
+
+        for entry in Self::current_error_codes(&env).iter() {
+            let still_present = manifest
+                .error_codes
+                .iter()
+                .any(|candidate| candidate.name == entry.name && candidate.code == entry.code);
+            if !still_present {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::UnauthorizedUpgrade as u32,
+                ));
+            }
+        }
+
+        for key in Self::current_storage_keys(&env).iter() {
+            if !manifest.storage_keys.iter().any(|k| k == key) {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::UnauthorizedUpgrade as u32,
+                ));
+            }
+        }
+    }
+
+    /// Exported functions whose removal would break every existing
+    /// integration against this contract; an upgrade must keep exporting
+    /// all of them with an unchanged signature. Not exhaustive over the
+    /// whole public surface — scoped to the core read/write operations other
+    /// contracts and clients depend on.
+    fn required_exported_functions(env: &Env) -> Vec<FunctionEntry> {
+        let entries: [(&str, &str); 8] = [
+            ("commit_ip", "commit_ip(owner:Address,commitment_hash:BytesN<32>,pow_difficulty:u32)->u64"),
+            ("get_ip", "get_ip(ip_id:u64)->IpRecord"),
+            ("transfer_ip_ownership", "transfer_ip_ownership(ip_id:u64,new_owner:Address)->()"),
+            ("verify_commitment", "verify_commitment(ip_id:u64,secret:BytesN<32>,blinding_factor:BytesN<32>)->bool"),
+            ("revoke_ip", "revoke_ip(ip_id:u64)->()"),
+            ("list_ip_by_owner", "list_ip_by_owner(owner:Address)->Vec<u64>"),
+            ("upgrade", "upgrade(new_wasm_hash:BytesN<32>)->()"),
+            ("validate_upgrade", "validate_upgrade(new_wasm_hash:BytesN<32>,manifest:UpgradeManifest)->()"),
+        ];
+        let mut out = Vec::new(env);
+        for (name, signature) in entries {
+            out.push_back(FunctionEntry {
+                name: soroban_sdk::Symbol::new(env, name),
+                signature: soroban_sdk::String::from_str(env, signature),
+            });
+        }
+        out
+    }
+
+    /// (name, discriminant) for every `ContractError` variant this contract
+    /// currently defines. Referencing `ContractError::X as u32` rather than
+    /// a hand-typed literal means a future rename/removal of a variant
+    /// fails to compile here instead of silently drifting out of sync.
+    fn current_error_codes(env: &Env) -> Vec<ErrorCodeEntry> {
+        let codes: [(&str, u32); 35] = [
+            ("IpNotFound", ContractError::IpNotFound as u32),
+            ("ZeroCommitmentHash", ContractError::ZeroCommitmentHash as u32),
+            ("CommitmentAlreadyRegistered", ContractError::CommitmentAlreadyRegistered as u32),
+            ("IpAlreadyRevoked", ContractError::IpAlreadyRevoked as u32),
+            ("UnauthorizedUpgrade", ContractError::UnauthorizedUpgrade as u32),
+            ("Unauthorized", ContractError::Unauthorized as u32),
+            ("IpExpired", ContractError::IpExpired as u32),
+            ("MetadataTooLarge", ContractError::MetadataTooLarge as u32),
+            ("LicenseeNotFound", ContractError::LicenseeNotFound as u32),
+            ("InsufficientPoW", ContractError::InsufficientPoW as u32),
+            ("InvalidExpiry", ContractError::InvalidExpiry as u32),
+            ("IpInDispute", ContractError::IpInDispute as u32),
+            ("CoOwnerNotFound", ContractError::CoOwnerNotFound as u32),
+            ("InvalidOwnershipPercentage", ContractError::InvalidOwnershipPercentage as u32),
+            ("OnlyOwnerCanManageCoOwners", ContractError::OnlyOwnerCanManageCoOwners as u32),
+            ("DisputeNotFound", ContractError::DisputeNotFound as u32),
+            ("DisputeAlreadyResolved", ContractError::DisputeAlreadyResolved as u32),
+            ("StakeNotFound", ContractError::StakeNotFound as u32),
+            ("AlreadyStaked", ContractError::AlreadyStaked as u32),
+            ("StakeAlreadySlashed", ContractError::StakeAlreadySlashed as u32),
+            ("ArbitrationNotFound", ContractError::ArbitrationNotFound as u32),
+            ("ArbitrationAlreadyFinalized", ContractError::ArbitrationAlreadyFinalized as u32),
+            ("NotAnArbitrator", ContractError::NotAnArbitrator as u32),
+            ("ThresholdNotMet", ContractError::ThresholdNotMet as u32),
+            ("SignerNotAuthorized", ContractError::SignerNotAuthorized as u32),
+            ("AlreadySigned", ContractError::AlreadySigned as u32),
+            ("BatchMetadataTooLarge", ContractError::BatchMetadataTooLarge as u32),
+            ("EncryptedDataTooLarge", ContractError::EncryptedDataTooLarge as u32),
+            ("EscrowNotFound", ContractError::EscrowNotFound as u32),
+            ("EscrowNotActive", ContractError::EscrowNotActive as u32),
+            ("EscrowTimeoutNotReached", ContractError::EscrowTimeoutNotReached as u32),
+            ("InvalidCategoryHash", ContractError::InvalidCategoryHash as u32),
+            ("InvalidCategoryDepth", ContractError::InvalidCategoryDepth as u32),
+            ("CategoryNotFound", ContractError::CategoryNotFound as u32),
+            ("BatchSizeMismatch", ContractError::BatchSizeMismatch as u32),
+        ];
+        let mut out = Vec::new(env);
+        for (name, code) in codes {
+            out.push_back(ErrorCodeEntry {
+                name: soroban_sdk::Symbol::new(env, name),
+                code,
+            });
+        }
+        out
+    }
+
+    /// Name of every `DataKey` storage key variant this contract currently
+    /// defines. Kept in sync with the `DataKey` enum by hand — Rust gives no
+    /// built-in reflection over enum variant names, so unlike
+    /// `current_error_codes` this list isn't compiler-enforced.
+    fn current_storage_keys(env: &Env) -> Vec<soroban_sdk::Symbol> {
+        let names = [
+            "IpRecord", "OwnerIps", "NextId", "CommitmentOwner", "AnonymousOwner",
+            "UsedBlindedOwner", "Admin", "PartialDisclosure", "IpLicenses", "CategoryIps",
+            "PowDifficulty", "IpVersions", "SuggestedPrice", "IpCommitmentChecksum",
+            "IpAccessGrants", "NotarySignature", "IpVersionChain", "OwnershipChallenge",
+            "NextChallengeId", "EncryptionKeyRotation", "NotaryPublicKey", "CommitmentHashes",
+            "IpPowDifficulty", "ShardIps", "ShardSubIps", "ShardHead", "IpAuditTrail",
+            "RenewalCount", "Delegates", "DelegateDepth", "IpDisputes", "NextDisputeId",
+            "IpStake", "OwnerReputation", "ArbitrationCase", "NextArbitrationId",
+            "ArbitratorPool", "CompressedCommitment", "BatchVerifyResult",
+            "CompressionSelection", "HierarchyNode", "OwnerCategories", "CategoryDepth",
+            "ThresholdConfig", "ThresholdSignatures", "BatchMetadata", "EncryptedCommitment",
+            "BatchEscrow",
+        ];
+        let mut out = Vec::new(env);
+        for name in names {
+            out.push_back(soroban_sdk::Symbol::new(env, name));
+        }
+        out
     }
 
     /// Admin-only contract upgrade.

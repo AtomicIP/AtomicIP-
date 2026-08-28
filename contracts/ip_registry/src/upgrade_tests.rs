@@ -20,10 +20,10 @@
 
 #[cfg(test)]
 mod upgrade_tests {
-    use crate::IpRecord;
+    use crate::{ErrorCodeEntry, FunctionEntry, IpRecord, IpRegistry, UpgradeManifest};
     use soroban_sdk::contractclient;
     use soroban_sdk::testutils::Address as TestAddress;
-    use soroban_sdk::{Address, BytesN, Env};
+    use soroban_sdk::{Address, BytesN, Env, String, Symbol};
 
     #[contractclient(name = "UpgradeTestClient")]
     #[allow(dead_code)]
@@ -35,7 +35,7 @@ mod upgrade_tests {
             pow_difficulty: u32,
         ) -> u64;
         fn get_ip(env: Env, ip_id: u64) -> IpRecord;
-        fn validate_upgrade(env: Env, new_wasm_hash: BytesN<32>);
+        fn validate_upgrade(env: Env, new_wasm_hash: BytesN<32>, manifest: UpgradeManifest);
         fn upgrade(env: Env, new_wasm_hash: BytesN<32>);
     }
 
@@ -46,6 +46,17 @@ mod upgrade_tests {
         (env, client)
     }
 
+    /// A manifest that faithfully describes the contract's own current
+    /// interface — must always pass `validate_upgrade` (given a non-zero
+    /// hash), since it changes nothing.
+    fn full_manifest(env: &Env) -> UpgradeManifest {
+        UpgradeManifest {
+            exported_functions: IpRegistry::required_exported_functions(env),
+            error_codes: IpRegistry::current_error_codes(env),
+            storage_keys: IpRegistry::current_storage_keys(env),
+        }
+    }
+
     // ── validate_upgrade: acceptance ──────────────────────────────────────────
 
     #[test]
@@ -53,14 +64,14 @@ mod upgrade_tests {
         let (env, client) = setup();
         let hash = BytesN::from_array(&env, &[1u8; 32]);
         // Must not panic.
-        client.validate_upgrade(&hash);
+        client.validate_upgrade(&hash, &full_manifest(&env));
     }
 
     #[test]
     fn validate_upgrade_accepts_all_ones_hash() {
         let (env, client) = setup();
         let hash = BytesN::from_array(&env, &[0xffu8; 32]);
-        client.validate_upgrade(&hash);
+        client.validate_upgrade(&hash, &full_manifest(&env));
     }
 
     #[test]
@@ -69,7 +80,27 @@ mod upgrade_tests {
         let mut bytes = [0u8; 32];
         bytes[31] = 1; // smallest non-zero hash
         let hash = BytesN::from_array(&env, &bytes);
-        client.validate_upgrade(&hash);
+        client.validate_upgrade(&hash, &full_manifest(&env));
+    }
+
+    #[test]
+    fn validate_upgrade_accepts_additive_changes() {
+        // Adding a brand-new function, error code, and storage key is not
+        // a breaking change — everything the current interface requires is
+        // still present.
+        let (env, client) = setup();
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+        let mut manifest = full_manifest(&env);
+        manifest.exported_functions.push_back(FunctionEntry {
+            name: Symbol::new(&env, "new_query"),
+            signature: String::from_str(&env, "new_query(id:u64)->bool"),
+        });
+        manifest.error_codes.push_back(ErrorCodeEntry {
+            name: Symbol::new(&env, "NewError"),
+            code: 999,
+        });
+        manifest.storage_keys.push_back(Symbol::new(&env, "NewIndex"));
+        client.validate_upgrade(&hash, &manifest);
     }
 
     // ── validate_upgrade: rejection ───────────────────────────────────────────
@@ -79,7 +110,109 @@ mod upgrade_tests {
     fn validate_upgrade_rejects_zero_hash() {
         let (env, client) = setup();
         let zero = BytesN::from_array(&env, &[0u8; 32]);
-        client.validate_upgrade(&zero);
+        client.validate_upgrade(&zero, &full_manifest(&env));
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #5)")]
+    fn validate_upgrade_rejects_missing_required_function() {
+        // A deliberately incompatible candidate: `commit_ip` dropped from
+        // the manifest, standing in for a candidate WASM that no longer
+        // exports it.
+        let (env, client) = setup();
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+        let mut manifest = full_manifest(&env);
+        let commit_ip = Symbol::new(&env, "commit_ip");
+        let mut trimmed: soroban_sdk::Vec<FunctionEntry> = soroban_sdk::Vec::new(&env);
+        for f in manifest.exported_functions.iter() {
+            if f.name != commit_ip {
+                trimmed.push_back(f);
+            }
+        }
+        manifest.exported_functions = trimmed;
+        client.validate_upgrade(&hash, &manifest);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #5)")]
+    fn validate_upgrade_rejects_changed_function_signature() {
+        // A deliberately incompatible candidate: `get_ip`'s signature
+        // changed, standing in for a candidate WASM with a breaking
+        // parameter/return-type change on a required function.
+        let (env, client) = setup();
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+        let mut manifest = full_manifest(&env);
+        let get_ip = Symbol::new(&env, "get_ip");
+        let mut patched: soroban_sdk::Vec<FunctionEntry> = soroban_sdk::Vec::new(&env);
+        for mut f in manifest.exported_functions.iter() {
+            if f.name == get_ip {
+                f.signature = String::from_str(&env, "get_ip(ip_id:u64)->Option<IpRecord>");
+            }
+            patched.push_back(f);
+        }
+        manifest.exported_functions = patched;
+        client.validate_upgrade(&hash, &manifest);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #5)")]
+    fn validate_upgrade_rejects_missing_error_code() {
+        // A deliberately incompatible candidate: `IpNotFound` dropped from
+        // the manifest, standing in for a candidate WASM that removed an
+        // error variant clients pattern-match on.
+        let (env, client) = setup();
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+        let mut manifest = full_manifest(&env);
+        let ip_not_found = Symbol::new(&env, "IpNotFound");
+        let mut trimmed: soroban_sdk::Vec<ErrorCodeEntry> = soroban_sdk::Vec::new(&env);
+        for e in manifest.error_codes.iter() {
+            if e.name != ip_not_found {
+                trimmed.push_back(e);
+            }
+        }
+        manifest.error_codes = trimmed;
+        client.validate_upgrade(&hash, &manifest);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #5)")]
+    fn validate_upgrade_rejects_renumbered_error_code() {
+        // A deliberately incompatible candidate: `IpNotFound` renumbered
+        // from 1 to 99, standing in for a candidate WASM whose error codes
+        // shifted — silently breaking any client matching on the old value.
+        let (env, client) = setup();
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+        let mut manifest = full_manifest(&env);
+        let ip_not_found = Symbol::new(&env, "IpNotFound");
+        let mut patched: soroban_sdk::Vec<ErrorCodeEntry> = soroban_sdk::Vec::new(&env);
+        for mut e in manifest.error_codes.iter() {
+            if e.name == ip_not_found {
+                e.code = 99;
+            }
+            patched.push_back(e);
+        }
+        manifest.error_codes = patched;
+        client.validate_upgrade(&hash, &manifest);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #5)")]
+    fn validate_upgrade_rejects_missing_storage_key() {
+        // A deliberately incompatible candidate: the `Admin` storage key
+        // dropped from the manifest, standing in for a candidate WASM that
+        // stopped declaring a storage key existing records rely on.
+        let (env, client) = setup();
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+        let mut manifest = full_manifest(&env);
+        let admin = Symbol::new(&env, "Admin");
+        let mut trimmed: soroban_sdk::Vec<Symbol> = soroban_sdk::Vec::new(&env);
+        for k in manifest.storage_keys.iter() {
+            if k != admin {
+                trimmed.push_back(k);
+            }
+        }
+        manifest.storage_keys = trimmed;
+        client.validate_upgrade(&hash, &manifest);
     }
 
     // ── validate_upgrade is repeatable / side-effect free ─────────────────────
@@ -90,7 +223,7 @@ mod upgrade_tests {
         let hash = BytesN::from_array(&env, &[7u8; 32]);
         // Calling the compatibility check repeatedly is always safe.
         for _ in 0..5 {
-            client.validate_upgrade(&hash);
+            client.validate_upgrade(&hash, &full_manifest(&env));
         }
     }
 
@@ -110,7 +243,7 @@ mod upgrade_tests {
 
         // Run the upgrade compatibility gate against live state.
         let candidate = BytesN::from_array(&env, &[9u8; 32]);
-        client.validate_upgrade(&candidate);
+        client.validate_upgrade(&candidate, &full_manifest(&env));
 
         // Records and ID allocation must be untouched by the validation.
         let r1 = client.get_ip(&id1);
