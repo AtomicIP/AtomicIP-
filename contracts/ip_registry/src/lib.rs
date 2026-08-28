@@ -16,8 +16,6 @@ use types::*;
 
 mod zk_commitment;
 
-// FIXME: test.rs has compilation errors from merge conflict - re-enable after fix
-// FIXME: test.rs has pre-existing compilation errors from a merge conflict - fix before enabling
 #[cfg(test)]
 mod test;
 
@@ -34,9 +32,8 @@ mod snapshot_tests;
 #[cfg(test)]
 mod differential_tests;
 
-// FIXME: invariant_tests.rs has pre-existing compilation errors from a merge conflict
-// #[cfg(test)]
-// mod invariant_tests;
+#[cfg(test)]
+mod invariant_tests;
 
 #[cfg(test)]
 mod upgrade_tests;
