@@ -38,7 +38,6 @@ This Soroban implementation makes Atomic Patent:
 - Rust (1.70+)
 - Soroban CLI
 - Stellar CLI
-- Node.js (16+) and npm (for JS layer testing)
 
 ### Build
 
@@ -48,23 +47,9 @@ This Soroban implementation makes Atomic Patent:
 
 ### Test
 
-Run all tests (Rust + JS):
-
 ```bash
-# Run Rust tests
 ./scripts/test.sh
-
-# Run JS tests
-npm test
-
-# Run JS tests with coverage
-npm run test:coverage
-
-# Watch mode for JS tests
-npm run test:watch
 ```
-
-The JS test suite covers batch operations (cancellation, dispute resolution, fee calculation, etc.) and SDK modules.
 
 ### Deploy to Testnet
 
