@@ -11,7 +11,9 @@ use tokio::time::{Duration, Instant};
 use tracing::instrument;
 use crate::cache;
 use crate::deduplication::{create_store, DeduplicationStore};
+use crate::graphql::SorobanQueryClient;
 use crate::schemas::*;
+use std::sync::Arc;
 use crate::webhook;
 
 // #523: Per-handler idempotency store for batch swap operations.
@@ -136,6 +138,7 @@ pub async fn verify_commitment(Json(body): Json<VerifyCommitmentRequest>) -> Res
 pub async fn list_ip_by_owner(
     Path(owner): Path<String>,
     Query(pagination): Query<PaginationParams>,
+    axum::extract::State(client): axum::extract::State<Arc<SorobanQueryClient>>,
 ) -> impl IntoResponse {
     let limit = pagination.limit.min(200);
     let offset = pagination.offset;
@@ -150,9 +153,17 @@ pub async fn list_ip_by_owner(
         ).into_response();
     }
 
-    // TODO: Call Soroban RPC to invoke ip_registry.list_ip_by_owner
-    // Stub: empty paginated response
-    let all_ids: Vec<u64> = vec![];
+    let all_ids = match client.list_ip_by_owner(&owner).await {
+        Ok(ids) => ids,
+        Err(error) => {
+            tracing::error!(%error, owner = %owner, "failed to list IPs by owner");
+            return (
+                StatusCode::BAD_GATEWAY,
+                [(header::CACHE_CONTROL, cache::no_cache_header())],
+                Json(serde_json::json!({ "error": "failed to query IP registry" })),
+            ).into_response();
+        }
+    };
     let total_count = all_ids.len() as u64;
     let page: Vec<u64> = all_ids
         .into_iter()
@@ -189,18 +200,19 @@ pub async fn list_ip_by_owner(
 pub async fn list_ip_by_owner_cursor(
     Path(owner): Path<String>,
     Query(pagination): Query<CursorPaginationParams>,
+    axum::extract::State(client): axum::extract::State<Arc<SorobanQueryClient>>,
 ) -> impl IntoResponse {
     let limit = pagination.limit.min(200);
 
     // Decode cursor if provided
-    let (last_id, offset) = match pagination.cursor {
+    let offset = match pagination.cursor {
         Some(cursor) => {
             match crate::schemas::cursor::decode(&cursor) {
-                Some(data) => (data.last_id, data.offset),
-                None => (0, 0), // Invalid cursor, start from beginning
+                Some(data) => data.offset,
+                None => 0, // Invalid cursor, start from beginning
             }
         }
-        None => (0, 0),
+        None => 0,
     };
 
     // #316: Check cache with cursor-based key
@@ -213,9 +225,17 @@ pub async fn list_ip_by_owner_cursor(
         ).into_response();
     }
 
-    // TODO: Call Soroban RPC to invoke ip_registry.list_ip_by_owner with cursor
-    // Stub: empty paginated response
-    let all_ids: Vec<u64> = vec![];
+    let all_ids = match client.list_ip_by_owner(&owner).await {
+        Ok(ids) => ids,
+        Err(error) => {
+            tracing::error!(%error, owner = %owner, "failed to list IPs by owner");
+            return (
+                StatusCode::BAD_GATEWAY,
+                [(header::CACHE_CONTROL, cache::no_cache_header())],
+                Json(serde_json::json!({ "error": "failed to query IP registry" })),
+            ).into_response();
+        }
+    };
     let total_count = all_ids.len() as u64;
 
     // Apply cursor-based pagination
