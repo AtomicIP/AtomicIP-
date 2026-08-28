@@ -12,6 +12,7 @@ use std::sync::Arc;
 #[derive(Clone)]
 struct AppState {
     schema:           graphql::AtomicIpSchema,
+    query_client:     Arc<graphql::SorobanQueryClient>,
     ws_broadcaster:   Arc<websocket::EventBroadcaster>,
     sse_broadcaster:  Arc<events::EventBroadcaster>,
     health_checker:   Arc<health::HealthChecker>,
@@ -177,13 +178,16 @@ async fn main() {
     metrics::init();
 
     let subscription_broadcaster = init_subscription_broadcaster().await;
+    let rpc_client: Arc<dyn graphql::SorobanRpcClient> = Arc::new(graphql::MockSorobanRpcClient::default());
+    let query_client = Arc::new(graphql::SorobanQueryClient::new(rpc_client.clone()));
     let schema = graphql::build_schema_with_broadcaster(
-        Arc::new(graphql::MockSorobanRpcClient::default()),
+        rpc_client,
         subscription_broadcaster.clone(),
     );
 
     let state = AppState {
         schema,
+        query_client,
         ws_broadcaster:  Arc::new(websocket::EventBroadcaster::new()),
         sse_broadcaster: Arc::new(events::create_event_broadcaster().0),
         health_checker:  Arc::new(health::HealthChecker::new()),
@@ -204,6 +208,8 @@ async fn main() {
         .route("/ip/transfer",                    post(handlers::transfer_ip))
         .route("/ip/verify",                      post(handlers::verify_commitment))
         .route("/ip/owner/{owner}",               get(handlers::list_ip_by_owner))
+        .route("/ip/owner/{owner}/cursor",        get(handlers::list_ip_by_owner_cursor))
+        .route("/ip/owner/{owner}/cursor",        get(handlers::list_ip_by_owner_cursor))
         .route("/swap/initiate",                  post(handlers::initiate_swap))
         .route("/swap/batch-initiate",            post(handlers::batch_initiate_swap))
         .route("/swap/{swap_id}/accept",          post(handlers::accept_swap))
@@ -266,6 +272,7 @@ async fn events_handler(
 }
 
 fn build_app() -> Router {
+    let query_client = Arc::new(graphql::SorobanQueryClient::new(Arc::new(graphql::MockSorobanRpcClient::default())));
     let schema = graphql::build_schema();
     let health_checker = Arc::new(health::HealthChecker::new());
     let circuit_breaker = Arc::new(circuit_breaker::CircuitBreaker::new(
@@ -274,6 +281,14 @@ fn build_app() -> Router {
     ));
     
     let rate_limiter = rate_limit::RateLimitMiddleware::new(rate_limit::RateLimitConfig::default());
+    let state = AppState {
+        schema,
+        query_client,
+        ws_broadcaster: Arc::new(websocket::EventBroadcaster::new()),
+        sse_broadcaster: Arc::new(events::create_event_broadcaster().0),
+        health_checker,
+    };
+
     Router::new()
         .route("/health", get(health::health_handler))
         .route("/version", get(versioning::get_version_info))
@@ -283,6 +298,8 @@ fn build_app() -> Router {
         .route("/v1/ip/transfer", post(handlers::transfer_ip))
         .route("/v1/ip/verify", post(handlers::verify_commitment))
         .route("/v1/ip/owner/{owner}", get(handlers::list_ip_by_owner))
+        .route("/v1/ip/owner/{owner}/cursor", get(handlers::list_ip_by_owner_cursor))
+        .route("/v1/ip/owner/{owner}/cursor", get(handlers::list_ip_by_owner_cursor))
         .route("/v1/swap/initiate", post(handlers::initiate_swap))
         .route("/v1/swap/bulk/initiate", post(handlers::batch_initiate_swap))
         .route("/v1/swap/{swap_id}/accept", post(handlers::accept_swap))

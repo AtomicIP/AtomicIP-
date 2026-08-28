@@ -163,6 +163,7 @@ impl HasTimestamp for CategoryAssigned {
 #[async_trait::async_trait]
 pub trait SorobanRpcClient: Send + Sync {
     async fn get_ip_record(&self, ip_id: u64) -> Result<Option<IpRecord>, String>;
+    async fn get_ips_by_owner(&self, owner: &str) -> Result<Vec<u64>, String>;
     async fn get_swap_record(&self, swap_id: u64) -> Result<Option<SwapRecord>, String>;
     async fn get_swaps_by_seller(&self, seller: &str, limit: u64, cursor: Option<String>) -> Result<SwapConnection, String>;
     async fn get_swaps_by_buyer(&self, buyer: &str, limit: u64, cursor: Option<String>) -> Result<SwapConnection, String>;
@@ -179,6 +180,10 @@ pub struct MockSorobanRpcClient;
 impl SorobanRpcClient for MockSorobanRpcClient {
     async fn get_ip_record(&self, _ip_id: u64) -> Result<Option<IpRecord>, String> {
         Ok(None)
+    }
+
+    async fn get_ips_by_owner(&self, _owner: &str) -> Result<Vec<u64>, String> {
+        Ok(vec![])
     }
 
     async fn get_swap_record(&self, _swap_id: u64) -> Result<Option<SwapRecord>, String> {
@@ -222,6 +227,22 @@ impl SorobanRpcClient for MockSorobanRpcClient {
 #[derive(Clone)]
 pub struct GraphQLContext {
     pub rpc_client: Arc<dyn SorobanRpcClient>,
+}
+
+/// Shared contract-query client used by REST handlers as well as GraphQL.
+#[derive(Clone)]
+pub struct SorobanQueryClient {
+    rpc_client: Arc<dyn SorobanRpcClient>,
+}
+
+impl SorobanQueryClient {
+    pub fn new(rpc_client: Arc<dyn SorobanRpcClient>) -> Self {
+        Self { rpc_client }
+    }
+
+    pub async fn list_ip_by_owner(&self, owner: &str) -> Result<Vec<u64>, String> {
+        self.rpc_client.get_ips_by_owner(owner).await
+    }
 }
 
 impl GraphQLContext {
