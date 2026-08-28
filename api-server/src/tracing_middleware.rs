@@ -5,6 +5,31 @@ use axum::response::Response;
 use uuid::Uuid;
 use std::time::Instant;
 
+/// Instrument an async Soroban RPC call as a child of the active request span.
+/// This compatibility helper is useful to handlers that use this middleware.
+pub async fn trace_soroban_rpc<F, Fut, T>(operation: &'static str, call: F) -> Result<T, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    let span = tracing::info_span!(
+        "soroban.rpc",
+        "rpc.system" = "stellar_soroban",
+        "rpc.operation" = operation,
+        "rpc.duration_ms" = tracing::field::Empty,
+        error = tracing::field::Empty,
+    );
+    let _guard = span.entered();
+    let started = Instant::now();
+    let result = call().await;
+    span.record("rpc.duration_ms", started.elapsed().as_secs_f64() * 1000.0);
+    if let Err(ref error) = result {
+        span.record("error", true);
+        tracing::error!(error = %error, "Soroban RPC call failed");
+    }
+    result
+}
+
 /// Trace ID header name
 pub const TRACE_ID_HEADER: &str = "X-Trace-ID";
 
