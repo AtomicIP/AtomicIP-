@@ -87,9 +87,14 @@ pub async fn get_ip(Path(ip_id): Path<u64>) -> impl IntoResponse {
 )]
 #[instrument(skip(body))]
 pub async fn transfer_ip(Json(body): Json<TransferIpRequest>) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
-    // #316: Invalidate cache on mutation
-    cache::invalidate(&cache::ip_key(body.ip_id));
     // TODO: Call Soroban RPC to invoke ip_registry.transfer_ip
+    // #316: Invalidate AFTER the write commits. Invalidating before the RPC
+    // call leaves a window where a concurrent read can repopulate the cache
+    // with pre-write state and serve it stale for the full TTL; a post-write
+    // invalidation clears any such entry. The full key set must go — a
+    // transfer changes owner list membership too, so `ip:list:*` (not just
+    // the record) is invalidated.
+    cache::invalidate_ip(body.ip_id);
     Err((
         StatusCode::NOT_FOUND,
         Json(ErrorResponse {
@@ -378,9 +383,12 @@ pub async fn batch_initiate_swap(Json(body): Json<BatchInitiateSwapRequest>) -> 
 )]
 #[instrument(skip(body))]
 pub async fn accept_swap(Path(swap_id): Path<u64>, Json(body): Json<AcceptSwapRequest>) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
-    // #316: Invalidate swap cache on state change
-    cache::invalidate(&cache::swap_key(swap_id));
     // TODO: Call Soroban RPC to invoke atomic_swap.accept_swap
+    // #316: Invalidate AFTER the write commits (see `transfer_ip`) so a
+    // concurrent read cannot repopulate the cache with pre-write state. A
+    // state transition also changes seller/buyer list membership, so the
+    // swap record and both list prefixes are invalidated.
+    cache::invalidate_swap(swap_id);
     webhook::trigger_swap_status_changed(swap_id, Some("Pending".to_string()), "Accepted".to_string());
     Err((
         StatusCode::NOT_FOUND,
@@ -405,9 +413,13 @@ pub async fn accept_swap(Path(swap_id): Path<u64>, Json(body): Json<AcceptSwapRe
 )]
 #[instrument(skip(body))]
 pub async fn reveal_key(Path(swap_id): Path<u64>, Json(body): Json<RevealKeyRequest>) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
-    // #316: Invalidate swap cache on state change
-    cache::invalidate(&cache::swap_key(swap_id));
     // TODO: Call Soroban RPC to invoke atomic_swap.reveal_key
+    // #316: Invalidate AFTER the write commits (see `transfer_ip`). A
+    // completed swap changes seller/buyer list membership and both parties'
+    // reputation, so the record, both list prefixes, and the reputation
+    // cache are all invalidated.
+    cache::invalidate_swap(swap_id);
+    cache::invalidate_prefix("reputation:");
     webhook::trigger_swap_status_changed(swap_id, Some("Accepted".to_string()), "Completed".to_string());
     Err((
         StatusCode::NOT_FOUND,
@@ -432,9 +444,10 @@ pub async fn reveal_key(Path(swap_id): Path<u64>, Json(body): Json<RevealKeyRequ
 )]
 #[instrument(skip(body))]
 pub async fn cancel_swap(Path(swap_id): Path<u64>, Json(body): Json<CancelSwapRequest>) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
-    // #316: Invalidate swap cache on state change
-    cache::invalidate(&cache::swap_key(swap_id));
     // TODO: Call Soroban RPC to invoke atomic_swap.cancel_swap
+    // #316: Invalidate AFTER the write commits (see `transfer_ip`) — the
+    // swap record and both seller/buyer list prefixes.
+    cache::invalidate_swap(swap_id);
     webhook::trigger_swap_status_changed(swap_id, Some("Pending".to_string()), "Cancelled".to_string());
     Err((
         StatusCode::NOT_FOUND,
@@ -459,9 +472,10 @@ pub async fn cancel_swap(Path(swap_id): Path<u64>, Json(body): Json<CancelSwapRe
 )]
 #[instrument(skip(body))]
 pub async fn cancel_expired_swap(Path(swap_id): Path<u64>, Json(body): Json<CancelExpiredSwapRequest>) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
-    // #316: Invalidate swap cache on state change
-    cache::invalidate(&cache::swap_key(swap_id));
     // TODO: Call Soroban RPC to invoke atomic_swap.cancel_expired_swap
+    // #316: Invalidate AFTER the write commits (see `transfer_ip`) — the
+    // swap record and both seller/buyer list prefixes.
+    cache::invalidate_swap(swap_id);
     webhook::trigger_swap_status_changed(swap_id, Some("Accepted".to_string()), "Cancelled".to_string());
     Err((
         StatusCode::NOT_FOUND,
