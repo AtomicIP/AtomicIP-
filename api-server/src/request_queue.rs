@@ -55,18 +55,32 @@ impl RequestQueue {
 
     /// Try to acquire a slot in the queue
     pub async fn acquire(&self, request_id: String) -> Result<QueueGuard, StatusCode> {
-        let current_size = self.queue_size.load(std::sync::atomic::Ordering::Relaxed);
-        
-        if current_size >= self.config.max_queue_size {
+        // Reserve a slot immediately (before waiting for a semaphore permit) so that
+        // queue_size reflects all pending + active requests.  This is the correct
+        // backpressure signal: a request is "in the queue" from the moment it
+        // attempts to enter, not only after it wins a concurrency permit.
+        let prev_size = self.queue_size.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        if prev_size >= self.config.max_queue_size {
+            // Over capacity — undo the reservation and reject immediately.
+            self.queue_size.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             tracing::warn!(
-                queue_size = current_size,
+                queue_size = prev_size,
                 max_size = self.config.max_queue_size,
-                "Queue is full"
+                "Queue is full — request rejected"
             );
             return Err(StatusCode::SERVICE_UNAVAILABLE);
         }
 
-        // Try to acquire semaphore permit
+        // Register the entry so get_stats() can compute wait times.
+        let entry = QueueEntry {
+            request_id: request_id.clone(),
+            enqueued_at: Instant::now(),
+            priority: 0,
+        };
+        self.queue.insert(request_id.clone(), entry);
+
+        // Wait for a concurrency slot (bounded by request_timeout).
         let permit = match tokio::time::timeout(
             self.config.request_timeout,
             Arc::clone(&self.semaphore).acquire_owned(),
@@ -74,27 +88,25 @@ impl RequestQueue {
         .await
         {
             Ok(Ok(p)) => p,
-            Ok(Err(_)) => return Err(StatusCode::SERVICE_UNAVAILABLE),
+            Ok(Err(_)) => {
+                // Semaphore closed — clean up.
+                self.queue.remove(&request_id);
+                self.queue_size.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                return Err(StatusCode::SERVICE_UNAVAILABLE);
+            }
             Err(_) => {
-                tracing::warn!("Request timeout waiting for queue slot");
+                // Timeout waiting for a slot.
+                self.queue.remove(&request_id);
+                self.queue_size.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!(request_id = %request_id, "Request timeout waiting for queue slot");
                 return Err(StatusCode::REQUEST_TIMEOUT);
             }
         };
 
-        // Add to queue
-        let entry = QueueEntry {
-            request_id: request_id.clone(),
-            enqueued_at: Instant::now(),
-            priority: 0,
-        };
-        self.queue.insert(request_id.clone(), entry);
-        self.queue_size
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
         tracing::debug!(
             request_id = %request_id,
-            queue_size = current_size + 1,
-            "Request queued"
+            queue_size = prev_size + 1,
+            "Request acquired concurrency slot"
         );
 
         Ok(QueueGuard {
@@ -271,4 +283,141 @@ mod tests {
             assert!(handle.await.unwrap());
         }
     }
+
+    #[tokio::test]
+    async fn test_backpressure_under_simulated_rpc_latency() {
+        // Simulates RPC latency in the 200ms–2s range with realistic queue backpressure.
+        // Design: max_queue_size=5, max_concurrent_requests=2.
+        // Two permits are held directly (simulating in-flight Soroban RPC calls).
+        // Three more slots are occupied by waiting requests (total queue depth = 5).
+        // A 6th request must be rejected immediately with 503 Service Unavailable.
+        let config = QueueConfig {
+            max_queue_size: 5,
+            max_concurrent_requests: 2,
+            request_timeout: Duration::from_millis(1500),
+        };
+        let queue = Arc::new(RequestQueue::new(config));
+
+        // Acquire both concurrency permits on the main task — guaranteed before any assertion.
+        let guard_rpc1 = queue.acquire("req-rpc-1".to_string()).await.unwrap();
+        let guard_rpc2 = queue.acquire("req-rpc-2".to_string()).await.unwrap();
+        assert_eq!(queue.get_queue_size(), 2);
+
+        // Spawn 3 additional requests; they block on the semaphore but increment queue_size
+        // as soon as they enter acquire().
+        let q3 = queue.clone();
+        let h3 = tokio::spawn(async move {
+            let res = q3.acquire("req-rpc-3".to_string()).await;
+            assert!(res.is_ok());
+        });
+
+        let q4 = queue.clone();
+        let h4 = tokio::spawn(async move {
+            let res = q4.acquire("req-rpc-4".to_string()).await;
+            assert!(res.is_ok());
+        });
+
+        let q5 = queue.clone();
+        let h5 = tokio::spawn(async move {
+            let res = q5.acquire("req-rpc-5".to_string()).await;
+            assert!(res.is_ok());
+        });
+
+        // Retry loop: wait until all 3 spawned tasks have entered acquire() and
+        // registered in the queue (they increment queue_size before blocking on
+        // the semaphore). Avoids fixed-sleep flakiness.
+        for _ in 0..50 {
+            if queue.get_queue_size() == 5 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(queue.get_queue_size(), 5, "queue should be full (5/5)");
+
+        // 6th request exceeds max_queue_size -> rejected immediately with 503.
+        let rej = queue.acquire("req-rpc-rejected".to_string()).await;
+        assert_eq!(rej.unwrap_err(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // Release held permits so spawned tasks can complete.
+        drop(guard_rpc1);
+        drop(guard_rpc2);
+        h3.await.unwrap();
+        h4.await.unwrap();
+        h5.await.unwrap();
+
+        // After all tasks finish, queue drains back to 0.
+        assert_eq!(queue.get_queue_size(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_queue_depth_and_rejection_limits_under_rpc_latency() {
+        // Verifies queue depth and rejection behaviour under a single-concurrency config
+        // that simulates Soroban RPC latency holding the one available permit.
+        let config = QueueConfig {
+            max_queue_size: 3,
+            max_concurrent_requests: 1,
+            request_timeout: Duration::from_millis(1000),
+        };
+        let queue = Arc::new(RequestQueue::new(config));
+
+        // First request acquires the single permit (simulates in-flight RPC call).
+        let guard1 = queue.acquire("req-1".to_string()).await.unwrap();
+        assert_eq!(queue.get_queue_size(), 1);
+
+        // Spawn two more requests; they block on the semaphore but count in queue_size.
+        let q_clone = queue.clone();
+        let h2 = tokio::spawn(async move {
+            let _g = q_clone.acquire("req-2".to_string()).await;
+        });
+        let q_clone2 = queue.clone();
+        let h3 = tokio::spawn(async move {
+            let _g = q_clone2.acquire("req-3".to_string()).await;
+        });
+
+        // Retry loop — wait until queue reaches expected depth.
+        for _ in 0..50 {
+            if queue.get_queue_size() == 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(queue.get_queue_size(), 3, "queue should be full (3/3)");
+
+        // Confirm rejection when the queue limit is hit.
+        let reject_res = queue.acquire("req-overflow".to_string()).await;
+        assert!(reject_res.is_err());
+        assert_eq!(reject_res.unwrap_err(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // Release the first permit so waiting tasks can complete.
+        drop(guard1);
+        h2.await.unwrap();
+        h3.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_request_timeout_under_high_rpc_latency() {
+        let config = QueueConfig {
+            max_queue_size: 10,
+            max_concurrent_requests: 1,
+            request_timeout: Duration::from_millis(200), // Short queue wait timeout
+        };
+        let queue = Arc::new(RequestQueue::new(config));
+
+        // Holder simulates high RPC latency (e.g. 2000ms / 2s)
+        let q_holder = queue.clone();
+        let holder = tokio::spawn(async move {
+            let guard = q_holder.acquire("slow-rpc-call".to_string()).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+            drop(guard);
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Waiting request should time out waiting for semaphore permit
+        let timed_out_req = queue.acquire("waiting-req".to_string()).await;
+        assert_eq!(timed_out_req.unwrap_err(), StatusCode::REQUEST_TIMEOUT);
+
+        holder.await.unwrap();
+    }
 }
+
