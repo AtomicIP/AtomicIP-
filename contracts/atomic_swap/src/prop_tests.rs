@@ -46,7 +46,7 @@ mod prop_tests {
         preimage.append(&soroban_sdk::Bytes::from(secret.clone()));
         preimage.append(&soroban_sdk::Bytes::from(blinding.clone()));
         let commitment_hash: BytesN<32> = env.crypto().sha256(&preimage).into();
-        let ip_id = registry.commit_ip(&seller, &commitment_hash);
+        let ip_id = registry.commit_ip(&seller, &commitment_hash, &0u32);
 
         // Setup token and mint to buyer
         let token_id = env
@@ -60,7 +60,7 @@ mod prop_tests {
         client.initialize(&registry_id);
 
         client.initiate_swap(
-            &token_id, &ip_id, &seller, &price, &buyer, &0_u32, &None, &false,
+            &token_id, &ip_id, &seller, &price, &buyer, &0_u32, &None, &0i128, &false,
         );
 
         (env, client, ip_id, secret, blinding, seller, buyer)
@@ -87,7 +87,7 @@ mod prop_tests {
             preimage.append(&soroban_sdk::Bytes::from(secret.clone()));
             preimage.append(&soroban_sdk::Bytes::from(blinding.clone()));
             let hash: BytesN<32> = env.crypto().sha256(&preimage).into();
-            let ip_id = registry.commit_ip(&seller, &hash);
+            let ip_id = registry.commit_ip(&seller, &hash, &0u32);
 
             let token_id = env.register_stellar_asset_contract_v2(admin.clone()).address();
             StellarAssetClient::new(&env, &token_id).mint(&buyer, &price);
@@ -96,7 +96,7 @@ mod prop_tests {
             let client = AtomicSwapClient::new(&env, &contract_id);
             client.initialize(&registry_id);
 
-            let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &price, &buyer, &0_u32, &None, &false);
+            let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &price, &buyer, &0_u32, &None, &0i128, &false);
             let swap = client.get_swap(&swap_id).unwrap();
 
             prop_assert_eq!(swap.status, SwapStatus::Pending);
@@ -121,7 +121,7 @@ mod prop_tests {
             preimage.append(&soroban_sdk::Bytes::from(secret.clone()));
             preimage.append(&soroban_sdk::Bytes::from(blinding.clone()));
             let hash: BytesN<32> = env.crypto().sha256(&preimage).into();
-            let ip_id = registry.commit_ip(&seller, &hash);
+            let ip_id = registry.commit_ip(&seller, &hash, &0u32);
 
             let token_id = env.register_stellar_asset_contract_v2(admin.clone()).address();
             StellarAssetClient::new(&env, &token_id).mint(&buyer, &price);
@@ -130,7 +130,7 @@ mod prop_tests {
             let client = AtomicSwapClient::new(&env, &contract_id);
             client.initialize(&registry_id);
 
-            let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &price, &buyer, &0_u32, &None, &false);
+            let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &price, &buyer, &0_u32, &None, &0i128, &false);
 
             // Verify Pending before accept
             prop_assert_eq!(client.get_swap(&swap_id).unwrap().status, SwapStatus::Pending);
@@ -160,7 +160,7 @@ mod prop_tests {
             preimage.append(&soroban_sdk::Bytes::from(secret.clone()));
             preimage.append(&soroban_sdk::Bytes::from(blinding.clone()));
             let hash: BytesN<32> = env.crypto().sha256(&preimage).into();
-            let ip_id = registry.commit_ip(&seller, &hash);
+            let ip_id = registry.commit_ip(&seller, &hash, &0u32);
 
             let token_id = env.register_stellar_asset_contract_v2(admin.clone()).address();
             StellarAssetClient::new(&env, &token_id).mint(&buyer, &price);
@@ -169,7 +169,7 @@ mod prop_tests {
             let client = AtomicSwapClient::new(&env, &contract_id);
             client.initialize(&registry_id);
 
-            let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &price, &buyer, &0_u32, &None, &false);
+            let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &price, &buyer, &0_u32, &None, &0i128, &false);
             client.accept_swap(&swap_id);
             client.reveal_key(&swap_id, &seller, &secret, &blinding);
 
@@ -204,7 +204,7 @@ mod prop_tests {
             preimage.append(&soroban_sdk::Bytes::from(secret.clone()));
             preimage.append(&soroban_sdk::Bytes::from(blinding.clone()));
             let hash: BytesN<32> = env.crypto().sha256(&preimage).into();
-            let ip_id = registry.commit_ip(&seller, &hash);
+            let ip_id = registry.commit_ip(&seller, &hash, &0u32);
 
             let token_id = env.register_stellar_asset_contract_v2(admin.clone()).address();
             StellarAssetClient::new(&env, &token_id).mint(&buyer, &price);
@@ -213,8 +213,8 @@ mod prop_tests {
             let client = AtomicSwapClient::new(&env, &contract_id);
             client.initialize(&registry_id);
 
-            let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &price, &buyer, &0_u32, &None, &false);
-            client.cancel_swap(&swap_id);
+            let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &price, &buyer, &0_u32, &None, &0i128, &false);
+            client.cancel_swap(&swap_id, &seller);
 
             prop_assert_eq!(client.get_swap(&swap_id).unwrap().status, SwapStatus::Cancelled);
         }
@@ -237,7 +237,7 @@ mod prop_tests {
             preimage.append(&soroban_sdk::Bytes::from(secret.clone()));
             preimage.append(&soroban_sdk::Bytes::from(blinding.clone()));
             let hash: BytesN<32> = env.crypto().sha256(&preimage).into();
-            let ip_id = registry.commit_ip(&seller, &hash);
+            let ip_id = registry.commit_ip(&seller, &hash, &0u32);
 
             let token_id = env.register_stellar_asset_contract_v2(admin.clone()).address();
             StellarAssetClient::new(&env, &token_id).mint(&buyer, &price);
@@ -246,7 +246,7 @@ mod prop_tests {
             let client = AtomicSwapClient::new(&env, &contract_id);
             client.initialize(&registry_id);
 
-            let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &price, &buyer, &0_u32, &None, &false);
+            let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &price, &buyer, &0_u32, &None, &0i128, &false);
             let swap = client.get_swap(&swap_id).unwrap();
 
             prop_assert_eq!(swap.price, price);
@@ -273,7 +273,7 @@ mod prop_tests {
             preimage.append(&soroban_sdk::Bytes::from(secret.clone()));
             preimage.append(&soroban_sdk::Bytes::from(blinding.clone()));
             let hash: BytesN<32> = env.crypto().sha256(&preimage).into();
-            let ip_id = registry.commit_ip(&seller, &hash);
+            let ip_id = registry.commit_ip(&seller, &hash, &0u32);
 
             let token_id = env.register_stellar_asset_contract_v2(admin.clone()).address();
 
@@ -283,7 +283,7 @@ mod prop_tests {
 
             // initiate_swap with price <= 0 must panic (PriceMustBeGreaterThanZero = 3)
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                client.initiate_swap(&token_id, &ip_id, &seller, &price, &buyer, &0_u32, &None, &false);
+                client.initiate_swap(&token_id, &ip_id, &seller, &price, &buyer, &0_u32, &None, &0i128, &false);
             }));
             prop_assert!(result.is_err(), "Expected panic for price={}", price);
         }
@@ -306,7 +306,7 @@ mod prop_tests {
             preimage.append(&soroban_sdk::Bytes::from(secret.clone()));
             preimage.append(&soroban_sdk::Bytes::from(blinding.clone()));
             let hash: BytesN<32> = env.crypto().sha256(&preimage).into();
-            let ip_id = registry.commit_ip(&seller, &hash);
+            let ip_id = registry.commit_ip(&seller, &hash, &0u32);
 
             let token_id = env.register_stellar_asset_contract_v2(admin.clone()).address();
             StellarAssetClient::new(&env, &token_id).mint(&buyer, &price);
@@ -315,7 +315,7 @@ mod prop_tests {
             let client = AtomicSwapClient::new(&env, &contract_id);
             client.initialize(&registry_id);
 
-            let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &price, &buyer, &0_u32, &None, &false);
+            let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &price, &buyer, &0_u32, &None, &0i128, &false);
             let swap = client.get_swap(&swap_id).unwrap();
 
             prop_assert_eq!(swap.seller, seller);
@@ -345,7 +345,7 @@ mod prop_tests {
         preimage.append(&soroban_sdk::Bytes::from(secret.clone()));
         preimage.append(&soroban_sdk::Bytes::from(blinding.clone()));
         let hash: BytesN<32> = env.crypto().sha256(&preimage).into();
-        let ip_id = registry.commit_ip(&seller, &hash);
+        let ip_id = registry.commit_ip(&seller, &hash, &0u32);
 
         let token_id = env
             .register_stellar_asset_contract_v2(admin.clone())
@@ -357,7 +357,7 @@ mod prop_tests {
         client.initialize(&registry_id);
 
         let swap_id = client.initiate_swap(
-            &token_id, &ip_id, &seller, &1000, &buyer, &0_u32, &None, &false,
+            &token_id, &ip_id, &seller, &1000, &buyer, &0_u32, &None, &0i128, &false,
         );
         // Must panic: SwapNotAccepted = 8
         client.reveal_key(&swap_id, &seller, &secret, &blinding);
@@ -382,7 +382,7 @@ mod prop_tests {
         preimage.append(&soroban_sdk::Bytes::from(secret.clone()));
         preimage.append(&soroban_sdk::Bytes::from(blinding.clone()));
         let hash: BytesN<32> = env.crypto().sha256(&preimage).into();
-        let ip_id = registry.commit_ip(&seller, &hash);
+        let ip_id = registry.commit_ip(&seller, &hash, &0u32);
 
         let token_id = env
             .register_stellar_asset_contract_v2(admin.clone())
@@ -394,9 +394,9 @@ mod prop_tests {
         client.initialize(&registry_id);
 
         let swap_id = client.initiate_swap(
-            &token_id, &ip_id, &seller, &1000, &buyer, &0_u32, &None, &false,
+            &token_id, &ip_id, &seller, &1000, &buyer, &0_u32, &None, &0i128, &false,
         );
-        client.cancel_swap(&swap_id);
+        client.cancel_swap(&swap_id, &seller);
         // Must panic: SwapNotPending = 6
         client.accept_swap(&swap_id);
     }
@@ -420,7 +420,7 @@ mod prop_tests {
         preimage.append(&soroban_sdk::Bytes::from(secret.clone()));
         preimage.append(&soroban_sdk::Bytes::from(blinding.clone()));
         let hash: BytesN<32> = env.crypto().sha256(&preimage).into();
-        let ip_id = registry.commit_ip(&seller, &hash);
+        let ip_id = registry.commit_ip(&seller, &hash, &0u32);
 
         let token_id = env
             .register_stellar_asset_contract_v2(admin.clone())
@@ -432,7 +432,7 @@ mod prop_tests {
         client.initialize(&registry_id);
 
         let swap_id = client.initiate_swap(
-            &token_id, &ip_id, &seller, &1000, &buyer, &0_u32, &None, &false,
+            &token_id, &ip_id, &seller, &1000, &buyer, &0_u32, &None, &0i128, &false,
         );
         client.accept_swap(&swap_id);
 
@@ -461,7 +461,7 @@ mod prop_tests {
         preimage.append(&soroban_sdk::Bytes::from(secret.clone()));
         preimage.append(&soroban_sdk::Bytes::from(blinding.clone()));
         let hash: BytesN<32> = env.crypto().sha256(&preimage).into();
-        let ip_id = registry.commit_ip(&seller, &hash);
+        let ip_id = registry.commit_ip(&seller, &hash, &0u32);
 
         let token_id = env
             .register_stellar_asset_contract_v2(admin.clone())
@@ -473,7 +473,7 @@ mod prop_tests {
         client.initialize(&registry_id);
 
         let swap_id = client.initiate_swap(
-            &token_id, &ip_id, &seller, &1000, &buyer, &0_u32, &None, &false,
+            &token_id, &ip_id, &seller, &1000, &buyer, &0_u32, &None, &0i128, &false,
         );
         client.accept_swap(&swap_id);
         // Must panic: SwapNotPending = 6
@@ -499,7 +499,7 @@ mod prop_tests {
         preimage.append(&soroban_sdk::Bytes::from(secret.clone()));
         preimage.append(&soroban_sdk::Bytes::from(blinding.clone()));
         let hash: BytesN<32> = env.crypto().sha256(&preimage).into();
-        let ip_id = registry.commit_ip(&seller, &hash);
+        let ip_id = registry.commit_ip(&seller, &hash, &0u32);
 
         let token_id = env
             .register_stellar_asset_contract_v2(admin.clone())
@@ -511,11 +511,11 @@ mod prop_tests {
         client.initialize(&registry_id);
 
         client.initiate_swap(
-            &token_id, &ip_id, &seller, &1000, &buyer, &0_u32, &None, &false,
+            &token_id, &ip_id, &seller, &1000, &buyer, &0_u32, &None, &0i128, &false,
         );
         // Must panic: ActiveSwapAlreadyExistsForThisIpId = 5
         client.initiate_swap(
-            &token_id, &ip_id, &seller, &500, &buyer, &0_u32, &None, &false,
+            &token_id, &ip_id, &seller, &500, &buyer, &0_u32, &None, &0i128, &false,
         );
     }
 }

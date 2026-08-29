@@ -28,7 +28,7 @@ mod batch_swap_features_tests {
         preimage.append(&Bytes::from(secret.clone()));
         preimage.append(&Bytes::from(blinding.clone()));
         let hash: BytesN<32> = env.crypto().sha256(&preimage).into();
-        let ip_id = registry.commit_ip(owner, &hash);
+        let ip_id = registry.commit_ip(owner, &hash, &0u32);
         (ip_id, secret, blinding)
     }
 
@@ -36,7 +36,15 @@ mod batch_swap_features_tests {
         let token_id = env
             .register_stellar_asset_contract_v2(admin.clone())
             .address();
-        StellarAssetClient::new(env, &token_id).mint(recipient, &amount);
+        let sac = StellarAssetClient::new(env, &token_id);
+        sac.mint(recipient, &amount);
+        // #825: Establish a balance entry for the hardcoded protocol treasury so the
+        // protocol-fee transfer in batch_reveal_keys succeeds in the test environment.
+        let treasury = Address::from_string(&soroban_sdk::String::from_str(
+            env,
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+        ));
+        sac.mint(&treasury, &0);
         token_id
     }
 
