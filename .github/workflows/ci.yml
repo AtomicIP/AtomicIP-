@@ -33,6 +33,17 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      - name: Check for stale merge-conflict FIXMEs
+        # benchmarks.rs and invariant_tests.rs are intentionally still disabled
+        # (tracked separately) and carry accurate FIXMEs; everything else must
+        # be clean, so a re-enabled module never ships with a stale FIXME again.
+        run: |
+          if grep -rn "FIXME.*merge conflict" --include='*.rs' . \
+            | grep -v 'benchmarks\.rs\|invariant_tests\.rs'; then
+            echo "Found FIXME comments referencing unresolved merge conflicts. Resolve or remove them." >&2
+            exit 1
+          fi
+
       - name: Build
         run: cargo build --workspace --verbose
 

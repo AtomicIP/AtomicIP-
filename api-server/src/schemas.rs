@@ -167,6 +167,7 @@ pub enum SwapStatus {
     Pending,
     Accepted,
     Completed,
+    Disputed,
     Cancelled,
 }
 

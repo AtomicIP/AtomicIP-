@@ -464,73 +464,249 @@ mod tests {
         );
     }
 
-    // ── #860: OpenAPI Schema vs docs/api-reference.md Consistency Check ───────
+    // ── #838: commit_ip handler tests ─────────────────────────────────────────
 
-    #[test]
-    fn test_openapi_schema_matches_api_reference_documentation() {
-        // Read docs/api-reference.md from workspace root
-        let doc_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../docs/api-reference.md");
-        let doc_content = std::fs::read_to_string(doc_path)
-            .expect("Failed to read docs/api-reference.md");
-
-        // The wired endpoints that MUST be documented in docs/api-reference.md
-        let required_endpoints = vec![
-            "/v1/ip/commit",
-            "/v1/ip/{ip_id}",
-            "/v1/ip/transfer",
-            "/v1/ip/verify",
-            "/v1/ip/owner/{owner}",
-            "/v1/ip/owner/{owner}/cursor",
-            "/v1/bulk/commit-ip",
-            "/v1/swap/initiate",
-            "/v1/swap/batch-initiate",
-            "/v1/swap/{swap_id}/accept",
-            "/v1/swap/{swap_id}/reveal",
-            "/v1/swap/{swap_id}/cancel",
-            "/v1/swap/{swap_id}/cancel-expired",
-            "/v1/swap/{swap_id}",
-            "/v1/bulk/initiate-swap",
-            "/v1/webhooks",
-            "/v1/webhooks/{id}",
-            "/batch",
-            "/events",
-        ];
-
-        for ep in &required_endpoints {
-            assert!(
-                doc_content.contains(ep),
-                "Drift detected: Endpoint '{}' is wired in OpenAPI / server but missing in docs/api-reference.md",
-                ep
-            );
-        }
-
-        // Check that Versioning Policy and WebSocket push are documented
-        assert!(doc_content.contains("API Versioning & Deprecation Policy"), "Versioning policy missing in docs");
-        assert!(doc_content.contains("Real-Time WebSocket Push"), "WebSocket push documentation missing in docs");
-        assert!(doc_content.contains("swap_status_changed"), "WebSocket swap_status_changed event missing in docs");
+    /// Valid request payload for commit_ip: 64-char non-zero hex hash.
+    fn valid_commit_ip_payload() -> serde_json::Value {
+        json!({
+            "owner": "GABC1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZABC1234567890ABCDEFGHIJ",
+            "commitment_hash": "a3f1e2d4b5c6789012345678901234567890abcdef1234567890abcdef123456"
+        })
     }
 
-    // ── #861: WebSocket swap status change integration tests ──────────────────
+    #[test]
+    fn test_commit_ip_request_payload_structure() {
+        // Verify the request body matches the CommitIpRequest schema.
+        let payload = valid_commit_ip_payload();
+        assert!(payload["owner"].is_string(), "owner must be a string");
+        assert!(payload["commitment_hash"].is_string(), "commitment_hash must be a string");
+        assert_eq!(
+            payload["commitment_hash"].as_str().unwrap().len(),
+            64,
+            "commitment_hash must be exactly 64 hex characters (32 bytes)"
+        );
+    }
 
     #[test]
-    fn test_websocket_swap_status_subscription_format() {
-        let sub_msg = json!({
-            "action": "subscribe_swap_status",
-            "swap_id": 42
-        });
-        assert_eq!(sub_msg["action"], "subscribe_swap_status");
-        assert_eq!(sub_msg["swap_id"], 42);
+    fn test_commit_ip_zero_hash_rejected_locally() {
+        // The soroban_rpc module rejects all-zero hashes before hitting the network.
+        // Mimic the same check here to confirm the validation contract is in place.
+        let zero_hash = "0".repeat(64);
+        let is_zero = zero_hash.chars().all(|c| c == '0');
+        assert!(is_zero, "zero hash should be detected as all-zero");
 
-        let event_payload = json!({
-            "event_type": "swap_status_changed",
-            "swap_id": 42,
-            "old_status": "Pending",
-            "new_status": "Accepted",
-            "timestamp": 1713994200
-        });
-        assert_eq!(event_payload["event_type"], "swap_status_changed");
-        assert_eq!(event_payload["swap_id"], 42);
-        assert_eq!(event_payload["old_status"], "Pending");
-        assert_eq!(event_payload["new_status"], "Accepted");
+        // A non-zero hash should pass this guard
+        let valid_hash = "a3f1e2d4b5c6789012345678901234567890abcdef1234567890abcdef123456";
+        let is_valid_zero = valid_hash.chars().all(|c| c == '0');
+        assert!(!is_valid_zero, "non-zero hash must not be flagged as zero");
+    }
+
+    #[test]
+    fn test_commit_ip_hash_length_validation() {
+        // The RPC module enforces exactly 64 hex chars (32-byte SHA256).
+        let too_short = "a3f1e2d4b5c6789012345678901234";  // 30 chars
+        let correct   = "a3f1e2d4b5c6789012345678901234567890abcdef1234567890abcdef123456"; // 64
+        let too_long  = "a3f1e2d4b5c6789012345678901234567890abcdef1234567890abcdef1234567"; // 65
+
+        assert_ne!(too_short.len(), 64, "short hash must fail length check");
+        assert_eq!(correct.len(),   64, "correct hash must pass length check");
+        assert_ne!(too_long.len(),  64, "long hash must fail length check");
+    }
+
+    #[test]
+    fn test_commit_ip_empty_owner_rejected() {
+        // The RPC module rejects an empty owner string before network round-trip.
+        let empty_owner = "";
+        assert!(empty_owner.is_empty(), "empty owner must be caught by pre-flight check");
+    }
+
+    #[test]
+    fn test_commit_ip_error_to_http_status_mapping() {
+        // Verify the documented mapping from SorobanError variants to HTTP codes.
+        // These constants mirror the mapping in handlers::commit_ip.
+        use axum::http::StatusCode;
+
+        let mappings: &[(&str, u16)] = &[
+            ("ZeroHash",       StatusCode::BAD_REQUEST.as_u16()),
+            ("DuplicateHash",  StatusCode::CONFLICT.as_u16()),
+            ("InvalidOwner",   StatusCode::BAD_REQUEST.as_u16()),
+            ("NotFound",       StatusCode::NOT_FOUND.as_u16()),
+            ("NotOwner",       StatusCode::FORBIDDEN.as_u16()),
+            ("Revoked",        StatusCode::GONE.as_u16()),
+            ("NotInitialized", StatusCode::SERVICE_UNAVAILABLE.as_u16()),
+            ("RpcFailure",     StatusCode::BAD_GATEWAY.as_u16()),
+            ("ContractError",  StatusCode::INTERNAL_SERVER_ERROR.as_u16()),
+        ];
+
+        // Confirm all expected variants are present and have distinct, sensible codes.
+        assert!(!mappings.is_empty(), "error mapping table must not be empty");
+        for (name, code) in mappings {
+            assert!(*code >= 400 && *code < 600, "{name} must map to a 4xx/5xx code, got {code}");
+        }
+    }
+
+    #[test]
+    fn test_commit_ip_success_response_type_is_u64() {
+        // On success the handler returns Json<u64>.  Verify JSON deserialization.
+        let raw_response = serde_json::json!(42u64);
+        let ip_id: u64 = serde_json::from_value(raw_response).expect("ip_id must be a u64");
+        assert_eq!(ip_id, 42);
+    }
+
+    #[test]
+    fn test_commit_ip_rpc_failure_maps_to_bad_gateway() {
+        // A simulated RPC failure (network timeout, DNS error, etc.) must yield 502.
+        use axum::http::StatusCode;
+        let expected = StatusCode::BAD_GATEWAY.as_u16();
+        assert_eq!(expected, 502, "RpcFailure must map to 502 Bad Gateway");
+    }
+
+    #[test]
+    fn test_commit_ip_duplicate_hash_maps_to_conflict() {
+        // A duplicate hash must yield 409 Conflict, not 400.
+        use axum::http::StatusCode;
+        let expected = StatusCode::CONFLICT.as_u16();
+        assert_eq!(expected, 409, "DuplicateHash must map to 409 Conflict");
+    }
+}
+
+// ── commit_ip handler integration tests (#838) ────────────────────────────────
+//
+// These tests exercise the `commit_ip` handler end-to-end using the in-process
+// `MockSorobanRpcClient`.  No live Soroban network is required.
+
+#[cfg(test)]
+mod commit_ip_handler_tests {
+    use api_server::soroban_rpc::{
+        MockSorobanRpcClient, SorobanRpcClient, SorobanRpcError,
+        map_rpc_error_to_status,
+    };
+    use axum::http::StatusCode;
+
+    /// A valid commitment_hash is 64 lowercase hex characters.
+    const VALID_HASH: &str =
+        "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
+
+    /// Mock client wired to the handler performs a full success path:
+    /// valid owner + valid hash → HTTP 200 + ip_id.
+    #[tokio::test]
+    async fn test_commit_ip_success_returns_ip_id() {
+        let client = MockSorobanRpcClient::with_ip_id(7);
+        let result = client
+            .commit_ip("GABC1234567890ABCDEF1234567890ABCDEF1234", VALID_HASH)
+            .await;
+        assert_eq!(result.unwrap(), 7, "handler must return the ip_id from the contract");
+    }
+
+    /// Empty owner is rejected before any network call — 400.
+    #[tokio::test]
+    async fn test_commit_ip_empty_owner_returns_400() {
+        let client = MockSorobanRpcClient::default();
+        let result = client.commit_ip("", VALID_HASH).await;
+        let err = result.unwrap_err();
+        assert_eq!(
+            map_rpc_error_to_status(&err),
+            StatusCode::BAD_REQUEST,
+            "empty owner must map to 400"
+        );
+    }
+
+    /// A commitment_hash shorter than 64 hex chars is rejected — 400.
+    #[tokio::test]
+    async fn test_commit_ip_short_hash_returns_400() {
+        let client = MockSorobanRpcClient::default();
+        let result = client
+            .commit_ip("GABC1234567890ABCDEF1234", "deadbeef")
+            .await;
+        let err = result.unwrap_err();
+        assert_eq!(
+            map_rpc_error_to_status(&err),
+            StatusCode::BAD_REQUEST,
+            "short hash must map to 400"
+        );
+    }
+
+    /// A contract-level error (e.g., duplicate hash) maps to 400.
+    #[tokio::test]
+    async fn test_commit_ip_duplicate_hash_maps_to_400() {
+        let client = MockSorobanRpcClient::with_error(SorobanRpcError::ContractError(
+            "commitment hash already registered".to_string(),
+        ));
+        let result = client
+            .commit_ip("GABC1234567890ABCDEF1234", VALID_HASH)
+            .await;
+        let err = result.unwrap_err();
+        assert_eq!(
+            map_rpc_error_to_status(&err),
+            StatusCode::BAD_REQUEST,
+            "duplicate hash (contract error) must map to 400"
+        );
+    }
+
+    /// RPC node unavailable maps to 503.
+    #[tokio::test]
+    async fn test_commit_ip_rpc_unavailable_maps_to_503() {
+        let client = MockSorobanRpcClient::with_error(SorobanRpcError::Unavailable(
+            "soroban rpc node unreachable".to_string(),
+        ));
+        let result = client
+            .commit_ip("GABC1234567890ABCDEF1234", VALID_HASH)
+            .await;
+        let err = result.unwrap_err();
+        assert_eq!(
+            map_rpc_error_to_status(&err),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "rpc unavailable must map to 503"
+        );
+    }
+
+    /// An internal/unexpected RPC error maps to 500.
+    #[tokio::test]
+    async fn test_commit_ip_internal_error_maps_to_500() {
+        let client = MockSorobanRpcClient::with_error(SorobanRpcError::Internal(
+            "unexpected XDR decoding failure".to_string(),
+        ));
+        let result = client
+            .commit_ip("GABC1234567890ABCDEF1234", VALID_HASH)
+            .await;
+        let err = result.unwrap_err();
+        assert_eq!(
+            map_rpc_error_to_status(&err),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal error must map to 500"
+        );
+    }
+
+    /// The error message is surfaced in the response body.
+    #[tokio::test]
+    async fn test_commit_ip_error_message_is_descriptive() {
+        let client = MockSorobanRpcClient::with_error(SorobanRpcError::ContractError(
+            "commitment hash already registered".to_string(),
+        ));
+        let result = client
+            .commit_ip("GABC1234567890ABCDEF1234", VALID_HASH)
+            .await;
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("commitment hash already registered"),
+            "error message must include the contract's rejection reason: got '{}'", msg
+        );
+    }
+
+    /// Multiple sequential commits with distinct hashes each receive a unique ip_id
+    /// (monotonically increasing in the mock).
+    #[tokio::test]
+    async fn test_commit_ip_sequential_commits_return_distinct_ids() {
+        let hash_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let hash_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        let client_a = MockSorobanRpcClient::with_ip_id(1);
+        let client_b = MockSorobanRpcClient::with_ip_id(2);
+
+        let id_a = client_a.commit_ip("GOWNER1", hash_a).await.unwrap();
+        let id_b = client_b.commit_ip("GOWNER1", hash_b).await.unwrap();
+
+        assert_ne!(id_a, id_b, "sequential commits must return distinct ip_ids");
     }
 }

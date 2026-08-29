@@ -12,6 +12,7 @@ use std::sync::Arc;
 #[derive(Clone)]
 struct AppState {
     schema:           graphql::AtomicIpSchema,
+    query_client:     Arc<graphql::SorobanQueryClient>,
     ws_broadcaster:   Arc<websocket::EventBroadcaster>,
     sse_broadcaster:  Arc<events::EventBroadcaster>,
     health_checker:   Arc<health::HealthChecker>,
@@ -20,6 +21,12 @@ struct AppState {
 impl FromRef<AppState> for Arc<health::HealthChecker> {
     fn from_ref(state: &AppState) -> Self {
         state.health_checker.clone()
+    }
+}
+
+impl FromRef<AppState> for Arc<dyn graphql::SorobanRpcClient> {
+    fn from_ref(state: &AppState) -> Self {
+        state.rpc_client.clone()
     }
 }
 
@@ -34,6 +41,7 @@ mod handlers;
 mod metrics;
 mod middleware_pipeline;
 mod schemas;
+mod soroban_rpc;
 mod tracing_middleware;
 mod versioning;
 mod webhook;
@@ -178,50 +186,67 @@ async fn main() {
     metrics::init();
 
     let subscription_broadcaster = init_subscription_broadcaster().await;
+    let rpc_client: Arc<dyn graphql::SorobanRpcClient> = Arc::new(graphql::MockSorobanRpcClient::default());
+    let query_client = Arc::new(graphql::SorobanQueryClient::new(rpc_client.clone()));
     let schema = graphql::build_schema_with_broadcaster(
-        Arc::new(graphql::MockSorobanRpcClient::default()),
+        rpc_client,
         subscription_broadcaster.clone(),
     );
 
     let state = AppState {
         schema,
+        query_client,
         ws_broadcaster:  Arc::new(websocket::EventBroadcaster::new()),
         sse_broadcaster: Arc::new(events::create_event_broadcaster().0),
         health_checker:  Arc::new(health::HealthChecker::new()),
     };
 
     let rate_limiter = rate_limit::RateLimitMiddleware::new(rate_limit::RateLimitConfig::default());
+    let request_queue = Arc::new(request_queue::RequestQueue::new(
+        request_queue::QueueConfig::default(),
+    ));
+
+    // Mutating endpoints that move or commit IP/swap state require a signed
+    // request (see request_signing.rs) on top of the layers applied below.
+    let signed_routes = Router::new()
+        .route("/ip/commit",                      post(handlers::commit_ip))
+        .route("/ip/transfer",                    post(handlers::transfer_ip))
+        .route("/swap/initiate",                  post(handlers::initiate_swap))
+        .route("/swap/batch-initiate",            post(handlers::batch_initiate_swap))
+        .route("/swap/{swap_id}/accept",          post(handlers::accept_swap))
+        .route("/swap/{swap_id}/reveal",          post(handlers::reveal_key))
+        .route("/swap/{swap_id}/cancel",          post(handlers::cancel_swap))
+        .route("/swap/{swap_id}/cancel-expired",  post(handlers::cancel_expired_swap))
+        .route_layer(middleware::from_fn(request_signing::verify_request_signature));
+
     let app = Router::new()
-        .route("/health",                         get(health::health_handler))
-        .route("/health/detailed",                get(health::detailed_health_handler))
-        .route("/metrics",                        get(metrics::metrics_handler))
-        .route("/version",                        get(versioning::get_version_info))
-        .route("/graphql",                        post(graphql_handler))
-        .route("/graphql/ws",                     get(graphql_ws_handler))
-        .route("/ws",                             get(ws_handler))
-        .route("/events",                         get(events_handler))
-        .route("/batch",                          post(batch::batch_handler))
-        .route("/v1/graphql",                     post(graphql_handler))
-        .route("/v1/ip/commit",                   post(handlers::commit_ip))
-        .route("/v1/ip/{ip_id}",                  get(handlers::get_ip))
-        .route("/v1/ip/transfer",                 post(handlers::transfer_ip))
-        .route("/v1/ip/verify",                   post(handlers::verify_commitment))
-        .route("/v1/ip/owner/{owner}",            get(handlers::list_ip_by_owner))
-        .route("/v1/ip/owner/{owner}/cursor",     get(handlers::list_ip_by_owner_cursor))
-        .route("/v1/swap/initiate",               post(handlers::initiate_swap))
-        .route("/v1/swap/batch-initiate",         post(handlers::batch_initiate_swap))
-        .route("/v1/swap/bulk/initiate",          post(handlers::batch_initiate_swap))
-        .route("/v1/swap/{swap_id}/accept",       post(handlers::accept_swap))
-        .route("/v1/swap/{swap_id}/reveal",       post(handlers::reveal_key))
-        .route("/v1/swap/{swap_id}/cancel",       post(handlers::cancel_swap))
-        .route("/v1/swap/{swap_id}/cancel-expired", post(handlers::cancel_expired_swap))
-        .route("/v1/swap/{swap_id}",              get(handlers::get_swap))
-        .route("/v1/webhooks",                    post(handlers::register_webhook))
-        .route("/v1/webhooks/{id}",               axum::routing::delete(handlers::unregister_webhook))
-        .route("/v1/bulk/commit-ip",              post(handlers::bulk_commit_ip))
-        .route("/v1/bulk/initiate-swap",          post(handlers::bulk_initiate_swap))
-        .route("/openapi.json",                   get(openapi_handler))
+        .merge(signed_routes)
+        .route("/health",          get(health::health_handler))
+        .route("/health/detailed", get(health::detailed_health_handler))
+        .route("/metrics",         get(metrics::metrics_handler))
+        .route("/graphql",         post(graphql_handler))
+        .route("/graphql/ws",      get(graphql_ws_handler))
+        .route("/ws",              get(ws_handler))
+        .route("/events",          get(events_handler))
+        .route("/batch",           post(batch::batch_handler))
+        .route("/ip/{ip_id}",                     get(handlers::get_ip))
+        .route("/ip/verify",                      post(handlers::verify_commitment))
+        .route("/ip/owner/{owner}",               get(handlers::list_ip_by_owner))
+        .route("/ip/owner/{owner}/cursor",        get(handlers::list_ip_by_owner_cursor))
+        .route("/ip/owner/{owner}/cursor",        get(handlers::list_ip_by_owner_cursor))
+        .route("/swap/initiate",                  post(handlers::initiate_swap))
+        .route("/swap/batch-initiate",            post(handlers::batch_initiate_swap))
+        .route("/swap/{swap_id}/accept",          post(handlers::accept_swap))
+        .route("/swap/{swap_id}/reveal",          post(handlers::reveal_key))
+        .route("/swap/{swap_id}/cancel",          post(handlers::cancel_swap))
+        .route("/swap/{swap_id}/cancel-expired",  post(handlers::cancel_expired_swap))
+        .route("/swap/{swap_id}",                 get(handlers::get_swap))
+        .route("/openapi.json", get(openapi_handler))
         .with_state(state)
+        .layer(middleware::from_fn_with_state(
+            request_queue,
+            request_queue::request_queue_middleware,
+        ))
         .layer(middleware::from_fn_with_state(rate_limiter, rate_limit::rate_limit_middleware))
         .layer(middleware::from_fn(metrics::track))
         .layer(middleware::from_fn(distributed_tracing::distributed_tracing_middleware))
@@ -278,16 +303,30 @@ async fn events_handler(
 }
 
 fn build_app() -> Router {
+    let query_client = Arc::new(graphql::SorobanQueryClient::new(Arc::new(graphql::MockSorobanRpcClient::default())));
     let schema = graphql::build_schema();
     let health_checker = Arc::new(health::HealthChecker::new());
+    let circuit_breaker = Arc::new(circuit_breaker::CircuitBreaker::new(
+        "default",
+        circuit_breaker::CircuitBreakerConfig::default(),
+    ));
+    let state = AppState {
+        schema,
+        rpc_client,
+        ws_broadcaster:  Arc::new(websocket::EventBroadcaster::new()),
+        sse_broadcaster: Arc::new(events::create_event_broadcaster().0),
+        health_checker,
+    };
+
     let rate_limiter = rate_limit::RateLimitMiddleware::new(rate_limit::RateLimitConfig::default());
     let state = AppState {
         schema,
+        query_client,
         ws_broadcaster: Arc::new(websocket::EventBroadcaster::new()),
         sse_broadcaster: Arc::new(events::create_event_broadcaster().0),
-        health_checker: health_checker.clone(),
+        health_checker,
     };
-    
+
     Router::new()
         .route("/health", get(health::health_handler))
         .route("/health/detailed", get(health::detailed_health_handler))
@@ -304,6 +343,7 @@ fn build_app() -> Router {
         .route("/v1/ip/transfer", post(handlers::transfer_ip))
         .route("/v1/ip/verify", post(handlers::verify_commitment))
         .route("/v1/ip/owner/{owner}", get(handlers::list_ip_by_owner))
+        .route("/v1/ip/owner/{owner}/cursor", get(handlers::list_ip_by_owner_cursor))
         .route("/v1/ip/owner/{owner}/cursor", get(handlers::list_ip_by_owner_cursor))
         .route("/v1/swap/initiate", post(handlers::initiate_swap))
         .route("/v1/swap/batch-initiate", post(handlers::batch_initiate_swap))
@@ -500,6 +540,110 @@ mod tests {
         assert!(resp.headers().contains_key("cache-control"));
     }
 
+    // ── Swap-lookup read path: RPC read-through + cache backfill ────────────
+
+    /// Stub RPC client that returns a single known swap so the read path can
+    /// be exercised without a live Soroban node.
+    struct StubSwapRpcClient;
+
+    #[async_trait::async_trait]
+    impl graphql::SorobanRpcClient for StubSwapRpcClient {
+        async fn get_ip_record(&self, _ip_id: u64) -> Result<Option<graphql::IpRecord>, String> {
+            Ok(None)
+        }
+        async fn get_swap_record(&self, _swap_id: u64) -> Result<Option<graphql::SwapRecord>, String> {
+            Ok(Some(graphql::SwapRecord {
+                swap_id: 42,
+                ip_registry_id: "REG1".to_string(),
+                ip_id: 7,
+                seller: "GSELLER".to_string(),
+                buyer: "GBUYER".to_string(),
+                price: "1000".to_string(),
+                token: "CTOKEN".to_string(),
+                status: graphql::SwapStatus::Pending,
+                expiry: 999,
+                arbitrator: None,
+            }))
+        }
+        async fn get_swaps_by_seller(&self, _seller: &str, _limit: u64, _cursor: Option<String>) -> Result<graphql::SwapConnection, String> {
+            Ok(graphql::SwapConnection { swap_ids: vec![], has_next_page: false, cursor: None })
+        }
+        async fn get_swaps_by_buyer(&self, _buyer: &str, _limit: u64, _cursor: Option<String>) -> Result<graphql::SwapConnection, String> {
+            Ok(graphql::SwapConnection { swap_ids: vec![], has_next_page: false, cursor: None })
+        }
+        async fn get_swaps_by_ip(&self, _ip_id: u64, _limit: u64, _cursor: Option<String>) -> Result<graphql::SwapConnection, String> {
+            Ok(graphql::SwapConnection { swap_ids: vec![], has_next_page: false, cursor: None })
+        }
+        async fn get_dispute_evidence(&self, _swap_id: u64) -> Result<Vec<graphql::DisputeEvidence>, String> {
+            Ok(vec![])
+        }
+        async fn get_reputation(&self, _address: &str) -> Result<Option<graphql::Reputation>, String> {
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_swap_reads_through_rpc_on_cache_miss() {
+        cache::clear();
+        let app = app_with_rpc_client(Arc::new(StubSwapRpcClient));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/swap/42")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().contains_key("cache-control"));
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["ip_id"], 7);
+        assert_eq!(json["status"], "Pending");
+        assert_eq!(json["ip_registry_id"], "REG1");
+        assert_eq!(json["price"], 1000);
+    }
+
+    #[tokio::test]
+    async fn test_get_swap_serves_from_cache_after_rpc_read_through() {
+        cache::clear();
+        let app = app_with_rpc_client(Arc::new(StubSwapRpcClient));
+        // First request populates the cache via the RPC read-through.
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/swap/42")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert!(cache::get::<schemas::SwapRecord>(&cache::swap_key(42)).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_get_swap_returns_404_when_rpc_has_no_record() {
+        cache::clear();
+        let app = build_app(); // MockSorobanRpcClient always returns None
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/swap/999")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(resp.headers().contains_key("cache-control"));
+    }
+
     // ── #309: Batch initiate swap validation tests ────────────────────────────
 
     #[tokio::test]
@@ -537,6 +681,147 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_batch_initiate_swap_success_returns_pending_swaps() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/swap/bulk/initiate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"ip_registry_id":"C1","ip_ids":[1,2,3],"seller":"G1","prices":[100,200,300],"buyer":"G2","token":"C2"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let swap_ids: Vec<u64> = json["swap_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|id| id.as_u64().unwrap())
+            .collect();
+        assert_eq!(swap_ids.len(), 3);
+        // IDs are allocated sequentially, mirroring the contract's NextId.
+        assert_eq!(swap_ids[0] + 1, swap_ids[1]);
+        assert_eq!(swap_ids[1] + 1, swap_ids[2]);
+
+        // The created swaps are readable via GET /swap/{id} as Pending with a
+        // ~7-day expiry, matching the contract's batch_initiate_swap.
+        for swap_id in swap_ids {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(format!("/v1/swap/{}", swap_id))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let record: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(record["status"], "Pending");
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            assert!(record["expiry"].as_u64().unwrap() > now);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_batch_initiate_swap_too_large_returns_400() {
+        let app = build_app();
+        let ip_ids: Vec<String> = (1..=51).map(|i| i.to_string()).collect();
+        let prices: Vec<String> = (1..=51).map(|i| (i * 100).to_string()).collect();
+        let body = format!(
+            r#"{{"ip_registry_id":"C1","ip_ids":[{}],"seller":"G1","prices":[{}],"buyer":"G2","token":"C2"}}"#,
+            ip_ids.join(","),
+            prices.join(",")
+        );
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/swap/bulk/initiate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["error"].as_str().unwrap().contains("exceeds maximum"));
+    }
+
+    #[tokio::test]
+    async fn test_batch_initiate_swap_non_positive_price_returns_400() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/swap/bulk/initiate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"ip_registry_id":"C1","ip_ids":[1,2],"seller":"G1","prices":[100,0],"buyer":"G2","token":"C2"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["error"].as_str().unwrap().contains("positive"));
+    }
+
+    #[tokio::test]
+    async fn test_batch_initiate_swap_idempotent_replay_returns_same_ids() {
+        let app = build_app();
+        let body = r#"{"ip_registry_id":"C1","ip_ids":[10,11],"seller":"G1","prices":[100,200],"buyer":"G2","token":"C2","idempotency_key":"batch-init-test-key"}"#;
+        let send = || {
+            app.clone().oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/swap/bulk/initiate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+        };
+
+        let first = send().await.unwrap();
+        let second = send().await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(second.status(), StatusCode::OK);
+
+        let parse_ids = |resp: axum::response::Response| {
+            async move {
+                let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+                let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                json["swap_ids"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|id| id.as_u64().unwrap())
+                    .collect::<Vec<u64>>()
+            }
+        };
+
+        let first_ids = parse_ids(first).await;
+        let second_ids = parse_ids(second).await;
+        assert_eq!(first_ids.len(), 2);
+        // #523: replay with the same key must return the cached swap IDs.
+        assert_eq!(first_ids, second_ids);
     }
 
     // ── #319: API Versioning tests ────────────────────────────────────────────

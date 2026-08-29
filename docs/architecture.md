@@ -100,6 +100,53 @@ contents, since that could itself grow without bound.
 ### Atomic Swap Contract
 - **SwapRecord (u64):** Stores details of an active/completed swap (seller, buyer, price, status, escrowed token).
 
+## 🗂️ registry.rs — Local Registry Helper in the Atomic Swap Contract
+
+`contracts/atomic_swap/src/registry.rs` is a **thin helper module inside the
+`atomic_swap` contract**. It is **not** a standalone registry; all authoritative
+IP records live in the separate `ip_registry` contract.
+
+### Purpose
+
+The atomic swap contract needs to verify two things about an IP before it
+allows a swap to proceed:
+
+1. **Ownership** — the seller must be the current owner of the IP.
+2. **Validity** — the IP must not have been revoked.
+
+Rather than duplicating this logic inline across every entry-point that touches
+an IP, `registry.rs` centralises those cross-contract calls in two small
+functions:
+
+| Function | What it does |
+|---|---|
+| `ip_registry(env)` | Reads the stored `ip_registry` contract address from instance storage and returns it. Panics with `ContractError::NotInitialized` if the swap contract has not been initialised yet. |
+| `ensure_seller_owns_active_ip(env, ip_id, seller)` | Cross-calls `ip_registry.get_ip(ip_id)`, then panics with `NotIPOwner` or `IpRevoked` if the seller check fails. |
+| `verify_commitment(env, ip_id, secret, blinding_factor)` | Cross-calls `ip_registry.verify_commitment` and returns the boolean result. |
+
+### Relationship to `ip_registry`
+
+```
+atomic_swap contract
+└── registry.rs  ──cross-contract call──►  ip_registry contract
+    (local helper)                          (authoritative IP store)
+```
+
+- `registry.rs` is a **local read-only proxy** — it holds no IP state of its
+  own and never writes to the `ip_registry` contract.
+- The `ip_registry` contract is the **single source of truth** for IP records,
+  ownership, and revocation status.
+- `registry.rs` caches only the `ip_registry` contract *address* (stored under
+  `DataKey::IpRegistry` in the swap contract's instance storage) so the swap
+  contract does not need the address hardcoded in every call site.
+
+### Why a separate module instead of inline calls?
+
+Keeping cross-contract calls in one place makes the security boundary explicit:
+every read from `ip_registry` goes through `registry.rs`, so an auditor can
+find all external data dependencies in a single 35-line file rather than
+hunting through the entire `lib.rs`.
+
 ## 🌍 Infrastructure
 
 - **Network:** Stellar Testnet & Mainnet.
@@ -107,33 +154,41 @@ contents, since that could itself grow without bound.
 - **Automation:** GitHub Actions for contract deployment and API testing.
 - **Monitoring:** Periodic health checks and ledger event indexing (planned).
 
----
+## 🗂️ `registry.rs` — Atomic Swap's Cross-Contract Adapter
 
-## ⚡ Performance & Load-Testing Benchmarks: Batch vs Single-Item Endpoints
+`contracts/atomic_swap/src/registry.rs` is a **local adapter module inside the
+Atomic Swap contract**, not a standalone registry.  It bridges the gap between
+Atomic Swap logic and the separately-deployed `ip_registry` contract.
 
-Under high-volume workloads, batch endpoints (`POST /v1/swap/batch-initiate`, `POST /v1/bulk/commit-ip`) exhibit significantly different resource and latency profiles compared to single-item endpoints (`POST /v1/swap/initiate`, `POST /v1/ip/commit`).
+### What it does
 
-### Load Testing Scenarios (#862)
+| Function | Purpose |
+|---|---|
+| `ip_registry(env)` | Reads the `ip_registry` contract address stored in Atomic Swap's own instance storage (set at initialisation). |
+| `ensure_seller_owns_active_ip(env, ip_id, seller)` | Cross-contract call — fetches the `IpRecord` from `ip_registry` and panics with `ContractError::NotIPOwner` or `ContractError::IpRevoked` if the guard fails. |
+| `verify_commitment(env, ip_id, secret, blinding_factor)` | Cross-contract call — delegates commitment verification to `ip_registry.verify_commitment`. |
 
-Simulations using `load_testing.rs` evaluated concurrent request throughput across multiple batch sizes up to near max-size (100 items per request):
+### Relationship to `ip_registry`
 
-| Endpoint / Scenario | Concurrency | Total Requests | Items / Req | p50 Latency | p95 Latency | p99 Latency | Effective Throughput |
-|---|---|---|---|---|---|---|---|
-| `POST /v1/swap/initiate` (Single) | 20 | 200 | 1 | ~0.1 ms | ~0.3 ms | ~0.5 ms | ~1,200 items/s |
-| `POST /v1/swap/batch-initiate` (Small) | 10 | 100 | 5 | ~0.4 ms | ~0.8 ms | ~1.2 ms | ~4,200 items/s |
-| `POST /v1/swap/batch-initiate` (Medium) | 10 | 100 | 25 | ~1.4 ms | ~2.2 ms | ~3.1 ms | ~8,900 items/s |
-| `POST /v1/swap/batch-initiate` (Near Max) | 10 | 100 | 100 | ~5.2 ms | ~8.4 ms | ~12.1 ms | ~14,500 items/s |
-| `POST /v1/bulk/commit-ip` (Bulk) | 10 | 100 | 50 | ~2.6 ms | ~4.5 ms | ~6.2 ms | ~11,200 items/s |
+```
+AtomicSwap contract (atomic_swap/)
+  └── registry.rs  ← this file; a thin adapter, no storage of its own
+        │  cross-contract call via IpRegistryClient
+        ▼
+  ip_registry contract  (ip_registry/)
+        └── owns the canonical IpRecord table
+              (owner, commitment_hash, timestamp, revoked)
+```
 
-### Key Architectural Findings:
+`registry.rs` **never stores IP ownership records itself**.  All IP state lives
+in the `ip_registry` contract.  The adapter only provides guarded read helpers
+so the swap logic can verify ownership and commitment validity without repeating
+the contract-address lookup at every call site.
 
-1. **Amortized Per-Item Latency**:
-   - Single-item endpoint: Requires 1 round-trip HTTP transaction, TLS framing, signature verification, and deduplication lookup per item.
-   - Batch endpoint: Amortizes HTTP/TLS handshake, connection overhead, authentication parsing, and logging across up to 100 items per request, reducing overall processing cost by **~70-85% per item**.
-2. **Resource Consumption Profiles**:
-   - **CPU**: Batch requests cause concentrated CPU utilization during batch array validation and duplicate-ID checking (`HashSet` insertion in `O(N)`).
-   - **Memory**: Higher heap allocations for JSON deserialization of vectors (`Vec<u64>`, `Vec<String>`). Strict capping at 100 items prevents memory exhaustion DoS.
-   - **Idempotency Store**: Batch swap requests utilize `BATCH_SWAP_IDEMPOTENCY` to cache responses for 1 hour, preventing double execution on network retries without repeating Soroban RPC calls.
-3. **Operational Recommendations**:
-   - High-frequency market makers and institutional sellers should utilize `/v1/swap/batch-initiate` for batches of 10–100 items.
-   - Real-time single retail transfers should use `/v1/swap/initiate` for minimal single-call p50 latency.
+### Why a separate `ip_registry` contract?
+
+Separating IP registration from swap execution keeps each contract's storage
+and upgrade surface small.  The `ip_registry` can be upgraded (or audited) in
+isolation without touching atomic-swap logic, and vice-versa.  `registry.rs`
+is the single seam between the two contracts: if the `ip_registry` interface
+changes, only this file needs to be updated.

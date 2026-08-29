@@ -36,6 +36,31 @@ use opentelemetry_semantic_conventions::trace as semconv;
 use std::time::Instant;
 use uuid::Uuid;
 
+/// Run an asynchronous Soroban RPC operation in a child span of the active
+/// request span, recording duration and failures at the RPC boundary.
+pub async fn in_soroban_rpc_span<F, Fut, T>(operation: &'static str, rpc_call: F) -> Result<T, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    let span = tracing::info_span!(
+        "soroban.rpc",
+        "rpc.system" = "stellar_soroban",
+        "rpc.operation" = operation,
+        "rpc.duration_ms" = tracing::field::Empty,
+        error = tracing::field::Empty,
+    );
+    let _entered = span.entered();
+    let started = Instant::now();
+    let result = rpc_call().await;
+    span.record("rpc.duration_ms", started.elapsed().as_secs_f64() * 1000.0);
+    if let Err(ref error) = result {
+        span.record("error", true);
+        tracing::error!(error = %error, "Soroban RPC call failed");
+    }
+    result
+}
+
 // ── Header names ──────────────────────────────────────────────────────────────
 
 /// W3C Trace Context propagation header (used by OTel SDK).
