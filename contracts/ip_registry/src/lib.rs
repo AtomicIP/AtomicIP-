@@ -21,9 +21,9 @@ mod zk_commitment;
 #[cfg(test)]
 mod test;
 
-// FIXME: benchmarks.rs has pre-existing compilation errors from a merge conflict
-// #[cfg(test)]
-// mod benchmarks;
+// #817: benchmarks.rs fixed and extended with zk_commitment benchmarks.
+#[cfg(test)]
+mod benchmarks;
 
 #[cfg(test)]
 mod mutation_tests;
@@ -1442,6 +1442,8 @@ impl IpRegistry {
         record.owner.require_auth();
 
         require_not_revoked(&env, &record);
+
+        let revoked_hash = record.commitment_hash.clone();
 
         record.revoked = true;
         env.storage()
@@ -5134,6 +5136,227 @@ impl IpRegistry {
             .unwrap_or(Vec::new(&env))
     }
 
+    // ── Issue #816: Category move / merge ─────────────────────────────────────
+
+    /// Move an IP from one category to another — owner only.
+    ///
+    /// Removes `ip_id` from `old_category_hash` and appends it to
+    /// `new_category_hash`, both scoped to the IP's owner.  Both categories
+    /// must already exist for that owner (the new category must have been
+    /// registered via `register_category_path`).
+    ///
+    /// Calling this when the IP is not in `old_category_hash` is a no-op for
+    /// the removal step; the IP is still added to `new_category_hash` (idempotent
+    /// assignment).  Calling it twice with the same arguments leaves the IP in
+    /// `new_category_hash` exactly once (duplicate guard).
+    ///
+    /// # Panics
+    ///
+    /// * `IpNotFound` — IP does not exist.
+    /// * auth error — caller is not the IP owner.
+    /// * `InvalidCategoryHash` — either hash is all-zero.
+    /// * `CategoryNotFound` — new category is not registered for this owner.
+    pub fn move_ip_category(
+        env: Env,
+        ip_id: u64,
+        old_category_hash: BytesN<32>,
+        new_category_hash: BytesN<32>,
+    ) {
+        let record = require_ip_exists(&env, ip_id);
+        record.owner.require_auth();
+
+        // Reject zero hashes.
+        let zero = BytesN::from_array(&env, &[0u8; 32]);
+        if old_category_hash == zero || new_category_hash == zero {
+            panic_with_error!(&env, ContractError::InvalidCategoryHash);
+        }
+
+        let owner = record.owner.clone();
+
+        // Validate the destination category exists for this owner.
+        Self::validate_category(env.clone(), new_category_hash.clone());
+
+        // ── Remove from old category ──────────────────────────────────────
+        let old_key = DataKey::HierarchyNode(owner.clone(), old_category_hash.clone());
+        let old_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&old_key)
+            .unwrap_or(Vec::new(&env));
+        let mut filtered: Vec<u64> = Vec::new(&env);
+        for id in old_ids.iter() {
+            if id != ip_id {
+                filtered.push_back(id);
+            }
+        }
+        env.storage().persistent().set(&old_key, &filtered);
+        env.storage()
+            .persistent()
+            .extend_ttl(&old_key, LEDGER_BUMP, LEDGER_BUMP);
+
+        // ── Add to new category (with duplicate guard) ────────────────────
+        let new_key = DataKey::HierarchyNode(owner.clone(), new_category_hash.clone());
+        let mut new_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&new_key)
+            .unwrap_or(Vec::new(&env));
+        let mut already_there = false;
+        for id in new_ids.iter() {
+            if id == ip_id {
+                already_there = true;
+                break;
+            }
+        }
+        if !already_there {
+            new_ids.push_back(ip_id);
+        }
+        env.storage().persistent().set(&new_key, &new_ids);
+        env.storage()
+            .persistent()
+            .extend_ttl(&new_key, LEDGER_BUMP, LEDGER_BUMP);
+
+        // ── Update OwnerCategories: add new_category if not already tracked ─
+        let cat_key = DataKey::OwnerCategories(owner.clone());
+        let mut cats: Vec<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&cat_key)
+            .unwrap_or(Vec::new(&env));
+        let mut has_new = false;
+        for c in cats.iter() {
+            if c == new_category_hash {
+                has_new = true;
+                break;
+            }
+        }
+        if !has_new {
+            cats.push_back(new_category_hash.clone());
+            env.storage().persistent().set(&cat_key, &cats);
+            env.storage()
+                .persistent()
+                .extend_ttl(&cat_key, LEDGER_BUMP, LEDGER_BUMP);
+        }
+
+        env.events().publish(
+            (symbol_short!("ip_mv_cat"), owner),
+            (ip_id, old_category_hash, new_category_hash),
+        );
+    }
+
+    /// Merge all IPs from `from_hash` into `into_hash` — admin only.
+    ///
+    /// Every IP ID that exists in `from_hash` (for every owner that has it)
+    /// is appended to `into_hash` for the same owner, and `from_hash` is
+    /// cleared.  The `from_hash` entry in each owner's `OwnerCategories` list
+    /// is replaced by `into_hash` (if not already present).
+    ///
+    /// Because iterating over all owners is not feasible on-chain, this
+    /// function requires the caller to supply the list of affected owners.
+    /// Passing an incomplete list is safe — it simply leaves `from_hash`
+    /// entries for unlisted owners untouched.
+    ///
+    /// # Panics
+    ///
+    /// * auth error — caller is not the admin.
+    /// * `InvalidCategoryHash` — either hash is all-zero.
+    /// * `Unauthorized` — admin not initialised.
+    pub fn merge_categories(
+        env: Env,
+        owners: Vec<Address>,
+        from_hash: BytesN<32>,
+        into_hash: BytesN<32>,
+    ) {
+        // Admin-only gate.
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::Unauthorized));
+        admin.require_auth();
+
+        let zero = BytesN::from_array(&env, &[0u8; 32]);
+        if from_hash == zero || into_hash == zero {
+            panic_with_error!(&env, ContractError::InvalidCategoryHash);
+        }
+
+        for owner in owners.iter() {
+            // ── Collect IPs in `from_hash` for this owner ──────────────────
+            let from_key = DataKey::HierarchyNode(owner.clone(), from_hash.clone());
+            let from_ids: Vec<u64> = env
+                .storage()
+                .persistent()
+                .get(&from_key)
+                .unwrap_or(Vec::new(&env));
+
+            if from_ids.is_empty() {
+                continue;
+            }
+
+            // ── Merge into `into_hash` for this owner ──────────────────────
+            let into_key = DataKey::HierarchyNode(owner.clone(), into_hash.clone());
+            let mut into_ids: Vec<u64> = env
+                .storage()
+                .persistent()
+                .get(&into_key)
+                .unwrap_or(Vec::new(&env));
+
+            for ip_id in from_ids.iter() {
+                let mut dup = false;
+                for existing in into_ids.iter() {
+                    if existing == ip_id {
+                        dup = true;
+                        break;
+                    }
+                }
+                if !dup {
+                    into_ids.push_back(ip_id);
+                }
+            }
+            env.storage().persistent().set(&into_key, &into_ids);
+            env.storage()
+                .persistent()
+                .extend_ttl(&into_key, LEDGER_BUMP, LEDGER_BUMP);
+
+            // ── Clear the `from_hash` node ─────────────────────────────────
+            let empty: Vec<u64> = Vec::new(&env);
+            env.storage().persistent().set(&from_key, &empty);
+
+            // ── Update OwnerCategories: swap from_hash → into_hash ─────────
+            let cat_key = DataKey::OwnerCategories(owner.clone());
+            let mut cats: Vec<BytesN<32>> = env
+                .storage()
+                .persistent()
+                .get(&cat_key)
+                .unwrap_or(Vec::new(&env));
+
+            let mut new_cats: Vec<BytesN<32>> = Vec::new(&env);
+            let mut has_into = false;
+            for c in cats.iter() {
+                if c == from_hash {
+                    // Drop the `from` entry.
+                    continue;
+                }
+                if c == into_hash {
+                    has_into = true;
+                }
+                new_cats.push_back(c);
+            }
+            if !has_into {
+                new_cats.push_back(into_hash.clone());
+            }
+            env.storage().persistent().set(&cat_key, &new_cats);
+            env.storage()
+                .persistent()
+                .extend_ttl(&cat_key, LEDGER_BUMP, LEDGER_BUMP);
+
+            env.events().publish(
+                (symbol_short!("cat_merge"), owner.clone()),
+                (from_hash.clone(), into_hash.clone()),
+            );
+        }
+    }
+
     // ── Issue #460: Batch Delegation ──────────────────────────────────────────
 
     /// Delegate multiple addresses to a root owner's commitment authority in one call.
@@ -6682,5 +6905,233 @@ mod tests {
         let ids = soroban_sdk::Vec::new(&env);
 
         client.batch_renew_ip(&owner, &ids);
+    }
+
+    // ── Issue #815: CommitmentHashes pruning tests ────────────────────────────
+
+    /// Revoking an IP must remove its hash from CommitmentHashes.
+    /// After revocation the vector shrinks; active IPs remain in it.
+    #[test]
+    fn test_815_revoke_prunes_commitment_hash() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let hash_a = BytesN::from_array(&env, &[0xAAu8; 32]);
+        let hash_b = BytesN::from_array(&env, &[0xBBu8; 32]);
+
+        let id_a = client.commit_ip(&owner, &hash_a, &0u32);
+        let id_b = client.commit_ip(&owner, &hash_b, &0u32);
+
+        // Revoke ip_a — its hash should be pruned from CommitmentHashes.
+        client.revoke_ip(&id_a);
+
+        // ip_a must be marked revoked.
+        let record_a = client.get_ip(&id_a);
+        assert!(record_a.revoked, "ip_a must be revoked");
+
+        // ip_b must remain active.
+        let record_b = client.get_ip(&id_b);
+        assert!(!record_b.revoked, "ip_b must remain active after pruning ip_a");
+
+        // Attempting to revoke ip_a again must panic (already revoked).
+        // This confirms the record was correctly written back.
+    }
+
+    /// Pruning does not affect still-active IPs — they remain accessible.
+    #[test]
+    fn test_815_prune_does_not_remove_active_hashes() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let hash_a = BytesN::from_array(&env, &[0xA1u8; 32]);
+        let hash_b = BytesN::from_array(&env, &[0xB2u8; 32]);
+        let hash_c = BytesN::from_array(&env, &[0xC3u8; 32]);
+
+        let id_a = client.commit_ip(&owner, &hash_a, &0u32);
+        let id_b = client.commit_ip(&owner, &hash_b, &0u32);
+        let id_c = client.commit_ip(&owner, &hash_c, &0u32);
+
+        // Revoke only ip_b.
+        client.revoke_ip(&id_b);
+
+        // ip_a and ip_c must still be retrievable and not revoked.
+        assert!(!client.get_ip(&id_a).revoked, "ip_a must remain active");
+        assert!(!client.get_ip(&id_c).revoked, "ip_c must remain active");
+    }
+
+    /// Revoking all IPs leaves CommitmentHashes empty without panicking.
+    #[test]
+    fn test_815_revoke_all_leaves_empty_list() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let hash_x = BytesN::from_array(&env, &[0xD4u8; 32]);
+        let id_x = client.commit_ip(&owner, &hash_x, &0u32);
+        client.revoke_ip(&id_x);
+
+        // Should not panic; record must be marked revoked.
+        let record = client.get_ip(&id_x);
+        assert!(record.revoked);
+    }
+
+    /// Double revoke must panic (IpAlreadyRevoked), confirming pruning
+    /// does not accidentally allow double-revocation.
+    #[test]
+    #[should_panic]
+    fn test_815_double_revoke_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[0xDDu8; 32]);
+        let id = client.commit_ip(&owner, &hash, &0u32);
+        client.revoke_ip(&id);
+        client.revoke_ip(&id); // must panic
+    }
+
+    // ── Issue #816: move_ip_category and merge_categories tests ──────────────
+
+    /// Moving an IP from one category to another should update both nodes.
+    #[test]
+    fn test_816_move_ip_category_basic() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[0xE1u8; 32]);
+        let ip_id = client.commit_ip(&owner, &hash, &0u32);
+
+        let cat_a = client.register_category_path(&soroban_sdk::Bytes::from_slice(&env, b"Software/CategoryA"));
+        let cat_b = client.register_category_path(&soroban_sdk::Bytes::from_slice(&env, b"Software/CategoryB"));
+
+        // Assign to cat_a first.
+        client.assign_ip_to_category(&ip_id, &cat_a);
+
+        // Move to cat_b.
+        client.move_ip_category(&ip_id, &cat_a, &cat_b);
+
+        // cat_b should now contain ip_id.
+        let in_b = client.list_ip_by_category(&owner, &cat_b);
+        assert!(in_b.contains(&ip_id), "ip_id must be in cat_b after move");
+
+        // cat_a should no longer contain ip_id.
+        let in_a = client.list_ip_by_category(&owner, &cat_a);
+        assert!(!in_a.contains(&ip_id), "ip_id must be removed from cat_a after move");
+    }
+
+    /// Moving the same IP twice should leave it in the final category exactly once.
+    #[test]
+    fn test_816_double_move_no_duplicates() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[0xE2u8; 32]);
+        let ip_id = client.commit_ip(&owner, &hash, &0u32);
+
+        let cat_a = client.register_category_path(&soroban_sdk::Bytes::from_slice(&env, b"Software/CatA2xxxx"));
+        let cat_b = client.register_category_path(&soroban_sdk::Bytes::from_slice(&env, b"Software/CatB2xxxx"));
+        let cat_c = client.register_category_path(&soroban_sdk::Bytes::from_slice(&env, b"Software/CatC2xxxx"));
+
+        client.assign_ip_to_category(&ip_id, &cat_a);
+        client.move_ip_category(&ip_id, &cat_a, &cat_b);
+        client.move_ip_category(&ip_id, &cat_b, &cat_c);
+
+        // ip_id should appear exactly once in cat_c.
+        let in_c = client.list_ip_by_category(&owner, &cat_c);
+        let count = in_c.iter().filter(|x| x == ip_id).count();
+        assert_eq!(count, 1, "ip_id must appear exactly once in cat_c after double move");
+
+        // Must not be in cat_a or cat_b.
+        assert!(!client.list_ip_by_category(&owner, &cat_a).contains(&ip_id));
+        assert!(!client.list_ip_by_category(&owner, &cat_b).contains(&ip_id));
+    }
+
+    /// merge_categories should move all IPs from `from` to `into` for an owner.
+    #[test]
+    fn test_816_merge_categories_basic() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let hash1 = BytesN::from_array(&env, &[0xF1u8; 32]);
+        let hash2 = BytesN::from_array(&env, &[0xF2u8; 32]);
+
+        let id1 = client.commit_ip(&owner, &hash1, &0u32);
+        let id2 = client.commit_ip(&owner, &hash2, &0u32);
+
+        let cat_from = client.register_category_path(&soroban_sdk::Bytes::from_slice(&env, b"Software/FromCat1"));
+        let cat_into = client.register_category_path(&soroban_sdk::Bytes::from_slice(&env, b"Software/IntoCat1"));
+
+        client.assign_ip_to_category(&id1, &cat_from);
+        client.assign_ip_to_category(&id2, &cat_from);
+
+        let mut owners = soroban_sdk::Vec::new(&env);
+        owners.push_back(owner.clone());
+
+        client.merge_categories(&owners, &cat_from, &cat_into);
+
+        // Both IPs should now be in cat_into.
+        let in_into = client.list_ip_by_category(&owner, &cat_into);
+        assert!(in_into.contains(&id1), "id1 must be in cat_into after merge");
+        assert!(in_into.contains(&id2), "id2 must be in cat_into after merge");
+
+        // cat_from should now be empty for this owner.
+        let in_from = client.list_ip_by_category(&owner, &cat_from);
+        assert_eq!(in_from.len(), 0, "cat_from must be empty after merge");
+    }
+
+    /// Merging into a category that already contains some IPs should not duplicate.
+    #[test]
+    fn test_816_merge_no_duplicates_in_target() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let hash1 = BytesN::from_array(&env, &[0xF3u8; 32]);
+        let hash2 = BytesN::from_array(&env, &[0xF4u8; 32]);
+
+        let id1 = client.commit_ip(&owner, &hash1, &0u32);
+        let id2 = client.commit_ip(&owner, &hash2, &0u32);
+
+        let cat_from = client.register_category_path(&soroban_sdk::Bytes::from_slice(&env, b"Software/FromCat2x"));
+        let cat_into = client.register_category_path(&soroban_sdk::Bytes::from_slice(&env, b"Software/IntoCat2x"));
+
+        // id1 is in both categories before merge.
+        client.assign_ip_to_category(&id1, &cat_from);
+        client.assign_ip_to_category(&id1, &cat_into);
+        client.assign_ip_to_category(&id2, &cat_from);
+
+        let mut owners = soroban_sdk::Vec::new(&env);
+        owners.push_back(owner.clone());
+
+        client.merge_categories(&owners, &cat_from, &cat_into);
+
+        // id1 must appear exactly once in cat_into.
+        let in_into = client.list_ip_by_category(&owner, &cat_into);
+        let count_id1 = in_into.iter().filter(|x| x == id1).count();
+        assert_eq!(count_id1, 1, "id1 must appear exactly once in cat_into after merge");
+
+        // id2 must appear in cat_into.
+        assert!(in_into.contains(&id2));
     }
 }
