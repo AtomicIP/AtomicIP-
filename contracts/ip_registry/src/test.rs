@@ -197,6 +197,10 @@ mod tests {
         fn set_ip_expiry(env: Env, ip_id: u64, expiry_timestamp: u64, grace_period_seconds: u64);
         fn renew_ip_commitment(env: Env, ip_id: u64, new_expiry: u64) -> bool;
         fn cleanup_expired_ips(env: Env, ip_ids: Vec<u64>);
+        // Issue #809
+        fn add_co_owner(env: Env, ip_id: u64, co_owner: Address, percentage: u32);
+        fn remove_co_owner(env: Env, ip_id: u64, co_owner: Address);
+        fn get_ownership_shares(env: Env, ip_id: u64) -> Vec<crate::OwnershipShare>;
     }
 
     #[test]
@@ -2759,6 +2763,92 @@ mod expiry_tests {
         // Verify at least one event was emitted (set_ip_expiry + cleanup_expired_ips).
         let events = env.events().all();
         assert!(events.events().len() >= 1, "ip_clean event must be emitted");
+    }
+
+    #[test]
+    fn test_verify_commitment_emits_expiry_event_exactly_once() {
+        let (env, client, _owner, ip_id) = setup();
+        let now = env.ledger().timestamp();
+        client.set_ip_expiry(&ip_id, &(now + 100), &500);
+
+        // Advance past expiry but still within the grace period.
+        env.ledger().with_mut(|l| l.timestamp = now + 150);
+
+        let secret = BytesN::from_array(&env, &[1u8; 32]);
+        let blinding = BytesN::from_array(&env, &[2u8; 32]);
+
+        // No events emitted yet (set_ip_expiry does not publish).
+        assert_eq!(env.events().all().events().len(), 0);
+
+        // Calling verify_commitment repeatedly must only fire the expiry
+        // event once for this expiry transition.
+        client.verify_commitment(&ip_id, &secret, &blinding);
+        assert_eq!(env.events().all().events().len(), 1);
+
+        client.verify_commitment(&ip_id, &secret, &blinding);
+        client.verify_commitment(&ip_id, &secret, &blinding);
+        assert_eq!(
+            env.events().all().events().len(),
+            1,
+            "EXPIRY_TOPIC must fire exactly once per expiry transition"
+        );
+    }
+}
+
+// ── Issue #809: OwnershipShare Percentage Sum Invariant ──────────────────────
+
+#[cfg(test)]
+mod ownership_share_tests {
+    use super::tests::IpRegistryClient;
+    use soroban_sdk::{testutils::Address as _, Address, BytesN, Env};
+
+    fn setup() -> (Env, IpRegistryClient<'static>, Address, u64) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[0x55u8; 32]);
+        let ip_id = client.commit_ip(&owner, &hash, &0u32);
+        (env, client, owner, ip_id)
+    }
+
+    #[test]
+    fn test_add_co_owner_splits_shares_to_100() {
+        let (env, client, owner, ip_id) = setup();
+        let co_owner = Address::generate(&env);
+        client.add_co_owner(&ip_id, &co_owner, &40);
+
+        let shares = client.get_ownership_shares(&ip_id);
+        assert_eq!(shares.len(), 2);
+        let total: u32 = shares.iter().map(|s| s.percentage).sum();
+        assert_eq!(total, 100);
+        assert_eq!(shares.get(0).unwrap().address, owner);
+        assert_eq!(shares.get(0).unwrap().percentage, 60);
+        assert_eq!(shares.get(1).unwrap().address, co_owner);
+        assert_eq!(shares.get(1).unwrap().percentage, 40);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_add_co_owner_rejects_percentage_exceeding_owner_share() {
+        let (env, client, _owner, ip_id) = setup();
+        let co_owner = Address::generate(&env);
+        // Owner only holds 100; requesting 101 must panic (sum would exceed 100).
+        client.add_co_owner(&ip_id, &co_owner, &101);
+    }
+
+    #[test]
+    fn test_remove_co_owner_returns_share_to_owner() {
+        let (env, client, owner, ip_id) = setup();
+        let co_owner = Address::generate(&env);
+        client.add_co_owner(&ip_id, &co_owner, &30);
+        client.remove_co_owner(&ip_id, &co_owner);
+
+        let shares = client.get_ownership_shares(&ip_id);
+        assert_eq!(shares.len(), 1);
+        assert_eq!(shares.get(0).unwrap().address, owner);
+        assert_eq!(shares.get(0).unwrap().percentage, 100);
     }
 }
 
