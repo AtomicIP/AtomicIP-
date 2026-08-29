@@ -243,6 +243,10 @@ impl SorobanQueryClient {
         Self { rpc_client }
     }
 
+    pub async fn get_ip_record(&self, ip_id: u64) -> Result<Option<IpRecord>, String> {
+        self.rpc_client.get_ip_record(ip_id).await
+    }
+
     pub async fn list_ip_by_owner(&self, owner: &str) -> Result<Vec<u64>, String> {
         self.rpc_client.get_ips_by_owner(owner).await
     }
@@ -254,10 +258,10 @@ impl GraphQLContext {
     }
 }
 
-fn get_rpc_client(ctx: &Context<'_>) -> Arc<dyn SorobanRpcClient> {
+fn get_rpc_client(ctx: &Context<'_>) -> Result<Arc<dyn SorobanRpcClient>, async_graphql::Error> {
     ctx.data::<GraphQLContext>()
         .map(|c| c.rpc_client.clone())
-        .unwrap_or_else(|_| Arc::new(MockSorobanRpcClient::default()))
+        .map_err(|_| async_graphql::Error::new("GraphQL RPC client is not configured"))
 }
 
 fn get_broadcaster(ctx: &Context<'_>) -> Arc<SubscriptionBroadcaster> {
@@ -274,7 +278,7 @@ pub struct QueryRoot;
 impl QueryRoot {
     /// Fetch an IP record by its ID.
     async fn ip(&self, ctx: &Context<'_>, ip_id: u64) -> Result<Option<IpRecord>, async_graphql::Error> {
-        let rpc_client = get_rpc_client(ctx);
+        let rpc_client = get_rpc_client(ctx)?;
         in_soroban_rpc_span("get_ip_record", || rpc_client.get_ip_record(ip_id))
             .await
             .map_err(|e| async_graphql::Error::new(e))
@@ -282,7 +286,7 @@ impl QueryRoot {
 
     /// Fetch a swap record by its ID.
     async fn swap(&self, ctx: &Context<'_>, swap_id: u64) -> Result<Option<SwapRecord>, async_graphql::Error> {
-        let rpc_client = get_rpc_client(ctx);
+        let rpc_client = get_rpc_client(ctx)?;
         in_soroban_rpc_span("get_swap_record", || rpc_client.get_swap_record(swap_id))
             .await
             .map_err(|e| async_graphql::Error::new(e))
@@ -296,7 +300,7 @@ impl QueryRoot {
         limit: Option<u64>,
         cursor: Option<String>,
     ) -> Result<SwapConnection, async_graphql::Error> {
-        let rpc_client = get_rpc_client(ctx);
+        let rpc_client = get_rpc_client(ctx)?;
         in_soroban_rpc_span("get_swaps_by_seller", || rpc_client.get_swaps_by_seller(&seller, limit.unwrap_or(50), cursor))
             .await
             .map_err(|e| async_graphql::Error::new(e))
@@ -310,7 +314,7 @@ impl QueryRoot {
         limit: Option<u64>,
         cursor: Option<String>,
     ) -> Result<SwapConnection, async_graphql::Error> {
-        let rpc_client = get_rpc_client(ctx);
+        let rpc_client = get_rpc_client(ctx)?;
         in_soroban_rpc_span("get_swaps_by_buyer", || rpc_client.get_swaps_by_buyer(&buyer, limit.unwrap_or(50), cursor))
             .await
             .map_err(|e| async_graphql::Error::new(e))
@@ -324,7 +328,7 @@ impl QueryRoot {
         limit: Option<u64>,
         cursor: Option<String>,
     ) -> Result<SwapConnection, async_graphql::Error> {
-        let rpc_client = get_rpc_client(ctx);
+        let rpc_client = get_rpc_client(ctx)?;
         in_soroban_rpc_span("get_swaps_by_ip", || rpc_client.get_swaps_by_ip(ip_id, limit.unwrap_or(50), cursor))
             .await
             .map_err(|e| async_graphql::Error::new(e))
@@ -332,7 +336,7 @@ impl QueryRoot {
 
     /// Retrieve all dispute evidence hashes for a swap.
     async fn dispute_evidence(&self, ctx: &Context<'_>, swap_id: u64) -> Result<Vec<DisputeEvidence>, async_graphql::Error> {
-        let rpc_client = get_rpc_client(ctx);
+        let rpc_client = get_rpc_client(ctx)?;
         in_soroban_rpc_span("get_dispute_evidence", || rpc_client.get_dispute_evidence(swap_id))
             .await
             .map_err(|e| async_graphql::Error::new(e))
@@ -340,7 +344,7 @@ impl QueryRoot {
 
     /// Get reputation information for a user.
     async fn reputation(&self, ctx: &Context<'_>, address: String) -> Result<Option<Reputation>, async_graphql::Error> {
-        let rpc_client = get_rpc_client(ctx);
+        let rpc_client = get_rpc_client(ctx)?;
         in_soroban_rpc_span("get_reputation", || rpc_client.get_reputation(&address))
             .await
             .map_err(|e| async_graphql::Error::new(e))
@@ -929,7 +933,7 @@ async fn tail_redis_streams(broadcaster: Arc<SubscriptionBroadcaster>, mut conn:
 pub type AtomicIpSchema = Schema<QueryRoot, EmptyMutation, SubscriptionRoot>;
 
 pub fn build_schema() -> AtomicIpSchema {
-    Schema::build(QueryRoot, EmptyMutation, SubscriptionRoot).finish()
+    build_schema_with_context(Arc::new(MockSorobanRpcClient::default()))
 }
 
 pub fn build_schema_with_context(rpc_client: Arc<dyn SorobanRpcClient>) -> AtomicIpSchema {
@@ -993,6 +997,50 @@ mod tests {
             .await;
         assert!(res.errors.is_empty(), "unexpected errors: {:?}", res.errors);
         assert_eq!(serde_json::to_string(&res.data).unwrap(), r#"{"disputeEvidence":[]}"#);
+    }
+
+    #[tokio::test]
+    async fn test_graphql_query_uses_injected_rpc_client() {
+        let rpc_client: Arc<dyn SorobanRpcClient> = Arc::new(TestRpcClient {
+            ip_record: Some(IpRecord {
+                ip_id: 7,
+                owner: "GOWNER".to_string(),
+                commitment_hash: "HASH".to_string(),
+                timestamp: 123,
+                revoked: false,
+            }),
+        });
+        let schema = build_schema_with_context(rpc_client);
+        let res = schema
+            .execute(Request::new("{ ip(ipId: 7) { ipId owner commitmentHash } }"))
+            .await;
+        assert!(res.errors.is_empty(), "unexpected errors: {:?}", res.errors);
+        assert_eq!(serde_json::to_string(&res.data).unwrap(), r#"{\"ip\":{\"ipId\":7,\"owner\":\"GOWNER\",\"commitmentHash\":\"HASH\"}}"#);
+    }
+
+    #[derive(Clone)]
+    struct TestRpcClient {
+        ip_record: Option<IpRecord>,
+    }
+
+    #[async_trait::async_trait]
+    impl SorobanRpcClient for TestRpcClient {
+        async fn get_ip_record(&self, _ip_id: u64) -> Result<Option<IpRecord>, String> {
+            Ok(self.ip_record.clone())
+        }
+        async fn get_ips_by_owner(&self, _owner: &str) -> Result<Vec<u64>, String> { Ok(vec![]) }
+        async fn get_swap_record(&self, _swap_id: u64) -> Result<Option<SwapRecord>, String> { Ok(None) }
+        async fn get_swaps_by_seller(&self, _seller: &str, _limit: u64, _cursor: Option<String>) -> Result<SwapConnection, String> {
+            Ok(SwapConnection { swap_ids: vec![], has_next_page: false, cursor: None })
+        }
+        async fn get_swaps_by_buyer(&self, _buyer: &str, _limit: u64, _cursor: Option<String>) -> Result<SwapConnection, String> {
+            Ok(SwapConnection { swap_ids: vec![], has_next_page: false, cursor: None })
+        }
+        async fn get_swaps_by_ip(&self, _ip_id: u64, _limit: u64, _cursor: Option<String>) -> Result<SwapConnection, String> {
+            Ok(SwapConnection { swap_ids: vec![], has_next_page: false, cursor: None })
+        }
+        async fn get_dispute_evidence(&self, _swap_id: u64) -> Result<Vec<DisputeEvidence>, String> { Ok(vec![]) }
+        async fn get_reputation(&self, _address: &str) -> Result<Option<Reputation>, String> { Ok(None) }
     }
 
     #[tokio::test]

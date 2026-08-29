@@ -1,0 +1,44 @@
+{
+  "name": "atomicip",
+  "version": "1.0.0",
+  "description": "Atomic Patent - Decentralized IP Registry on Stellar Soroban",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage"
+  },
+  "keywords": [
+    "blockchain",
+    "stellar",
+    "soroban",
+    "intellectual-property",
+    "atomic-swap"
+  ],
+  "author": "Atomic Patent Contributors",
+  "license": "MIT",
+  "devDependencies": {
+    "jest": "^29.7.0"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "testMatch": [
+      "src/**/__tests__/**/*.test.js",
+      "src/**/*.test.js"
+    ],
+    "collectCoverageFrom": [
+      "src/**/*.js",
+      "!src/**/__tests__/**",
+      "!src/**/*.test.js"
+    ],
+    "coverageThreshold": {
+      "global": {
+        "branches": 70,
+        "functions": 70,
+        "lines": 70,
+        "statements": 70
+      }
+    }
+  }
+}

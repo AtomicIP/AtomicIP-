@@ -16,7 +16,7 @@ mod fuzz_tests {
             "GBRPYHIL2CI3\0WHZDTOOQFC6EB4KJJGUJJBBQ5ECVVF7C3UFOCHJEAZD", // Null byte
             "0BRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBQ5ECVVF7C3UFOCHJEAZD", // Invalid first char
             "GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBQ5ECVVF7C3UFOCHJEAZ", // Too short
-            "GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBQ5ECVVF7C3UFOCHJEAZDD", // Too long
+            "GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBQ5ECVVF7C3UFOCHJEAZDDD", // Too long (57 chars)
             "GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBQ5ECVVF7C3UFOCHJEAZD/", // Special char
         ];
 
@@ -154,6 +154,7 @@ mod fuzz_tests {
     /// Fuzz test: URL validation with various protocols and patterns
     #[test]
     fn fuzz_url_validation_edge_cases() {
+        let long_url = format!("http://{}", "a".repeat(1000));
         let test_urls = vec![
             ("", false),
             ("http://", true),
@@ -166,7 +167,7 @@ mod fuzz_tests {
             ("example.com", false),
             ("//example.com", false),
             ("http://example.com\0malicious", false),
-            ("http://" + &"a".repeat(1000), false), // Exceeds OWASP length limit
+            (long_url.as_str(), false), // Exceeds OWASP length limit
         ];
 
         for (url, should_pass) in test_urls {

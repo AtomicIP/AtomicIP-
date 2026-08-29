@@ -141,7 +141,8 @@ mod oracle_tests {
     ) -> (AtomicSwapClient<'static>, Address) {
         let contract_id = env.register(AtomicSwap, ());
         let client = AtomicSwapClient::new(env, &contract_id);
-        client.initialize(registry_id);
+        let treasury = Address::generate(env);
+        client.initialize(registry_id, &treasury);
         // Seed admin: first initiate_swap sets admin = seller
         client.initiate_swap(
             token_id, &ip_id, seller, &500_i128, buyer, &0_u32, &None, &0_i128, &false,
@@ -267,7 +268,8 @@ mod oracle_tests {
         let registry_id = env.register(IpRegistry, ());
         let contract_id = env.register(AtomicSwap, ());
         let client = AtomicSwapClient::new(&env, &contract_id);
-        client.initialize(&registry_id);
+        let treasury = Address::generate(&env);
+        client.initialize(&registry_id, &treasury);
 
         assert!(client.get_oracle_config().is_none());
     }
@@ -308,7 +310,8 @@ mod oracle_tests {
         let registry_id = env.register(IpRegistry, ());
         let contract_id = env.register(AtomicSwap, ());
         let client = AtomicSwapClient::new(&env, &contract_id);
-        client.initialize(&registry_id);
+        let treasury = Address::generate(&env);
+        client.initialize(&registry_id, &treasury);
         let token = Address::generate(&env);
 
         let result = client.try_get_oracle_price(&token);
@@ -703,7 +706,8 @@ mod oracle_tests {
         let token_id = setup_token(&env, &admin, &buyer, 10_000_000);
         let contract_id = env.register(AtomicSwap, ());
         let client = AtomicSwapClient::new(&env, &contract_id);
-        client.initialize(&registry_id);
+        let treasury = Address::generate(&env);
+        client.initialize(&registry_id, &treasury);
 
         let result = client.try_initiate_swap_with_oracle_price(
             &token_id, &ip_id, &seller, &buyer, &0_u32, &None, &0_i128, &false, &0_i128, &0_i128,
@@ -980,6 +984,220 @@ mod oracle_tests {
         let swap = client.get_swap(&swap_id).unwrap();
         assert_eq!(swap.price, 300_000_i128);
         assert!(swap.price >= 100_000_i128 && swap.price <= 500_000_i128);
+    }
+
+    // ── #834: Boundary staleness tests ───────────────────────────────────────
+
+    /// Exactly at the threshold (staleness_secs == ORACLE_STALENESS_THRESHOLD_SECS == 300)
+    /// is still considered fresh (`<=` comparison), so a new attestation is
+    /// fetched and returned instead of the cached price.
+    #[test]
+    fn test_oracle_price_staleness_exactly_at_threshold_is_fresh() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (registry_id, ip_id, _, _) = setup_registry(&env, &seller);
+        let token_id = setup_token(&env, &admin, &buyer, 10_000_000);
+        let oracle_id = env.register(MockOracle, ());
+        let oracle_client = MockOracleClient::new(&env, &oracle_id);
+        let (client, admin_addr) =
+            setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
+        enable_oracle(
+            &env,
+            &client,
+            &admin_addr,
+            &oracle_id,
+            &oracle_client,
+            &token_id,
+            500_000_i128,
+        );
+
+        // Establish cache with the initial price.
+        let initial_price = client.get_oracle_price(&token_id);
+        assert_eq!(initial_price, 500_000_i128);
+
+        // Advance time by exactly the threshold (300 s). The staleness check is
+        // `staleness_secs <= ORACLE_STALENESS_THRESHOLD_SECS`, so 300 <= 300 is
+        // true — the path takes the *fresh* branch, fetches a new attestation,
+        // and returns the new price rather than the cache.
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + 300);
+
+        // Publish a new signed price at the updated timestamp.
+        publish_price(&env, &oracle_client, &token_id, 550_000_i128);
+
+        let price = client.get_oracle_price(&token_id);
+        // Exactly-at-threshold → fresh fetch path → new price returned.
+        assert_eq!(
+            price, 550_000_i128,
+            "price at exactly 300 s should use the fresh fetch path, not the cached price"
+        );
+
+        // Verify the cache was updated to the fresh price.
+        let config = client.get_oracle_config().unwrap();
+        assert_eq!(config.cached_price, 550_000_i128);
+    }
+
+    /// One second past the threshold (staleness_secs == 301) triggers the stale
+    /// branch: the cached (previously-verified) price is returned and the newly
+    /// published price is NOT fetched.
+    #[test]
+    fn test_oracle_price_staleness_just_past_threshold_uses_cache() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (registry_id, ip_id, _, _) = setup_registry(&env, &seller);
+        let token_id = setup_token(&env, &admin, &buyer, 10_000_000);
+        let oracle_id = env.register(MockOracle, ());
+        let oracle_client = MockOracleClient::new(&env, &oracle_id);
+        let (client, admin_addr) =
+            setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
+        enable_oracle(
+            &env,
+            &client,
+            &admin_addr,
+            &oracle_id,
+            &oracle_client,
+            &token_id,
+            500_000_i128,
+        );
+
+        // Establish the cached price.
+        let initial_price = client.get_oracle_price(&token_id);
+        assert_eq!(initial_price, 500_000_i128);
+
+        // Advance time by threshold + 1 (301 s). Now
+        // `staleness_secs (301) <= 300` is false → stale branch.
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + 301);
+
+        // Publish a new signed price; it should NOT be used.
+        publish_price(&env, &oracle_client, &token_id, 700_000_i128);
+
+        let price = client.get_oracle_price(&token_id);
+        // Just-past-threshold → stale branch → cached price returned.
+        assert_eq!(
+            price, 500_000_i128,
+            "price at 301 s should use the stale-fallback path and return the cached price"
+        );
+
+        // The cache must NOT have been updated (stale path does not write back).
+        let config = client.get_oracle_config().unwrap();
+        assert_eq!(config.cached_price, 500_000_i128);
+    }
+
+    #[test]
+    fn test_oracle_price_staleness_exactly_at_threshold_swap_uses_fresh_price() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (registry_id, ip_id, _, _) = setup_registry(&env, &seller);
+        let token_id = setup_token(&env, &admin, &buyer, 10_000_000);
+        let oracle_id = env.register(MockOracle, ());
+        let oracle_client = MockOracleClient::new(&env, &oracle_id);
+        let (client, admin_addr) =
+            setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
+        enable_oracle(
+            &env,
+            &client,
+            &admin_addr,
+            &oracle_id,
+            &oracle_client,
+            &token_id,
+            500_000_i128,
+        );
+
+        // Establish cache.
+        let initial_price = client.get_oracle_price(&token_id);
+        assert_eq!(initial_price, 500_000_i128);
+
+        // Advance exactly to the threshold.
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + 300);
+
+        // Publish new price; exactly-at-threshold → fresh path → new price used.
+        publish_price(&env, &oracle_client, &token_id, 450_000_i128);
+
+        // setup_swap_contract already cancelled the seeding swap (id 0),
+        // so the IP is free.  Initiate a new swap now.
+        let swap_id = client.initiate_swap_with_oracle_price(
+            &token_id,
+            &ip_id,
+            &seller,
+            &buyer,
+            &0_u32,
+            &None,
+            &0_i128,
+            &false,
+            &0_i128,
+            &0_i128,
+        );
+        let swap = client.get_swap(&swap_id).unwrap();
+        assert_eq!(
+            swap.price, 450_000_i128,
+            "swap at exactly-at-threshold should use the fresh oracle price"
+        );
+    }
+
+    #[test]
+    fn test_oracle_price_staleness_just_past_threshold_swap_uses_cache() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (registry_id, ip_id, _, _) = setup_registry(&env, &seller);
+        let token_id = setup_token(&env, &admin, &buyer, 10_000_000);
+        let oracle_id = env.register(MockOracle, ());
+        let oracle_client = MockOracleClient::new(&env, &oracle_id);
+        let (client, admin_addr) =
+            setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
+        enable_oracle(
+            &env,
+            &client,
+            &admin_addr,
+            &oracle_id,
+            &oracle_client,
+            &token_id,
+            500_000_i128,
+        );
+
+        // Establish cache.
+        let initial_price = client.get_oracle_price(&token_id);
+        assert_eq!(initial_price, 500_000_i128);
+
+        // Advance 1 s past the threshold.
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + 301);
+
+        // Publish a new price; stale path should ignore it and use the cache.
+        publish_price(&env, &oracle_client, &token_id, 700_000_i128);
+
+        // setup_swap_contract already cancelled the seeding swap (id 0),
+        // so the IP is free.  Initiate a new swap now.
+        let swap_id = client.initiate_swap_with_oracle_price(
+            &token_id,
+            &ip_id,
+            &seller,
+            &buyer,
+            &0_u32,
+            &None,
+            &0_i128,
+            &false,
+            &0_i128,
+            &0_i128,
+        );
+        let swap = client.get_swap(&swap_id).unwrap();
+        assert_eq!(
+            swap.price, 500_000_i128,
+            "swap at just-past-threshold should use the cached price, not the new oracle price"
+        );
     }
 
     #[test]

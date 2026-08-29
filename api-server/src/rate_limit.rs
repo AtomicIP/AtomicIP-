@@ -283,11 +283,18 @@ return reply
 /// script invocation fails, the store fails open — it allows the request and
 /// logs a warning — so a Redis outage degrades to unlimited-but-available
 /// rather than taking the whole API down with false `429`s.
-#[derive(Debug)]
 struct RedisStore {
     client: redis::Client,
     script: redis::Script,
     conn: tokio::sync::OnceCell<redis::aio::ConnectionManager>,
+}
+
+impl std::fmt::Debug for RedisStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RedisStore")
+            .field("client", &self.client)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RedisStore {

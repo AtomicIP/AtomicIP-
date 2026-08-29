@@ -55,6 +55,7 @@ pub mod request_queue;
 pub mod request_signing;
 pub mod rate_limit;
 pub mod schemas;
+pub mod soroban_rpc;
 pub mod tracing_middleware;
 pub mod versioning;
 pub mod webhook;
