@@ -12,6 +12,7 @@ mod tests {
     #[contractclient(name = "IpRegistryClient")]
     #[allow(dead_code)]
     pub trait IpRegistry {
+        fn initialize(env: Env, admin: Address);
         fn commit_ip(
             env: Env,
             owner: Address,
@@ -43,7 +44,11 @@ mod tests {
             blinding_factor: BytesN<32>,
         ) -> bool;
         fn get_partial_disclosure(env: Env, ip_id: u64) -> Option<BytesN<32>>;
-        fn validate_upgrade(env: Env, new_wasm_hash: BytesN<32>);
+        fn validate_upgrade(
+            env: Env,
+            new_wasm_hash: BytesN<32>,
+            candidate: crate::UpgradeManifest,
+        );
         fn upgrade(env: Env, new_wasm_hash: BytesN<32>);
         fn get_pow_difficulty(env: Env) -> u32;
         fn get_ip_strength(env: Env, ip_id: u64) -> u32;
@@ -333,6 +338,7 @@ mod tests {
         let commitment2 = BytesN::from_array(&env, &[15u8; 32]);
 
         env.mock_all_auths();
+        client.initialize(&owner1);
         let ip_id1 = client.commit_ip(&owner1, &commitment1, &0u32);
         let ip_id2 = client.commit_ip(&owner2, &commitment2, &0u32);
 
@@ -364,6 +370,7 @@ mod tests {
         let commitment = BytesN::from_array(&env, &[16u8; 32]);
 
         env.mock_all_auths();
+        client.initialize(&owner);
         let ip_id = client.commit_ip(&owner, &commitment, &0u32);
 
         let mut ip_ids = Vec::new(&env);
@@ -980,7 +987,7 @@ mod tests {
 
         let valid_hash = BytesN::from_array(&env, &[1u8; 32]);
         // Should not panic
-        client.validate_upgrade(&valid_hash);
+        client.validate_upgrade(&valid_hash, &crate::IpRegistry::current_manifest(&env));
     }
 
     #[test]
@@ -991,7 +998,7 @@ mod tests {
         let client = IpRegistryClient::new(&env, &contract_id);
 
         let zero_hash = BytesN::from_array(&env, &[0u8; 32]);
-        client.validate_upgrade(&zero_hash);
+        client.validate_upgrade(&zero_hash, &crate::IpRegistry::current_manifest(&env));
     }
 
     // ── PoW Tests ─────────────────────────────────────────────────────────────
@@ -1805,6 +1812,7 @@ mod tests {
         let client = IpRegistryClient::new(&env, &contract_id);
 
         let owner = <Address as TestAddress>::generate(&env);
+        client.initialize(&owner);
         let commitment = BytesN::from_array(&env, &[50u8; 32]);
         let ip_id = client.commit_ip(&owner, &commitment, &0u32);
 
@@ -1998,6 +2006,7 @@ mod tests {
         let client = IpRegistryClient::new(&env, &contract_id);
 
         let owner = <Address as TestAddress>::generate(&env);
+        client.initialize(&owner);
         let commitment = BytesN::from_array(&env, &[51u8; 32]);
         let ip_id = client.commit_ip(&owner, &commitment, &0u32);
 
@@ -2042,6 +2051,7 @@ mod tests {
         let owner = <Address as TestAddress>::generate(&env);
         let challenger = <Address as TestAddress>::generate(&env);
         env.mock_all_auths();
+        client.initialize(&owner);
 
         let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[5u8; 32]), &0u32);
         let dispute_id = client.initiate_dispute(
@@ -2082,6 +2092,7 @@ mod tests {
         let owner = <Address as TestAddress>::generate(&env);
         let challenger = <Address as TestAddress>::generate(&env);
         env.mock_all_auths();
+        client.initialize(&owner);
 
         let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[6u8; 32]), &0u32);
         let dispute_id = client.initiate_dispute(
@@ -2138,6 +2149,7 @@ mod tests {
         let client = IpRegistryClient::new(&env, &contract_id);
 
         let owner = <Address as TestAddress>::generate(&env);
+        client.initialize(&owner);
         let commitment = BytesN::from_array(&env, &[53u8; 32]);
         let ip_id = client.commit_ip(&owner, &commitment, &0u32);
 
