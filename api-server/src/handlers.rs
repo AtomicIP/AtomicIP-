@@ -5,7 +5,6 @@ use axum::{
     Json,
 };
 use once_cell::sync::Lazy;
-use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::time::{Duration, Instant};
@@ -17,8 +16,24 @@ use crate::schemas::*;
 use std::sync::Arc;
 use crate::webhook;
 
-// #523: Per-handler idempotency store for batch swap operations.
-static BATCH_SWAP_IDEMPOTENCY: Lazy<DeduplicationStore> = Lazy::new(create_store);
+// #523/#800: Per-handler idempotency store for batch swap operations. Uses a
+// shared Redis backend when REDIS_URL is configured, so a client's retry is
+// deduplicated correctly no matter which api-server instance behind the load
+// balancer it lands on; falls back to an in-process (single-instance-only)
+// store otherwise, mirroring `cache::REDIS_POOL`'s init pattern.
+static BATCH_SWAP_IDEMPOTENCY: Lazy<DeduplicationStore> = Lazy::new(|| match std::env::var("REDIS_URL") {
+    Ok(url) if !url.is_empty() => {
+        tracing::info!("batch-swap idempotency store: using shared Redis backend via REDIS_URL");
+        create_store_with_backend(DeduplicationBackend::Redis(url))
+    }
+    _ => {
+        tracing::warn!(
+            "batch-swap idempotency store: REDIS_URL not set, falling back to in-process store \
+             (not safe for a multi-instance deployment)"
+        );
+        create_store()
+    }
+});
 
 // #520: Mirrors the contract's MAX_BATCH_SIZE cap on a single batch.
 const MAX_BATCH_SIZE: usize = 50;
@@ -362,17 +377,11 @@ pub async fn batch_initiate_swap(Json(body): Json<BatchInitiateSwapRequest>) -> 
     }
 
     // #523: Return cached result if the caller supplied a matching idempotency key.
+    // The store itself only returns unexpired entries (TTL is enforced by the backend).
     if let Some(ref key) = body.idempotency_key {
-        if let Some(entry) = BATCH_SWAP_IDEMPOTENCY.get(key.as_str()) {
-            let cached: &serde_json::Value = &entry.0;
-            let ts: &tokio::time::Instant = &entry.1;
-            if ts.elapsed() < Duration::from_secs(3600) {
-                if let Ok(response) = serde_json::from_value::<BatchInitiateSwapResponse>(cached.clone()) {
-                    return Ok(Json(response));
-                }
-            } else {
-                drop(entry);
-                BATCH_SWAP_IDEMPOTENCY.remove(key.as_str());
+        if let Some(cached) = BATCH_SWAP_IDEMPOTENCY.get(key.as_str()).await {
+            if let Ok(response) = serde_json::from_value::<BatchInitiateSwapResponse>(cached) {
+                return Ok(Json(response));
             }
         }
     }
