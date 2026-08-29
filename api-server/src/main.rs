@@ -41,6 +41,7 @@ mod handlers;
 mod metrics;
 mod middleware_pipeline;
 mod schemas;
+mod soroban_rpc;
 mod tracing_middleware;
 mod versioning;
 mod webhook;

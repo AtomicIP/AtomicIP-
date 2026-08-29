@@ -64,17 +64,30 @@ fn now_timestamp() -> u64 {
     responses(
         (status = 200, description = "IP committed successfully, returns assigned ip_id", body = u64),
         (status = 400, description = "Invalid request (zero hash, duplicate hash)", body = ErrorResponse),
+        (status = 503, description = "Soroban RPC node unavailable", body = ErrorResponse),
     )
 )]
 #[instrument(skip(body))]
-pub async fn commit_ip(Json(body): Json<CommitIpRequest>) -> Result<Json<u64>, (StatusCode, Json<ErrorResponse>)> {
-    // TODO: Call Soroban RPC to invoke ip_registry.commit_ip
-    Err((
-        StatusCode::BAD_REQUEST,
-        Json(ErrorResponse {
-            error: "commit_ip not yet implemented".to_string(),
-        }),
-    ))
+pub async fn commit_ip(
+    Json(body): Json<CommitIpRequest>,
+) -> Result<Json<u64>, (StatusCode, Json<ErrorResponse>)> {
+    // Delegate to the Soroban RPC client.  The client validates inputs before
+    // making the network call, so validation errors are surfaced as 400 without
+    // a round-trip to the RPC node.
+    let ip_id = SOROBAN_CLIENT
+        .commit_ip(&body.owner, &body.commitment_hash)
+        .await
+        .map_err(|err| {
+            let status = soroban_rpc::map_rpc_error_to_status(&err);
+            (
+                status,
+                Json(ErrorResponse {
+                    error: err.to_string(),
+                }),
+            )
+        })?;
+
+    Ok(Json(ip_id))
 }
 
 /// Retrieve an IP record by ID.
