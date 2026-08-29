@@ -2,7 +2,7 @@
 #![allow(deprecated)]
 mod registry;
 mod swap;
-// mod upgrade;
+mod upgrade;
 mod multi_currency;
 mod price_oracle;
 mod types;
@@ -18,7 +18,7 @@ use soroban_sdk::{
     BytesN, Env, Error, IntoVal, String, Val, Vec,
 };
 
-// pub use upgrade::{build_v1_schema, ContractSchema, ErrorEntry, FunctionEntry};
+pub use upgrade::{build_v1_schema, ContractSchema, ErrorEntry, FunctionEntry};
 pub use types::*;
 
 mod validation;
@@ -5402,17 +5402,17 @@ impl AtomicSwap {
 // #[cfg(test)]
 // mod regression_tests;
 
-// #[cfg(test)]
-// mod benchmarks;
+#[cfg(test)]
+mod benchmarks;
 
-// #[cfg(test)]
-// mod mutation_tests;
+#[cfg(test)]
+mod mutation_tests;
 
-// #[cfg(test)]
-// mod snapshot_tests;
+#[cfg(test)]
+mod snapshot_tests;
 
-// #[cfg(test)]
-// mod upgrade_chaos_tests;
+#[cfg(test)]
+mod upgrade_chaos_tests;
 
 // FIXME: pre-existing compile errors from merge conflict - re-enable after fix
 // #[cfg(test)]

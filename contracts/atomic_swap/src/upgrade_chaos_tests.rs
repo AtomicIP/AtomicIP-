@@ -245,7 +245,7 @@ mod chaos {
 
         assert_eq!(
             check_schema_compatibility(&v1, &v2),
-            Err(ContractError::UpgradeFunctionSignatureChanged)
+            Err(ContractError::FuncChanged)
         );
     }
 
@@ -274,7 +274,7 @@ mod chaos {
 
         assert_eq!(
             check_schema_compatibility(&v1, &v2),
-            Err(ContractError::UpgradeFunctionSignatureChanged)
+            Err(ContractError::FuncChanged)
         );
     }
 
@@ -383,5 +383,155 @@ mod chaos {
         };
 
         assert_eq!(check_schema_compatibility(&v1, &v3), Ok(()));
+    }
+
+    // ── 8. Concurrent / mid-swap upgrade resilience ────────────────────────────
+
+    /// Sequential valid upgrades must all pass and leave the correct version.
+    #[test]
+    fn chaos_concurrent_upgrades_sequential_valid() {
+        let env = Env::default();
+        let v1 = build_v1_schema(&env);
+        store_schema(&env, &v1);
+
+        for expected_version in 2u32..=4 {
+            let current = load_schema(&env).unwrap();
+            let next = bump(&current);
+            assert_eq!(check_schema_compatibility(&current, &next), Ok(()));
+            store_schema(&env, &next);
+            assert_eq!(load_schema(&env).unwrap().version, expected_version);
+        }
+    }
+
+    /// An invalid schema after a valid upgrade must be rejected and must not
+    /// mutate the stored schema.
+    #[test]
+    fn chaos_concurrent_upgrade_invalid_rejected() {
+        let env = Env::default();
+        let v1 = build_v1_schema(&env);
+        store_schema(&env, &v1);
+
+        let bad = ContractSchema {
+            version: v1.version + 1,
+            functions: Vec::new(&env),
+            errors: v1.errors.clone(),
+            storage_keys: v1.storage_keys.clone(),
+        };
+        assert!(check_schema_compatibility(&v1, &bad).is_err());
+
+        let stored = load_schema(&env).unwrap();
+        assert_eq!(stored.version, v1.version);
+    }
+
+    /// Mid-swap upgrade: a swap in Pending state must survive a schema bump
+    /// and remain operable afterwards.
+    #[test]
+    fn chaos_mid_swap_upgrade_preserves_state() {
+        let env = Env::default();
+        let v1 = build_v1_schema(&env);
+        store_schema(&env, &v1);
+
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        let swap_id: u64 = 42;
+        let swap = crate::SwapRecord {
+            ip_id: 1,
+            seller: seller.clone(),
+            buyer: buyer.clone(),
+            price: 1000,
+            token: token.clone(),
+            status: crate::SwapStatus::Pending,
+            expiry: env.ledger().timestamp() + 604800,
+            accept_timestamp: 0,
+            required_approvals: 0,
+            dispute_timestamp: 0,
+            referrer: None,
+            collateral_amount: 0,
+            insurance_premium: 0,
+            insurance_enabled: false,
+            escrow_agent: None,
+            quantity: 1,
+            conditions: Vec::new(&env),
+            paid_amount: 0,
+            is_installment: false,
+            arbitrator: None,
+        };
+
+        env.storage().persistent().set(&crate::DataKey::Swap(swap_id), &swap);
+        env.storage().persistent().extend_ttl(
+            &crate::DataKey::Swap(swap_id),
+            crate::LEDGER_BUMP,
+            crate::LEDGER_BUMP,
+        );
+
+        let v2 = bump(&v1);
+        assert_eq!(check_schema_compatibility(&v1, &v2), Ok(()));
+        store_schema(&env, &v2);
+
+        let stored: crate::SwapRecord = env
+            .storage()
+            .persistent()
+            .get(&crate::DataKey::Swap(swap_id))
+            .unwrap();
+        assert_eq!(stored.status, crate::SwapStatus::Pending);
+        assert_eq!(stored.price, 1000);
+    }
+
+    /// Mid-swap upgrade: a swap in Accepted state must survive a schema bump
+    /// and still be completable.
+    #[test]
+    fn chaos_mid_swap_upgrade_accepted_survives() {
+        let env = Env::default();
+        let v1 = build_v1_schema(&env);
+        store_schema(&env, &v1);
+
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        let swap_id: u64 = 99;
+        let swap = crate::SwapRecord {
+            ip_id: 1,
+            seller: seller.clone(),
+            buyer: buyer.clone(),
+            price: 500,
+            token: token.clone(),
+            status: crate::SwapStatus::Accepted,
+            expiry: env.ledger().timestamp() + 604800,
+            accept_timestamp: env.ledger().timestamp(),
+            required_approvals: 0,
+            dispute_timestamp: 0,
+            referrer: None,
+            collateral_amount: 0,
+            insurance_premium: 0,
+            insurance_enabled: false,
+            escrow_agent: None,
+            quantity: 1,
+            conditions: Vec::new(&env),
+            paid_amount: 0,
+            is_installment: false,
+            arbitrator: None,
+        };
+
+        env.storage().persistent().set(&crate::DataKey::Swap(swap_id), &swap);
+        env.storage().persistent().extend_ttl(
+            &crate::DataKey::Swap(swap_id),
+            crate::LEDGER_BUMP,
+            crate::LEDGER_BUMP,
+        );
+
+        let v2 = bump(&v1);
+        assert_eq!(check_schema_compatibility(&v1, &v2), Ok(()));
+        store_schema(&env, &v2);
+
+        let stored: crate::SwapRecord = env
+            .storage()
+            .persistent()
+            .get(&crate::DataKey::Swap(swap_id))
+            .unwrap();
+        assert_eq!(stored.status, crate::SwapStatus::Accepted);
+        assert_eq!(stored.price, 500);
     }
 }

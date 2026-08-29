@@ -41,6 +41,7 @@ mod handlers;
 mod metrics;
 mod middleware_pipeline;
 mod schemas;
+mod soroban_rpc;
 mod tracing_middleware;
 mod versioning;
 mod webhook;
@@ -73,6 +74,7 @@ mod validation_fuzz_tests;
         handlers::transfer_ip,
         handlers::verify_commitment,
         handlers::list_ip_by_owner,
+        handlers::list_ip_by_owner_cursor,
         handlers::initiate_swap,
         handlers::batch_initiate_swap,
         handlers::accept_swap,
@@ -200,7 +202,25 @@ async fn main() {
     };
 
     let rate_limiter = rate_limit::RateLimitMiddleware::new(rate_limit::RateLimitConfig::default());
+    let request_queue = Arc::new(request_queue::RequestQueue::new(
+        request_queue::QueueConfig::default(),
+    ));
+
+    // Mutating endpoints that move or commit IP/swap state require a signed
+    // request (see request_signing.rs) on top of the layers applied below.
+    let signed_routes = Router::new()
+        .route("/ip/commit",                      post(handlers::commit_ip))
+        .route("/ip/transfer",                    post(handlers::transfer_ip))
+        .route("/swap/initiate",                  post(handlers::initiate_swap))
+        .route("/swap/batch-initiate",            post(handlers::batch_initiate_swap))
+        .route("/swap/{swap_id}/accept",          post(handlers::accept_swap))
+        .route("/swap/{swap_id}/reveal",          post(handlers::reveal_key))
+        .route("/swap/{swap_id}/cancel",          post(handlers::cancel_swap))
+        .route("/swap/{swap_id}/cancel-expired",  post(handlers::cancel_expired_swap))
+        .route_layer(middleware::from_fn(request_signing::verify_request_signature));
+
     let app = Router::new()
+        .merge(signed_routes)
         .route("/health",          get(health::health_handler))
         .route("/health/detailed", get(health::detailed_health_handler))
         .route("/metrics",         get(metrics::metrics_handler))
@@ -209,9 +229,7 @@ async fn main() {
         .route("/ws",              get(ws_handler))
         .route("/events",          get(events_handler))
         .route("/batch",           post(batch::batch_handler))
-        .route("/ip/commit",                      post(handlers::commit_ip))
         .route("/ip/{ip_id}",                     get(handlers::get_ip))
-        .route("/ip/transfer",                    post(handlers::transfer_ip))
         .route("/ip/verify",                      post(handlers::verify_commitment))
         .route("/ip/owner/{owner}",               get(handlers::list_ip_by_owner))
         .route("/ip/owner/{owner}/cursor",        get(handlers::list_ip_by_owner_cursor))
@@ -225,10 +243,17 @@ async fn main() {
         .route("/swap/{swap_id}",                 get(handlers::get_swap))
         .route("/openapi.json", get(openapi_handler))
         .with_state(state)
+        .layer(middleware::from_fn_with_state(
+            request_queue,
+            request_queue::request_queue_middleware,
+        ))
         .layer(middleware::from_fn_with_state(rate_limiter, rate_limit::rate_limit_middleware))
         .layer(middleware::from_fn(metrics::track))
         .layer(middleware::from_fn(distributed_tracing::distributed_tracing_middleware))
-        .layer(middleware::from_fn(middleware_pipeline::cors_middleware));
+        .layer(middleware::from_fn(versioning::version_negotiation))
+        .layer(middleware::from_fn(compression::compression_middleware))
+        .layer(middleware::from_fn(middleware_pipeline::cors_middleware))
+        .layer(middleware::from_fn(require_json_content_type));
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
     println!("OpenAPI JSON    -> http://localhost:8080/openapi.json");
@@ -304,7 +329,14 @@ fn build_app() -> Router {
 
     Router::new()
         .route("/health", get(health::health_handler))
+        .route("/health/detailed", get(health::detailed_health_handler))
+        .route("/metrics", get(metrics::metrics_handler))
         .route("/version", get(versioning::get_version_info))
+        .route("/graphql", post(graphql_handler))
+        .route("/graphql/ws", get(graphql_ws_handler))
+        .route("/ws", get(ws_handler))
+        .route("/events", get(events_handler))
+        .route("/batch", post(batch::batch_handler))
         .route("/v1/graphql", post(graphql_handler))
         .route("/v1/ip/commit", post(handlers::commit_ip))
         .route("/v1/ip/{ip_id}", get(handlers::get_ip))
@@ -314,14 +346,18 @@ fn build_app() -> Router {
         .route("/v1/ip/owner/{owner}/cursor", get(handlers::list_ip_by_owner_cursor))
         .route("/v1/ip/owner/{owner}/cursor", get(handlers::list_ip_by_owner_cursor))
         .route("/v1/swap/initiate", post(handlers::initiate_swap))
+        .route("/v1/swap/batch-initiate", post(handlers::batch_initiate_swap))
         .route("/v1/swap/bulk/initiate", post(handlers::batch_initiate_swap))
         .route("/v1/swap/{swap_id}/accept", post(handlers::accept_swap))
         .route("/v1/swap/{swap_id}/reveal", post(handlers::reveal_key))
         .route("/v1/swap/{swap_id}/cancel", post(handlers::cancel_swap))
         .route("/v1/swap/{swap_id}/cancel-expired", post(handlers::cancel_expired_swap))
         .route("/v1/swap/{swap_id}", get(handlers::get_swap))
+        .route("/v1/webhooks", post(handlers::register_webhook))
+        .route("/v1/webhooks/{id}", axum::routing::delete(handlers::unregister_webhook))
         .route("/v1/bulk/commit-ip", post(handlers::bulk_commit_ip))
         .route("/v1/bulk/initiate-swap", post(handlers::bulk_initiate_swap))
+        .route("/openapi.json", get(openapi_handler))
         .with_state(state)
         .layer(middleware::from_fn_with_state(rate_limiter, rate_limit::rate_limit_middleware))
         .layer(middleware::from_fn(tracing_middleware::trace_requests))
@@ -814,7 +850,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/v1/ip/1")
+                    .uri("/v1/ip/owner/GADDR")
                     .header("Accept-Version", "1.0.0")
                     .body(Body::empty())
                     .unwrap(),
@@ -822,6 +858,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("API-Version").unwrap(), "1.0.0");
     }
 
     #[tokio::test]
@@ -839,6 +876,65 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_ACCEPTABLE);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["error"].as_str().unwrap().contains("not supported"));
+        assert!(json["supported_versions"].is_array());
+    }
+
+    #[tokio::test]
+    async fn test_unversioned_request_is_rejected_404() {
+        let app = build_app();
+        let resp = app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/ip/1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let resp_swap = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/swap/1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_swap.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_all_13_handlers_attached_to_v1_version() {
+        let app = build_app();
+        for handler in versioning::V1_HANDLERS {
+            assert!(handler.starts_with("/v1/"), "Handler {} must have /v1/ prefix", handler);
+        }
+        let test_endpoints = vec![
+            "/v1/ip/1",
+            "/v1/ip/owner/GADDR",
+            "/v1/ip/owner/GADDR/cursor",
+            "/v1/swap/1",
+        ];
+        for path in test_endpoints {
+            let resp = app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.headers().get("API-Version").unwrap(), "1.0.0");
+        }
     }
 
     // ── #320: API Request Tracing tests ──────────────────────────────────────
@@ -1031,7 +1127,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/v1/ip/1")
+                    .uri("/v1/ip/owner/GADDR")
                     .header("Accept-Version", "1.0.0")
                     .body(Body::empty())
                     .unwrap(),

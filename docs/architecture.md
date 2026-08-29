@@ -100,6 +100,53 @@ contents, since that could itself grow without bound.
 ### Atomic Swap Contract
 - **SwapRecord (u64):** Stores details of an active/completed swap (seller, buyer, price, status, escrowed token).
 
+## 🗂️ registry.rs — Local Registry Helper in the Atomic Swap Contract
+
+`contracts/atomic_swap/src/registry.rs` is a **thin helper module inside the
+`atomic_swap` contract**. It is **not** a standalone registry; all authoritative
+IP records live in the separate `ip_registry` contract.
+
+### Purpose
+
+The atomic swap contract needs to verify two things about an IP before it
+allows a swap to proceed:
+
+1. **Ownership** — the seller must be the current owner of the IP.
+2. **Validity** — the IP must not have been revoked.
+
+Rather than duplicating this logic inline across every entry-point that touches
+an IP, `registry.rs` centralises those cross-contract calls in two small
+functions:
+
+| Function | What it does |
+|---|---|
+| `ip_registry(env)` | Reads the stored `ip_registry` contract address from instance storage and returns it. Panics with `ContractError::NotInitialized` if the swap contract has not been initialised yet. |
+| `ensure_seller_owns_active_ip(env, ip_id, seller)` | Cross-calls `ip_registry.get_ip(ip_id)`, then panics with `NotIPOwner` or `IpRevoked` if the seller check fails. |
+| `verify_commitment(env, ip_id, secret, blinding_factor)` | Cross-calls `ip_registry.verify_commitment` and returns the boolean result. |
+
+### Relationship to `ip_registry`
+
+```
+atomic_swap contract
+└── registry.rs  ──cross-contract call──►  ip_registry contract
+    (local helper)                          (authoritative IP store)
+```
+
+- `registry.rs` is a **local read-only proxy** — it holds no IP state of its
+  own and never writes to the `ip_registry` contract.
+- The `ip_registry` contract is the **single source of truth** for IP records,
+  ownership, and revocation status.
+- `registry.rs` caches only the `ip_registry` contract *address* (stored under
+  `DataKey::IpRegistry` in the swap contract's instance storage) so the swap
+  contract does not need the address hardcoded in every call site.
+
+### Why a separate module instead of inline calls?
+
+Keeping cross-contract calls in one place makes the security boundary explicit:
+every read from `ip_registry` goes through `registry.rs`, so an auditor can
+find all external data dependencies in a single 35-line file rather than
+hunting through the entire `lib.rs`.
+
 ## 🌍 Infrastructure
 
 - **Network:** Stellar Testnet & Mainnet.
@@ -107,96 +154,41 @@ contents, since that could itself grow without bound.
 - **Automation:** GitHub Actions for contract deployment and API testing.
 - **Monitoring:** Periodic health checks and ledger event indexing (planned).
 
-## 🛡️ API Server Middleware Pipeline & Ordering
+## 🗂️ `registry.rs` — Atomic Swap's Cross-Contract Adapter
 
-The API Server uses an onion-layered middleware pipeline built on Axum/Tower. Incoming HTTP requests traverse from the outermost edge layer inward to the route handler, and outgoing HTTP responses traverse back out in reverse order.
+`contracts/atomic_swap/src/registry.rs` is a **local adapter module inside the
+Atomic Swap contract**, not a standalone registry.  It bridges the gap between
+Atomic Swap logic and the separately-deployed `ip_registry` contract.
 
-```mermaid
-graph TD
-    Client([HTTP Client]) --> M1[1. Distributed Tracing / Request Tracing]
-    M1 --> M2[2. CORS Headers]
-    M2 --> M3[3. Compression & Vary Encoding]
-    M3 --> M4[4. API Versioning & Negotiation]
-    M4 --> M5[5. Request Validation & Content-Type]
-    M5 --> M6[6. Authentication & Identity Extraction]
-    M6 --> M7[7. Rate Limiting & User Quotas]
-    M7 --> M8[8. Circuit Breakers & Resilience]
-    M8 --> Handler[9. RPC / GraphQL / REST Handlers]
+### What it does
 
-    Handler --> M8
-    M8 --> M7
-    M7 --> M6
-    M6 --> M5
-    M5 --> M4
-    M4 --> M3
-    M3 --> M2
-    M2 --> M1
-    M1 --> Client
+| Function | Purpose |
+|---|---|
+| `ip_registry(env)` | Reads the `ip_registry` contract address stored in Atomic Swap's own instance storage (set at initialisation). |
+| `ensure_seller_owns_active_ip(env, ip_id, seller)` | Cross-contract call — fetches the `IpRecord` from `ip_registry` and panics with `ContractError::NotIPOwner` or `ContractError::IpRevoked` if the guard fails. |
+| `verify_commitment(env, ip_id, secret, blinding_factor)` | Cross-contract call — delegates commitment verification to `ip_registry.verify_commitment`. |
+
+### Relationship to `ip_registry`
+
+```
+AtomicSwap contract (atomic_swap/)
+  └── registry.rs  ← this file; a thin adapter, no storage of its own
+        │  cross-contract call via IpRegistryClient
+        ▼
+  ip_registry contract  (ip_registry/)
+        └── owns the canonical IpRecord table
+              (owner, commitment_hash, timestamp, revoked)
 ```
 
-### Pipeline Layer Specification
+`registry.rs` **never stores IP ownership records itself**.  All IP state lives
+in the `ip_registry` contract.  The adapter only provides guarded read helpers
+so the swap logic can verify ownership and commitment validity without repeating
+the contract-address lookup at every call site.
 
-| Inbound Order | Outbound Order | Middleware Layer | Module | Primary Responsibility |
-|:---:|:---:|:---|:---|:---|
-| **1** | **8** | **Tracing & Metrics** | `tracing_middleware.rs` / `distributed_tracing.rs` | Extracts/generates `X-Trace-ID` and `X-Request-ID`, creates root request span, starts request timing, and attaches trace headers to *all* responses (including early rejections). |
-| **2** | **7** | **CORS** | `middleware_pipeline.rs:cors_middleware` | Injects CORS headers (`Access-Control-Allow-Origin`, `Access-Control-Allow-Headers`, etc.) across all responses (200, 400, 401, 429, 500). |
-| **3** | **6** | **Compression** | `compression.rs:compression_middleware` | Inspects `Accept-Encoding`, appends `Vary: Accept-Encoding`, and applies gzip/brotli/deflate encoding to outgoing payloads. |
-| **4** | **5** | **API Versioning** | `versioning.rs:version_negotiation` | Evaluates `Accept-Version` header / version URL prefix, rejects unsupported versions with `406 Not Acceptable`, and sets `API-Version`. |
-| **5** | **4** | **Request Validation** | `validation_middleware.rs` / `require_json_content_type` | Validates `Content-Type: application/json` on mutating requests (POST/PUT/PATCH) and checks payload schemas before expensive operations. |
-| **6** | **3** | **Authentication** | `auth.rs:require_auth` | Verifies JWT bearer tokens or Stellar Ed25519 signatures; extracts `Claims` and inserts `AuthExtension` into request extensions. Rejects unauthenticated requests with `401 Unauthorized`. |
-| **7** | **2** | **Rate Limiting** | `rate_limit.rs:rate_limit_middleware` | Token-bucket enforcement across global, source-IP, and authenticated user scopes. Employs `AuthExtension` to apply user tiers (Free/Premium/Enterprise). |
-| **8** | **1** | **Circuit Breaker** | `circuit_breaker.rs` | Protects downstream dependencies (Soroban RPC node, database, Redis) against cascading outages with fast-failure when tripped. |
-| **9** | — | **Handlers** | `handlers.rs`, `graphql.rs`, `batch.rs` | Executes business logic, interacts with smart contracts via Soroban RPC client, and returns JSON/GraphQL responses. |
+### Why a separate `ip_registry` contract?
 
-### ⚠️ Ordering Rationale & Anti-Pattern Flags
-
-The exact sequence of middleware execution is critical to system security, performance, and correctness:
-
-1. **Authentication BEFORE Rate Limiting (Crucial Rule)**:
-   - **Why Auth must precede Rate Limiting**: Placing authentication *before* rate limiting ensures the caller's verified identity (`AuthExtension`) is available during rate-limit evaluation. This allows the rate limiter to correctly apply user billing tiers (e.g. Premium vs. Enterprise vs. Free) and enforce user-level quotas rather than falling back to IP-based rate limiting.
-   - **Flagged Anti-Pattern (Rate Limiting before Auth)**: Placing rate limiting *before* authentication is dangerous because unauthenticated traffic can exhaust the global and IP rate-limit budgets for legitimate authenticated clients sharing a proxy or NAT gateway. Furthermore, unauthenticated requests could consume quotas before identity verification occurs.
-2. **Tracing & CORS Outermost**:
-   - Tracing must wrap all other layers so that rejection responses generated by upstream middleware (e.g., 401 Unauthorized from auth, 429 from rate limit, 415 from content validation) still receive trace identifiers, metrics tracking, and accurate duration measurements.
-   - CORS must be placed outside auth and rate limiting so that browser clients making cross-origin requests receive valid CORS headers on error responses (`401`, `429`, `500`) and preflight `OPTIONS` requests succeed without requiring authentication.
-3. **Request Validation before Authentication/Rate Limiting**:
-   - Rejecting requests lacking required headers (e.g., non-JSON bodies on mutating endpoints) early prevents unnecessary cryptographic signature verification and token bucket consumption.
-
-### Middleware Pipeline Implementation Notes
-
-The API Server middleware pipeline is implemented in `api-server/src/middleware_pipeline.rs` using Axum/Tower's layered middleware system. Requests flow through layers from outside-in on ingress and inside-out on egress.
-
-#### Key Implementation Details
-
-- **Layer Configuration**: `DOCUMENTED_PIPELINE_ORDER` constant in `middleware_pipeline.rs` defines the official order.
-- **Runtime Validation**: `validate_pipeline_ordering()` function checks for common ordering anti-patterns at startup.
-- **Layer Assembly**: Layers must be added in **reverse** order in code (innermost added first) because Tower stacks them outward.
-- **Axum Router Construction**: In `main.rs`, layers are applied using `.layer(middleware::from_fn(...))` in the correct sequence.
-
-#### Module References
-
-| Module | Responsibility | File |
-|--------|---|---|
-| Distributed Tracing | Trace ID generation, request timing | `distributed_tracing.rs`, `tracing_middleware.rs` |
-| CORS | Cross-origin request headers | `middleware_pipeline.rs` |
-| Compression | Request/response encoding (gzip, brotli, deflate) | `compression.rs` |
-| API Versioning | Version negotiation via headers/URL | `versioning.rs` |
-| Validation | Content-Type, payload schema checks | `validation_middleware.rs`, `validation.rs` |
-| Authentication | JWT/Ed25519 signature verification | `auth.rs` |
-| Rate Limiting | Token-bucket quotas per user/IP/global | `rate_limit.rs` |
-| Circuit Breaker | Failure resilience for RPC/Redis/DB | `circuit_breaker.rs` |
-| Handler Execution | Business logic, Soroban RPC calls | `handlers.rs`, `graphql.rs`, `batch.rs` |
-
-#### Testing the Pipeline
-
-The middleware pipeline is tested in `middleware_pipeline.rs` tests:
-
-1. **`test_documented_pipeline_order_matches_architecture()`**: Verifies the documented order is internally consistent and passes validation rules.
-2. **`test_pipeline_runtime_execution_order_in_axum()`**: Constructs a real Axum app with all middleware layers and verifies inbound/outbound execution order using a shared log.
-3. **Anti-Pattern Detection Tests**: Each test flags a specific unintended ordering (e.g., RateLimit before Auth, Auth before CORS) and asserts it is rejected by `validate_pipeline_ordering()`.
-
-To run tests:
-```bash
-cd api-server
-cargo test middleware_pipeline
-```
-
+Separating IP registration from swap execution keeps each contract's storage
+and upgrade surface small.  The `ip_registry` can be upgraded (or audited) in
+isolation without touching atomic-swap logic, and vice-versa.  `registry.rs`
+is the single seam between the two contracts: if the `ip_registry` interface
+changes, only this file needs to be updated.
