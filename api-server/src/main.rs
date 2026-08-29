@@ -13,6 +13,7 @@ use std::sync::Arc;
 struct AppState {
     schema:           graphql::AtomicIpSchema,
     query_client:     Arc<graphql::SorobanQueryClient>,
+    rpc_client:       Arc<dyn graphql::SorobanRpcClient>,
     ws_broadcaster:   Arc<websocket::EventBroadcaster>,
     sse_broadcaster:  Arc<events::EventBroadcaster>,
     health_checker:   Arc<health::HealthChecker>,
@@ -187,19 +188,23 @@ async fn main() {
     let rpc_client: Arc<dyn graphql::SorobanRpcClient> = Arc::new(graphql::MockSorobanRpcClient::default());
     let query_client = Arc::new(graphql::SorobanQueryClient::new(rpc_client.clone()));
     let schema = graphql::build_schema_with_broadcaster(
-        rpc_client,
+        rpc_client.clone(),
         subscription_broadcaster.clone(),
     );
 
     let state = AppState {
         schema,
         query_client,
+        rpc_client,
         ws_broadcaster:  Arc::new(websocket::EventBroadcaster::new()),
         sse_broadcaster: Arc::new(events::create_event_broadcaster().0),
         health_checker:  Arc::new(health::HealthChecker::new()),
     };
 
     let rate_limiter = rate_limit::RateLimitMiddleware::new(rate_limit::RateLimitConfig::default());
+    // #535: request-signing middleware, enforced on every write endpoint that
+    // submits a signed transaction to Soroban (commit / transfer / swap lifecycle).
+    let signed = middleware::from_fn(request_signing::verify_request_signature);
     let app = Router::new()
         .route("/health",          get(health::health_handler))
         .route("/health/detailed", get(health::detailed_health_handler))
@@ -209,18 +214,17 @@ async fn main() {
         .route("/ws",              get(ws_handler))
         .route("/events",          get(events_handler))
         .route("/batch",           post(batch::batch_handler))
-        .route("/ip/commit",                      post(handlers::commit_ip))
+        .route("/ip/commit",                      post(handlers::commit_ip).layer(signed.clone()))
         .route("/ip/{ip_id}",                     get(handlers::get_ip))
-        .route("/ip/transfer",                    post(handlers::transfer_ip))
+        .route("/ip/transfer",                    post(handlers::transfer_ip).layer(signed.clone()))
         .route("/ip/verify",                      post(handlers::verify_commitment))
         .route("/ip/owner/{owner}",               get(handlers::list_ip_by_owner))
         .route("/ip/owner/{owner}/cursor",        get(handlers::list_ip_by_owner_cursor))
-        .route("/ip/owner/{owner}/cursor",        get(handlers::list_ip_by_owner_cursor))
-        .route("/swap/initiate",                  post(handlers::initiate_swap))
+        .route("/swap/initiate",                  post(handlers::initiate_swap).layer(signed.clone()))
         .route("/swap/batch-initiate",            post(handlers::batch_initiate_swap))
-        .route("/swap/{swap_id}/accept",          post(handlers::accept_swap))
-        .route("/swap/{swap_id}/reveal",          post(handlers::reveal_key))
-        .route("/swap/{swap_id}/cancel",          post(handlers::cancel_swap))
+        .route("/swap/{swap_id}/accept",          post(handlers::accept_swap).layer(signed.clone()))
+        .route("/swap/{swap_id}/reveal",          post(handlers::reveal_key).layer(signed.clone()))
+        .route("/swap/{swap_id}/cancel",          post(handlers::cancel_swap).layer(signed.clone()))
         .route("/swap/{swap_id}/cancel-expired",  post(handlers::cancel_expired_swap))
         .route("/swap/{swap_id}",                 get(handlers::get_swap))
         .route("/openapi.json", get(openapi_handler))
@@ -278,15 +282,13 @@ async fn events_handler(
 }
 
 fn build_app() -> Router {
-    let query_client = Arc::new(graphql::SorobanQueryClient::new(Arc::new(graphql::MockSorobanRpcClient::default())));
+    let rpc_client: Arc<dyn graphql::SorobanRpcClient> = Arc::new(graphql::MockSorobanRpcClient::default());
+    let query_client = Arc::new(graphql::SorobanQueryClient::new(rpc_client.clone()));
     let schema = graphql::build_schema();
     let health_checker = Arc::new(health::HealthChecker::new());
-    let circuit_breaker = Arc::new(circuit_breaker::CircuitBreaker::new(
-        "default",
-        circuit_breaker::CircuitBreakerConfig::default(),
-    ));
     let state = AppState {
         schema,
+        query_client,
         rpc_client,
         ws_broadcaster:  Arc::new(websocket::EventBroadcaster::new()),
         sse_broadcaster: Arc::new(events::create_event_broadcaster().0),
@@ -294,30 +296,25 @@ fn build_app() -> Router {
     };
 
     let rate_limiter = rate_limit::RateLimitMiddleware::new(rate_limit::RateLimitConfig::default());
-    let state = AppState {
-        schema,
-        query_client,
-        ws_broadcaster: Arc::new(websocket::EventBroadcaster::new()),
-        sse_broadcaster: Arc::new(events::create_event_broadcaster().0),
-        health_checker,
-    };
 
+    // #535: same signing enforcement as the production router, so the test
+    // router exercises the identical middleware on the six write endpoints.
+    let signed = middleware::from_fn(request_signing::verify_request_signature);
     Router::new()
         .route("/health", get(health::health_handler))
         .route("/version", get(versioning::get_version_info))
         .route("/v1/graphql", post(graphql_handler))
-        .route("/v1/ip/commit", post(handlers::commit_ip))
+        .route("/v1/ip/commit", post(handlers::commit_ip).layer(signed.clone()))
         .route("/v1/ip/{ip_id}", get(handlers::get_ip))
-        .route("/v1/ip/transfer", post(handlers::transfer_ip))
+        .route("/v1/ip/transfer", post(handlers::transfer_ip).layer(signed.clone()))
         .route("/v1/ip/verify", post(handlers::verify_commitment))
         .route("/v1/ip/owner/{owner}", get(handlers::list_ip_by_owner))
         .route("/v1/ip/owner/{owner}/cursor", get(handlers::list_ip_by_owner_cursor))
-        .route("/v1/ip/owner/{owner}/cursor", get(handlers::list_ip_by_owner_cursor))
-        .route("/v1/swap/initiate", post(handlers::initiate_swap))
+        .route("/v1/swap/initiate", post(handlers::initiate_swap).layer(signed.clone()))
         .route("/v1/swap/bulk/initiate", post(handlers::batch_initiate_swap))
-        .route("/v1/swap/{swap_id}/accept", post(handlers::accept_swap))
-        .route("/v1/swap/{swap_id}/reveal", post(handlers::reveal_key))
-        .route("/v1/swap/{swap_id}/cancel", post(handlers::cancel_swap))
+        .route("/v1/swap/{swap_id}/accept", post(handlers::accept_swap).layer(signed.clone()))
+        .route("/v1/swap/{swap_id}/reveal", post(handlers::reveal_key).layer(signed.clone()))
+        .route("/v1/swap/{swap_id}/cancel", post(handlers::cancel_swap).layer(signed.clone()))
         .route("/v1/swap/{swap_id}/cancel-expired", post(handlers::cancel_expired_swap))
         .route("/v1/swap/{swap_id}", get(handlers::get_swap))
         .route("/v1/bulk/commit-ip", post(handlers::bulk_commit_ip))
@@ -339,6 +336,25 @@ mod tests {
         http::{Request, StatusCode},
     };
     use tower::ServiceExt;
+
+    /// Test router with an injectable RPC client, used by the swap read-path
+    /// tests to exercise `GET /v1/swap/{id}` against a stub client.
+    fn app_with_rpc_client(rpc_client: Arc<dyn graphql::SorobanRpcClient>) -> Router {
+        let query_client = Arc::new(graphql::SorobanQueryClient::new(rpc_client.clone()));
+        let schema = graphql::build_schema();
+        let health_checker = Arc::new(health::HealthChecker::new());
+        let state = AppState {
+            schema,
+            query_client,
+            rpc_client,
+            ws_broadcaster:  Arc::new(websocket::EventBroadcaster::new()),
+            sse_broadcaster: Arc::new(events::create_event_broadcaster().0),
+            health_checker,
+        };
+        Router::new()
+            .route("/v1/swap/{swap_id}", get(handlers::get_swap))
+            .with_state(state)
+    }
 
     #[tokio::test]
     async fn test_post_without_content_type_returns_415() {
@@ -1179,5 +1195,75 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.headers().get("Content-Encoding").unwrap(), "gzip");
+    }
+
+    // ── #535: Request-signing enforcement on Soroban write endpoints ──────────
+
+    /// Every write endpoint that submits a signed transaction to Soroban must
+    /// reject requests that carry no valid signature. The middleware runs
+    /// per-route on exactly these six endpoints — not on reads, verification,
+    /// or batch/bulk variants.
+    #[tokio::test]
+    async fn test_signed_write_endpoints_reject_unsigned_requests() {
+        let app = build_app();
+        let cases = [
+            ("/v1/ip/commit", r#"{"owner":"GADDR","commitment_hash":"abc"}"#),
+            ("/v1/ip/transfer", r#"{"ip_id":1,"new_owner":"GBUYER"}"#),
+            ("/v1/swap/initiate", r#"{"ip_registry_id":"C1","ip_id":1,"seller":"GSELLER","price":100,"buyer":"GBUYER","token":"CTOKEN"}"#),
+            ("/v1/swap/1/accept", r#"{"buyer":"GBUYER"}"#),
+            ("/v1/swap/1/reveal", r#"{"caller":"GSELLER","secret":"abcd","blinding_factor":"efgh"}"#),
+            ("/v1/swap/1/cancel", r#"{"canceller":"GSELLER"}"#),
+        ];
+        for (path, body) in cases {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "unsigned POST {path} must be rejected by request-signing middleware"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_signed_write_endpoint_accepts_valid_signature() {
+        let app = build_app();
+        let method = "POST";
+        let path = "/v1/ip/commit";
+        let body = r#"{"owner":"GADDR","commitment_hash":"abc"}"#;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let body_hash = request_signing::hash_body(body.as_bytes());
+        let public_key = "GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBQ5ECVVF7C3XVQCRWGSGAX";
+        let signature = request_signing::generate_signature(method, path, now, &body_hash, public_key);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .header("X-Signature", signature)
+                    .header("X-Timestamp", now.to_string())
+                    .header("X-Public-Key", public_key)
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Middleware verified the signature and let the request through; the
+        // commit_ip stub then returns 400 ("not yet implemented").
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }
