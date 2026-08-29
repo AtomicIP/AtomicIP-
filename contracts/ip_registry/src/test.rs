@@ -994,6 +994,14 @@ mod tests {
         assert_eq!(id5, 5);
     }
 
+    fn full_upgrade_manifest(env: &Env) -> crate::UpgradeManifest {
+        crate::UpgradeManifest {
+            exported_functions: crate::IpRegistry::required_exported_functions(env),
+            error_codes: crate::IpRegistry::current_error_codes(env),
+            storage_keys: crate::IpRegistry::current_storage_keys(env),
+        }
+    }
+
     #[test]
     fn test_validate_upgrade_accepts_non_zero_hash() {
         let env = Env::default();

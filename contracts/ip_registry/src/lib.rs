@@ -32,9 +32,8 @@ mod snapshot_tests;
 #[cfg(test)]
 mod differential_tests;
 
-// FIXME: invariant_tests.rs has pre-existing compilation errors from a merge conflict
-// #[cfg(test)]
-// mod invariant_tests;
+#[cfg(test)]
+mod invariant_tests;
 
 #[cfg(test)]
 mod upgrade_tests;

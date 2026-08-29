@@ -23,7 +23,7 @@ mod upgrade_tests {
     use crate::{IpRecord, UpgradeManifest};
     use soroban_sdk::contractclient;
     use soroban_sdk::testutils::Address as TestAddress;
-    use soroban_sdk::{Address, BytesN, Env};
+    use soroban_sdk::{Address, BytesN, Env, String, Symbol};
 
     #[contractclient(name = "UpgradeTestClient")]
     #[allow(dead_code)]

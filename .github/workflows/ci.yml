@@ -21,6 +21,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Check for disabled test modules
+        run: ./scripts/check-disabled-tests.sh
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: actions/cache@v5
