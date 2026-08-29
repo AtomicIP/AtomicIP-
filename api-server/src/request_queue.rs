@@ -1,10 +1,11 @@
 use axum::{
-    extract::Request,
+    extract::{Request, State},
     http::StatusCode,
     middleware::Next,
     response::{IntoResponse, Response},
 };
 use dashmap::DashMap;
+use metrics::{gauge, histogram};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
@@ -168,19 +169,108 @@ pub struct QueueStats {
     pub avg_wait_time: Duration,
 }
 
-/// Middleware for request queuing
+/// Middleware for request queuing/backpressure, backed by a real `RequestQueue`.
+///
+/// Every request must acquire a queue slot before reaching its handler. If the
+/// queue is already at `max_queue_size`, the request is rejected immediately
+/// with `503 Service Unavailable`. Otherwise it waits (FIFO, via the
+/// underlying semaphore) for one of `max_concurrent_requests` slots to free
+/// up, up to `request_timeout`; a wait that exceeds the timeout is rejected
+/// with `408 Request Timeout`. Queue depth and wait time are published as
+/// metrics so operators can observe backpressure occurring.
 pub async fn request_queue_middleware(
+    State(queue): State<Arc<RequestQueue>>,
     req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    // This would be integrated with the main app state
-    // For now, just pass through
-    Ok(next.run(req).await)
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let wait_start = Instant::now();
+
+    let guard = queue.acquire(request_id).await?;
+
+    histogram!("request_queue_wait_seconds").record(wait_start.elapsed().as_secs_f64());
+    gauge!("request_queue_depth").set(queue.get_queue_size() as f64);
+
+    let response = next.run(req).await;
+    drop(guard);
+    gauge!("request_queue_depth").set(queue.get_queue_size() as f64);
+
+    Ok(response)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{body::Body, http::Request as HttpRequest, routing::get, Router};
+    use tower::ServiceExt;
+
+    fn app_with_queue(config: QueueConfig) -> Router {
+        let queue = Arc::new(RequestQueue::new(config));
+        Router::new()
+            .route("/ok", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                queue,
+                request_queue_middleware,
+            ))
+    }
+
+    /// Issue #792: requests within capacity are actually served through the
+    /// real middleware path, not just through direct `RequestQueue` calls.
+    #[tokio::test]
+    async fn test_middleware_serves_requests_within_capacity() {
+        let app = app_with_queue(QueueConfig {
+            max_queue_size: 10,
+            max_concurrent_requests: 10,
+            request_timeout: Duration::from_secs(5),
+        });
+
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/ok")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Issue #792: once the queue is at capacity, excess requests are
+    /// rejected through the real middleware path rather than passing through
+    /// unthrottled.
+    #[tokio::test]
+    async fn test_middleware_rejects_when_queue_full() {
+        let config = QueueConfig {
+            max_queue_size: 1,
+            max_concurrent_requests: 100,
+            request_timeout: Duration::from_secs(5),
+        };
+        let queue = Arc::new(RequestQueue::new(config));
+        // Occupy the only queue slot directly so the middleware call below
+        // must observe the queue as full.
+        let _held = queue.acquire("holder".to_string()).await.unwrap();
+
+        let app = Router::new()
+            .route("/ok", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                queue,
+                request_queue_middleware,
+            ));
+
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/ok")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
 
     #[tokio::test]
     async fn test_queue_creation() {
