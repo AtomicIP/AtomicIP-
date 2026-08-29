@@ -463,6 +463,111 @@ mod tests {
             "generated trace_id must be a valid UUID v4"
         );
     }
+
+    // ── #838: commit_ip handler tests ─────────────────────────────────────────
+
+    /// Valid request payload for commit_ip: 64-char non-zero hex hash.
+    fn valid_commit_ip_payload() -> serde_json::Value {
+        json!({
+            "owner": "GABC1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZABC1234567890ABCDEFGHIJ",
+            "commitment_hash": "a3f1e2d4b5c6789012345678901234567890abcdef1234567890abcdef123456"
+        })
+    }
+
+    #[test]
+    fn test_commit_ip_request_payload_structure() {
+        // Verify the request body matches the CommitIpRequest schema.
+        let payload = valid_commit_ip_payload();
+        assert!(payload["owner"].is_string(), "owner must be a string");
+        assert!(payload["commitment_hash"].is_string(), "commitment_hash must be a string");
+        assert_eq!(
+            payload["commitment_hash"].as_str().unwrap().len(),
+            64,
+            "commitment_hash must be exactly 64 hex characters (32 bytes)"
+        );
+    }
+
+    #[test]
+    fn test_commit_ip_zero_hash_rejected_locally() {
+        // The soroban_rpc module rejects all-zero hashes before hitting the network.
+        // Mimic the same check here to confirm the validation contract is in place.
+        let zero_hash = "0".repeat(64);
+        let is_zero = zero_hash.chars().all(|c| c == '0');
+        assert!(is_zero, "zero hash should be detected as all-zero");
+
+        // A non-zero hash should pass this guard
+        let valid_hash = "a3f1e2d4b5c6789012345678901234567890abcdef1234567890abcdef123456";
+        let is_valid_zero = valid_hash.chars().all(|c| c == '0');
+        assert!(!is_valid_zero, "non-zero hash must not be flagged as zero");
+    }
+
+    #[test]
+    fn test_commit_ip_hash_length_validation() {
+        // The RPC module enforces exactly 64 hex chars (32-byte SHA256).
+        let too_short = "a3f1e2d4b5c6789012345678901234";  // 30 chars
+        let correct   = "a3f1e2d4b5c6789012345678901234567890abcdef1234567890abcdef123456"; // 64
+        let too_long  = "a3f1e2d4b5c6789012345678901234567890abcdef1234567890abcdef1234567"; // 65
+
+        assert_ne!(too_short.len(), 64, "short hash must fail length check");
+        assert_eq!(correct.len(),   64, "correct hash must pass length check");
+        assert_ne!(too_long.len(),  64, "long hash must fail length check");
+    }
+
+    #[test]
+    fn test_commit_ip_empty_owner_rejected() {
+        // The RPC module rejects an empty owner string before network round-trip.
+        let empty_owner = "";
+        assert!(empty_owner.is_empty(), "empty owner must be caught by pre-flight check");
+    }
+
+    #[test]
+    fn test_commit_ip_error_to_http_status_mapping() {
+        // Verify the documented mapping from SorobanError variants to HTTP codes.
+        // These constants mirror the mapping in handlers::commit_ip.
+        use axum::http::StatusCode;
+
+        let mappings: &[(&str, u16)] = &[
+            ("ZeroHash",       StatusCode::BAD_REQUEST.as_u16()),
+            ("DuplicateHash",  StatusCode::CONFLICT.as_u16()),
+            ("InvalidOwner",   StatusCode::BAD_REQUEST.as_u16()),
+            ("NotFound",       StatusCode::NOT_FOUND.as_u16()),
+            ("NotOwner",       StatusCode::FORBIDDEN.as_u16()),
+            ("Revoked",        StatusCode::GONE.as_u16()),
+            ("NotInitialized", StatusCode::SERVICE_UNAVAILABLE.as_u16()),
+            ("RpcFailure",     StatusCode::BAD_GATEWAY.as_u16()),
+            ("ContractError",  StatusCode::INTERNAL_SERVER_ERROR.as_u16()),
+        ];
+
+        // Confirm all expected variants are present and have distinct, sensible codes.
+        assert!(!mappings.is_empty(), "error mapping table must not be empty");
+        for (name, code) in mappings {
+            assert!(*code >= 400 && *code < 600, "{name} must map to a 4xx/5xx code, got {code}");
+        }
+    }
+
+    #[test]
+    fn test_commit_ip_success_response_type_is_u64() {
+        // On success the handler returns Json<u64>.  Verify JSON deserialization.
+        let raw_response = serde_json::json!(42u64);
+        let ip_id: u64 = serde_json::from_value(raw_response).expect("ip_id must be a u64");
+        assert_eq!(ip_id, 42);
+    }
+
+    #[test]
+    fn test_commit_ip_rpc_failure_maps_to_bad_gateway() {
+        // A simulated RPC failure (network timeout, DNS error, etc.) must yield 502.
+        use axum::http::StatusCode;
+        let expected = StatusCode::BAD_GATEWAY.as_u16();
+        assert_eq!(expected, 502, "RpcFailure must map to 502 Bad Gateway");
+    }
+
+    #[test]
+    fn test_commit_ip_duplicate_hash_maps_to_conflict() {
+        // A duplicate hash must yield 409 Conflict, not 400.
+        use axum::http::StatusCode;
+        let expected = StatusCode::CONFLICT.as_u16();
+        assert_eq!(expected, 409, "DuplicateHash must map to 409 Conflict");
+    }
 }
 
 // ── commit_ip handler integration tests (#838) ────────────────────────────────

@@ -20,7 +20,12 @@
 //! 3. `collect_fee` returns the canonical fee amount denominated in `fee_asset`
 //!    decimals so the caller can debit the correct amount from the right account.
 
-use soroban_sdk::{contracttype, Address, Env, String, Vec};
+use soroban_sdk::{contracttype, panic_with_error, Address, Env, String, Vec};
+
+// Import the canonical error enum from the contract root (lib.rs).
+// This avoids duplicating error codes and keeps the fee-asset error ordinal
+// stable across upgrades.
+use crate::ContractError;
 
 /// Supported payment tokens.
 #[contracttype]
