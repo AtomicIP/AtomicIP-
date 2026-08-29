@@ -100,20 +100,52 @@ contents, since that could itself grow without bound.
 ### Atomic Swap Contract
 - **SwapRecord (u64):** Stores details of an active/completed swap (seller, buyer, price, status, escrowed token).
 
-## ⚡ Performance Benchmarks
+## 🗂️ registry.rs — Local Registry Helper in the Atomic Swap Contract
 
-`contracts/ip_registry/src/benchmarks.rs` (`cargo test bench_ -p ip_registry`) tracks CPU-instruction
-budget regressions for the core IP Registry operations against these baseline ceilings:
+`contracts/atomic_swap/src/registry.rs` is a **thin helper module inside the
+`atomic_swap` contract**. It is **not** a standalone registry; all authoritative
+IP records live in the separate `ip_registry` contract.
 
-| Operation | CPU instruction ceiling |
+### Purpose
+
+The atomic swap contract needs to verify two things about an IP before it
+allows a swap to proceed:
+
+1. **Ownership** — the seller must be the current owner of the IP.
+2. **Validity** — the IP must not have been revoked.
+
+Rather than duplicating this logic inline across every entry-point that touches
+an IP, `registry.rs` centralises those cross-contract calls in two small
+functions:
+
+| Function | What it does |
 |---|---|
-| `commit_ip` | 600,000 |
-| `verify_commitment` | 200,000 |
-| `get_ip` | 100,000 |
-| `list_ip_by_owner` (5 IPs) | 150,000 |
+| `ip_registry(env)` | Reads the stored `ip_registry` contract address from instance storage and returns it. Panics with `ContractError::NotInitialized` if the swap contract has not been initialised yet. |
+| `ensure_seller_owns_active_ip(env, ip_id, seller)` | Cross-calls `ip_registry.get_ip(ip_id)`, then panics with `NotIPOwner` or `IpRevoked` if the seller check fails. |
+| `verify_commitment(env, ip_id, secret, blinding_factor)` | Cross-calls `ip_registry.verify_commitment` and returns the boolean result. |
 
-These are conservative upper bounds, not measured averages — a benchmark failing past its ceiling
-signals a real regression worth investigating, not just budget churn.
+### Relationship to `ip_registry`
+
+```
+atomic_swap contract
+└── registry.rs  ──cross-contract call──►  ip_registry contract
+    (local helper)                          (authoritative IP store)
+```
+
+- `registry.rs` is a **local read-only proxy** — it holds no IP state of its
+  own and never writes to the `ip_registry` contract.
+- The `ip_registry` contract is the **single source of truth** for IP records,
+  ownership, and revocation status.
+- `registry.rs` caches only the `ip_registry` contract *address* (stored under
+  `DataKey::IpRegistry` in the swap contract's instance storage) so the swap
+  contract does not need the address hardcoded in every call site.
+
+### Why a separate module instead of inline calls?
+
+Keeping cross-contract calls in one place makes the security boundary explicit:
+every read from `ip_registry` goes through `registry.rs`, so an auditor can
+find all external data dependencies in a single 35-line file rather than
+hunting through the entire `lib.rs`.
 
 ## 🌍 Infrastructure
 
@@ -121,3 +153,42 @@ signals a real regression worth investigating, not just budget churn.
 - **RPC:** Public Soroban RPC nodes (SDF).
 - **Automation:** GitHub Actions for contract deployment and API testing.
 - **Monitoring:** Periodic health checks and ledger event indexing (planned).
+
+## 🗂️ `registry.rs` — Atomic Swap's Cross-Contract Adapter
+
+`contracts/atomic_swap/src/registry.rs` is a **local adapter module inside the
+Atomic Swap contract**, not a standalone registry.  It bridges the gap between
+Atomic Swap logic and the separately-deployed `ip_registry` contract.
+
+### What it does
+
+| Function | Purpose |
+|---|---|
+| `ip_registry(env)` | Reads the `ip_registry` contract address stored in Atomic Swap's own instance storage (set at initialisation). |
+| `ensure_seller_owns_active_ip(env, ip_id, seller)` | Cross-contract call — fetches the `IpRecord` from `ip_registry` and panics with `ContractError::NotIPOwner` or `ContractError::IpRevoked` if the guard fails. |
+| `verify_commitment(env, ip_id, secret, blinding_factor)` | Cross-contract call — delegates commitment verification to `ip_registry.verify_commitment`. |
+
+### Relationship to `ip_registry`
+
+```
+AtomicSwap contract (atomic_swap/)
+  └── registry.rs  ← this file; a thin adapter, no storage of its own
+        │  cross-contract call via IpRegistryClient
+        ▼
+  ip_registry contract  (ip_registry/)
+        └── owns the canonical IpRecord table
+              (owner, commitment_hash, timestamp, revoked)
+```
+
+`registry.rs` **never stores IP ownership records itself**.  All IP state lives
+in the `ip_registry` contract.  The adapter only provides guarded read helpers
+so the swap logic can verify ownership and commitment validity without repeating
+the contract-address lookup at every call site.
+
+### Why a separate `ip_registry` contract?
+
+Separating IP registration from swap execution keeps each contract's storage
+and upgrade surface small.  The `ip_registry` can be upgraded (or audited) in
+isolation without touching atomic-swap logic, and vice-versa.  `registry.rs`
+is the single seam between the two contracts: if the `ip_registry` interface
+changes, only this file needs to be updated.

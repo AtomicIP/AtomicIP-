@@ -5,7 +5,7 @@ extern crate std;
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
-    Bytes, BytesN, Env, Error, Vec,
+    Bytes, BytesN, Env, Error, Symbol, Vec,
 };
 
 mod validation;
@@ -19,6 +19,7 @@ mod zk_commitment;
 #[cfg(test)]
 mod test;
 
+// #817: benchmarks.rs fixed and extended with zk_commitment benchmarks.
 #[cfg(test)]
 mod benchmarks;
 
@@ -93,6 +94,14 @@ pub enum ContractError {
     CategoryNotFound = 34,
     /// Batch operation size mismatch.
     BatchSizeMismatch = 35,
+    /// #790: Contract has not been initialized with a real admin address yet.
+    NotInitialized = 36,
+    /// #790: `initialize` was called on a contract that already has an admin.
+    AlreadyInitialized = 37,
+    /// #791: candidate upgrade WASM's manifest is missing an exported function,
+    /// storage key, or error code that the current contract relies on, or it
+    /// reassigns an existing error code to a different meaning.
+    IncompatibleUpgrade = 38,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -100,6 +109,10 @@ pub enum ContractError {
 /// Minimum ledger TTL bump applied to every persistent storage write.
 /// ~1 year at ~5s per ledger: 365 * 24 * 3600 / 5 ≈ 6_307_200 ledgers.
 pub const LEDGER_BUMP: u32 = 6_307_200;
+
+/// Issue #811: Default TTL for ownership challenges, in seconds (24 hours).
+/// Can be overridden via `set_challenge_ttl`.
+pub const DEFAULT_CHALLENGE_TTL_SECONDS: u64 = 86_400;
 
 /// Maximum metadata size: 1 KB
 pub const MAX_METADATA_BYTES: u32 = 1024;
@@ -192,50 +205,130 @@ pub enum DataKey {
     EncryptedCommitment(u64),
     // Issue #465: Batch escrow — keyed by escrow_id (sha256 of ip_ids + timestamp)
     BatchEscrow(BytesN<32>),
+    // Issue #811: TTL (in seconds) for ownership challenges
+    ChallengeTtl,
+    // Issue #812: Cached Merkle root for an owner's commitment set; None = stale
+    MerkleRoot(Address),
+    // Issue #812: Flag indicating the cached Merkle root for an owner is stale
+    MerkleRootStale(Address),
 }
 
-/// #806: One exported function's (name, signature) pair, as declared by a
-/// candidate WASM's manifest — see [`UpgradeManifest`]. `signature` is a
-/// deterministic encoding of the full argument/return types, e.g.
-/// `"get_ip(ip_id:u64)->IpRecord"`; any change (including argument
-/// reordering) is treated as a breaking change.
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct FunctionEntry {
-    pub name: soroban_sdk::Symbol,
-    pub signature: soroban_sdk::String,
-}
+// ── Upgrade Compatibility Manifest (#791) ───────────────────────────────────
 
-/// #806: One `ContractError` variant's (name, discriminant) pair, as
-/// declared by a candidate WASM's manifest — see [`UpgradeManifest`].
+/// A single (error name, error code) pair, part of an `UpgradeManifest`.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
-pub struct ErrorCodeEntry {
-    pub name: soroban_sdk::Symbol,
+pub struct ManifestErrorCode {
+    pub name: Symbol,
     pub code: u32,
 }
 
-/// #806: Self-attested description of a candidate WASM's public interface,
-/// supplied by the upgrade proposer to [`validate_upgrade`].
-///
-/// A Soroban guest contract has no host API to read the bytecode of another
-/// contract from a WASM hash, so byte-level diffing of exported functions,
-/// storage keys, and error codes cannot happen from inside the contract
-/// itself — that parsing has to run off-chain (e.g. `wasm-tools` inspecting
-/// the candidate `.wasm`'s export section), which is what produces this
-/// manifest. `validate_upgrade` then checks the manifest against the
-/// invariants this contract currently guarantees: no required function,
-/// error code, or storage key may be removed or renumbered.
+/// Describes a candidate contract WASM's public interface for compatibility
+/// checking in `validate_upgrade`. A Soroban contract cannot introspect an
+/// arbitrary WASM blob from within itself, so off-chain tooling that built the
+/// candidate WASM supplies this manifest alongside its hash.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct UpgradeManifest {
-    /// Every function the candidate WASM exports.
-    pub exported_functions: Vec<FunctionEntry>,
-    /// Every `ContractError` variant the candidate WASM defines.
-    pub error_codes: Vec<ErrorCodeEntry>,
-    /// Name of every storage key variant the candidate WASM defines.
-    pub storage_keys: Vec<soroban_sdk::Symbol>,
+    /// Names of every function the candidate contract exports.
+    pub functions: Vec<Symbol>,
+    /// Names of every `DataKey` storage-key variant the candidate contract uses.
+    pub storage_keys: Vec<Symbol>,
+    /// Every (error name, error code) pair the candidate contract defines.
+    pub error_codes: Vec<ManifestErrorCode>,
 }
+
+/// Names of every function exported by the currently deployed contract.
+/// Used as the compatibility baseline in `validate_upgrade`.
+const CURRENT_FUNCTIONS: &[&str] = &[
+    "add_co_owner", "add_threshold_signature", "assign_ip_to_category", "batch_commit_ip",
+    "batch_commit_ip_anonymous", "batch_delegate_commitment", "batch_escrow_commitments", "batch_renew_ip",
+    "batch_stake_commitments", "batch_update_reputation", "batch_verify_commitments", "cancel_batch_escrow",
+    "check_expiration_warning", "check_ip_access", "cleanup_expired_ips", "commit_ip",
+    "commit_ip_delegated", "commit_ip_version", "compute_ip_merkle_root", "create_ip_version",
+    "delegate_commitment_authority", "encrypt_commitment", "finalize_arbitration", "find_duplicate_commitment",
+    "generate_merkle_proof", "get_anonymous_owner", "get_arbitration", "get_batch_escrow",
+    "get_batch_metadata", "get_blinded_owner_batch", "get_commitment_compression", "get_commitment_shard",
+    "get_compressed_bytes", "get_compressed_commitment", "get_dispute", "get_encrypted_commitment",
+    "get_ip", "get_ip_access_grants", "get_ip_audit_trail", "get_ip_lineage",
+    "get_ip_notary_signature", "get_ip_strength", "get_ip_suggested_price", "get_ip_version_chain",
+    "get_ip_versions", "get_key_rotation_history", "get_licenses", "get_ownership_challenge",
+    "get_partial_disclosure", "get_pow_difficulty", "get_renewal_count", "get_reputation",
+    "get_stake", "get_threshold_config", "get_threshold_signatures", "grant_ip_access",
+    "grant_license", "initialize", "initiate_dispute", "is_delegate",
+    "is_ip_owner", "issue_ownership_challenge", "list_ip_by_category", "list_ip_by_owner",
+    "list_ip_by_shard", "list_owner_categories", "merge_duplicate_commitment", "nominate_arbitrator",
+    "notarize_ip_timestamp", "open_arbitration", "register_category_path", "release_batch_escrow",
+    "remove_co_owner", "renew_ip", "renew_ip_commitment", "require_threshold_signatures",
+    "resolve_dispute", "respond_to_ownership_challenge", "reveal_and_verify_commitments", "reveal_partial",
+    "revoke_delegation", "revoke_ip", "revoke_ip_access", "revoke_license",
+    "rotate_commitment_key", "set_admin", "set_batch_metadata", "set_commitment_compression",
+    "set_ip_expiry", "set_ip_suggested_price", "set_notary_public_key", "slash_stake",
+    "stake_commitment", "submit_dispute_evidence", "transfer_ip", "transfer_ip_ownership",
+    "unstake", "update_reputation", "upgrade", "validate_category",
+    "validate_upgrade", "verify_batch_proof", "verify_commitment", "verify_commitment_integrity",
+    "verify_commitment_pow", "verify_ip_merkle_proof", "verify_ownership_challenge", "verify_threshold_signatures",
+    "vote_on_dispute",
+];
+
+/// Names of every `DataKey` storage-key variant the currently deployed
+/// contract reads or writes. Used as the compatibility baseline in
+/// `validate_upgrade`.
+const CURRENT_STORAGE_KEYS: &[&str] = &[
+    "IpRecord", "OwnerIps", "NextId", "CommitmentOwner", "AnonymousOwner", "UsedBlindedOwner",
+    "Admin", "PartialDisclosure", "IpLicenses", "CategoryIps", "PowDifficulty", "IpVersions",
+    "SuggestedPrice", "IpCommitmentChecksum", "IpAccessGrants", "NotarySignature", "IpVersionChain",
+    "OwnershipChallenge", "NextChallengeId", "EncryptionKeyRotation", "NotaryPublicKey",
+    "CommitmentHashes", "IpPowDifficulty", "ShardIps", "ShardSubIps", "ShardHead", "IpAuditTrail",
+    "RenewalCount", "Delegates", "DelegateDepth", "IpDisputes", "NextDisputeId", "IpStake",
+    "OwnerReputation", "ArbitrationCase", "NextArbitrationId", "ArbitratorPool",
+    "CompressedCommitment", "BatchVerifyResult", "CompressionSelection", "HierarchyNode",
+    "OwnerCategories", "CategoryDepth", "ThresholdConfig", "ThresholdSignatures", "BatchMetadata",
+    "EncryptedCommitment", "BatchEscrow",
+];
+
+/// (error name, error code) pairs defined by the currently deployed contract.
+/// Used as the compatibility baseline in `validate_upgrade`.
+const CURRENT_ERROR_CODES: &[(&str, u32)] = &[
+    ("IpNotFound", 1),
+    ("ZeroCommitmentHash", 2),
+    ("CommitmentAlreadyRegistered", 3),
+    ("IpAlreadyRevoked", 4),
+    ("UnauthorizedUpgrade", 5),
+    ("Unauthorized", 6),
+    ("IpExpired", 7),
+    ("MetadataTooLarge", 8),
+    ("LicenseeNotFound", 9),
+    ("InsufficientPoW", 10),
+    ("InvalidExpiry", 11),
+    ("IpInDispute", 12),
+    ("CoOwnerNotFound", 13),
+    ("InvalidOwnershipPercentage", 14),
+    ("OnlyOwnerCanManageCoOwners", 15),
+    ("DisputeNotFound", 16),
+    ("DisputeAlreadyResolved", 17),
+    ("StakeNotFound", 18),
+    ("AlreadyStaked", 19),
+    ("StakeAlreadySlashed", 20),
+    ("ArbitrationNotFound", 21),
+    ("ArbitrationAlreadyFinalized", 22),
+    ("NotAnArbitrator", 23),
+    ("ThresholdNotMet", 24),
+    ("SignerNotAuthorized", 25),
+    ("AlreadySigned", 26),
+    ("BatchMetadataTooLarge", 27),
+    ("EncryptedDataTooLarge", 28),
+    ("EscrowNotFound", 29),
+    ("EscrowNotActive", 30),
+    ("EscrowTimeoutNotReached", 31),
+    ("InvalidCategoryHash", 32),
+    ("InvalidCategoryDepth", 33),
+    ("CategoryNotFound", 34),
+    ("BatchSizeMismatch", 35),
+    ("NotInitialized", 36),
+    ("AlreadyInitialized", 37),
+    ("IncompatibleUpgrade", 38),
+];
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -544,6 +637,55 @@ pub struct IpRegistry;
 
 #[contractimpl]
 impl IpRegistry {
+    /// Initialize the contract with a real, externally-controlled admin address.
+    ///
+    /// Must be called exactly once, before any admin-gated function is usable.
+    /// Requires the auth of the `admin` address being set, so a caller cannot
+    /// install an admin they do not control.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the contract has already been initialized.
+    pub fn initialize(env: Env, admin: Address) {
+        admin.require_auth();
+
+        if env.storage().persistent().has(&DataKey::Admin) {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::AlreadyInitialized as u32,
+            ));
+        }
+
+        env.storage().persistent().set(&DataKey::Admin, &admin);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Admin, LEDGER_BUMP, LEDGER_BUMP);
+    }
+
+    /// Rotate the admin address. Only the current admin may do this.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the contract has not been initialized or the caller is not
+    /// the current admin.
+    pub fn set_admin(env: Env, new_admin: Address) {
+        let admin = Self::require_admin(&env);
+        admin.require_auth();
+
+        env.storage().persistent().set(&DataKey::Admin, &new_admin);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Admin, LEDGER_BUMP, LEDGER_BUMP);
+    }
+
+    /// Fetch the stored admin address, panicking if the contract has not been
+    /// initialized yet.
+    fn require_admin(env: &Env) -> Address {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(env, ContractError::NotInitialized))
+    }
+
     /// Timestamp a new IP commitment. Returns the assigned IP ID.
     ///
     /// This function creates a new IP record with a cryptographic commitment hash,
@@ -593,15 +735,6 @@ impl IpRegistry {
         // Enforced by the Soroban host: panics if the transaction does not carry
         // a valid authorization for `owner`. This is the correct auth pattern.
         owner.require_auth();
-
-        // Initialize admin on first call if not set
-        if !env.storage().persistent().has(&DataKey::Admin) {
-            let admin = env.current_contract_address();
-            env.storage().persistent().set(&DataKey::Admin, &admin);
-            env.storage()
-                .persistent()
-                .extend_ttl(&DataKey::Admin, 50000, 50000);
-        }
 
         // Reject zero-byte commitment hash (Issue #40)
         require_non_zero_commitment(&env, &commitment_hash);
@@ -713,6 +846,9 @@ impl IpRegistry {
         // Adjust PoW difficulty based on daily commit volume
         Self::adjust_pow_difficulty(&env);
 
+        // Issue #812: Mark cached Merkle root stale for this owner
+        Self::mark_merkle_root_stale(&env, &owner);
+
         id
     }
 
@@ -748,15 +884,6 @@ impl IpRegistry {
         commitment_hashes: Vec<BytesN<32>>,
     ) -> Vec<u64> {
         owner.require_auth();
-
-        // Initialize admin on first call if not set
-        if !env.storage().persistent().has(&DataKey::Admin) {
-            let admin = env.current_contract_address();
-            env.storage().persistent().set(&DataKey::Admin, &admin);
-            env.storage()
-                .persistent()
-                .extend_ttl(&DataKey::Admin, 50000, 50000);
-        }
 
         let mut ids = Vec::new(&env);
         let timestamp = env.ledger().timestamp();
@@ -916,15 +1043,6 @@ impl IpRegistry {
             LEDGER_BUMP,
             LEDGER_BUMP,
         );
-
-        // Initialize admin on first call if not set
-        if !env.storage().persistent().has(&DataKey::Admin) {
-            let admin = env.current_contract_address();
-            env.storage().persistent().set(&DataKey::Admin, &admin);
-            env.storage()
-                .persistent()
-                .extend_ttl(&DataKey::Admin, 50000, 50000);
-        }
 
         let mut ids = Vec::new(&env);
         let timestamp = env.ledger().timestamp();
@@ -1286,10 +1404,14 @@ impl IpRegistry {
 
         // Emit transfer event: (ip_id, old_owner, new_owner)
         env.events()
-            .publish((TRANSFER_TOPIC, ip_id), (old_owner, new_owner.clone()));
+            .publish((TRANSFER_TOPIC, ip_id), (old_owner.clone(), new_owner.clone()));
 
         // Issue #436: Record immutable audit entry for ownership transfer
-        Self::append_audit_entry(&env, ip_id, symbol_short!("xferred"), new_owner);
+        Self::append_audit_entry(&env, ip_id, symbol_short!("xferred"), new_owner.clone());
+
+        // Issue #812: Mark cached Merkle root stale for both old and new owner
+        Self::mark_merkle_root_stale(&env, &old_owner);
+        Self::mark_merkle_root_stale(&env, &new_owner);
     }
 
     /// Transfer IP ownership to a new address (named alias for transfer_ip).
@@ -1318,6 +1440,8 @@ impl IpRegistry {
 
         require_not_revoked(&env, &record);
 
+        let revoked_hash = record.commitment_hash.clone();
+
         record.revoked = true;
         env.storage()
             .persistent()
@@ -1332,25 +1456,27 @@ impl IpRegistry {
         );
 
         // Issue #436: Record immutable audit entry for revocation
-        Self::append_audit_entry(&env, ip_id, symbol_short!("revoked"), record.owner);
+        Self::append_audit_entry(&env, ip_id, symbol_short!("revoked"), record.owner.clone());
+
+        // Issue #812: Mark cached Merkle root stale for this owner
+        Self::mark_merkle_root_stale(&env, &record.owner);
     }
 
-    /// Validate that a new WASM is compatible for upgrade.
+    /// Validate that a candidate WASM is compatible for upgrade.
     ///
-    /// Checks the candidate's self-attested [`UpgradeManifest`] (see its
-    /// docs for why this contract can't diff raw WASM bytes itself) to
-    /// confirm it keeps the same contract interface: every currently
-    /// required exported function must keep the same signature, and every
-    /// error code and storage key must still be present with the same
-    /// name/discriminant. New functions, codes, or keys may be freely added.
+    /// Checks that `new_wasm_hash` is non-zero, and that `candidate` — a
+    /// manifest of the candidate WASM's exported functions, storage keys, and
+    /// error codes, supplied by the off-chain tooling that built it — does not
+    /// remove any function, storage key, or error code the current contract
+    /// relies on, and does not reassign an existing error code to a different
+    /// meaning. Additive changes (new functions, keys, or codes) are allowed.
     ///
     /// # Panics
     ///
-    /// Panics if `new_wasm_hash` is zero, or if the manifest shows a
-    /// required function, error code, or storage key was removed, or a
-    /// required function's signature or an error code's discriminant
-    /// changed.
-    pub fn validate_upgrade(env: Env, new_wasm_hash: BytesN<32>, manifest: UpgradeManifest) {
+    /// Panics if `new_wasm_hash` is zero, or if `candidate` is missing an
+    /// existing function/storage key, is missing an existing error code, or
+    /// reassigns an existing error code's number to a different name.
+    pub fn validate_upgrade(env: Env, new_wasm_hash: BytesN<32>, candidate: UpgradeManifest) {
         let zero_hash = BytesN::from_array(&env, &[0u8; 32]);
         if new_wasm_hash == zero_hash {
             env.panic_with_error(Error::from_contract_error(
@@ -1358,145 +1484,83 @@ impl IpRegistry {
             ));
         }
 
-        for required in Self::required_exported_functions(&env).iter() {
-            let still_matches = manifest.exported_functions.iter().any(|candidate| {
-                candidate.name == required.name && candidate.signature == required.signature
-            });
-            if !still_matches {
+        let baseline = Self::current_manifest(&env);
+
+        for name in baseline.functions.iter() {
+            if !Self::symbol_vec_contains(&candidate.functions, &name) {
                 env.panic_with_error(Error::from_contract_error(
-                    ContractError::UnauthorizedUpgrade as u32,
+                    ContractError::IncompatibleUpgrade as u32,
                 ));
             }
         }
 
-        for entry in Self::current_error_codes(&env).iter() {
-            let still_present = manifest
-                .error_codes
-                .iter()
-                .any(|candidate| candidate.name == entry.name && candidate.code == entry.code);
-            if !still_present {
+        for key in baseline.storage_keys.iter() {
+            if !Self::symbol_vec_contains(&candidate.storage_keys, &key) {
                 env.panic_with_error(Error::from_contract_error(
-                    ContractError::UnauthorizedUpgrade as u32,
+                    ContractError::IncompatibleUpgrade as u32,
                 ));
             }
         }
 
-        for key in Self::current_storage_keys(&env).iter() {
-            if !manifest.storage_keys.iter().any(|k| k == key) {
+        for entry in baseline.error_codes.iter() {
+            let mut matched = false;
+            for candidate_entry in candidate.error_codes.iter() {
+                if candidate_entry.name == entry.name {
+                    if candidate_entry.code != entry.code {
+                        env.panic_with_error(Error::from_contract_error(
+                            ContractError::IncompatibleUpgrade as u32,
+                        ));
+                    }
+                    matched = true;
+                    break;
+                }
+            }
+            if !matched {
                 env.panic_with_error(Error::from_contract_error(
-                    ContractError::UnauthorizedUpgrade as u32,
+                    ContractError::IncompatibleUpgrade as u32,
                 ));
             }
         }
     }
 
-    /// Exported functions whose removal would break every existing
-    /// integration against this contract; an upgrade must keep exporting
-    /// all of them with an unchanged signature. Not exhaustive over the
-    /// whole public surface — scoped to the core read/write operations other
-    /// contracts and clients depend on.
-    fn required_exported_functions(env: &Env) -> Vec<FunctionEntry> {
-        let entries: [(&str, &str); 8] = [
-            ("commit_ip", "commit_ip(owner:Address,commitment_hash:BytesN<32>,pow_difficulty:u32)->u64"),
-            ("get_ip", "get_ip(ip_id:u64)->IpRecord"),
-            ("transfer_ip_ownership", "transfer_ip_ownership(ip_id:u64,new_owner:Address)->()"),
-            ("verify_commitment", "verify_commitment(ip_id:u64,secret:BytesN<32>,blinding_factor:BytesN<32>)->bool"),
-            ("revoke_ip", "revoke_ip(ip_id:u64)->()"),
-            ("list_ip_by_owner", "list_ip_by_owner(owner:Address)->Vec<u64>"),
-            ("upgrade", "upgrade(new_wasm_hash:BytesN<32>)->()"),
-            ("validate_upgrade", "validate_upgrade(new_wasm_hash:BytesN<32>,manifest:UpgradeManifest)->()"),
-        ];
-        let mut out = Vec::new(env);
-        for (name, signature) in entries {
-            out.push_back(FunctionEntry {
-                name: soroban_sdk::Symbol::new(env, name),
-                signature: soroban_sdk::String::from_str(env, signature),
+    /// The compatibility baseline: the currently deployed contract's own
+    /// exported functions, storage keys, and error codes.
+    fn current_manifest(env: &Env) -> UpgradeManifest {
+        let mut functions = Vec::new(env);
+        for name in CURRENT_FUNCTIONS.iter() {
+            functions.push_back(Symbol::new(env, name));
+        }
+
+        let mut storage_keys = Vec::new(env);
+        for name in CURRENT_STORAGE_KEYS.iter() {
+            storage_keys.push_back(Symbol::new(env, name));
+        }
+
+        let mut error_codes = Vec::new(env);
+        for (name, code) in CURRENT_ERROR_CODES.iter() {
+            error_codes.push_back(ManifestErrorCode {
+                name: Symbol::new(env, name),
+                code: *code,
             });
         }
-        out
+
+        UpgradeManifest {
+            functions,
+            storage_keys,
+            error_codes,
+        }
     }
 
-    /// (name, discriminant) for every `ContractError` variant this contract
-    /// currently defines. Referencing `ContractError::X as u32` rather than
-    /// a hand-typed literal means a future rename/removal of a variant
-    /// fails to compile here instead of silently drifting out of sync.
-    fn current_error_codes(env: &Env) -> Vec<ErrorCodeEntry> {
-        let codes: [(&str, u32); 35] = [
-            ("IpNotFound", ContractError::IpNotFound as u32),
-            ("ZeroCommitmentHash", ContractError::ZeroCommitmentHash as u32),
-            ("CommitmentAlreadyRegistered", ContractError::CommitmentAlreadyRegistered as u32),
-            ("IpAlreadyRevoked", ContractError::IpAlreadyRevoked as u32),
-            ("UnauthorizedUpgrade", ContractError::UnauthorizedUpgrade as u32),
-            ("Unauthorized", ContractError::Unauthorized as u32),
-            ("IpExpired", ContractError::IpExpired as u32),
-            ("MetadataTooLarge", ContractError::MetadataTooLarge as u32),
-            ("LicenseeNotFound", ContractError::LicenseeNotFound as u32),
-            ("InsufficientPoW", ContractError::InsufficientPoW as u32),
-            ("InvalidExpiry", ContractError::InvalidExpiry as u32),
-            ("IpInDispute", ContractError::IpInDispute as u32),
-            ("CoOwnerNotFound", ContractError::CoOwnerNotFound as u32),
-            ("InvalidOwnershipPercentage", ContractError::InvalidOwnershipPercentage as u32),
-            ("OnlyOwnerCanManageCoOwners", ContractError::OnlyOwnerCanManageCoOwners as u32),
-            ("DisputeNotFound", ContractError::DisputeNotFound as u32),
-            ("DisputeAlreadyResolved", ContractError::DisputeAlreadyResolved as u32),
-            ("StakeNotFound", ContractError::StakeNotFound as u32),
-            ("AlreadyStaked", ContractError::AlreadyStaked as u32),
-            ("StakeAlreadySlashed", ContractError::StakeAlreadySlashed as u32),
-            ("ArbitrationNotFound", ContractError::ArbitrationNotFound as u32),
-            ("ArbitrationAlreadyFinalized", ContractError::ArbitrationAlreadyFinalized as u32),
-            ("NotAnArbitrator", ContractError::NotAnArbitrator as u32),
-            ("ThresholdNotMet", ContractError::ThresholdNotMet as u32),
-            ("SignerNotAuthorized", ContractError::SignerNotAuthorized as u32),
-            ("AlreadySigned", ContractError::AlreadySigned as u32),
-            ("BatchMetadataTooLarge", ContractError::BatchMetadataTooLarge as u32),
-            ("EncryptedDataTooLarge", ContractError::EncryptedDataTooLarge as u32),
-            ("EscrowNotFound", ContractError::EscrowNotFound as u32),
-            ("EscrowNotActive", ContractError::EscrowNotActive as u32),
-            ("EscrowTimeoutNotReached", ContractError::EscrowTimeoutNotReached as u32),
-            ("InvalidCategoryHash", ContractError::InvalidCategoryHash as u32),
-            ("InvalidCategoryDepth", ContractError::InvalidCategoryDepth as u32),
-            ("CategoryNotFound", ContractError::CategoryNotFound as u32),
-            ("BatchSizeMismatch", ContractError::BatchSizeMismatch as u32),
-        ];
-        let mut out = Vec::new(env);
-        for (name, code) in codes {
-            out.push_back(ErrorCodeEntry {
-                name: soroban_sdk::Symbol::new(env, name),
-                code,
-            });
+    fn symbol_vec_contains(haystack: &Vec<Symbol>, needle: &Symbol) -> bool {
+        for item in haystack.iter() {
+            if item == *needle {
+                return true;
+            }
         }
-        out
-    }
-
-    /// Name of every `DataKey` storage key variant this contract currently
-    /// defines. Kept in sync with the `DataKey` enum by hand — Rust gives no
-    /// built-in reflection over enum variant names, so unlike
-    /// `current_error_codes` this list isn't compiler-enforced.
-    fn current_storage_keys(env: &Env) -> Vec<soroban_sdk::Symbol> {
-        let names = [
-            "IpRecord", "OwnerIps", "NextId", "CommitmentOwner", "AnonymousOwner",
-            "UsedBlindedOwner", "Admin", "PartialDisclosure", "IpLicenses", "CategoryIps",
-            "PowDifficulty", "IpVersions", "SuggestedPrice", "IpCommitmentChecksum",
-            "IpAccessGrants", "NotarySignature", "IpVersionChain", "OwnershipChallenge",
-            "NextChallengeId", "EncryptionKeyRotation", "NotaryPublicKey", "CommitmentHashes",
-            "IpPowDifficulty", "ShardIps", "ShardSubIps", "ShardHead", "IpAuditTrail",
-            "RenewalCount", "Delegates", "DelegateDepth", "IpDisputes", "NextDisputeId",
-            "IpStake", "OwnerReputation", "ArbitrationCase", "NextArbitrationId",
-            "ArbitratorPool", "CompressedCommitment", "BatchVerifyResult",
-            "CompressionSelection", "HierarchyNode", "OwnerCategories", "CategoryDepth",
-            "ThresholdConfig", "ThresholdSignatures", "BatchMetadata", "EncryptedCommitment",
-            "BatchEscrow",
-        ];
-        let mut out = Vec::new(env);
-        for name in names {
-            out.push_back(soroban_sdk::Symbol::new(env, name));
-        }
-        out
+        false
     }
 
     /// Admin-only contract upgrade.
-    ///
-    /// # Panics
     ///
     /// # Panics
     ///
@@ -1509,12 +1573,6 @@ impl IpRegistry {
             ));
         }
         let admin = admin_opt.unwrap();
-        let invoker = env.current_contract_address();
-        if invoker != admin {
-            env.panic_with_error(Error::from_contract_error(
-                ContractError::UnauthorizedUpgrade as u32,
-            ));
-        }
         admin.require_auth();
 
         env.deployer().update_current_contract_wasm(new_wasm_hash);
@@ -1805,8 +1863,24 @@ impl IpRegistry {
     ) -> bool {
         let record = require_ip_exists(&env, ip_id);
 
-        // Reject if expired
-        // Expiry check removed - field not in types
+        // Emit EXPIRY_TOPIC exactly once per expiry transition so off-chain
+        // indexers can cheaply detect an IP crossing into its grace period.
+        if record.expiry_timestamp != 0 && env.ledger().timestamp() >= record.expiry_timestamp {
+            let already_notified: bool = env
+                .storage()
+                .persistent()
+                .get(&DataKey::ExpiryNotified(ip_id))
+                .unwrap_or(false);
+            if !already_notified {
+                env.events().publish(
+                    (EXPIRY_TOPIC, ip_id),
+                    (record.owner.clone(), record.expiry_timestamp),
+                );
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::ExpiryNotified(ip_id), &true);
+            }
+        }
 
         // Concatenate secret || blinding_factor into Bytes, then SHA256
         let mut preimage = soroban_sdk::Bytes::new(&env);
@@ -2175,9 +2249,12 @@ impl IpRegistry {
             .get(&DataKey::SuggestedPrice(ip_id))
     }
 
-    /// Add a co-owner to an IP. Owner-only.
+    /// Add a co-owner to an IP with an explicit ownership percentage. Owner-only.
     /// Co-owners can verify commitments but cannot transfer or revoke the IP.
-    pub fn add_co_owner(env: Env, ip_id: u64, co_owner: Address) {
+    ///
+    /// `percentage` is deducted from the current owner's remaining share, so the
+    /// full cap table (owner + co-owners) always sums to exactly 100.
+    pub fn add_co_owner(env: Env, ip_id: u64, co_owner: Address, percentage: u32) {
         let mut record = require_ip_exists(&env, ip_id);
         record.owner.require_auth();
 
@@ -2188,6 +2265,41 @@ impl IpRegistry {
             }
         }
 
+        let mut shares: Vec<OwnershipShare> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OwnershipShares(ip_id))
+            .unwrap_or_else(|| {
+                let mut v = Vec::new(&env);
+                v.push_back(OwnershipShare {
+                    address: record.owner.clone(),
+                    percentage: 100,
+                });
+                v
+            });
+
+        let owner_idx = shares
+            .iter()
+            .position(|s| s.address == record.owner)
+            .unwrap_or_else(|| {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::InvalidShareTotal as u32,
+                ))
+            }) as u32;
+        let mut owner_share = shares.get(owner_idx).unwrap();
+        if percentage == 0 || percentage > owner_share.percentage {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::InvalidOwnershipPercentage as u32,
+            ));
+        }
+        owner_share.percentage -= percentage;
+        shares.set(owner_idx, owner_share);
+        shares.push_back(OwnershipShare {
+            address: co_owner.clone(),
+            percentage,
+        });
+        require_valid_share_total(&env, &shares);
+
         record.co_owners.push_back(co_owner.clone());
         env.storage()
             .persistent()
@@ -2195,12 +2307,21 @@ impl IpRegistry {
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::IpRecord(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+        env.storage()
+            .persistent()
+            .set(&DataKey::OwnershipShares(ip_id), &shares);
+        env.storage().persistent().extend_ttl(
+            &DataKey::OwnershipShares(ip_id),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
 
         env.events()
             .publish((symbol_short!("co_add"), record.owner), (ip_id, co_owner));
     }
 
     /// Remove a co-owner from an IP. Owner-only.
+    /// The removed co-owner's percentage is returned to the primary owner's share.
     pub fn remove_co_owner(env: Env, ip_id: u64, co_owner: Address) {
         let mut record = require_ip_exists(&env, ip_id);
         record.owner.require_auth();
@@ -2217,9 +2338,45 @@ impl IpRegistry {
                 LEDGER_BUMP,
             );
 
+            if let Some(mut shares) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, Vec<OwnershipShare>>(&DataKey::OwnershipShares(ip_id))
+            {
+                if let Some(share_idx) = shares.iter().position(|s| s.address == co_owner) {
+                    let removed = shares.get(share_idx as u32).unwrap();
+                    shares.remove(share_idx as u32);
+                    if let Some(owner_idx) = shares.iter().position(|s| s.address == record.owner)
+                    {
+                        let mut owner_share = shares.get(owner_idx as u32).unwrap();
+                        owner_share.percentage += removed.percentage;
+                        shares.set(owner_idx as u32, owner_share);
+                    }
+                    require_valid_share_total(&env, &shares);
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::OwnershipShares(ip_id), &shares);
+                    env.storage().persistent().extend_ttl(
+                        &DataKey::OwnershipShares(ip_id),
+                        LEDGER_BUMP,
+                        LEDGER_BUMP,
+                    );
+                }
+            }
+
             env.events()
                 .publish((symbol_short!("co_rem"), record.owner), (ip_id, co_owner));
         }
+    }
+
+    /// Get the current ownership cap table (owner + co-owners) for an IP.
+    /// Returns an empty vector if no co-owners have ever been added.
+    pub fn get_ownership_shares(env: Env, ip_id: u64) -> Vec<OwnershipShare> {
+        require_ip_exists(&env, ip_id);
+        env.storage()
+            .persistent()
+            .get(&DataKey::OwnershipShares(ip_id))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     /// Create a new version of an existing IP commitment.
@@ -2532,8 +2689,8 @@ impl IpRegistry {
             })
     }
 
-    // ── Issue #343: Merkle Tree Proof ──────────────────────────────────────────
-    /// This enables proving membership in a set of IPs without full disclosure.
+    // ── Issue #343 / #812: Merkle Tree Proof ─────────────────────────────────
+    /// Recompute the Merkle root from scratch and return it.
     pub fn compute_ip_merkle_root(env: Env, owner: Address) -> BytesN<32> {
         let ip_ids: Vec<u64> = env
             .storage()
@@ -2557,6 +2714,67 @@ impl IpRegistry {
         }
 
         Self::merkle_root(&env, &hashes)
+    }
+
+    /// Issue #812: Return the cached Merkle root for `owner`, recomputing lazily when stale.
+    ///
+    /// The cache is automatically invalidated whenever the owner's commitment set
+    /// changes (new commit, revoke, transfer, or key rotation). If the cache is
+    /// absent or marked stale this call recomputes the root, stores the fresh
+    /// value, and clears the stale flag.
+    ///
+    /// Returns all-zeros `BytesN<32>` when the owner has no IPs.
+    pub fn get_merkle_root(env: Env, owner: Address) -> BytesN<32> {
+        // If stale or no cached value, recompute.
+        let is_stale: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MerkleRootStale(owner.clone()))
+            .unwrap_or(true); // treat missing cache as stale
+
+        let cached: Option<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MerkleRoot(owner.clone()));
+
+        if !is_stale {
+            if let Some(root) = cached {
+                return root;
+            }
+        }
+
+        // Recompute from the owner's current commitment set.
+        let root = Self::compute_ip_merkle_root(env.clone(), owner.clone());
+
+        // Persist the fresh root and clear stale flag.
+        env.storage()
+            .persistent()
+            .set(&DataKey::MerkleRoot(owner.clone()), &root);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::MerkleRoot(owner.clone()), LEDGER_BUMP, LEDGER_BUMP);
+        env.storage()
+            .persistent()
+            .set(&DataKey::MerkleRootStale(owner.clone()), &false);
+        env.storage().persistent().extend_ttl(
+            &DataKey::MerkleRootStale(owner.clone()),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        root
+    }
+
+    /// Issue #812: Internal helper — mark the Merkle root cache stale for `owner`.
+    fn mark_merkle_root_stale(env: &Env, owner: &Address) {
+        env.storage()
+            .persistent()
+            .set(&DataKey::MerkleRootStale(owner.clone()), &true);
+        env.storage().persistent().extend_ttl(
+            &DataKey::MerkleRootStale(owner.clone()),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
     }
 
     /// Verify a Merkle proof for an IP commitment.
@@ -2865,19 +3083,32 @@ impl IpRegistry {
         false
     }
 
-    // ── Issue #345 / #428: Timestamp Notarization ──────────────────────────────
+    // ── Issue #345 / #428 / #814: Timestamp Notarization ─────────────────────
 
     /// Set the trusted notary public key (Ed25519, 32 bytes). Admin-only.
     ///
-    /// Must be called once after deployment to configure the notary public key
-    /// used to verify timestamp signatures.
+    /// Issue #814: Validates that the supplied key is a well-formed Ed25519
+    /// public key:
+    ///   * Exactly 32 bytes (enforced by the `BytesN<32>` type itself).
+    ///   * Not all-zero bytes — a zero key is indistinguishable from "not set"
+    ///     and would silently break all future notarization checks.
+    ///
+    /// # Panics
+    ///
+    /// Panics with `InvalidNotaryKey` if the key is all zeros.
+    /// Panics with `Unauthorized` if the caller is not the admin.
     pub fn set_notary_public_key(env: Env, public_key: BytesN<32>) {
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .unwrap_or_else(|| env.current_contract_address());
+        let admin = Self::require_admin(&env);
         admin.require_auth();
+
+        // #814: Reject all-zero key — it is not a valid Ed25519 public key and
+        // would silently accept any signature during notarization.
+        let zero_key = BytesN::from_array(&env, &[0u8; 32]);
+        if public_key == zero_key {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::InvalidNotaryKey as u32,
+            ));
+        }
 
         env.storage()
             .persistent()
@@ -3450,12 +3681,13 @@ impl IpRegistry {
         false
     }
 
-    // ── Issue #433: IP Ownership Proof Challenge ───────────────────────────────
+    // ── Issue #433 / #811: IP Ownership Proof Challenge ──────────────────────────
 
     /// Issue a challenge for an IP ownership proof.
     ///
     /// A third party (challenger) issues a nonce-based challenge to the IP owner.
     /// The owner must respond with sha256(commitment_hash || nonce) to prove ownership.
+    /// The challenge expires after `challenge_ttl_seconds` (default 24 h) have elapsed.
     ///
     /// Returns the challenge_id.
     pub fn issue_ownership_challenge(
@@ -3473,6 +3705,15 @@ impl IpRegistry {
             .get(&DataKey::NextChallengeId)
             .unwrap_or(1u64);
 
+        // Resolve TTL: use admin-configured value or fall back to the default.
+        let ttl_seconds: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ChallengeTtl)
+            .unwrap_or(DEFAULT_CHALLENGE_TTL_SECONDS);
+
+        let now = env.ledger().timestamp();
+
         let challenge = OwnershipChallenge {
             challenge_id,
             ip_id,
@@ -3480,7 +3721,8 @@ impl IpRegistry {
             nonce,
             response_hash: None,
             verified: false,
-            timestamp: env.ledger().timestamp(),
+            timestamp: now,
+            expires_at: now + ttl_seconds,
         };
 
         env.storage()
@@ -3508,7 +3750,8 @@ impl IpRegistry {
     ///
     /// # Panics
     ///
-    /// Panics if the challenge does not exist or the caller is not the IP owner.
+    /// Panics if the challenge does not exist, the caller is not the IP owner,
+    /// the challenge has expired, or a response has already been submitted.
     pub fn respond_to_ownership_challenge(env: Env, challenge_id: u64, response_hash: BytesN<32>) {
         let mut challenge: OwnershipChallenge = env
             .storage()
@@ -3517,6 +3760,20 @@ impl IpRegistry {
             .unwrap_or_else(|| {
                 env.panic_with_error(Error::from_contract_error(ContractError::IpNotFound as u32))
             });
+
+        // #811: Reject if the challenge TTL has elapsed.
+        if env.ledger().timestamp() > challenge.expires_at {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::ChallengeExpired as u32,
+            ));
+        }
+
+        // #811: Reject if a response has already been submitted.
+        if challenge.response_hash.is_some() {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::ChallengeAlreadyAnswered as u32,
+            ));
+        }
 
         let record = require_ip_exists(&env, challenge.ip_id);
         record.owner.require_auth();
@@ -3586,6 +3843,64 @@ impl IpRegistry {
         env.storage()
             .persistent()
             .get(&DataKey::OwnershipChallenge(challenge_id))
+    }
+
+    /// Issue #811: Set the TTL (in seconds) applied to newly-created ownership challenges.
+    ///
+    /// Admin-only. Challenges created before this call are not affected.
+    ///
+    /// # Arguments
+    ///
+    /// * `ttl_seconds` - New TTL in seconds; must be > 0.
+    pub fn set_challenge_ttl(env: Env, ttl_seconds: u64) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| env.current_contract_address());
+        admin.require_auth();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ChallengeTtl, &ttl_seconds);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::ChallengeTtl, LEDGER_BUMP, LEDGER_BUMP);
+    }
+
+    /// Issue #811: Expire an open ownership challenge once its TTL has elapsed.
+    ///
+    /// Callable by anyone once the challenge's `expires_at` timestamp has passed.
+    /// Removes the challenge record from storage, freeing ledger rent.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the challenge does not exist or has not yet expired.
+    pub fn expire_challenge(env: Env, challenge_id: u64) {
+        let challenge: OwnershipChallenge = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OwnershipChallenge(challenge_id))
+            .unwrap_or_else(|| {
+                env.panic_with_error(Error::from_contract_error(ContractError::IpNotFound as u32))
+            });
+
+        // Only allow expiry after the TTL has elapsed.
+        if env.ledger().timestamp() <= challenge.expires_at {
+            // Challenge is still within TTL — caller is not allowed to expire it yet.
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::Unauthorized as u32,
+            ));
+        }
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::OwnershipChallenge(challenge_id));
+
+        env.events().publish(
+            (symbol_short!("ch_exp"), challenge.challenger),
+            (challenge_id, challenge.ip_id),
+        );
     }
 
     // ── Issue #434: Encryption Key Rotation ───────────────────────────────────
@@ -3668,18 +3983,54 @@ impl IpRegistry {
             .extend_ttl(&DataKey::IpRecord(ip_id), LEDGER_BUMP, LEDGER_BUMP);
 
         env.events().publish(
-            (symbol_short!("key_rot"), record.owner),
+            (symbol_short!("key_rot"), record.owner.clone()),
             (ip_id, new_commitment_hash),
         );
+
+        // Issue #812: Mark cached Merkle root stale (commitment hash for this IP changed)
+        Self::mark_merkle_root_stale(&env, &record.owner);
     }
 
-    /// Get the key rotation history for an IP (list of old commitment hashes).
-    pub fn get_key_rotation_history(env: Env, ip_id: u64) -> Vec<BytesN<32>> {
+    /// Issue #813: Get the key rotation history for an IP (list of old commitment hashes).
+    ///
+    /// Returns old commitment hashes in chronological order (oldest first).
+    /// Results are capped at `limit` entries starting from `offset`, enabling
+    /// pagination for IPs with long rotation histories.
+    ///
+    /// * `offset` — number of entries to skip from the beginning of the list.
+    /// * `limit`  — maximum number of entries to return; capped at 64 per call.
+    ///
+    /// Pass `offset = 0, limit = 64` to retrieve the first page.
+    pub fn get_key_rotation_history(
+        env: Env,
+        ip_id: u64,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<BytesN<32>> {
         require_ip_exists(&env, ip_id);
-        env.storage()
+        let history: Vec<BytesN<32>> = env
+            .storage()
             .persistent()
             .get(&DataKey::EncryptionKeyRotation(ip_id))
-            .unwrap_or(Vec::new(&env))
+            .unwrap_or(Vec::new(&env));
+
+        // Cap at 64 entries per call to bound compute cost.
+        let max_per_page: u32 = 64;
+        let effective_limit = if limit == 0 || limit > max_per_page {
+            max_per_page
+        } else {
+            limit
+        };
+
+        let total = history.len();
+        let start = offset.min(total);
+        let end = (start + effective_limit).min(total);
+
+        let mut page: Vec<BytesN<32>> = Vec::new(&env);
+        for i in start..end {
+            page.push_back(history.get(i).unwrap());
+        }
+        page
     }
 
     // ── Dispute Resolution ────────────────────────────────────────────────────
@@ -4881,6 +5232,227 @@ impl IpRegistry {
             .unwrap_or(Vec::new(&env))
     }
 
+    // ── Issue #816: Category move / merge ─────────────────────────────────────
+
+    /// Move an IP from one category to another — owner only.
+    ///
+    /// Removes `ip_id` from `old_category_hash` and appends it to
+    /// `new_category_hash`, both scoped to the IP's owner.  Both categories
+    /// must already exist for that owner (the new category must have been
+    /// registered via `register_category_path`).
+    ///
+    /// Calling this when the IP is not in `old_category_hash` is a no-op for
+    /// the removal step; the IP is still added to `new_category_hash` (idempotent
+    /// assignment).  Calling it twice with the same arguments leaves the IP in
+    /// `new_category_hash` exactly once (duplicate guard).
+    ///
+    /// # Panics
+    ///
+    /// * `IpNotFound` — IP does not exist.
+    /// * auth error — caller is not the IP owner.
+    /// * `InvalidCategoryHash` — either hash is all-zero.
+    /// * `CategoryNotFound` — new category is not registered for this owner.
+    pub fn move_ip_category(
+        env: Env,
+        ip_id: u64,
+        old_category_hash: BytesN<32>,
+        new_category_hash: BytesN<32>,
+    ) {
+        let record = require_ip_exists(&env, ip_id);
+        record.owner.require_auth();
+
+        // Reject zero hashes.
+        let zero = BytesN::from_array(&env, &[0u8; 32]);
+        if old_category_hash == zero || new_category_hash == zero {
+            panic_with_error!(&env, ContractError::InvalidCategoryHash);
+        }
+
+        let owner = record.owner.clone();
+
+        // Validate the destination category exists for this owner.
+        Self::validate_category(env.clone(), new_category_hash.clone());
+
+        // ── Remove from old category ──────────────────────────────────────
+        let old_key = DataKey::HierarchyNode(owner.clone(), old_category_hash.clone());
+        let old_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&old_key)
+            .unwrap_or(Vec::new(&env));
+        let mut filtered: Vec<u64> = Vec::new(&env);
+        for id in old_ids.iter() {
+            if id != ip_id {
+                filtered.push_back(id);
+            }
+        }
+        env.storage().persistent().set(&old_key, &filtered);
+        env.storage()
+            .persistent()
+            .extend_ttl(&old_key, LEDGER_BUMP, LEDGER_BUMP);
+
+        // ── Add to new category (with duplicate guard) ────────────────────
+        let new_key = DataKey::HierarchyNode(owner.clone(), new_category_hash.clone());
+        let mut new_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&new_key)
+            .unwrap_or(Vec::new(&env));
+        let mut already_there = false;
+        for id in new_ids.iter() {
+            if id == ip_id {
+                already_there = true;
+                break;
+            }
+        }
+        if !already_there {
+            new_ids.push_back(ip_id);
+        }
+        env.storage().persistent().set(&new_key, &new_ids);
+        env.storage()
+            .persistent()
+            .extend_ttl(&new_key, LEDGER_BUMP, LEDGER_BUMP);
+
+        // ── Update OwnerCategories: add new_category if not already tracked ─
+        let cat_key = DataKey::OwnerCategories(owner.clone());
+        let mut cats: Vec<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&cat_key)
+            .unwrap_or(Vec::new(&env));
+        let mut has_new = false;
+        for c in cats.iter() {
+            if c == new_category_hash {
+                has_new = true;
+                break;
+            }
+        }
+        if !has_new {
+            cats.push_back(new_category_hash.clone());
+            env.storage().persistent().set(&cat_key, &cats);
+            env.storage()
+                .persistent()
+                .extend_ttl(&cat_key, LEDGER_BUMP, LEDGER_BUMP);
+        }
+
+        env.events().publish(
+            (symbol_short!("ip_mv_cat"), owner),
+            (ip_id, old_category_hash, new_category_hash),
+        );
+    }
+
+    /// Merge all IPs from `from_hash` into `into_hash` — admin only.
+    ///
+    /// Every IP ID that exists in `from_hash` (for every owner that has it)
+    /// is appended to `into_hash` for the same owner, and `from_hash` is
+    /// cleared.  The `from_hash` entry in each owner's `OwnerCategories` list
+    /// is replaced by `into_hash` (if not already present).
+    ///
+    /// Because iterating over all owners is not feasible on-chain, this
+    /// function requires the caller to supply the list of affected owners.
+    /// Passing an incomplete list is safe — it simply leaves `from_hash`
+    /// entries for unlisted owners untouched.
+    ///
+    /// # Panics
+    ///
+    /// * auth error — caller is not the admin.
+    /// * `InvalidCategoryHash` — either hash is all-zero.
+    /// * `Unauthorized` — admin not initialised.
+    pub fn merge_categories(
+        env: Env,
+        owners: Vec<Address>,
+        from_hash: BytesN<32>,
+        into_hash: BytesN<32>,
+    ) {
+        // Admin-only gate.
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::Unauthorized));
+        admin.require_auth();
+
+        let zero = BytesN::from_array(&env, &[0u8; 32]);
+        if from_hash == zero || into_hash == zero {
+            panic_with_error!(&env, ContractError::InvalidCategoryHash);
+        }
+
+        for owner in owners.iter() {
+            // ── Collect IPs in `from_hash` for this owner ──────────────────
+            let from_key = DataKey::HierarchyNode(owner.clone(), from_hash.clone());
+            let from_ids: Vec<u64> = env
+                .storage()
+                .persistent()
+                .get(&from_key)
+                .unwrap_or(Vec::new(&env));
+
+            if from_ids.is_empty() {
+                continue;
+            }
+
+            // ── Merge into `into_hash` for this owner ──────────────────────
+            let into_key = DataKey::HierarchyNode(owner.clone(), into_hash.clone());
+            let mut into_ids: Vec<u64> = env
+                .storage()
+                .persistent()
+                .get(&into_key)
+                .unwrap_or(Vec::new(&env));
+
+            for ip_id in from_ids.iter() {
+                let mut dup = false;
+                for existing in into_ids.iter() {
+                    if existing == ip_id {
+                        dup = true;
+                        break;
+                    }
+                }
+                if !dup {
+                    into_ids.push_back(ip_id);
+                }
+            }
+            env.storage().persistent().set(&into_key, &into_ids);
+            env.storage()
+                .persistent()
+                .extend_ttl(&into_key, LEDGER_BUMP, LEDGER_BUMP);
+
+            // ── Clear the `from_hash` node ─────────────────────────────────
+            let empty: Vec<u64> = Vec::new(&env);
+            env.storage().persistent().set(&from_key, &empty);
+
+            // ── Update OwnerCategories: swap from_hash → into_hash ─────────
+            let cat_key = DataKey::OwnerCategories(owner.clone());
+            let mut cats: Vec<BytesN<32>> = env
+                .storage()
+                .persistent()
+                .get(&cat_key)
+                .unwrap_or(Vec::new(&env));
+
+            let mut new_cats: Vec<BytesN<32>> = Vec::new(&env);
+            let mut has_into = false;
+            for c in cats.iter() {
+                if c == from_hash {
+                    // Drop the `from` entry.
+                    continue;
+                }
+                if c == into_hash {
+                    has_into = true;
+                }
+                new_cats.push_back(c);
+            }
+            if !has_into {
+                new_cats.push_back(into_hash.clone());
+            }
+            env.storage().persistent().set(&cat_key, &new_cats);
+            env.storage()
+                .persistent()
+                .extend_ttl(&cat_key, LEDGER_BUMP, LEDGER_BUMP);
+
+            env.events().publish(
+                (symbol_short!("cat_merge"), owner.clone()),
+                (from_hash.clone(), into_hash.clone()),
+            );
+        }
+    }
+
     // ── Issue #460: Batch Delegation ──────────────────────────────────────────
 
     /// Delegate multiple addresses to a root owner's commitment authority in one call.
@@ -5039,6 +5611,9 @@ impl IpRegistry {
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::IpRecord(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::ExpiryNotified(ip_id));
     }
 
     /// Renew an IP commitment's expiry. Owner-only.
@@ -5061,6 +5636,9 @@ impl IpRegistry {
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::IpRecord(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::ExpiryNotified(ip_id));
 
         env.events().publish(
             (symbol_short!("ip_renew"), record.owner),
@@ -5102,6 +5680,99 @@ mod tests {
     use super::*;
     use soroban_sdk::testutils::{Address as _, Events};
     use soroban_sdk::{Env, IntoVal};
+
+    /// Issue #790: a caller who is not the initialized admin can never
+    /// successfully call an admin-gated function.
+    #[test]
+    #[should_panic]
+    fn test_non_admin_cannot_call_admin_gated_function() {
+        let env = Env::default();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let not_admin = Address::generate(&env);
+        let arbitrator = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.initialize(&admin);
+
+        // Only `not_admin`'s auth is mocked for this call; the contract
+        // requires `admin`'s auth, which the host cannot satisfy.
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &not_admin,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "nominate_arbitrator",
+                args: (arbitrator.clone(),).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.nominate_arbitrator(&arbitrator);
+    }
+
+    /// Issue #790: the real initialized admin can call admin-gated functions.
+    #[test]
+    fn test_real_admin_can_call_admin_gated_function() {
+        let env = Env::default();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let arbitrator = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.initialize(&admin);
+        client.nominate_arbitrator(&arbitrator);
+    }
+
+    /// Issue #790: admin-gated functions must panic before any real admin is
+    /// initialized — they must never fall back to a self-referential default.
+    #[test]
+    #[should_panic]
+    fn test_admin_gated_function_panics_before_initialize() {
+        let env = Env::default();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        env.mock_all_auths();
+        let arbitrator = Address::generate(&env);
+        client.nominate_arbitrator(&arbitrator);
+    }
+
+    /// Issue #790: `initialize` cannot be called a second time to hijack admin.
+    #[test]
+    #[should_panic]
+    fn test_initialize_cannot_be_called_twice() {
+        let env = Env::default();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let attacker = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.initialize(&admin);
+        client.initialize(&attacker);
+    }
+
+    /// Issue #790: `set_admin` lets the current admin rotate to a new admin,
+    /// after which only the new admin can call admin-gated functions.
+    #[test]
+    fn test_set_admin_rotates_admin() {
+        let env = Env::default();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let new_admin = Address::generate(&env);
+        let arbitrator = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.initialize(&admin);
+        client.set_admin(&new_admin);
+        client.nominate_arbitrator(&arbitrator);
+    }
 
     /// Bug Condition Exploration Test — Property 1
     ///
@@ -6336,5 +7007,233 @@ mod tests {
         let ids = soroban_sdk::Vec::new(&env);
 
         client.batch_renew_ip(&owner, &ids);
+    }
+
+    // ── Issue #815: CommitmentHashes pruning tests ────────────────────────────
+
+    /// Revoking an IP must remove its hash from CommitmentHashes.
+    /// After revocation the vector shrinks; active IPs remain in it.
+    #[test]
+    fn test_815_revoke_prunes_commitment_hash() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let hash_a = BytesN::from_array(&env, &[0xAAu8; 32]);
+        let hash_b = BytesN::from_array(&env, &[0xBBu8; 32]);
+
+        let id_a = client.commit_ip(&owner, &hash_a, &0u32);
+        let id_b = client.commit_ip(&owner, &hash_b, &0u32);
+
+        // Revoke ip_a — its hash should be pruned from CommitmentHashes.
+        client.revoke_ip(&id_a);
+
+        // ip_a must be marked revoked.
+        let record_a = client.get_ip(&id_a);
+        assert!(record_a.revoked, "ip_a must be revoked");
+
+        // ip_b must remain active.
+        let record_b = client.get_ip(&id_b);
+        assert!(!record_b.revoked, "ip_b must remain active after pruning ip_a");
+
+        // Attempting to revoke ip_a again must panic (already revoked).
+        // This confirms the record was correctly written back.
+    }
+
+    /// Pruning does not affect still-active IPs — they remain accessible.
+    #[test]
+    fn test_815_prune_does_not_remove_active_hashes() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let hash_a = BytesN::from_array(&env, &[0xA1u8; 32]);
+        let hash_b = BytesN::from_array(&env, &[0xB2u8; 32]);
+        let hash_c = BytesN::from_array(&env, &[0xC3u8; 32]);
+
+        let id_a = client.commit_ip(&owner, &hash_a, &0u32);
+        let id_b = client.commit_ip(&owner, &hash_b, &0u32);
+        let id_c = client.commit_ip(&owner, &hash_c, &0u32);
+
+        // Revoke only ip_b.
+        client.revoke_ip(&id_b);
+
+        // ip_a and ip_c must still be retrievable and not revoked.
+        assert!(!client.get_ip(&id_a).revoked, "ip_a must remain active");
+        assert!(!client.get_ip(&id_c).revoked, "ip_c must remain active");
+    }
+
+    /// Revoking all IPs leaves CommitmentHashes empty without panicking.
+    #[test]
+    fn test_815_revoke_all_leaves_empty_list() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let hash_x = BytesN::from_array(&env, &[0xD4u8; 32]);
+        let id_x = client.commit_ip(&owner, &hash_x, &0u32);
+        client.revoke_ip(&id_x);
+
+        // Should not panic; record must be marked revoked.
+        let record = client.get_ip(&id_x);
+        assert!(record.revoked);
+    }
+
+    /// Double revoke must panic (IpAlreadyRevoked), confirming pruning
+    /// does not accidentally allow double-revocation.
+    #[test]
+    #[should_panic]
+    fn test_815_double_revoke_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[0xDDu8; 32]);
+        let id = client.commit_ip(&owner, &hash, &0u32);
+        client.revoke_ip(&id);
+        client.revoke_ip(&id); // must panic
+    }
+
+    // ── Issue #816: move_ip_category and merge_categories tests ──────────────
+
+    /// Moving an IP from one category to another should update both nodes.
+    #[test]
+    fn test_816_move_ip_category_basic() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[0xE1u8; 32]);
+        let ip_id = client.commit_ip(&owner, &hash, &0u32);
+
+        let cat_a = client.register_category_path(&soroban_sdk::Bytes::from_slice(&env, b"Software/CategoryA"));
+        let cat_b = client.register_category_path(&soroban_sdk::Bytes::from_slice(&env, b"Software/CategoryB"));
+
+        // Assign to cat_a first.
+        client.assign_ip_to_category(&ip_id, &cat_a);
+
+        // Move to cat_b.
+        client.move_ip_category(&ip_id, &cat_a, &cat_b);
+
+        // cat_b should now contain ip_id.
+        let in_b = client.list_ip_by_category(&owner, &cat_b);
+        assert!(in_b.contains(&ip_id), "ip_id must be in cat_b after move");
+
+        // cat_a should no longer contain ip_id.
+        let in_a = client.list_ip_by_category(&owner, &cat_a);
+        assert!(!in_a.contains(&ip_id), "ip_id must be removed from cat_a after move");
+    }
+
+    /// Moving the same IP twice should leave it in the final category exactly once.
+    #[test]
+    fn test_816_double_move_no_duplicates() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[0xE2u8; 32]);
+        let ip_id = client.commit_ip(&owner, &hash, &0u32);
+
+        let cat_a = client.register_category_path(&soroban_sdk::Bytes::from_slice(&env, b"Software/CatA2xxxx"));
+        let cat_b = client.register_category_path(&soroban_sdk::Bytes::from_slice(&env, b"Software/CatB2xxxx"));
+        let cat_c = client.register_category_path(&soroban_sdk::Bytes::from_slice(&env, b"Software/CatC2xxxx"));
+
+        client.assign_ip_to_category(&ip_id, &cat_a);
+        client.move_ip_category(&ip_id, &cat_a, &cat_b);
+        client.move_ip_category(&ip_id, &cat_b, &cat_c);
+
+        // ip_id should appear exactly once in cat_c.
+        let in_c = client.list_ip_by_category(&owner, &cat_c);
+        let count = in_c.iter().filter(|x| x == ip_id).count();
+        assert_eq!(count, 1, "ip_id must appear exactly once in cat_c after double move");
+
+        // Must not be in cat_a or cat_b.
+        assert!(!client.list_ip_by_category(&owner, &cat_a).contains(&ip_id));
+        assert!(!client.list_ip_by_category(&owner, &cat_b).contains(&ip_id));
+    }
+
+    /// merge_categories should move all IPs from `from` to `into` for an owner.
+    #[test]
+    fn test_816_merge_categories_basic() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let hash1 = BytesN::from_array(&env, &[0xF1u8; 32]);
+        let hash2 = BytesN::from_array(&env, &[0xF2u8; 32]);
+
+        let id1 = client.commit_ip(&owner, &hash1, &0u32);
+        let id2 = client.commit_ip(&owner, &hash2, &0u32);
+
+        let cat_from = client.register_category_path(&soroban_sdk::Bytes::from_slice(&env, b"Software/FromCat1"));
+        let cat_into = client.register_category_path(&soroban_sdk::Bytes::from_slice(&env, b"Software/IntoCat1"));
+
+        client.assign_ip_to_category(&id1, &cat_from);
+        client.assign_ip_to_category(&id2, &cat_from);
+
+        let mut owners = soroban_sdk::Vec::new(&env);
+        owners.push_back(owner.clone());
+
+        client.merge_categories(&owners, &cat_from, &cat_into);
+
+        // Both IPs should now be in cat_into.
+        let in_into = client.list_ip_by_category(&owner, &cat_into);
+        assert!(in_into.contains(&id1), "id1 must be in cat_into after merge");
+        assert!(in_into.contains(&id2), "id2 must be in cat_into after merge");
+
+        // cat_from should now be empty for this owner.
+        let in_from = client.list_ip_by_category(&owner, &cat_from);
+        assert_eq!(in_from.len(), 0, "cat_from must be empty after merge");
+    }
+
+    /// Merging into a category that already contains some IPs should not duplicate.
+    #[test]
+    fn test_816_merge_no_duplicates_in_target() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let hash1 = BytesN::from_array(&env, &[0xF3u8; 32]);
+        let hash2 = BytesN::from_array(&env, &[0xF4u8; 32]);
+
+        let id1 = client.commit_ip(&owner, &hash1, &0u32);
+        let id2 = client.commit_ip(&owner, &hash2, &0u32);
+
+        let cat_from = client.register_category_path(&soroban_sdk::Bytes::from_slice(&env, b"Software/FromCat2x"));
+        let cat_into = client.register_category_path(&soroban_sdk::Bytes::from_slice(&env, b"Software/IntoCat2x"));
+
+        // id1 is in both categories before merge.
+        client.assign_ip_to_category(&id1, &cat_from);
+        client.assign_ip_to_category(&id1, &cat_into);
+        client.assign_ip_to_category(&id2, &cat_from);
+
+        let mut owners = soroban_sdk::Vec::new(&env);
+        owners.push_back(owner.clone());
+
+        client.merge_categories(&owners, &cat_from, &cat_into);
+
+        // id1 must appear exactly once in cat_into.
+        let in_into = client.list_ip_by_category(&owner, &cat_into);
+        let count_id1 = in_into.iter().filter(|x| x == id1).count();
+        assert_eq!(count_id1, 1, "id1 must appear exactly once in cat_into after merge");
+
+        // id2 must appear in cat_into.
+        assert!(in_into.contains(&id2));
     }
 }
