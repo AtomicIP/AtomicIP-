@@ -16,6 +16,7 @@ struct AppState {
     ws_broadcaster:   Arc<websocket::EventBroadcaster>,
     sse_broadcaster:  Arc<events::EventBroadcaster>,
     health_checker:   Arc<health::HealthChecker>,
+    rpc_client:       Arc<dyn graphql::SorobanRpcClient>,
 }
 
 impl FromRef<AppState> for Arc<health::HealthChecker> {
@@ -197,6 +198,7 @@ async fn main() {
         ws_broadcaster:  Arc::new(websocket::EventBroadcaster::new()),
         sse_broadcaster: Arc::new(events::create_event_broadcaster().0),
         health_checker:  Arc::new(health::HealthChecker::new()),
+        rpc_client: rpc_client.clone(),
     };
 
     let rate_limiter = rate_limit::RateLimitMiddleware::new(rate_limit::RateLimitConfig::default());
@@ -278,19 +280,17 @@ async fn events_handler(
 }
 
 fn build_app() -> Router {
-    let query_client = Arc::new(graphql::SorobanQueryClient::new(Arc::new(graphql::MockSorobanRpcClient::default())));
-    let schema = graphql::build_schema();
+    let rpc_client: Arc<dyn graphql::SorobanRpcClient> = Arc::new(graphql::MockSorobanRpcClient::default());
+    let query_client = Arc::new(graphql::SorobanQueryClient::new(rpc_client.clone()));
+    let schema = graphql::build_schema_with_context(rpc_client.clone());
     let health_checker = Arc::new(health::HealthChecker::new());
-    let circuit_breaker = Arc::new(circuit_breaker::CircuitBreaker::new(
-        "default",
-        circuit_breaker::CircuitBreakerConfig::default(),
-    ));
     let state = AppState {
         schema,
-        rpc_client,
-        ws_broadcaster:  Arc::new(websocket::EventBroadcaster::new()),
+        query_client: query_client.clone(),
+        ws_broadcaster: Arc::new(websocket::EventBroadcaster::new()),
         sse_broadcaster: Arc::new(events::create_event_broadcaster().0),
         health_checker,
+        rpc_client: rpc_client.clone(),
     };
 
     let rate_limiter = rate_limit::RateLimitMiddleware::new(rate_limit::RateLimitConfig::default());
@@ -300,6 +300,7 @@ fn build_app() -> Router {
         ws_broadcaster: Arc::new(websocket::EventBroadcaster::new()),
         sse_broadcaster: Arc::new(events::create_event_broadcaster().0),
         health_checker,
+        rpc_client,
     };
 
     Router::new()
