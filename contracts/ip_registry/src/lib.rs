@@ -5,7 +5,7 @@ extern crate std;
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
-    Bytes, BytesN, Env, Error, Vec,
+    Bytes, BytesN, Env, Error, Symbol, Vec,
 };
 
 mod validation;
@@ -97,14 +97,14 @@ pub enum ContractError {
     CategoryNotFound = 34,
     /// Batch operation size mismatch.
     BatchSizeMismatch = 35,
-    /// #811: Ownership challenge has expired (TTL elapsed).
-    ChallengeExpired = 36,
-    /// #811: Ownership challenge has already been responded to.
-    ChallengeAlreadyAnswered = 37,
-    /// #812: Merkle root is stale and needs recomputation.
-    MerkleRootStale = 38,
-    /// #814: Notary public key has invalid length or format.
-    InvalidNotaryKey = 39,
+    /// #790: Contract has not been initialized with a real admin address yet.
+    NotInitialized = 36,
+    /// #790: `initialize` was called on a contract that already has an admin.
+    AlreadyInitialized = 37,
+    /// #791: candidate upgrade WASM's manifest is missing an exported function,
+    /// storage key, or error code that the current contract relies on, or it
+    /// reassigns an existing error code to a different meaning.
+    IncompatibleUpgrade = 38,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -215,6 +215,123 @@ pub enum DataKey {
     // Issue #812: Flag indicating the cached Merkle root for an owner is stale
     MerkleRootStale(Address),
 }
+
+// ── Upgrade Compatibility Manifest (#791) ───────────────────────────────────
+
+/// A single (error name, error code) pair, part of an `UpgradeManifest`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ManifestErrorCode {
+    pub name: Symbol,
+    pub code: u32,
+}
+
+/// Describes a candidate contract WASM's public interface for compatibility
+/// checking in `validate_upgrade`. A Soroban contract cannot introspect an
+/// arbitrary WASM blob from within itself, so off-chain tooling that built the
+/// candidate WASM supplies this manifest alongside its hash.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct UpgradeManifest {
+    /// Names of every function the candidate contract exports.
+    pub functions: Vec<Symbol>,
+    /// Names of every `DataKey` storage-key variant the candidate contract uses.
+    pub storage_keys: Vec<Symbol>,
+    /// Every (error name, error code) pair the candidate contract defines.
+    pub error_codes: Vec<ManifestErrorCode>,
+}
+
+/// Names of every function exported by the currently deployed contract.
+/// Used as the compatibility baseline in `validate_upgrade`.
+const CURRENT_FUNCTIONS: &[&str] = &[
+    "add_co_owner", "add_threshold_signature", "assign_ip_to_category", "batch_commit_ip",
+    "batch_commit_ip_anonymous", "batch_delegate_commitment", "batch_escrow_commitments", "batch_renew_ip",
+    "batch_stake_commitments", "batch_update_reputation", "batch_verify_commitments", "cancel_batch_escrow",
+    "check_expiration_warning", "check_ip_access", "cleanup_expired_ips", "commit_ip",
+    "commit_ip_delegated", "commit_ip_version", "compute_ip_merkle_root", "create_ip_version",
+    "delegate_commitment_authority", "encrypt_commitment", "finalize_arbitration", "find_duplicate_commitment",
+    "generate_merkle_proof", "get_anonymous_owner", "get_arbitration", "get_batch_escrow",
+    "get_batch_metadata", "get_blinded_owner_batch", "get_commitment_compression", "get_commitment_shard",
+    "get_compressed_bytes", "get_compressed_commitment", "get_dispute", "get_encrypted_commitment",
+    "get_ip", "get_ip_access_grants", "get_ip_audit_trail", "get_ip_lineage",
+    "get_ip_notary_signature", "get_ip_strength", "get_ip_suggested_price", "get_ip_version_chain",
+    "get_ip_versions", "get_key_rotation_history", "get_licenses", "get_ownership_challenge",
+    "get_partial_disclosure", "get_pow_difficulty", "get_renewal_count", "get_reputation",
+    "get_stake", "get_threshold_config", "get_threshold_signatures", "grant_ip_access",
+    "grant_license", "initialize", "initiate_dispute", "is_delegate",
+    "is_ip_owner", "issue_ownership_challenge", "list_ip_by_category", "list_ip_by_owner",
+    "list_ip_by_shard", "list_owner_categories", "merge_duplicate_commitment", "nominate_arbitrator",
+    "notarize_ip_timestamp", "open_arbitration", "register_category_path", "release_batch_escrow",
+    "remove_co_owner", "renew_ip", "renew_ip_commitment", "require_threshold_signatures",
+    "resolve_dispute", "respond_to_ownership_challenge", "reveal_and_verify_commitments", "reveal_partial",
+    "revoke_delegation", "revoke_ip", "revoke_ip_access", "revoke_license",
+    "rotate_commitment_key", "set_admin", "set_batch_metadata", "set_commitment_compression",
+    "set_ip_expiry", "set_ip_suggested_price", "set_notary_public_key", "slash_stake",
+    "stake_commitment", "submit_dispute_evidence", "transfer_ip", "transfer_ip_ownership",
+    "unstake", "update_reputation", "upgrade", "validate_category",
+    "validate_upgrade", "verify_batch_proof", "verify_commitment", "verify_commitment_integrity",
+    "verify_commitment_pow", "verify_ip_merkle_proof", "verify_ownership_challenge", "verify_threshold_signatures",
+    "vote_on_dispute",
+];
+
+/// Names of every `DataKey` storage-key variant the currently deployed
+/// contract reads or writes. Used as the compatibility baseline in
+/// `validate_upgrade`.
+const CURRENT_STORAGE_KEYS: &[&str] = &[
+    "IpRecord", "OwnerIps", "NextId", "CommitmentOwner", "AnonymousOwner", "UsedBlindedOwner",
+    "Admin", "PartialDisclosure", "IpLicenses", "CategoryIps", "PowDifficulty", "IpVersions",
+    "SuggestedPrice", "IpCommitmentChecksum", "IpAccessGrants", "NotarySignature", "IpVersionChain",
+    "OwnershipChallenge", "NextChallengeId", "EncryptionKeyRotation", "NotaryPublicKey",
+    "CommitmentHashes", "IpPowDifficulty", "ShardIps", "ShardSubIps", "ShardHead", "IpAuditTrail",
+    "RenewalCount", "Delegates", "DelegateDepth", "IpDisputes", "NextDisputeId", "IpStake",
+    "OwnerReputation", "ArbitrationCase", "NextArbitrationId", "ArbitratorPool",
+    "CompressedCommitment", "BatchVerifyResult", "CompressionSelection", "HierarchyNode",
+    "OwnerCategories", "CategoryDepth", "ThresholdConfig", "ThresholdSignatures", "BatchMetadata",
+    "EncryptedCommitment", "BatchEscrow",
+];
+
+/// (error name, error code) pairs defined by the currently deployed contract.
+/// Used as the compatibility baseline in `validate_upgrade`.
+const CURRENT_ERROR_CODES: &[(&str, u32)] = &[
+    ("IpNotFound", 1),
+    ("ZeroCommitmentHash", 2),
+    ("CommitmentAlreadyRegistered", 3),
+    ("IpAlreadyRevoked", 4),
+    ("UnauthorizedUpgrade", 5),
+    ("Unauthorized", 6),
+    ("IpExpired", 7),
+    ("MetadataTooLarge", 8),
+    ("LicenseeNotFound", 9),
+    ("InsufficientPoW", 10),
+    ("InvalidExpiry", 11),
+    ("IpInDispute", 12),
+    ("CoOwnerNotFound", 13),
+    ("InvalidOwnershipPercentage", 14),
+    ("OnlyOwnerCanManageCoOwners", 15),
+    ("DisputeNotFound", 16),
+    ("DisputeAlreadyResolved", 17),
+    ("StakeNotFound", 18),
+    ("AlreadyStaked", 19),
+    ("StakeAlreadySlashed", 20),
+    ("ArbitrationNotFound", 21),
+    ("ArbitrationAlreadyFinalized", 22),
+    ("NotAnArbitrator", 23),
+    ("ThresholdNotMet", 24),
+    ("SignerNotAuthorized", 25),
+    ("AlreadySigned", 26),
+    ("BatchMetadataTooLarge", 27),
+    ("EncryptedDataTooLarge", 28),
+    ("EscrowNotFound", 29),
+    ("EscrowNotActive", 30),
+    ("EscrowTimeoutNotReached", 31),
+    ("InvalidCategoryHash", 32),
+    ("InvalidCategoryDepth", 33),
+    ("CategoryNotFound", 34),
+    ("BatchSizeMismatch", 35),
+    ("NotInitialized", 36),
+    ("AlreadyInitialized", 37),
+    ("IncompatibleUpgrade", 38),
+];
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -523,6 +640,55 @@ pub struct IpRegistry;
 
 #[contractimpl]
 impl IpRegistry {
+    /// Initialize the contract with a real, externally-controlled admin address.
+    ///
+    /// Must be called exactly once, before any admin-gated function is usable.
+    /// Requires the auth of the `admin` address being set, so a caller cannot
+    /// install an admin they do not control.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the contract has already been initialized.
+    pub fn initialize(env: Env, admin: Address) {
+        admin.require_auth();
+
+        if env.storage().persistent().has(&DataKey::Admin) {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::AlreadyInitialized as u32,
+            ));
+        }
+
+        env.storage().persistent().set(&DataKey::Admin, &admin);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Admin, LEDGER_BUMP, LEDGER_BUMP);
+    }
+
+    /// Rotate the admin address. Only the current admin may do this.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the contract has not been initialized or the caller is not
+    /// the current admin.
+    pub fn set_admin(env: Env, new_admin: Address) {
+        let admin = Self::require_admin(&env);
+        admin.require_auth();
+
+        env.storage().persistent().set(&DataKey::Admin, &new_admin);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Admin, LEDGER_BUMP, LEDGER_BUMP);
+    }
+
+    /// Fetch the stored admin address, panicking if the contract has not been
+    /// initialized yet.
+    fn require_admin(env: &Env) -> Address {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(env, ContractError::NotInitialized))
+    }
+
     /// Timestamp a new IP commitment. Returns the assigned IP ID.
     ///
     /// This function creates a new IP record with a cryptographic commitment hash,
@@ -572,15 +738,6 @@ impl IpRegistry {
         // Enforced by the Soroban host: panics if the transaction does not carry
         // a valid authorization for `owner`. This is the correct auth pattern.
         owner.require_auth();
-
-        // Initialize admin on first call if not set
-        if !env.storage().persistent().has(&DataKey::Admin) {
-            let admin = env.current_contract_address();
-            env.storage().persistent().set(&DataKey::Admin, &admin);
-            env.storage()
-                .persistent()
-                .extend_ttl(&DataKey::Admin, 50000, 50000);
-        }
 
         // Reject zero-byte commitment hash (Issue #40)
         require_non_zero_commitment(&env, &commitment_hash);
@@ -730,15 +887,6 @@ impl IpRegistry {
         commitment_hashes: Vec<BytesN<32>>,
     ) -> Vec<u64> {
         owner.require_auth();
-
-        // Initialize admin on first call if not set
-        if !env.storage().persistent().has(&DataKey::Admin) {
-            let admin = env.current_contract_address();
-            env.storage().persistent().set(&DataKey::Admin, &admin);
-            env.storage()
-                .persistent()
-                .extend_ttl(&DataKey::Admin, 50000, 50000);
-        }
 
         let mut ids = Vec::new(&env);
         let timestamp = env.ledger().timestamp();
@@ -898,15 +1046,6 @@ impl IpRegistry {
             LEDGER_BUMP,
             LEDGER_BUMP,
         );
-
-        // Initialize admin on first call if not set
-        if !env.storage().persistent().has(&DataKey::Admin) {
-            let admin = env.current_contract_address();
-            env.storage().persistent().set(&DataKey::Admin, &admin);
-            env.storage()
-                .persistent()
-                .extend_ttl(&DataKey::Admin, 50000, 50000);
-        }
 
         let mut ids = Vec::new(&env);
         let timestamp = env.ledger().timestamp();
@@ -1324,28 +1463,105 @@ impl IpRegistry {
         Self::mark_merkle_root_stale(&env, &record.owner);
     }
 
-    /// Validate that a new WASM is compatible for upgrade.
+    /// Validate that a candidate WASM is compatible for upgrade.
     ///
-    /// Checks that the new WASM has the same contract interface,
-    /// does not remove storage keys, and does not change error codes.
+    /// Checks that `new_wasm_hash` is non-zero, and that `candidate` — a
+    /// manifest of the candidate WASM's exported functions, storage keys, and
+    /// error codes, supplied by the off-chain tooling that built it — does not
+    /// remove any function, storage key, or error code the current contract
+    /// relies on, and does not reassign an existing error code to a different
+    /// meaning. Additive changes (new functions, keys, or codes) are allowed.
     ///
     /// # Panics
     ///
-    /// Panics if the new WASM is not compatible.
-    pub fn validate_upgrade(env: Env, new_wasm_hash: BytesN<32>) {
-        // For now, simple validation: ensure new_wasm_hash is not zero
+    /// Panics if `new_wasm_hash` is zero, or if `candidate` is missing an
+    /// existing function/storage key, is missing an existing error code, or
+    /// reassigns an existing error code's number to a different name.
+    pub fn validate_upgrade(env: Env, new_wasm_hash: BytesN<32>, candidate: UpgradeManifest) {
         let zero_hash = BytesN::from_array(&env, &[0u8; 32]);
         if new_wasm_hash == zero_hash {
             env.panic_with_error(Error::from_contract_error(
                 ContractError::UnauthorizedUpgrade as u32,
             ));
         }
-        // TODO: Implement full validation for exported functions, storage keys, error codes
+
+        let baseline = Self::current_manifest(&env);
+
+        for name in baseline.functions.iter() {
+            if !Self::symbol_vec_contains(&candidate.functions, &name) {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::IncompatibleUpgrade as u32,
+                ));
+            }
+        }
+
+        for key in baseline.storage_keys.iter() {
+            if !Self::symbol_vec_contains(&candidate.storage_keys, &key) {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::IncompatibleUpgrade as u32,
+                ));
+            }
+        }
+
+        for entry in baseline.error_codes.iter() {
+            let mut matched = false;
+            for candidate_entry in candidate.error_codes.iter() {
+                if candidate_entry.name == entry.name {
+                    if candidate_entry.code != entry.code {
+                        env.panic_with_error(Error::from_contract_error(
+                            ContractError::IncompatibleUpgrade as u32,
+                        ));
+                    }
+                    matched = true;
+                    break;
+                }
+            }
+            if !matched {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::IncompatibleUpgrade as u32,
+                ));
+            }
+        }
+    }
+
+    /// The compatibility baseline: the currently deployed contract's own
+    /// exported functions, storage keys, and error codes.
+    fn current_manifest(env: &Env) -> UpgradeManifest {
+        let mut functions = Vec::new(env);
+        for name in CURRENT_FUNCTIONS.iter() {
+            functions.push_back(Symbol::new(env, name));
+        }
+
+        let mut storage_keys = Vec::new(env);
+        for name in CURRENT_STORAGE_KEYS.iter() {
+            storage_keys.push_back(Symbol::new(env, name));
+        }
+
+        let mut error_codes = Vec::new(env);
+        for (name, code) in CURRENT_ERROR_CODES.iter() {
+            error_codes.push_back(ManifestErrorCode {
+                name: Symbol::new(env, name),
+                code: *code,
+            });
+        }
+
+        UpgradeManifest {
+            functions,
+            storage_keys,
+            error_codes,
+        }
+    }
+
+    fn symbol_vec_contains(haystack: &Vec<Symbol>, needle: &Symbol) -> bool {
+        for item in haystack.iter() {
+            if item == *needle {
+                return true;
+            }
+        }
+        false
     }
 
     /// Admin-only contract upgrade.
-    ///
-    /// # Panics
     ///
     /// # Panics
     ///
@@ -1358,12 +1574,6 @@ impl IpRegistry {
             ));
         }
         let admin = admin_opt.unwrap();
-        let invoker = env.current_contract_address();
-        if invoker != admin {
-            env.panic_with_error(Error::from_contract_error(
-                ContractError::UnauthorizedUpgrade as u32,
-            ));
-        }
         admin.require_auth();
 
         env.deployer().update_current_contract_wasm(new_wasm_hash);
@@ -2790,11 +3000,7 @@ impl IpRegistry {
     /// Panics with `InvalidNotaryKey` if the key is all zeros.
     /// Panics with `Unauthorized` if the caller is not the admin.
     pub fn set_notary_public_key(env: Env, public_key: BytesN<32>) {
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .unwrap_or_else(|| env.current_contract_address());
+        let admin = Self::require_admin(&env);
         admin.require_auth();
 
         // #814: Reject all-zero key — it is not a valid Ed25519 public key and
@@ -5149,6 +5355,99 @@ mod tests {
     use super::*;
     use soroban_sdk::testutils::{Address as _, Events};
     use soroban_sdk::{Env, IntoVal};
+
+    /// Issue #790: a caller who is not the initialized admin can never
+    /// successfully call an admin-gated function.
+    #[test]
+    #[should_panic]
+    fn test_non_admin_cannot_call_admin_gated_function() {
+        let env = Env::default();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let not_admin = Address::generate(&env);
+        let arbitrator = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.initialize(&admin);
+
+        // Only `not_admin`'s auth is mocked for this call; the contract
+        // requires `admin`'s auth, which the host cannot satisfy.
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &not_admin,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "nominate_arbitrator",
+                args: (arbitrator.clone(),).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.nominate_arbitrator(&arbitrator);
+    }
+
+    /// Issue #790: the real initialized admin can call admin-gated functions.
+    #[test]
+    fn test_real_admin_can_call_admin_gated_function() {
+        let env = Env::default();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let arbitrator = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.initialize(&admin);
+        client.nominate_arbitrator(&arbitrator);
+    }
+
+    /// Issue #790: admin-gated functions must panic before any real admin is
+    /// initialized — they must never fall back to a self-referential default.
+    #[test]
+    #[should_panic]
+    fn test_admin_gated_function_panics_before_initialize() {
+        let env = Env::default();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        env.mock_all_auths();
+        let arbitrator = Address::generate(&env);
+        client.nominate_arbitrator(&arbitrator);
+    }
+
+    /// Issue #790: `initialize` cannot be called a second time to hijack admin.
+    #[test]
+    #[should_panic]
+    fn test_initialize_cannot_be_called_twice() {
+        let env = Env::default();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let attacker = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.initialize(&admin);
+        client.initialize(&attacker);
+    }
+
+    /// Issue #790: `set_admin` lets the current admin rotate to a new admin,
+    /// after which only the new admin can call admin-gated functions.
+    #[test]
+    fn test_set_admin_rotates_admin() {
+        let env = Env::default();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let new_admin = Address::generate(&env);
+        let arbitrator = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.initialize(&admin);
+        client.set_admin(&new_admin);
+        client.nominate_arbitrator(&arbitrator);
+    }
 
     /// Bug Condition Exploration Test — Property 1
     ///
