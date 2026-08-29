@@ -101,6 +101,15 @@ pub enum ContractError {
     TimelockNotElapsed = 63,
     RulingFinalized = 64,
     BatchArbitrationDisabled = 65,
+    /// #354: `claim_insurance` was called for a swap that has no coverage
+    /// reservation carved against the pool (never accepted with insurance, or
+    /// the reservation was already released).
+    InsuranceNotReserved = 66,
+    /// #354: The insurance pool for this token holds less than the claiming
+    /// policy's own reserved coverage. The claim is valid but the pool is
+    /// under-collateralized; nothing is paid rather than paying a silent
+    /// partial amount.
+    InsufficientInsuranceReserve = 67,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -181,6 +190,13 @@ pub enum DataKey {
     InsuranceClaimable(u64),
     /// #354: Global insurance pool balance for the token (token Address → i128).
     InsurancePool(Address),
+    /// #354: Maps swap_id → coverage amount reserved against the pool for that
+    /// policy. Carved when the premium is collected, released when the policy
+    /// pays out or can no longer be claimed.
+    InsuranceReserved(u64),
+    /// #354: Sum of all outstanding `InsuranceReserved` amounts for the token.
+    /// The pool is collateralized while `InsurancePool >= InsuranceReservedTotal`.
+    InsuranceReservedTotal(Address),
     /// #353: Maps swap_id → RenegotiationOffer for pending renegotiation.
     SwapRenegotiations(u64),
     /// #352: Maps swap_id → escrow agent address.
@@ -760,6 +776,11 @@ impl AtomicSwap {
             env.storage()
                 .persistent()
                 .extend_ttl(&pool_key, LEDGER_BUMP, LEDGER_BUMP);
+
+            // Carve this policy's coverage out of the pool at issuance so a
+            // later claim is paid from its own reservation rather than from
+            // whatever another policy's claim left behind.
+            Self::reserve_insurance_coverage(&env, swap_id, &swap.token, swap.price);
         }
 
         swap.accept_timestamp = env.ledger().timestamp();
@@ -1968,8 +1989,149 @@ impl AtomicSwap {
 
     // ── #354: Insurance ───────────────────────────────────────────────────────
 
+    /// Reserve `amount` of coverage for `swap_id` against the token's pool.
+    ///
+    /// Called wherever an insurance premium is collected. The reservation, not
+    /// the pool remainder, is what a later claim is paid from, so two policies
+    /// on the same token can never draw on each other's coverage.
+    fn reserve_insurance_coverage(env: &Env, swap_id: u64, token: &Address, amount: i128) {
+        if amount <= 0 {
+            return;
+        }
+        // Idempotent: a swap already carrying a reservation is not re-reserved.
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::InsuranceReserved(swap_id))
+        {
+            return;
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::InsuranceReserved(swap_id), &amount);
+        env.storage().persistent().extend_ttl(
+            &DataKey::InsuranceReserved(swap_id),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        let total_key = DataKey::InsuranceReservedTotal(token.clone());
+        let total: i128 = env.storage().persistent().get(&total_key).unwrap_or(0);
+        env.storage().persistent().set(&total_key, &(total + amount));
+        env.storage()
+            .persistent()
+            .extend_ttl(&total_key, LEDGER_BUMP, LEDGER_BUMP);
+    }
+
+    /// Drop `swap_id`'s reservation and decrement the token's outstanding total.
+    ///
+    /// Idempotent - a swap with no reservation is a no-op - so it is safe to
+    /// call from every terminal transition without checking insurance state.
+    fn release_insurance_reservation(env: &Env, swap_id: u64, token: &Address) {
+        let reserved: i128 = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::InsuranceReserved(swap_id))
+        {
+            Some(amount) => amount,
+            None => return,
+        };
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::InsuranceReserved(swap_id));
+
+        let total_key = DataKey::InsuranceReservedTotal(token.clone());
+        let total: i128 = env.storage().persistent().get(&total_key).unwrap_or(0);
+        // Saturate at zero rather than letting a double-release go negative.
+        let remaining = if total > reserved { total - reserved } else { 0 };
+        env.storage().persistent().set(&total_key, &remaining);
+        env.storage()
+            .persistent()
+            .extend_ttl(&total_key, LEDGER_BUMP, LEDGER_BUMP);
+    }
+
+    /// Coverage currently reserved for `swap_id`, or 0 if the policy holds none.
+    pub fn get_insurance_reservation(env: Env, swap_id: u64) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::InsuranceReserved(swap_id))
+            .unwrap_or(0)
+    }
+
+    /// Pool balance versus outstanding reservations for `token`.
+    ///
+    /// Under-collateralization is observable here before it turns into a failed
+    /// payout: `collateralized == false` means some outstanding policy cannot
+    /// currently be paid in full.
+    pub fn get_insurance_pool_status(env: Env, token: Address) -> InsurancePoolStatus {
+        let balance: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::InsurancePool(token.clone()))
+            .unwrap_or(0);
+        let reserved: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::InsuranceReservedTotal(token.clone()))
+            .unwrap_or(0);
+
+        InsurancePoolStatus {
+            token,
+            balance,
+            reserved,
+            collateralized: balance >= reserved,
+            shortfall: if reserved > balance {
+                reserved - balance
+            } else {
+                0
+            },
+        }
+    }
+
+    /// Top up a token's insurance pool.
+    ///
+    /// Premiums alone are a fraction of the coverage they buy, so without an
+    /// external funding path a pool can never reach the collateralization the
+    /// claim check now requires.
+    pub fn fund_insurance_pool(env: Env, funder: Address, token: Address, amount: i128) {
+        funder.require_auth();
+
+        if amount <= 0 {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::PriceTooSmall as u32,
+            ));
+        }
+
+        token::Client::new(&env, &token).transfer(&funder, &env.current_contract_address(), &amount);
+
+        let pool_key = DataKey::InsurancePool(token.clone());
+        let pool: i128 = env.storage().persistent().get(&pool_key).unwrap_or(0);
+        let new_balance = pool + amount;
+        env.storage().persistent().set(&pool_key, &new_balance);
+        env.storage()
+            .persistent()
+            .extend_ttl(&pool_key, LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("ins_fund"),),
+            InsurancePoolFundedEvent {
+                token,
+                funder,
+                amount,
+                new_balance,
+            },
+        );
+    }
+
     /// Buyer claims insurance payout after seller revealed an invalid key.
     /// Requires insurance to have been enabled and the swap to be marked claimable.
+    ///
+    /// Pays the policy's own reservation, never the pool remainder. If the pool
+    /// cannot cover it the call panics with `InsufficientInsuranceReserve`
+    /// rather than transferring a reduced amount, so a claimant is never left
+    /// unable to distinguish "invalid claim" from "someone drained the pool".
     pub fn claim_insurance(env: Env, swap_id: u64) {
         let swap = require_swap_exists(&env, swap_id);
         swap.buyer.require_auth();
@@ -1990,23 +2152,35 @@ impl AtomicSwap {
             ));
         }
 
-        // Payout = swap price (buyer gets their payment back from the pool)
-        let payout = swap.price;
+        let payout: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::InsuranceReserved(swap_id))
+            .unwrap_or(0);
+
+        if payout <= 0 {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::InsuranceNotReserved as u32,
+            ));
+        }
+
         let pool_key = DataKey::InsurancePool(swap.token.clone());
         let pool: i128 = env.storage().persistent().get(&pool_key).unwrap_or(0);
 
-        // Deduct from pool (pool may be partially funded; pay what's available)
-        let actual_payout = if pool >= payout { payout } else { pool };
+        if pool < payout {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::InsufficientInsuranceReserve as u32,
+            ));
+        }
 
         token::Client::new(&env, &swap.token).transfer(
             &env.current_contract_address(),
             &swap.buyer,
-            &actual_payout,
+            &payout,
         );
 
-        env.storage()
-            .persistent()
-            .set(&pool_key, &(pool - actual_payout));
+        env.storage().persistent().set(&pool_key, &(pool - payout));
+        Self::release_insurance_reservation(&env, swap_id, &swap.token);
         // Clear claimable flag so it can't be claimed twice
         env.storage()
             .persistent()
@@ -2017,7 +2191,7 @@ impl AtomicSwap {
             InsurancePayoutEvent {
                 swap_id,
                 buyer: swap.buyer,
-                payout_amount: actual_payout,
+                payout_amount: payout,
             },
         );
     }
@@ -3883,6 +4057,8 @@ impl AtomicSwap {
                 env.storage()
                     .persistent()
                     .extend_ttl(&pool_key, LEDGER_BUMP, LEDGER_BUMP);
+
+                Self::reserve_insurance_coverage(&env, swap_id, &swap.token, swap.price);
             }
 
             swap.accept_timestamp = env.ledger().timestamp();
@@ -5893,5 +6069,212 @@ mod batch_enhancement_tests {
             event.reasons.get(2).unwrap(),
             Bytes::from_slice(&env, b"reason3")
         );
+    }
+}
+
+
+#[cfg(test)]
+mod insurance_reserve_tests {
+    use ip_registry::{IpRegistry, IpRegistryClient};
+    use soroban_sdk::{testutils::Address as _, token::StellarAssetClient, Address, BytesN, Env};
+
+    use crate::{AtomicSwap, AtomicSwapClient, DataKey};
+
+    const PRICE: i128 = 1_000;
+    const PREMIUM: i128 = PRICE * 2 / 100;
+
+    struct Pool {
+        contract_id: Address,
+        token: Address,
+        funder: Address,
+        buyer_a: Address,
+        buyer_b: Address,
+        swap_a: u64,
+        swap_b: u64,
+    }
+
+    fn commit_ip(env: &Env, registry: &IpRegistryClient, owner: &Address, seed: u8) -> u64 {
+        let secret = BytesN::from_array(env, &[seed; 32]);
+        let blinding = BytesN::from_array(env, &[seed.wrapping_add(1); 32]);
+        let mut preimage = soroban_sdk::Bytes::new(env);
+        preimage.append(&soroban_sdk::Bytes::from(secret));
+        preimage.append(&soroban_sdk::Bytes::from(blinding));
+        let commitment_hash: BytesN<32> = env.crypto().sha256(&preimage).into();
+        registry.commit_ip(owner, &commitment_hash, &0u32)
+    }
+
+    /// Two independently valid policies on the same token, both accepted so the
+    /// premium is collected and the coverage reservation is carved. The pool is
+    /// left holding only the two premiums, well short of the coverage they buy.
+    fn setup_two_policies(env: &Env) -> Pool {
+        let seller = Address::generate(env);
+        let buyer_a = Address::generate(env);
+        let buyer_b = Address::generate(env);
+        let funder = Address::generate(env);
+        let token_admin = Address::generate(env);
+
+        let registry_id = env.register(IpRegistry, ());
+        let registry = IpRegistryClient::new(env, &registry_id);
+        let ip_a = commit_ip(env, &registry, &seller, 2);
+        let ip_b = commit_ip(env, &registry, &seller, 7);
+
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin.clone())
+            .address();
+        let minter = StellarAssetClient::new(env, &token);
+        minter.mint(&buyer_a, &(PRICE + PREMIUM));
+        minter.mint(&buyer_b, &(PRICE + PREMIUM));
+        minter.mint(&funder, &(PRICE * 4));
+
+        let contract_id = env.register(AtomicSwap, ());
+        let client = AtomicSwapClient::new(env, &contract_id);
+        client.initialize(&registry_id);
+
+        let swap_a = client.initiate_swap(
+            &token, &ip_a, &seller, &PRICE, &buyer_a, &0u32, &None, &0i128, &true,
+        );
+        let swap_b = client.initiate_swap(
+            &token, &ip_b, &seller, &PRICE, &buyer_b, &0u32, &None, &0i128, &true,
+        );
+        client.accept_swap(&swap_a);
+        client.accept_swap(&swap_b);
+
+        Pool {
+            contract_id,
+            token,
+            funder,
+            buyer_a,
+            buyer_b,
+            swap_a,
+            swap_b,
+        }
+    }
+
+    /// Flags a swap as claimable. `reveal_key` sets this flag and then panics,
+    /// which reverts the write, so the flag is seeded directly rather than
+    /// through that path - a separate pre-existing bug, untouched here.
+    fn mark_claimable(env: &Env, contract_id: &Address, swap_id: u64) {
+        env.as_contract(contract_id, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::InsuranceClaimable(swap_id), &true);
+        });
+    }
+
+    fn claim_in_order(first_is_a: bool) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let pool = setup_two_policies(&env);
+        let client = AtomicSwapClient::new(&env, &pool.contract_id);
+
+        let status = client.get_insurance_pool_status(&pool.token);
+        assert_eq!(status.reserved, PRICE * 2);
+        assert_eq!(status.balance, PREMIUM * 2);
+        assert!(!status.collateralized);
+
+        // Top the pool up to the full outstanding coverage.
+        client.fund_insurance_pool(&pool.funder, &pool.token, &status.shortfall);
+        assert!(client
+            .get_insurance_pool_status(&pool.token)
+            .collateralized);
+
+        mark_claimable(&env, &pool.contract_id, pool.swap_a);
+        mark_claimable(&env, &pool.contract_id, pool.swap_b);
+
+        let token_client = soroban_sdk::token::Client::new(&env, &pool.token);
+        let before_a = token_client.balance(&pool.buyer_a);
+        let before_b = token_client.balance(&pool.buyer_b);
+
+        if first_is_a {
+            client.claim_insurance(&pool.swap_a);
+            client.claim_insurance(&pool.swap_b);
+        } else {
+            client.claim_insurance(&pool.swap_b);
+            client.claim_insurance(&pool.swap_a);
+        }
+
+        // Neither claimant starved the other: both were paid in full.
+        assert_eq!(token_client.balance(&pool.buyer_a) - before_a, PRICE);
+        assert_eq!(token_client.balance(&pool.buyer_b) - before_b, PRICE);
+
+        // Funded to exactly the outstanding coverage, so paying both in full
+        // drains the pool to zero and leaves nothing reserved against it.
+        let after = client.get_insurance_pool_status(&pool.token);
+        assert_eq!(after.reserved, 0);
+        assert_eq!(after.balance, 0);
+        assert!(after.collateralized);
+    }
+
+    #[test]
+    fn test_two_policies_both_paid_in_full_a_then_b() {
+        claim_in_order(true);
+    }
+
+    #[test]
+    fn test_two_policies_both_paid_in_full_b_then_a() {
+        claim_in_order(false);
+    }
+
+    /// Contract error #67, `InsufficientInsuranceReserve`.
+    #[test]
+    #[should_panic(expected = "Error(Contract, #67)")]
+    fn test_claim_against_undercollateralized_pool_errors() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let pool = setup_two_policies(&env);
+        let client = AtomicSwapClient::new(&env, &pool.contract_id);
+
+        // Pool holds only the two premiums, far short of one policy's coverage.
+        let status = client.get_insurance_pool_status(&pool.token);
+        assert!(!status.collateralized);
+        assert_eq!(status.shortfall, PRICE * 2 - PREMIUM * 2);
+
+        mark_claimable(&env, &pool.contract_id, pool.swap_a);
+        client.claim_insurance(&pool.swap_a);
+    }
+
+    #[test]
+    fn test_undercollateralization_is_observable_before_claiming() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let pool = setup_two_policies(&env);
+        let client = AtomicSwapClient::new(&env, &pool.contract_id);
+
+        let status = client.get_insurance_pool_status(&pool.token);
+        assert_eq!(status.token, pool.token);
+        assert_eq!(status.balance, PREMIUM * 2);
+        assert_eq!(status.reserved, PRICE * 2);
+        assert!(!status.collateralized);
+        assert_eq!(status.shortfall, status.reserved - status.balance);
+
+        assert_eq!(client.get_insurance_reservation(&pool.swap_a), PRICE);
+        assert_eq!(client.get_insurance_reservation(&pool.swap_b), PRICE);
+
+        client.fund_insurance_pool(&pool.funder, &pool.token, &status.shortfall);
+
+        let funded = client.get_insurance_pool_status(&pool.token);
+        assert!(funded.collateralized);
+        assert_eq!(funded.shortfall, 0);
+    }
+
+    /// A claim only ever draws its own reservation, so a swap that never had
+    /// one is refused with #66 rather than being handed the pool remainder.
+    #[test]
+    #[should_panic(expected = "Error(Contract, #66)")]
+    fn test_claim_without_reservation_errors() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let pool = setup_two_policies(&env);
+        let client = AtomicSwapClient::new(&env, &pool.contract_id);
+
+        client.fund_insurance_pool(&pool.funder, &pool.token, &(PRICE * 4));
+
+        env.as_contract(&pool.contract_id, || {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::InsuranceReserved(pool.swap_a));
+        });
+        mark_claimable(&env, &pool.contract_id, pool.swap_a);
+        client.claim_insurance(&pool.swap_a);
     }
 }

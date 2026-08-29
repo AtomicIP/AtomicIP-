@@ -1,6 +1,25 @@
-/// Unit tests for cross-contract failure attribution.
+/// Unit tests for cross-contract failure attribution and end-to-end lifecycle
+/// tests spanning ip_registry and atomic_swap.
 ///
-/// Covers:
+/// # #833: Full-lifecycle integration tests
+///
+/// The integration section covers the complete IP-sale lifecycle:
+///   commit → initiate_swap → accept_swap → reveal_key → Completed
+///
+/// Each test deploys both contracts in the Soroban test environment so that
+/// the cross-contract calls made by atomic_swap into ip_registry execute
+/// against real contract WASM, exercising both contracts' state consistently.
+///
+/// Additional tests cover negative paths:
+///   - A swap referencing a revoked IP must be rejected at initiation.
+///   - IP ownership does NOT change through atomic_swap (the swap contract
+///     does not call ip_registry.transfer_ip); the registry owner record is
+///     unchanged by the swap completion.  Buyers who want formal ownership
+///     transfer must call ip_registry.transfer_ip separately.
+///
+/// # #832: Failure attribution unit tests
+///
+/// The attribution section covers:
 /// 1. Successful cross-contract execution — no failure, result is `Ok`.
 /// 2. Single contract failure — `FailureAttribution` names the failing contract
 ///    and the call chain is empty.
@@ -8,11 +27,325 @@
 ///    an outer contract carries the full call chain in outermost→innermost order.
 #[cfg(test)]
 mod cross_contract_tests {
-    use soroban_sdk::{testutils::Address as _, Address, BytesN, Env, String};
+    use soroban_sdk::{testutils::Address as _, Address, Bytes, BytesN, Env, String};
 
     use crate::cross_contract::{
         attribute_failure, propagate_failure, CrossContractResult, FailureAttribution,
     };
+
+    // ── #833: Full-lifecycle cross-contract integration tests ─────────────────
+
+    use ip_registry::{IpRegistry, IpRegistryClient};
+    use soroban_sdk::token::StellarAssetClient;
+
+    use crate::{AtomicSwap, AtomicSwapClient, ContractError, SwapStatus};
+
+    // ── helpers ───────────────────────────────────────────────────────────────
+
+    /// Build a Pedersen-style commitment: SHA-256(secret || blinding_factor).
+    fn make_commitment(env: &Env, secret: &BytesN<32>, blinding: &BytesN<32>) -> BytesN<32> {
+        let mut preimage = Bytes::new(env);
+        preimage.append(&Bytes::from(secret.clone()));
+        preimage.append(&Bytes::from(blinding.clone()));
+        env.crypto().sha256(&preimage).into()
+    }
+
+    /// Deploy and initialise ip_registry.  Returns (registry_address, ip_id,
+    /// secret, blinding_factor).
+    fn setup_registry(
+        env: &Env,
+        owner: &Address,
+    ) -> (Address, u64, BytesN<32>, BytesN<32>) {
+        let registry_id = env.register(IpRegistry, ());
+        let registry = IpRegistryClient::new(env, &registry_id);
+        let secret = BytesN::from_array(env, &[0xAAu8; 32]);
+        let blinding = BytesN::from_array(env, &[0xBBu8; 32]);
+        let hash = make_commitment(env, &secret, &blinding);
+        let ip_id = registry.commit_ip(owner, &hash, &0u32);
+        (registry_id, ip_id, secret, blinding)
+    }
+
+    /// Create a Stellar Asset token, mint `amount` stroops to `recipient`.
+    fn setup_token(env: &Env, admin: &Address, recipient: &Address, amount: i128) -> Address {
+        let token_id = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        StellarAssetClient::new(env, &token_id).mint(recipient, &amount);
+        token_id
+    }
+
+    // ── #833-1: Full happy-path lifecycle ─────────────────────────────────────
+
+    /// commit → initiate_swap → accept_swap → reveal_key → Completed
+    ///
+    /// Verifies:
+    /// - The swap transitions through Pending → Accepted → Completed.
+    /// - The registry IP record still exists after the swap (ownership is NOT
+    ///   transferred by the swap contract; that requires a separate
+    ///   `ip_registry.transfer_ip` call).
+    /// - The seller's token balance increases by `price` on completion (net
+    ///   of any fees — zero fees here because no `admin_set_protocol_config`
+    ///   is called).
+    /// - The active-swap lock on the IP is released (a second swap can be
+    ///   opened after the first completes).
+    #[test]
+    fn test_full_lifecycle_commit_initiate_accept_reveal_complete() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        // 1. Commit IP in ip_registry.
+        let (registry_id, ip_id, secret, blinding) = setup_registry(&env, &seller);
+
+        // 2. Mint tokens to buyer so they can pay.
+        let price: i128 = 1_000_000;
+        let token_id = setup_token(&env, &token_admin, &buyer, price * 2);
+
+        // 3. Deploy and initialise atomic_swap.
+        let swap_id_addr = env.register(AtomicSwap, ());
+        let swap_client = AtomicSwapClient::new(&env, &swap_id_addr);
+        swap_client.initialize(&registry_id, &treasury);
+
+        // 4. Seller initiates the swap.
+        let swap_id = swap_client.initiate_swap(
+            &token_id,
+            &ip_id,
+            &seller,
+            &price,
+            &buyer,
+            &0u32,   // no approvals required
+            &None,   // no referrer
+            &0i128,  // no collateral
+            &false,  // no insurance
+        );
+        let swap = swap_client.get_swap(&swap_id).unwrap();
+        assert_eq!(swap.status, SwapStatus::Pending, "swap must start as Pending");
+        assert_eq!(swap.ip_id, ip_id);
+        assert_eq!(swap.seller, seller);
+        assert_eq!(swap.buyer, buyer);
+        assert_eq!(swap.price, price);
+
+        // 5. Buyer accepts (funds move into escrow).
+        swap_client.accept_swap(&swap_id);
+        let swap = swap_client.get_swap(&swap_id).unwrap();
+        assert_eq!(swap.status, SwapStatus::Accepted, "swap must be Accepted after buyer pays");
+
+        // Verify funds left buyer's wallet.
+        let token_client = soroban_sdk::token::Client::new(&env, &token_id);
+        let buyer_balance_after_accept = token_client.balance(&buyer);
+        assert_eq!(
+            buyer_balance_after_accept,
+            price, // minted 2×price, spent 1×price into escrow
+            "buyer must have price_amount left after accepting"
+        );
+
+        // 6. Seller reveals the secret + blinding factor.  The swap contract
+        //    calls ip_registry.verify_commitment internally to validate the key.
+        swap_client.reveal_key(&swap_id, &seller, &secret, &blinding);
+
+        // 7. Verify the swap is now Completed.
+        let swap = swap_client.get_swap(&swap_id).unwrap();
+        assert_eq!(swap.status, SwapStatus::Completed, "swap must be Completed after reveal");
+
+        // 8. Verify the seller received the payment (no protocol fee configured).
+        let seller_balance = token_client.balance(&seller);
+        assert_eq!(
+            seller_balance, price,
+            "seller must receive full price with zero protocol fee"
+        );
+
+        // 9. The ip_registry record still exists and is owned by `seller`
+        //    (the swap contract does NOT call transfer_ip — that is a
+        //    separate, explicit step).
+        let registry_client = IpRegistryClient::new(&env, &registry_id);
+        let ip_record = registry_client.get_ip(&ip_id);
+        assert_eq!(
+            ip_record.owner, seller,
+            "ip_registry ownership must not change as a side-effect of the swap"
+        );
+        assert!(
+            !ip_record.revoked,
+            "IP must not be revoked by a successful swap"
+        );
+
+        // 10. The active-swap lock must be released; a second swap can be opened.
+        let swap_id_2 = swap_client.initiate_swap(
+            &token_id,
+            &ip_id,
+            &seller,
+            &price,
+            &buyer,
+            &0u32,
+            &None,
+            &0i128,
+            &false,
+        );
+        let swap2 = swap_client.get_swap(&swap_id_2).unwrap();
+        assert_eq!(
+            swap2.status,
+            SwapStatus::Pending,
+            "IP must be unlocked after completion, allowing a new swap"
+        );
+    }
+
+    // ── #833-2: Revoked IP rejected at swap initiation ────────────────────────
+
+    /// A swap for a revoked IP must be rejected at `initiate_swap` with
+    /// `IpIsRevoked`.  Both contracts' states must remain consistent: the
+    /// ip_registry record is revoked, and no swap record is created.
+    #[test]
+    fn test_initiate_swap_for_revoked_ip_is_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        // Commit IP.
+        let (registry_id, ip_id, _secret, _blinding) = setup_registry(&env, &seller);
+
+        let price: i128 = 500_000;
+        let token_id = setup_token(&env, &token_admin, &buyer, price);
+
+        // Deploy swap contract.
+        let swap_addr = env.register(AtomicSwap, ());
+        let swap_client = AtomicSwapClient::new(&env, &swap_addr);
+        swap_client.initialize(&registry_id, &treasury);
+
+        // Revoke the IP through ip_registry.
+        let registry_client = IpRegistryClient::new(&env, &registry_id);
+        registry_client.revoke_ip(&ip_id);
+
+        // Confirm revocation.
+        let ip_record = registry_client.get_ip(&ip_id);
+        assert!(ip_record.revoked, "IP must be revoked before the swap attempt");
+
+        // Attempting to initiate a swap must fail with IpIsRevoked.
+        let result = swap_client.try_initiate_swap(
+            &token_id,
+            &ip_id,
+            &seller,
+            &price,
+            &buyer,
+            &0u32,
+            &None,
+            &0i128,
+            &false,
+        );
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            ContractError::IpRevoked.into(),
+            "swap initiation for a revoked IP must return IpRevoked"
+        );
+
+        // No swap record should have been created.
+        assert!(
+            swap_client.get_swap(&0u64).is_none(),
+            "no swap record must exist after a rejected initiation"
+        );
+    }
+
+    // ── #833-3: Ownership record unchanged after swap (explicit assertion) ────
+
+    /// Verify that after a full lifecycle the registry still records `seller`
+    /// as the IP owner; the buyer must call `ip_registry.transfer_ip` separately.
+    #[test]
+    fn test_registry_ownership_unchanged_after_swap_completion() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        let (registry_id, ip_id, secret, blinding) = setup_registry(&env, &seller);
+        let price: i128 = 200_000;
+        let token_id = setup_token(&env, &token_admin, &buyer, price);
+
+        let swap_addr = env.register(AtomicSwap, ());
+        let swap_client = AtomicSwapClient::new(&env, &swap_addr);
+        swap_client.initialize(&registry_id, &treasury);
+
+        let swap_id = swap_client.initiate_swap(
+            &token_id,
+            &ip_id,
+            &seller,
+            &price,
+            &buyer,
+            &0u32,
+            &None,
+            &0i128,
+            &false,
+        );
+        swap_client.accept_swap(&swap_id);
+        swap_client.reveal_key(&swap_id, &seller, &secret, &blinding);
+
+        // Swap is complete.
+        let swap = swap_client.get_swap(&swap_id).unwrap();
+        assert_eq!(swap.status, SwapStatus::Completed);
+
+        // Registry ownership is still `seller`.
+        let registry_client = IpRegistryClient::new(&env, &registry_id);
+        let ip_record = registry_client.get_ip(&ip_id);
+        assert_eq!(
+            ip_record.owner, seller,
+            "ip_registry ownership record must remain with the seller after swap completion \
+             — the buyer must call ip_registry.transfer_ip to assume formal ownership"
+        );
+    }
+
+    // ── #833-4: Multiple swaps on same IP (sequential, each complete) ─────────
+
+    /// After the first swap completes and the active-swap lock is released,
+    /// the same IP can be swapped again.  Both swap records must reflect the
+    /// correct status independently.
+    #[test]
+    fn test_sequential_swaps_on_same_ip() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        let (registry_id, ip_id, secret, blinding) = setup_registry(&env, &seller);
+        let price: i128 = 100_000;
+        // Mint enough for two full purchases.
+        let token_id = setup_token(&env, &token_admin, &buyer, price * 3);
+
+        let swap_addr = env.register(AtomicSwap, ());
+        let swap_client = AtomicSwapClient::new(&env, &swap_addr);
+        swap_client.initialize(&registry_id, &treasury);
+
+        // First swap.
+        let swap_id_1 = swap_client.initiate_swap(
+            &token_id, &ip_id, &seller, &price, &buyer, &0u32, &None, &0i128, &false,
+        );
+        swap_client.accept_swap(&swap_id_1);
+        swap_client.reveal_key(&swap_id_1, &seller, &secret, &blinding);
+        let swap1 = swap_client.get_swap(&swap_id_1).unwrap();
+        assert_eq!(swap1.status, SwapStatus::Completed);
+
+        // Second swap on the same IP (lock released after first completion).
+        let swap_id_2 = swap_client.initiate_swap(
+            &token_id, &ip_id, &seller, &price, &buyer, &0u32, &None, &0i128, &false,
+        );
+        swap_client.accept_swap(&swap_id_2);
+        swap_client.reveal_key(&swap_id_2, &seller, &secret, &blinding);
+        let swap2 = swap_client.get_swap(&swap_id_2).unwrap();
+        assert_eq!(swap2.status, SwapStatus::Completed);
+
+        // Both swap IDs must be distinct.
+        assert_ne!(swap_id_1, swap_id_2);
+    }
 
     // ── helpers ───────────────────────────────────────────────────────────────
 
