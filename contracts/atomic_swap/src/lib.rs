@@ -2,7 +2,7 @@
 #![allow(deprecated)]
 mod registry;
 mod swap;
-// mod upgrade;
+mod upgrade;
 mod multi_currency;
 mod price_oracle;
 mod types;
@@ -18,7 +18,7 @@ use soroban_sdk::{
     BytesN, Env, Error, IntoVal, String, Val, Vec,
 };
 
-// pub use upgrade::{build_v1_schema, ContractSchema, ErrorEntry, FunctionEntry};
+pub use upgrade::{build_v1_schema, ContractSchema, ErrorEntry, FunctionEntry};
 pub use types::*;
 
 mod validation;
@@ -5413,19 +5413,19 @@ impl AtomicSwap {
 // #[cfg(test)]
 // mod regression_tests;
 
-// #[cfg(test)]
-// mod benchmarks;
+#[cfg(test)]
+mod benchmarks;
 
-// #[cfg(test)]
-// mod mutation_tests;
+#[cfg(test)]
+mod mutation_tests;
 
-// #[cfg(test)]
-// mod snapshot_tests;
+#[cfg(test)]
+mod snapshot_tests;
 
-// #[cfg(test)]
-// mod upgrade_chaos_tests;
+#[cfg(test)]
+mod upgrade_chaos_tests;
 
-// #823: re-enabled — fixed commit_ip call missing pow_difficulty arg.
+// #830: compile errors fixed — re-enabled
 #[cfg(test)]
 mod escrow_tests;
 
@@ -5435,38 +5435,32 @@ mod escrow_tests;
 #[cfg(test)]
 mod arbitration_tests;
 
-// FIXME: pre-existing compile errors from merge conflict - re-enable after fix
-// include!("multi_signer_tests.rs");
+// #824: compile errors fixed — re-enabled
+include!("multi_signer_tests.rs");
 
-// FIXME: pre-existing compile errors from merge conflict - re-enable after fix
-// (also has pre-existing runtime failures in test_batch_reveal_keys_* unrelated
-// to #781 — a protocol-fee transfer to protocol_config().treasury's hardcoded
-// placeholder address fails for lack of a trustline; same root cause noted in
-// docs/threat-model.md's #781 update, left unfixed here as out of scope).
-// #[cfg(test)]
-// mod batch_swap_features_tests;
+// #825: compile errors fixed and treasury runtime bug resolved — re-enabled
+#[cfg(test)]
+mod batch_swap_features_tests;
 
-// #826: re-enabled — fixed commit_ip arg and added get_swap_approvals to
-// public API.
+// #831: compile errors fixed — re-enabled
 #[cfg(test)]
 mod batch_approval_tests;
 
-// #827: re-enabled — fixed commit_ip arg, removed stale cancel_swap Bytes
-// arg, added explicit one-history-entry-per-swap assertion.
+// #832: compile errors fixed — re-enabled
 #[cfg(test)]
 mod batch_history_tests;
 
-// FIXME: pre-existing compile errors from merge conflict - re-enable after fix
-// #[cfg(test)]
-// mod prop_tests;
+// #828: compile errors fixed — re-enabled
+#[cfg(test)]
+mod prop_tests;
 
 // FIXME: pre-existing compile errors from merge conflict - re-enable after fix
 // #[cfg(test)]
 // mod benchmarks;
 
-// FIXME: pre-existing compile errors from merge conflict - re-enable after fix
-// #[cfg(test)]
-// mod chaos_tests;
+// #829: compile errors fixed — re-enabled
+#[cfg(test)]
+mod chaos_tests;
 
 #[cfg(test)]
 mod installment_tests {

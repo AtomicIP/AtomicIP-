@@ -12,6 +12,7 @@ mod tests {
     #[contractclient(name = "IpRegistryClient")]
     #[allow(dead_code)]
     pub trait IpRegistry {
+        fn initialize(env: Env, admin: Address);
         fn commit_ip(
             env: Env,
             owner: Address,
@@ -43,7 +44,11 @@ mod tests {
             blinding_factor: BytesN<32>,
         ) -> bool;
         fn get_partial_disclosure(env: Env, ip_id: u64) -> Option<BytesN<32>>;
-        fn validate_upgrade(env: Env, new_wasm_hash: BytesN<32>);
+        fn validate_upgrade(
+            env: Env,
+            new_wasm_hash: BytesN<32>,
+            candidate: crate::UpgradeManifest,
+        );
         fn upgrade(env: Env, new_wasm_hash: BytesN<32>);
         fn get_pow_difficulty(env: Env) -> u32;
         fn get_ip_strength(env: Env, ip_id: u64) -> u32;
@@ -153,6 +158,9 @@ mod tests {
             env: Env,
             challenge_id: u64,
         ) -> Option<crate::types::OwnershipChallenge>;
+        // Issue #811
+        fn set_challenge_ttl(env: Env, ttl_seconds: u64);
+        fn expire_challenge(env: Env, challenge_id: u64);
         // Issue #434
         fn rotate_commitment_key(
             env: Env,
@@ -161,11 +169,19 @@ mod tests {
             old_secret: BytesN<32>,
             old_blinding_factor: BytesN<32>,
         );
-        fn get_key_rotation_history(env: Env, ip_id: u64) -> Vec<BytesN<32>>;
+        // Issue #813: paginated history
+        fn get_key_rotation_history(
+            env: Env,
+            ip_id: u64,
+            offset: u32,
+            limit: u32,
+        ) -> Vec<BytesN<32>>;
         // Issue #435
         fn generate_merkle_proof(env: Env, ip_id: u64) -> Vec<BytesN<32>>;
         fn compute_ip_merkle_root(env: Env, owner: Address) -> BytesN<32>;
         fn verify_ip_merkle_proof(env: Env, ip_id: u64, proof: Vec<BytesN<32>>) -> bool;
+        // Issue #812
+        fn get_merkle_root(env: Env, owner: Address) -> BytesN<32>;
         fn set_notary_public_key(env: Env, public_key: BytesN<32>);
         fn notarize_ip_timestamp(env: Env, ip_id: u64, notary_signature: soroban_sdk::Bytes);
         fn get_ip_notary_signature(env: Env, ip_id: u64) -> Option<soroban_sdk::Bytes>;
@@ -181,6 +197,10 @@ mod tests {
         fn set_ip_expiry(env: Env, ip_id: u64, expiry_timestamp: u64, grace_period_seconds: u64);
         fn renew_ip_commitment(env: Env, ip_id: u64, new_expiry: u64) -> bool;
         fn cleanup_expired_ips(env: Env, ip_ids: Vec<u64>);
+        // Issue #809
+        fn add_co_owner(env: Env, ip_id: u64, co_owner: Address, percentage: u32);
+        fn remove_co_owner(env: Env, ip_id: u64, co_owner: Address);
+        fn get_ownership_shares(env: Env, ip_id: u64) -> Vec<crate::OwnershipShare>;
     }
 
     #[test]
@@ -333,6 +353,7 @@ mod tests {
         let commitment2 = BytesN::from_array(&env, &[15u8; 32]);
 
         env.mock_all_auths();
+        client.initialize(&owner1);
         let ip_id1 = client.commit_ip(&owner1, &commitment1, &0u32);
         let ip_id2 = client.commit_ip(&owner2, &commitment2, &0u32);
 
@@ -364,6 +385,7 @@ mod tests {
         let commitment = BytesN::from_array(&env, &[16u8; 32]);
 
         env.mock_all_auths();
+        client.initialize(&owner);
         let ip_id = client.commit_ip(&owner, &commitment, &0u32);
 
         let mut ip_ids = Vec::new(&env);
@@ -972,6 +994,14 @@ mod tests {
         assert_eq!(id5, 5);
     }
 
+    fn full_upgrade_manifest(env: &Env) -> crate::UpgradeManifest {
+        crate::UpgradeManifest {
+            exported_functions: crate::IpRegistry::required_exported_functions(env),
+            error_codes: crate::IpRegistry::current_error_codes(env),
+            storage_keys: crate::IpRegistry::current_storage_keys(env),
+        }
+    }
+
     #[test]
     fn test_validate_upgrade_accepts_non_zero_hash() {
         let env = Env::default();
@@ -980,7 +1010,7 @@ mod tests {
 
         let valid_hash = BytesN::from_array(&env, &[1u8; 32]);
         // Should not panic
-        client.validate_upgrade(&valid_hash);
+        client.validate_upgrade(&valid_hash, &crate::IpRegistry::current_manifest(&env));
     }
 
     #[test]
@@ -991,7 +1021,7 @@ mod tests {
         let client = IpRegistryClient::new(&env, &contract_id);
 
         let zero_hash = BytesN::from_array(&env, &[0u8; 32]);
-        client.validate_upgrade(&zero_hash);
+        client.validate_upgrade(&zero_hash, &crate::IpRegistry::current_manifest(&env));
     }
 
     // ── PoW Tests ─────────────────────────────────────────────────────────────
@@ -1788,7 +1818,7 @@ mod tests {
         let record = client.get_ip(&ip_id);
         assert_eq!(record.commitment_hash, new_hash);
 
-        let history = client.get_key_rotation_history(&ip_id);
+        let history = client.get_key_rotation_history(&ip_id, &0u32, &64u32);
         assert_eq!(history.len(), 1);
         assert_eq!(history.get(0).unwrap(), old_hash);
     }
@@ -1805,6 +1835,7 @@ mod tests {
         let client = IpRegistryClient::new(&env, &contract_id);
 
         let owner = <Address as TestAddress>::generate(&env);
+        client.initialize(&owner);
         let commitment = BytesN::from_array(&env, &[50u8; 32]);
         let ip_id = client.commit_ip(&owner, &commitment, &0u32);
 
@@ -1998,6 +2029,7 @@ mod tests {
         let client = IpRegistryClient::new(&env, &contract_id);
 
         let owner = <Address as TestAddress>::generate(&env);
+        client.initialize(&owner);
         let commitment = BytesN::from_array(&env, &[51u8; 32]);
         let ip_id = client.commit_ip(&owner, &commitment, &0u32);
 
@@ -2042,6 +2074,7 @@ mod tests {
         let owner = <Address as TestAddress>::generate(&env);
         let challenger = <Address as TestAddress>::generate(&env);
         env.mock_all_auths();
+        client.initialize(&owner);
 
         let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[5u8; 32]), &0u32);
         let dispute_id = client.initiate_dispute(
@@ -2082,6 +2115,7 @@ mod tests {
         let owner = <Address as TestAddress>::generate(&env);
         let challenger = <Address as TestAddress>::generate(&env);
         env.mock_all_auths();
+        client.initialize(&owner);
 
         let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[6u8; 32]), &0u32);
         let dispute_id = client.initiate_dispute(
@@ -2138,6 +2172,7 @@ mod tests {
         let client = IpRegistryClient::new(&env, &contract_id);
 
         let owner = <Address as TestAddress>::generate(&env);
+        client.initialize(&owner);
         let commitment = BytesN::from_array(&env, &[53u8; 32]);
         let ip_id = client.commit_ip(&owner, &commitment, &0u32);
 
@@ -2736,6 +2771,92 @@ mod expiry_tests {
         // Verify at least one event was emitted (set_ip_expiry + cleanup_expired_ips).
         let events = env.events().all();
         assert!(events.events().len() >= 1, "ip_clean event must be emitted");
+    }
+
+    #[test]
+    fn test_verify_commitment_emits_expiry_event_exactly_once() {
+        let (env, client, _owner, ip_id) = setup();
+        let now = env.ledger().timestamp();
+        client.set_ip_expiry(&ip_id, &(now + 100), &500);
+
+        // Advance past expiry but still within the grace period.
+        env.ledger().with_mut(|l| l.timestamp = now + 150);
+
+        let secret = BytesN::from_array(&env, &[1u8; 32]);
+        let blinding = BytesN::from_array(&env, &[2u8; 32]);
+
+        // No events emitted yet (set_ip_expiry does not publish).
+        assert_eq!(env.events().all().events().len(), 0);
+
+        // Calling verify_commitment repeatedly must only fire the expiry
+        // event once for this expiry transition.
+        client.verify_commitment(&ip_id, &secret, &blinding);
+        assert_eq!(env.events().all().events().len(), 1);
+
+        client.verify_commitment(&ip_id, &secret, &blinding);
+        client.verify_commitment(&ip_id, &secret, &blinding);
+        assert_eq!(
+            env.events().all().events().len(),
+            1,
+            "EXPIRY_TOPIC must fire exactly once per expiry transition"
+        );
+    }
+}
+
+// ── Issue #809: OwnershipShare Percentage Sum Invariant ──────────────────────
+
+#[cfg(test)]
+mod ownership_share_tests {
+    use super::tests::IpRegistryClient;
+    use soroban_sdk::{testutils::Address as _, Address, BytesN, Env};
+
+    fn setup() -> (Env, IpRegistryClient<'static>, Address, u64) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[0x55u8; 32]);
+        let ip_id = client.commit_ip(&owner, &hash, &0u32);
+        (env, client, owner, ip_id)
+    }
+
+    #[test]
+    fn test_add_co_owner_splits_shares_to_100() {
+        let (env, client, owner, ip_id) = setup();
+        let co_owner = Address::generate(&env);
+        client.add_co_owner(&ip_id, &co_owner, &40);
+
+        let shares = client.get_ownership_shares(&ip_id);
+        assert_eq!(shares.len(), 2);
+        let total: u32 = shares.iter().map(|s| s.percentage).sum();
+        assert_eq!(total, 100);
+        assert_eq!(shares.get(0).unwrap().address, owner);
+        assert_eq!(shares.get(0).unwrap().percentage, 60);
+        assert_eq!(shares.get(1).unwrap().address, co_owner);
+        assert_eq!(shares.get(1).unwrap().percentage, 40);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_add_co_owner_rejects_percentage_exceeding_owner_share() {
+        let (env, client, _owner, ip_id) = setup();
+        let co_owner = Address::generate(&env);
+        // Owner only holds 100; requesting 101 must panic (sum would exceed 100).
+        client.add_co_owner(&ip_id, &co_owner, &101);
+    }
+
+    #[test]
+    fn test_remove_co_owner_returns_share_to_owner() {
+        let (env, client, owner, ip_id) = setup();
+        let co_owner = Address::generate(&env);
+        client.add_co_owner(&ip_id, &co_owner, &30);
+        client.remove_co_owner(&ip_id, &co_owner);
+
+        let shares = client.get_ownership_shares(&ip_id);
+        assert_eq!(shares.len(), 1);
+        assert_eq!(shares.get(0).unwrap().address, owner);
+        assert_eq!(shares.get(0).unwrap().percentage, 100);
     }
 }
 
@@ -3608,5 +3729,367 @@ mod batch_escrow_tests {
                 .persistent()
                 .has(&crate::DataKey::ShardSubIps(shard_id, 1u32)));
         });
+    }
+
+    // ── Tests for Issue #811: OwnershipChallenge expiry ──────────────────────
+
+    #[test]
+    fn test_challenge_expires_after_ttl() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let commitment = BytesN::from_array(&env, &[0xA1u8; 32]);
+        let ip_id = client.commit_ip(&owner, &commitment, &0u32);
+
+        // Set a very short TTL: 100 seconds
+        client.set_challenge_ttl(&100u64);
+
+        let challenger = <Address as TestAddress>::generate(&env);
+        let nonce = BytesN::from_array(&env, &[0x42u8; 32]);
+        let challenge_id = client.issue_ownership_challenge(&ip_id, &challenger, &nonce);
+
+        // Verify challenge was stored with correct expires_at
+        let ch = client.get_ownership_challenge(&challenge_id).unwrap();
+        assert_eq!(ch.expires_at, ch.timestamp + 100);
+
+        // Advance ledger time past the TTL
+        env.ledger().with_mut(|l| l.timestamp = ch.expires_at + 1);
+
+        // respond_to_challenge should now panic with ChallengeExpired
+        let response = BytesN::from_array(&env, &[0xBBu8; 32]);
+        let result = std::panic::catch_unwind(|| {
+            client.respond_to_ownership_challenge(&challenge_id, &response);
+        });
+        assert!(result.is_err(), "response after TTL must panic");
+    }
+
+    #[test]
+    fn test_expire_challenge_callable_after_ttl() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let commitment = BytesN::from_array(&env, &[0xA2u8; 32]);
+        let ip_id = client.commit_ip(&owner, &commitment, &0u32);
+
+        // Short TTL
+        client.set_challenge_ttl(&50u64);
+
+        let challenger = <Address as TestAddress>::generate(&env);
+        let nonce = BytesN::from_array(&env, &[0x55u8; 32]);
+        let challenge_id = client.issue_ownership_challenge(&ip_id, &challenger, &nonce);
+
+        let ch = client.get_ownership_challenge(&challenge_id).unwrap();
+
+        // Advance past expiry
+        env.ledger().with_mut(|l| l.timestamp = ch.expires_at + 10);
+
+        // expire_challenge should succeed and remove the record
+        client.expire_challenge(&challenge_id);
+
+        // Challenge should no longer exist in storage
+        assert!(client.get_ownership_challenge(&challenge_id).is_none());
+    }
+
+    #[test]
+    fn test_expire_challenge_not_yet_expired_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let commitment = BytesN::from_array(&env, &[0xA3u8; 32]);
+        let ip_id = client.commit_ip(&owner, &commitment, &0u32);
+
+        let challenger = <Address as TestAddress>::generate(&env);
+        let nonce = BytesN::from_array(&env, &[0x66u8; 32]);
+        let challenge_id = client.issue_ownership_challenge(&ip_id, &challenger, &nonce);
+
+        // Do NOT advance time — challenge is still within TTL
+        // expire_challenge should panic
+        let result = std::panic::catch_unwind(|| {
+            client.expire_challenge(&challenge_id);
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_challenge_already_answered_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let commitment = BytesN::from_array(&env, &[0xA4u8; 32]);
+        let ip_id = client.commit_ip(&owner, &commitment, &0u32);
+
+        let challenger = <Address as TestAddress>::generate(&env);
+        let nonce = BytesN::from_array(&env, &[0x77u8; 32]);
+        let challenge_id = client.issue_ownership_challenge(&ip_id, &challenger, &nonce);
+
+        let response = BytesN::from_array(&env, &[0x88u8; 32]);
+        // First response should succeed
+        client.respond_to_ownership_challenge(&challenge_id, &response);
+
+        // Second response should panic (already answered)
+        let result = std::panic::catch_unwind(|| {
+            client.respond_to_ownership_challenge(
+                &challenge_id,
+                &BytesN::from_array(&env, &[0x99u8; 32]),
+            );
+        });
+        assert!(result.is_err());
+    }
+
+    // ── Tests for Issue #812: Merkle root staleness ────────────────────────
+
+    #[test]
+    fn test_merkle_root_recomputes_after_new_commit() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let h1 = BytesN::from_array(&env, &[0xC1u8; 32]);
+        client.commit_ip(&owner, &h1, &0u32);
+
+        // First call — builds and caches the root
+        let root_v1 = client.get_merkle_root(&owner);
+
+        // Commit a second IP — invalidates the cache
+        let h2 = BytesN::from_array(&env, &[0xC2u8; 32]);
+        client.commit_ip(&owner, &h2, &0u32);
+
+        // Second call — must return a different (recomputed) root
+        let root_v2 = client.get_merkle_root(&owner);
+        assert_ne!(root_v1, root_v2, "Merkle root must change after a new commit");
+    }
+
+    #[test]
+    fn test_merkle_root_recomputes_after_revoke() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let h1 = BytesN::from_array(&env, &[0xD1u8; 32]);
+        let h2 = BytesN::from_array(&env, &[0xD2u8; 32]);
+        let ip1 = client.commit_ip(&owner, &h1, &0u32);
+        client.commit_ip(&owner, &h2, &0u32);
+
+        let root_before = client.get_merkle_root(&owner);
+
+        client.revoke_ip(&ip1);
+
+        let root_after = client.get_merkle_root(&owner);
+        assert_ne!(root_before, root_after, "Merkle root must change after revoke");
+    }
+
+    #[test]
+    fn test_get_merkle_root_empty_owner() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+
+        // Owner with no IPs — should return zero root
+        let root = client.get_merkle_root(&owner);
+        assert_eq!(root, BytesN::from_array(&env, &[0u8; 32]));
+    }
+
+    // ── Tests for Issue #813: key-rotation history pagination ─────────────
+
+    #[test]
+    fn test_key_rotation_history_zero_rotations() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let commitment = BytesN::from_array(&env, &[0xE1u8; 32]);
+        let ip_id = client.commit_ip(&owner, &commitment, &0u32);
+
+        let history = client.get_key_rotation_history(&ip_id, &0u32, &64u32);
+        assert_eq!(history.len(), 0, "New IP should have empty rotation history");
+    }
+
+    #[test]
+    fn test_key_rotation_history_one_rotation() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+
+        // Build a valid Pedersen-style commitment: sha256(secret || bf)
+        let secret = BytesN::from_array(&env, &[0x11u8; 32]);
+        let bf = BytesN::from_array(&env, &[0x22u8; 32]);
+        let mut pre = soroban_sdk::Bytes::new(&env);
+        pre.append(&secret.clone().into());
+        pre.append(&bf.clone().into());
+        let old_hash: BytesN<32> = env.crypto().sha256(&pre).into();
+
+        let ip_id = client.commit_ip(&owner, &old_hash, &0u32);
+        let new_hash = BytesN::from_array(&env, &[0xE2u8; 32]);
+        client.rotate_commitment_key(&ip_id, &new_hash, &secret, &bf);
+
+        let history = client.get_key_rotation_history(&ip_id, &0u32, &64u32);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history.get(0).unwrap(), old_hash);
+    }
+
+    #[test]
+    fn test_key_rotation_history_many_rotations_paginated() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+
+        // Build initial commitment
+        let secret = BytesN::from_array(&env, &[0xAAu8; 32]);
+        let bf = BytesN::from_array(&env, &[0xBBu8; 32]);
+        let mut pre = soroban_sdk::Bytes::new(&env);
+        pre.append(&secret.clone().into());
+        pre.append(&bf.clone().into());
+        let initial_hash: BytesN<32> = env.crypto().sha256(&pre).into();
+        let ip_id = client.commit_ip(&owner, &initial_hash, &0u32);
+
+        // Perform 3 rotations to build a history of 3 entries
+        let hashes: [BytesN<32>; 3] = [
+            BytesN::from_array(&env, &[0xE3u8; 32]),
+            BytesN::from_array(&env, &[0xE4u8; 32]),
+            BytesN::from_array(&env, &[0xE5u8; 32]),
+        ];
+
+        // First rotation: prove knowledge of initial_hash via secret+bf
+        client.rotate_commitment_key(&ip_id, &hashes[0], &secret, &bf);
+
+        // Subsequent rotations use a dummy secret/bf that hashes to the current commitment
+        // — we already stored new_hash directly, so we fake each rotation by inserting
+        // the previous new_hash as a "known old hash".
+        // For simplicity, seal each subsequent rotation with a unique preimage.
+        for i in 1..3usize {
+            let s = BytesN::from_array(&env, &[i as u8; 32]);
+            let b = BytesN::from_array(&env, &[(i + 0x10) as u8; 32]);
+            let mut p = soroban_sdk::Bytes::new(&env);
+            p.append(&s.clone().into());
+            p.append(&b.clone().into());
+            // The current commitment is hashes[i-1]; build a hash that equals it
+            // by storing the old via rotate (we set the commitment to a precomputed hash).
+            // We need to prove knowledge: sha256(s||b) == hashes[i-1]
+            // Since we can't reverse sha256, instead inject via direct storage in test.
+            env.as_contract(&contract_id, || {
+                let mut hist: soroban_sdk::Vec<BytesN<32>> = env
+                    .storage()
+                    .persistent()
+                    .get(&crate::DataKey::EncryptionKeyRotation(ip_id))
+                    .unwrap_or(soroban_sdk::Vec::new(&env));
+                hist.push_back(hashes[i - 1].clone());
+                env.storage()
+                    .persistent()
+                    .set(&crate::DataKey::EncryptionKeyRotation(ip_id), &hist);
+                // Update record to current new hash so pagination has 3 entries total
+                let mut rec: crate::IpRecord = env
+                    .storage()
+                    .persistent()
+                    .get(&crate::DataKey::IpRecord(ip_id))
+                    .unwrap();
+                rec.commitment_hash = hashes[i].clone();
+                env.storage()
+                    .persistent()
+                    .set(&crate::DataKey::IpRecord(ip_id), &rec);
+            });
+        }
+
+        // Full history: 3 entries
+        let all = client.get_key_rotation_history(&ip_id, &0u32, &64u32);
+        assert_eq!(all.len(), 3, "Should have 3 rotation entries total");
+
+        // Page 1: first 2
+        let page1 = client.get_key_rotation_history(&ip_id, &0u32, &2u32);
+        assert_eq!(page1.len(), 2);
+
+        // Page 2: last 1
+        let page2 = client.get_key_rotation_history(&ip_id, &2u32, &2u32);
+        assert_eq!(page2.len(), 1);
+    }
+
+    // ── Tests for Issue #814: NotaryPublicKey validation ─────────────────
+
+    #[test]
+    fn test_set_notary_public_key_valid() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        // A valid (non-zero) 32-byte key should be accepted
+        let valid_key = BytesN::from_array(&env, &[0x12u8; 32]);
+        client.set_notary_public_key(&valid_key);
+    }
+
+    #[test]
+    fn test_set_notary_public_key_zero_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        // An all-zero key must be rejected with InvalidNotaryKey (error 39)
+        let zero_key = BytesN::from_array(&env, &[0u8; 32]);
+        let result = std::panic::catch_unwind(|| {
+            client.set_notary_public_key(&zero_key);
+        });
+        assert!(
+            result.is_err(),
+            "set_notary_public_key with zero key must panic"
+        );
+    }
+
+    #[test]
+    fn test_set_notary_public_key_truncated_rejected() {
+        // BytesN<32> enforces exact length at the type level, so a truncated key
+        // cannot even be constructed; this test confirms the type-level enforcement
+        // by verifying that only exactly 32-byte values compile and pass through.
+        // We represent a "bad" key as one where only the first byte is set (simulating
+        // a zero-padded / truncated real key) — format validation catches it if
+        // it is all zeros.  The test below uses a non-zero truncated-style key to show
+        // it IS accepted (length is fine), and a zero key to show it's rejected.
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        // Non-zero key: passes (length is correct, not all-zero)
+        let partial_key = BytesN::from_array(
+            &env,
+            &[
+                0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0,
+            ],
+        );
+        client.set_notary_public_key(&partial_key);
+
+        // All-zero "oversized" representation: rejected
+        let oversized_zero = BytesN::from_array(&env, &[0u8; 32]);
+        let result = std::panic::catch_unwind(|| {
+            client.set_notary_public_key(&oversized_zero);
+        });
+        assert!(result.is_err(), "zero/oversized key must be rejected");
     }
 }

@@ -14,7 +14,6 @@ mod benchmarks {
 
     use crate::{AtomicSwap, AtomicSwapClient};
 
-    // CPU instruction limits (conservative upper bounds).
     const INITIATE_SWAP_CPU_LIMIT: u64 = 800_000;
     const ACCEPT_SWAP_CPU_LIMIT: u64 = 600_000;
     const REVEAL_KEY_CPU_LIMIT: u64 = 600_000;
@@ -30,9 +29,9 @@ mod benchmarks {
 
     struct BenchCtx {
         env: Env,
-        swap: AtomicSwapClient<'static>,
         token: Address,
         registry_id: Address,
+        swap_id: Address,
     }
 
     fn setup() -> BenchCtx {
@@ -46,9 +45,9 @@ mod benchmarks {
         swap.initialize(&registry_id);
         BenchCtx {
             env,
-            swap,
             token,
             registry_id,
+            swap_id,
         }
     }
 
@@ -69,8 +68,9 @@ mod benchmarks {
         let (ip_id, _secret, _blinding) = commit_ip(&ctx, &seller, 0x01);
         StellarAssetClient::new(&ctx.env, &ctx.token).mint(&buyer, &1000);
 
+        let swap = AtomicSwapClient::new(&ctx.env, &ctx.swap_id);
         ctx.env.budget().reset_default();
-        ctx.swap.initiate_swap(
+        swap.initiate_swap(
             &ctx.token, &ip_id, &seller, &1000, &buyer, &0_u32, &None, &0i128, &false,
         );
         let cpu = ctx.env.budget().cpu_instruction_count();
@@ -90,12 +90,13 @@ mod benchmarks {
         let buyer = Address::generate(&ctx.env);
         let (ip_id, _secret, _blinding) = commit_ip(&ctx, &seller, 0x02);
         StellarAssetClient::new(&ctx.env, &ctx.token).mint(&buyer, &1000);
-        let swap_id = ctx.swap.initiate_swap(
+        let swap = AtomicSwapClient::new(&ctx.env, &ctx.swap_id);
+        let swap_id = swap.initiate_swap(
             &ctx.token, &ip_id, &seller, &1000, &buyer, &0_u32, &None, &0i128, &false,
         );
 
         ctx.env.budget().reset_default();
-        ctx.swap.accept_swap(&swap_id);
+        swap.accept_swap(&swap_id);
         let cpu = ctx.env.budget().cpu_instruction_count();
 
         assert!(
@@ -113,13 +114,14 @@ mod benchmarks {
         let buyer = Address::generate(&ctx.env);
         let (ip_id, secret, blinding) = commit_ip(&ctx, &seller, 0x03);
         StellarAssetClient::new(&ctx.env, &ctx.token).mint(&buyer, &1000);
-        let swap_id = ctx.swap.initiate_swap(
+        let swap = AtomicSwapClient::new(&ctx.env, &ctx.swap_id);
+        let swap_id = swap.initiate_swap(
             &ctx.token, &ip_id, &seller, &1000, &buyer, &0_u32, &None, &0i128, &false,
         );
-        ctx.swap.accept_swap(&swap_id);
+        swap.accept_swap(&swap_id);
 
         ctx.env.budget().reset_default();
-        ctx.swap.reveal_key(&swap_id, &seller, &secret, &blinding);
+        swap.reveal_key(&swap_id, &seller, &secret, &blinding);
         let cpu = ctx.env.budget().cpu_instruction_count();
 
         assert!(
@@ -137,12 +139,13 @@ mod benchmarks {
         let buyer = Address::generate(&ctx.env);
         let (ip_id, _secret, _blinding) = commit_ip(&ctx, &seller, 0x04);
         StellarAssetClient::new(&ctx.env, &ctx.token).mint(&buyer, &1000);
-        let swap_id = ctx.swap.initiate_swap(
+        let swap = AtomicSwapClient::new(&ctx.env, &ctx.swap_id);
+        let swap_id = swap.initiate_swap(
             &ctx.token, &ip_id, &seller, &1000, &buyer, &0_u32, &None, &0i128, &false,
         );
 
         ctx.env.budget().reset_default();
-        ctx.swap.cancel_swap(&swap_id, &seller);
+        swap.cancel_swap(&swap_id, &seller);
         let cpu = ctx.env.budget().cpu_instruction_count();
 
         assert!(
@@ -160,12 +163,13 @@ mod benchmarks {
         let buyer = Address::generate(&ctx.env);
         let (ip_id, _secret, _blinding) = commit_ip(&ctx, &seller, 0x05);
         StellarAssetClient::new(&ctx.env, &ctx.token).mint(&buyer, &1000);
-        let swap_id = ctx.swap.initiate_swap(
+        let swap = AtomicSwapClient::new(&ctx.env, &ctx.swap_id);
+        let swap_id = swap.initiate_swap(
             &ctx.token, &ip_id, &seller, &1000, &buyer, &0_u32, &None, &0i128, &false,
         );
 
         ctx.env.budget().reset_default();
-        ctx.swap.get_swap(&swap_id);
+        swap.get_swap(&swap_id);
         let cpu = ctx.env.budget().cpu_instruction_count();
 
         assert!(
