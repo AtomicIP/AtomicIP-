@@ -107,4 +107,7 @@ pub struct OwnershipChallenge {
     pub response_hash: Option<BytesN<32>>,
     pub verified: bool,
     pub timestamp: u64,
+    /// Unix timestamp (seconds) after which this challenge is considered expired.
+    /// Computed as `timestamp + challenge_ttl_seconds` at creation time.
+    pub expires_at: u64,
 }
