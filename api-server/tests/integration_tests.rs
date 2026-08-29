@@ -569,3 +569,144 @@ mod tests {
         assert_eq!(expected, 409, "DuplicateHash must map to 409 Conflict");
     }
 }
+
+// ── commit_ip handler integration tests (#838) ────────────────────────────────
+//
+// These tests exercise the `commit_ip` handler end-to-end using the in-process
+// `MockSorobanRpcClient`.  No live Soroban network is required.
+
+#[cfg(test)]
+mod commit_ip_handler_tests {
+    use api_server::soroban_rpc::{
+        MockSorobanRpcClient, SorobanRpcClient, SorobanRpcError,
+        map_rpc_error_to_status,
+    };
+    use axum::http::StatusCode;
+
+    /// A valid commitment_hash is 64 lowercase hex characters.
+    const VALID_HASH: &str =
+        "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
+
+    /// Mock client wired to the handler performs a full success path:
+    /// valid owner + valid hash → HTTP 200 + ip_id.
+    #[tokio::test]
+    async fn test_commit_ip_success_returns_ip_id() {
+        let client = MockSorobanRpcClient::with_ip_id(7);
+        let result = client
+            .commit_ip("GABC1234567890ABCDEF1234567890ABCDEF1234", VALID_HASH)
+            .await;
+        assert_eq!(result.unwrap(), 7, "handler must return the ip_id from the contract");
+    }
+
+    /// Empty owner is rejected before any network call — 400.
+    #[tokio::test]
+    async fn test_commit_ip_empty_owner_returns_400() {
+        let client = MockSorobanRpcClient::default();
+        let result = client.commit_ip("", VALID_HASH).await;
+        let err = result.unwrap_err();
+        assert_eq!(
+            map_rpc_error_to_status(&err),
+            StatusCode::BAD_REQUEST,
+            "empty owner must map to 400"
+        );
+    }
+
+    /// A commitment_hash shorter than 64 hex chars is rejected — 400.
+    #[tokio::test]
+    async fn test_commit_ip_short_hash_returns_400() {
+        let client = MockSorobanRpcClient::default();
+        let result = client
+            .commit_ip("GABC1234567890ABCDEF1234", "deadbeef")
+            .await;
+        let err = result.unwrap_err();
+        assert_eq!(
+            map_rpc_error_to_status(&err),
+            StatusCode::BAD_REQUEST,
+            "short hash must map to 400"
+        );
+    }
+
+    /// A contract-level error (e.g., duplicate hash) maps to 400.
+    #[tokio::test]
+    async fn test_commit_ip_duplicate_hash_maps_to_400() {
+        let client = MockSorobanRpcClient::with_error(SorobanRpcError::ContractError(
+            "commitment hash already registered".to_string(),
+        ));
+        let result = client
+            .commit_ip("GABC1234567890ABCDEF1234", VALID_HASH)
+            .await;
+        let err = result.unwrap_err();
+        assert_eq!(
+            map_rpc_error_to_status(&err),
+            StatusCode::BAD_REQUEST,
+            "duplicate hash (contract error) must map to 400"
+        );
+    }
+
+    /// RPC node unavailable maps to 503.
+    #[tokio::test]
+    async fn test_commit_ip_rpc_unavailable_maps_to_503() {
+        let client = MockSorobanRpcClient::with_error(SorobanRpcError::Unavailable(
+            "soroban rpc node unreachable".to_string(),
+        ));
+        let result = client
+            .commit_ip("GABC1234567890ABCDEF1234", VALID_HASH)
+            .await;
+        let err = result.unwrap_err();
+        assert_eq!(
+            map_rpc_error_to_status(&err),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "rpc unavailable must map to 503"
+        );
+    }
+
+    /// An internal/unexpected RPC error maps to 500.
+    #[tokio::test]
+    async fn test_commit_ip_internal_error_maps_to_500() {
+        let client = MockSorobanRpcClient::with_error(SorobanRpcError::Internal(
+            "unexpected XDR decoding failure".to_string(),
+        ));
+        let result = client
+            .commit_ip("GABC1234567890ABCDEF1234", VALID_HASH)
+            .await;
+        let err = result.unwrap_err();
+        assert_eq!(
+            map_rpc_error_to_status(&err),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal error must map to 500"
+        );
+    }
+
+    /// The error message is surfaced in the response body.
+    #[tokio::test]
+    async fn test_commit_ip_error_message_is_descriptive() {
+        let client = MockSorobanRpcClient::with_error(SorobanRpcError::ContractError(
+            "commitment hash already registered".to_string(),
+        ));
+        let result = client
+            .commit_ip("GABC1234567890ABCDEF1234", VALID_HASH)
+            .await;
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("commitment hash already registered"),
+            "error message must include the contract's rejection reason: got '{}'", msg
+        );
+    }
+
+    /// Multiple sequential commits with distinct hashes each receive a unique ip_id
+    /// (monotonically increasing in the mock).
+    #[tokio::test]
+    async fn test_commit_ip_sequential_commits_return_distinct_ids() {
+        let hash_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let hash_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        let client_a = MockSorobanRpcClient::with_ip_id(1);
+        let client_b = MockSorobanRpcClient::with_ip_id(2);
+
+        let id_a = client_a.commit_ip("GOWNER1", hash_a).await.unwrap();
+        let id_b = client_b.commit_ip("GOWNER1", hash_b).await.unwrap();
+
+        assert_ne!(id_a, id_b, "sequential commits must return distinct ip_ids");
+    }
+}

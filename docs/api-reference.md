@@ -600,6 +600,9 @@ if registry.is_ip_owner(&ip_id, &address) {
 | `CommitmentAlreadyRegistered` | 3 | Commitment hash already registered |
 | `IpAlreadyRevoked` | 4 | IP is already revoked |
 | `UnauthorizedUpgrade` | 5 | Caller is not admin (upgrade only) |
+| `NotInitialized` | 36 | An admin-gated function was called before `initialize` set a real admin |
+| `AlreadyInitialized` | 37 | `initialize` was called on a contract that already has an admin |
+| `IncompatibleUpgrade` | 38 | `validate_upgrade`'s candidate manifest is missing a function/storage key/error code the current contract relies on, or renumbers an existing error code |
 
 ---
 
@@ -622,7 +625,7 @@ Emitted when a new IP is committed.
 | `OwnerIps(Address)` | Persistent | Maps owner → Vec of IP IDs |
 | `NextId` | Persistent | Next available IP ID (monotonic counter) |
 | `CommitmentOwner(BytesN<32>)` | Persistent | Maps commitment hash → owner (duplicate detection) |
-| `Admin` | Persistent | Admin address for upgrades |
+| `Admin` | Persistent | Admin address gating admin-only functions; set once via `initialize(admin)` (never auto-derived), rotatable via `set_admin(new_admin)` |
 
 ---
 
@@ -1222,3 +1225,109 @@ The TCP peer address is used by default, and `X-Forwarded-For` is ignored to
 prevent clients from evading IP limits by spoofing headers. Set
 `RateLimitConfig::trust_proxy_headers` only when the API is reachable solely
 through a trusted reverse proxy that replaces `X-Forwarded-For`.
+
+## Issue #354: Swap Insurance
+
+A buyer may enable insurance when a swap is initiated. The premium is 2% of the
+swap price and is collected from the buyer at `accept_swap`. If the seller later
+reveals an invalid key, the swap is flagged claimable and the buyer can call
+`claim_insurance` to recover the swap price from the insurance pool.
+
+### Reservation model
+
+Coverage is **reserved per policy**, not drawn from a shared pool balance at
+claim time.
+
+- Each token has one pool balance, `InsurancePool(token)`.
+- When a policy is issued (that is, when `accept_swap` or `batch_accept_swaps`
+  collects its premium), the contract carves a reservation equal to that swap's
+  full coverage amount, which is the swap price. It is stored as
+  `InsuranceReserved(swap_id)` and added to `InsuranceReservedTotal(token)`.
+- `claim_insurance` pays that policy's own reservation. It never pays the pool
+  remainder, and it never pays a reduced amount.
+- The reservation is released when the policy pays out, and when the swap
+  reaches a settled state (`Completed`, `Cancelled`, `RolledBack`) without an
+  outstanding claim. A swap still flagged claimable keeps its reservation.
+
+The invariant the contract exposes is:
+
+```
+InsurancePool(token) >= InsuranceReservedTotal(token)
+```
+
+While it holds, every outstanding policy on that token can be paid in full
+regardless of the order claims arrive in. Two valid policies on the same token
+can no longer race, and the second claimant can no longer be silently handed a
+partial payout because the first drained the balance.
+
+### Collateralization
+
+Premiums alone do not collateralize the coverage they buy: a policy contributes
+2% of the price and reserves 100% of it. A pool funded only by premiums is
+therefore under-collateralized by construction, and every claim against it fails
+with `InsufficientInsuranceReserve`. Use `fund_insurance_pool` to top the pool
+up, and `get_insurance_pool_status` to see the shortfall before a claim hits it.
+
+### `claim_insurance`
+
+```rust
+fn claim_insurance(env: Env, swap_id: u64)
+```
+
+Buyer-authorized. Transfers the policy's reserved coverage from the pool to the
+buyer, releases the reservation, and clears the claimable flag so the policy
+cannot be claimed twice.
+
+Panics with:
+
+| Error | Code | Meaning |
+|---|---:|---|
+| `Unauthorized` | 23 | Insurance was not enabled for this swap, or the swap is not flagged claimable |
+| `InsuranceNotReserved` | 66 | The policy holds no coverage reservation: it was never accepted with insurance, or the reservation was already released |
+| `InsufficientInsuranceReserve` | 67 | The claim is valid, but the pool holds less than this policy's reserved coverage. Nothing is transferred |
+
+Codes 66 and 67 are deliberately distinct. A claimant can tell "my claim is not
+valid" apart from "the pool is under-collateralized and owes me a payout it
+cannot currently make".
+
+### `get_insurance_pool_status`
+
+```rust
+fn get_insurance_pool_status(env: Env, token: Address) -> InsurancePoolStatus
+```
+
+Read-only. Returns the pool's solvency for one token:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `token` | `Address` | Token the pool is denominated in |
+| `balance` | `i128` | Actual balance credited to the pool |
+| `reserved` | `i128` | Sum of coverage reserved by all outstanding policies |
+| `collateralized` | `bool` | True while `balance >= reserved` |
+| `shortfall` | `i128` | `reserved - balance` when under-collateralized, else 0 |
+
+Under-collateralization is observable here before it causes a failed payout.
+
+### `get_insurance_reservation`
+
+```rust
+fn get_insurance_reservation(env: Env, swap_id: u64) -> i128
+```
+
+Read-only. Coverage currently reserved for one swap, or 0 if it holds none.
+
+### `fund_insurance_pool`
+
+```rust
+fn fund_insurance_pool(env: Env, funder: Address, token: Address, amount: i128)
+```
+
+Funder-authorized. Transfers `amount` of `token` into the contract and credits
+it to that token's insurance pool. Panics with `PriceTooSmall` (3) if `amount`
+is not positive. Publishes `ins_fund` with an `InsurancePoolFundedEvent`.
+
+### Premium calculation
+
+Unchanged. The premium remains 2% of the swap price, applied identically in
+`initiate_swap` and `batch_initiate_with_insurance`. The reservation model
+changes only how a claim is paid, not what a policy costs.

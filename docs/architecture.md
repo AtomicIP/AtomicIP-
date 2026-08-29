@@ -100,6 +100,53 @@ contents, since that could itself grow without bound.
 ### Atomic Swap Contract
 - **SwapRecord (u64):** Stores details of an active/completed swap (seller, buyer, price, status, escrowed token).
 
+## 🗂️ registry.rs — Local Registry Helper in the Atomic Swap Contract
+
+`contracts/atomic_swap/src/registry.rs` is a **thin helper module inside the
+`atomic_swap` contract**. It is **not** a standalone registry; all authoritative
+IP records live in the separate `ip_registry` contract.
+
+### Purpose
+
+The atomic swap contract needs to verify two things about an IP before it
+allows a swap to proceed:
+
+1. **Ownership** — the seller must be the current owner of the IP.
+2. **Validity** — the IP must not have been revoked.
+
+Rather than duplicating this logic inline across every entry-point that touches
+an IP, `registry.rs` centralises those cross-contract calls in two small
+functions:
+
+| Function | What it does |
+|---|---|
+| `ip_registry(env)` | Reads the stored `ip_registry` contract address from instance storage and returns it. Panics with `ContractError::NotInitialized` if the swap contract has not been initialised yet. |
+| `ensure_seller_owns_active_ip(env, ip_id, seller)` | Cross-calls `ip_registry.get_ip(ip_id)`, then panics with `NotIPOwner` or `IpRevoked` if the seller check fails. |
+| `verify_commitment(env, ip_id, secret, blinding_factor)` | Cross-calls `ip_registry.verify_commitment` and returns the boolean result. |
+
+### Relationship to `ip_registry`
+
+```
+atomic_swap contract
+└── registry.rs  ──cross-contract call──►  ip_registry contract
+    (local helper)                          (authoritative IP store)
+```
+
+- `registry.rs` is a **local read-only proxy** — it holds no IP state of its
+  own and never writes to the `ip_registry` contract.
+- The `ip_registry` contract is the **single source of truth** for IP records,
+  ownership, and revocation status.
+- `registry.rs` caches only the `ip_registry` contract *address* (stored under
+  `DataKey::IpRegistry` in the swap contract's instance storage) so the swap
+  contract does not need the address hardcoded in every call site.
+
+### Why a separate module instead of inline calls?
+
+Keeping cross-contract calls in one place makes the security boundary explicit:
+every read from `ip_registry` goes through `registry.rs`, so an auditor can
+find all external data dependencies in a single 35-line file rather than
+hunting through the entire `lib.rs`.
+
 ## 🌍 Infrastructure
 
 - **Network:** Stellar Testnet & Mainnet.

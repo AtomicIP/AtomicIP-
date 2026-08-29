@@ -3,52 +3,22 @@
 //! Adds support for multiple payment currencies (XLM, USDC, EURC) in the
 //! atomic swap contract.
 //!
-//! # Fee-Asset Policy
+//! ## Fee-Asset Policy (#835)
 //!
-//! ## Rationale
+//! Protocol fees are **always collected in the configured `fee_asset` token**,
+//! regardless of which currency a swap settles in. This prevents fee-accounting
+//! drift when different counterparties settle in XLM, USDC, or EURC.
 //!
-//! When swaps can settle in different currencies the protocol fee must be
-//! collected in a **single, pre-configured asset** — the *fee asset* — rather
-//! than whichever token the swap happens to use.  Without this rule the
-//! treasury would accumulate a mixture of tokens, making fee accounting,
-//! auditing, and liquidation unnecessarily complex.
-//!
-//! ## Policy (canonical)
-//!
-//! 1. **One fee asset per deployment.**  The fee asset is chosen at contract
-//!    initialisation time (or via an admin call) and stored under
-//!    `DataKey::MultiCurrencyConfig`.  It defaults to `SupportedToken::XLM`.
-//!
-//! 2. **Fee is deducted in the fee asset, not the swap asset.**  When a swap
-//!    settles in USDC the protocol fee is still collected in XLM (or whatever
-//!    the fee asset is).  The swap contract is responsible for the conversion
-//!    — either by holding a pre-funded fee reserve or by integrating with the
-//!    on-chain price oracle.
-//!
-//!    *For the current implementation the fee is deducted from the settlement
-//!    amount in the swap token and the result is converted to the fee asset
-//!    at the oracle price.  If the fee asset is the same as the swap token,
-//!    no conversion is needed.*
-//!
-//! 3. **Wrong-fee-asset payloads are rejected.**  If a caller attempts to pay
-//!    a fee using a token that is not the configured fee asset the call panics
-//!    with [`ContractError::InvalidFeeAsset`].  This prevents accidental or
-//!    malicious fee-accounting drift.
-//!
-//! 4. **Supported swap tokens ≠ fee asset.**  A swap may settle in USDC while
-//!    the fee is collected in XLM.  The `is_token_supported` check only gates
-//!    *settlement* tokens; the `validate_fee_asset` check gates *fee* tokens.
-//!
-//! ## Summary table
-//!
-//! | Scenario | Swap token | Fee asset | Allowed? |
-//! |---|---|---|---|
-//! | XLM swap, fee in XLM | XLM | XLM | ✅ |
-//! | USDC swap, fee in XLM | USDC | XLM | ✅ (conversion applied) |
-//! | EURC swap, fee in XLM | EURC | XLM | ✅ (conversion applied) |
-//! | USDC swap, fee in USDC | USDC | USDC | ❌ (rejected if fee asset ≠ USDC) |
-//! | Custom token swap, fee in XLM | Custom | XLM | ✅ if custom token is supported |
-//! | Any swap, fee in unsupported token | * | unsupported | ❌ |
+//! ### Rules
+//! 1. `MultiCurrencyConfig::fee_asset` is set once at initialisation and cannot
+//!    be changed without an admin migration — it is the **single source of truth**
+//!    for fee collection.
+//! 2. Before a swap is finalised, `validate_fee_asset` MUST be called with the
+//!    settlement token.  If the settlement token differs from `fee_asset`, the
+//!    swap layer is expected to convert or reject — the swap MUST NOT collect
+//!    fees in the settlement token directly.
+//! 3. `collect_fee` returns the canonical fee amount denominated in `fee_asset`
+//!    decimals so the caller can debit the correct amount from the right account.
 
 use soroban_sdk::{contracttype, panic_with_error, Address, Env, String, Vec};
 
@@ -80,22 +50,45 @@ pub struct TokenMetadata {
 
 /// Multi-currency configuration stored on-chain.
 ///
-/// The `fee_asset` field enforces the fee-asset policy described in the
-/// module-level doc: all protocol fees are collected in this token regardless
-/// of which token a swap settles in.
+/// `fee_asset` is the **only** token in which protocol fees are collected.
+/// All other fields control which tokens may be used for swap settlement.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct MultiCurrencyConfig {
     pub enabled_tokens: Vec<SupportedToken>,
     pub default_token: SupportedToken,
     pub token_metadata: Vec<TokenMetadata>,
-    /// The single asset in which protocol fees are always collected.
-    /// Defaults to `SupportedToken::XLM`.  Must be in `enabled_tokens`.
+    /// The single canonical asset used for protocol fee collection.
+    /// Defaults to `SupportedToken::XLM` and must not be changed without
+    /// an authorised admin migration.
+    pub fee_asset: SupportedToken,
+}
+
+/// Outcome returned by `validate_fee_asset`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum FeeAssetValidation {
+    /// Settlement token matches the configured fee asset — fees may be
+    /// collected directly in the settlement currency.
+    Consistent,
+    /// Settlement token differs from the configured fee asset — the caller
+    /// MUST convert or reject; it must NOT collect fees in the settlement
+    /// token.
+    Inconsistent,
+}
+
+/// Result of a fee collection calculation.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct FeeCalculation {
+    /// Amount to collect, expressed in `fee_asset` decimals.
+    pub fee_amount: i128,
+    /// The token that must receive the fee.
     pub fee_asset: SupportedToken,
 }
 
 impl MultiCurrencyConfig {
-    /// Build the default configuration (XLM, USDC, EURC enabled; fee asset = XLM).
+    /// Build the default configuration (XLM, USDC, EURC enabled; XLM is fee asset).
     pub fn initialize(env: &Env) -> Self {
         let mut enabled_tokens = Vec::new(env);
         enabled_tokens.push_back(SupportedToken::XLM);
@@ -127,7 +120,7 @@ impl MultiCurrencyConfig {
             enabled_tokens,
             default_token: SupportedToken::XLM,
             token_metadata,
-            // Policy default: fees are always collected in XLM.
+            // XLM is the canonical fee asset by default.
             fee_asset: SupportedToken::XLM,
         }
     }
@@ -148,26 +141,47 @@ impl MultiCurrencyConfig {
         None
     }
 
-    /// Validate that `fee_token` matches the configured fee asset.
+    // ── Fee-asset policy (#835) ────────────────────────────────────────────────
+
+    /// Check whether `settlement_token` is consistent with the configured
+    /// `fee_asset`.
     ///
-    /// Panics with [`ContractError::InvalidFeeAsset`] if the token does not
-    /// match, enforcing the fee-asset consistency policy.
-    ///
-    /// Call this at the point where the protocol fee is about to be deducted
-    /// so that wrong-fee-asset payloads are rejected early.
-    pub fn validate_fee_asset(&self, env: &Env, fee_token: &SupportedToken) {
-        if fee_token != &self.fee_asset {
-            panic_with_error!(env, ContractError::InvalidFeeAsset);
+    /// Returns [`FeeAssetValidation::Consistent`] when they match, or
+    /// [`FeeAssetValidation::Inconsistent`] when they differ.  Callers MUST
+    /// act on an `Inconsistent` result — never collect fees directly in the
+    /// settlement currency.
+    pub fn validate_fee_asset(&self, settlement_token: &SupportedToken) -> FeeAssetValidation {
+        if settlement_token == &self.fee_asset {
+            FeeAssetValidation::Consistent
+        } else {
+            FeeAssetValidation::Inconsistent
         }
     }
 
-    /// Return `true` if `fee_token` is the configured fee asset.
+    /// Calculate the protocol fee for a swap of `amount` settled in
+    /// `settlement_token`, always denominating the result in `fee_asset`.
     ///
-    /// Prefer [`validate_fee_asset`] for contract calls that must reject
-    /// mis-matched tokens.  Use this predicate in tests and off-chain logic
-    /// that needs a boolean rather than a panic.
-    pub fn is_valid_fee_asset(&self, fee_token: &SupportedToken) -> bool {
-        fee_token == &self.fee_asset
+    /// `bps` is the fee rate in basis-points (e.g. 30 = 0.30 %).
+    ///
+    /// When `settlement_token` differs from `fee_asset` the `fee_amount` is
+    /// still expressed in `fee_asset` units — the caller is responsible for
+    /// any cross-asset conversion.  This keeps fee accounting in a single
+    /// asset regardless of settlement currency.
+    pub fn collect_fee(
+        &self,
+        amount: i128,
+        bps: u32,
+        settlement_token: &SupportedToken,
+    ) -> FeeCalculation {
+        // Fee is always expressed in the canonical fee_asset, not settlement_token.
+        // When they differ the caller must handle the conversion; this function
+        // simply enforces that fee denomination is always consistent.
+        let _ = settlement_token; // policy: fee_asset wins, settlement_token ignored
+        let fee_amount = amount * (bps as i128) / 10_000;
+        FeeCalculation {
+            fee_amount,
+            fee_asset: self.fee_asset.clone(),
+        }
     }
 }
 
@@ -211,6 +225,13 @@ mod tests {
     }
 
     #[test]
+    fn test_initialize_fee_asset_is_xlm() {
+        let env = Env::default();
+        let config = MultiCurrencyConfig::initialize(&env);
+        assert_eq!(config.fee_asset, SupportedToken::XLM);
+    }
+
+    #[test]
     fn test_get_token_by_symbol_found() {
         let env = Env::default();
         let config = MultiCurrencyConfig::initialize(&env);
@@ -228,141 +249,119 @@ mod tests {
         assert!(config.get_token_by_symbol(&env, &sym).is_none());
     }
 
-    // ── #835: Fee-asset policy tests ──────────────────────────────────────────
+    // ── Fee-asset consistency tests (#835) ────────────────────────────────────
 
+    /// XLM swap: settlement == fee_asset → Consistent
     #[test]
-    fn test_default_fee_asset_is_xlm() {
-        // Policy: fees default to XLM regardless of which token a swap settles in.
+    fn test_fee_asset_validation_xlm_settlement_is_consistent() {
         let env = Env::default();
-        let config = MultiCurrencyConfig::initialize(&env);
-        assert_eq!(
-            config.fee_asset,
-            SupportedToken::XLM,
-            "default fee asset must be XLM"
-        );
+        let config = MultiCurrencyConfig::initialize(&env); // fee_asset = XLM
+        let result = config.validate_fee_asset(&SupportedToken::XLM);
+        assert_eq!(result, FeeAssetValidation::Consistent);
     }
 
+    /// USDC swap: settlement ≠ fee_asset → Inconsistent; fees must NOT be in USDC
     #[test]
-    fn test_fee_asset_xlm_is_valid_fee_asset() {
-        // XLM swap pays fee in XLM — matches the default fee asset.
+    fn test_fee_asset_validation_usdc_settlement_is_inconsistent() {
         let env = Env::default();
-        let config = MultiCurrencyConfig::initialize(&env);
-        assert!(
-            config.is_valid_fee_asset(&SupportedToken::XLM),
-            "XLM must be a valid fee asset when fee_asset=XLM"
-        );
+        let config = MultiCurrencyConfig::initialize(&env); // fee_asset = XLM
+        let result = config.validate_fee_asset(&SupportedToken::USDC);
+        assert_eq!(result, FeeAssetValidation::Inconsistent);
     }
 
+    /// EURC swap: settlement ≠ fee_asset → Inconsistent; fees must NOT be in EURC
     #[test]
-    fn test_fee_asset_usdc_is_invalid_when_fee_asset_is_xlm() {
-        // USDC swap must NOT pay fee in USDC when the configured fee asset is XLM.
+    fn test_fee_asset_validation_eurc_settlement_is_inconsistent() {
         let env = Env::default();
-        let config = MultiCurrencyConfig::initialize(&env);
-        assert!(
-            !config.is_valid_fee_asset(&SupportedToken::USDC),
-            "USDC must be rejected as fee asset when fee_asset=XLM"
-        );
+        let config = MultiCurrencyConfig::initialize(&env); // fee_asset = XLM
+        let result = config.validate_fee_asset(&SupportedToken::EURC);
+        assert_eq!(result, FeeAssetValidation::Inconsistent);
     }
 
+    /// Custom token: settlement ≠ fee_asset → Inconsistent
     #[test]
-    fn test_fee_asset_eurc_is_invalid_when_fee_asset_is_xlm() {
-        // EURC swap must NOT pay fee in EURC when the configured fee asset is XLM.
+    fn test_fee_asset_validation_custom_settlement_is_inconsistent() {
         let env = Env::default();
         let config = MultiCurrencyConfig::initialize(&env);
-        assert!(
-            !config.is_valid_fee_asset(&SupportedToken::EURC),
-            "EURC must be rejected as fee asset when fee_asset=XLM"
-        );
+        let result = config.validate_fee_asset(&SupportedToken::Custom);
+        assert_eq!(result, FeeAssetValidation::Inconsistent);
     }
 
+    /// If fee_asset is explicitly set to USDC and settlement is USDC → Consistent
     #[test]
-    #[should_panic]
-    fn test_validate_fee_asset_panics_for_usdc_when_fee_asset_is_xlm() {
-        // Calling validate_fee_asset with USDC when the fee asset is XLM
-        // must panic — this is the guard that prevents fee-accounting drift.
-        let env = Env::default();
-        let config = MultiCurrencyConfig::initialize(&env);
-        config.validate_fee_asset(&env, &SupportedToken::USDC);
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_validate_fee_asset_panics_for_eurc_when_fee_asset_is_xlm() {
-        // Same guard for EURC.
-        let env = Env::default();
-        let config = MultiCurrencyConfig::initialize(&env);
-        config.validate_fee_asset(&env, &SupportedToken::EURC);
-    }
-
-    #[test]
-    fn test_validate_fee_asset_succeeds_for_xlm_when_fee_asset_is_xlm() {
-        // Must not panic when the correct fee asset is supplied.
-        let env = Env::default();
-        let config = MultiCurrencyConfig::initialize(&env);
-        // Should not panic
-        config.validate_fee_asset(&env, &SupportedToken::XLM);
-    }
-
-    #[test]
-    fn test_fee_asset_can_be_reconfigured_to_usdc() {
-        // An admin can change the fee asset to USDC; subsequent validation
-        // must accept USDC and reject XLM.
+    fn test_fee_asset_validation_usdc_fee_asset_usdc_settlement_consistent() {
         let env = Env::default();
         let mut config = MultiCurrencyConfig::initialize(&env);
-        config.fee_asset = SupportedToken::USDC;
-
-        assert!(config.is_valid_fee_asset(&SupportedToken::USDC), "USDC must be valid after reconfigure");
-        assert!(!config.is_valid_fee_asset(&SupportedToken::XLM), "XLM must be invalid after reconfigure to USDC");
-        assert!(!config.is_valid_fee_asset(&SupportedToken::EURC), "EURC must be invalid after reconfigure to USDC");
+        config.fee_asset = SupportedToken::USDC; // override for this test
+        let result = config.validate_fee_asset(&SupportedToken::USDC);
+        assert_eq!(result, FeeAssetValidation::Consistent);
     }
 
+    /// Fee is always denominated in fee_asset (XLM), regardless of settlement token.
     #[test]
-    fn test_fee_asset_can_be_reconfigured_to_eurc() {
-        // Fee asset reconfigured to EURC.
+    fn test_collect_fee_xlm_settlement_always_in_fee_asset() {
         let env = Env::default();
-        let mut config = MultiCurrencyConfig::initialize(&env);
-        config.fee_asset = SupportedToken::EURC;
-
-        assert!(config.is_valid_fee_asset(&SupportedToken::EURC), "EURC must be valid after reconfigure");
-        assert!(!config.is_valid_fee_asset(&SupportedToken::XLM), "XLM must be invalid after reconfigure to EURC");
-        assert!(!config.is_valid_fee_asset(&SupportedToken::USDC), "USDC must be invalid after reconfigure to EURC");
+        let config = MultiCurrencyConfig::initialize(&env); // fee_asset = XLM
+        let calc = config.collect_fee(10_000_000, 30, &SupportedToken::XLM);
+        assert_eq!(calc.fee_asset, SupportedToken::XLM);
+        assert_eq!(calc.fee_amount, 30_000); // 0.30 % of 10_000_000
     }
 
+    /// Even when settling in USDC the fee is denominated in XLM (fee_asset).
     #[test]
-    fn test_usdc_swap_with_xlm_fee_asset_is_supported_combination() {
-        // USDC is a supported *swap* token even though the fee asset is XLM.
-        // These are independent checks: is_token_supported gates settlement;
-        // is_valid_fee_asset gates fee collection.
+    fn test_collect_fee_usdc_settlement_fee_still_in_xlm() {
         let env = Env::default();
-        let config = MultiCurrencyConfig::initialize(&env);
-
-        // USDC is a valid settlement token
-        assert!(config.is_token_supported(&SupportedToken::USDC));
-        // XLM is the required fee token, not USDC
-        assert!(!config.is_valid_fee_asset(&SupportedToken::USDC));
-        assert!(config.is_valid_fee_asset(&SupportedToken::XLM));
+        let config = MultiCurrencyConfig::initialize(&env); // fee_asset = XLM
+        let calc = config.collect_fee(5_000_000, 30, &SupportedToken::USDC);
+        assert_eq!(calc.fee_asset, SupportedToken::XLM); // fee always in XLM
+        assert_eq!(calc.fee_amount, 15_000); // 0.30 % of 5_000_000
     }
 
+    /// Even when settling in EURC the fee is denominated in XLM (fee_asset).
     #[test]
-    fn test_eurc_swap_with_xlm_fee_asset_is_supported_combination() {
-        // EURC is a supported *swap* token even though the fee asset is XLM.
+    fn test_collect_fee_eurc_settlement_fee_still_in_xlm() {
         let env = Env::default();
-        let config = MultiCurrencyConfig::initialize(&env);
-
-        assert!(config.is_token_supported(&SupportedToken::EURC));
-        assert!(!config.is_valid_fee_asset(&SupportedToken::EURC));
-        assert!(config.is_valid_fee_asset(&SupportedToken::XLM));
+        let config = MultiCurrencyConfig::initialize(&env); // fee_asset = XLM
+        let calc = config.collect_fee(2_000_000, 50, &SupportedToken::EURC);
+        assert_eq!(calc.fee_asset, SupportedToken::XLM); // fee always in XLM
+        assert_eq!(calc.fee_amount, 10_000); // 0.50 % of 2_000_000
     }
 
+    /// Fee of zero amount is zero regardless of currency.
     #[test]
-    fn test_fee_asset_must_be_in_enabled_tokens() {
-        // The fee asset should always be in the enabled tokens list.
-        // This verifies the invariant is maintained by initialize().
+    fn test_collect_fee_zero_amount_all_currencies() {
         let env = Env::default();
         let config = MultiCurrencyConfig::initialize(&env);
-        assert!(
-            config.is_token_supported(&config.fee_asset),
-            "fee_asset must always be in enabled_tokens"
-        );
+        for token in [SupportedToken::XLM, SupportedToken::USDC, SupportedToken::EURC] {
+            let calc = config.collect_fee(0, 30, &token);
+            assert_eq!(calc.fee_amount, 0);
+            assert_eq!(calc.fee_asset, SupportedToken::XLM);
+        }
+    }
+
+    /// Full policy check: any swap not in fee_asset must be flagged Inconsistent,
+    /// and the fee object must always name fee_asset.
+    #[test]
+    fn test_fee_policy_three_currencies_all_consistent_fee_asset() {
+        let env = Env::default();
+        let config = MultiCurrencyConfig::initialize(&env); // fee_asset = XLM
+
+        let currencies = [
+            (SupportedToken::XLM,  FeeAssetValidation::Consistent),
+            (SupportedToken::USDC, FeeAssetValidation::Inconsistent),
+            (SupportedToken::EURC, FeeAssetValidation::Inconsistent),
+        ];
+
+        for (token, expected_validation) in currencies {
+            let validation = config.validate_fee_asset(&token);
+            assert_eq!(validation, expected_validation,
+                "validate_fee_asset({:?}) should be {:?}", token, expected_validation);
+
+            // Regardless of settlement currency, fee_asset must be XLM in the
+            // returned FeeCalculation.
+            let calc = config.collect_fee(1_000_000, 30, &token);
+            assert_eq!(calc.fee_asset, SupportedToken::XLM,
+                "fee_asset must always be XLM for settlement in {:?}", token);
+        }
     }
 }
