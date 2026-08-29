@@ -12,6 +12,7 @@ pub const LEDGER_BUMP: u32 = 6_307_200;
 pub const REVOKE_TOPIC: Symbol = soroban_sdk::symbol_short!("revoke");
 pub const TRANSFER_TOPIC: Symbol = soroban_sdk::symbol_short!("ip_xfer");
 pub const BATCH_VERIFY_TOPIC: Symbol = soroban_sdk::symbol_short!("batch_vfy");
+pub const EXPIRY_TOPIC: Symbol = soroban_sdk::symbol_short!("ip_expiry");
 
 // ── Access Control ────────────────────────────────────────────────────────────
 
@@ -106,4 +107,7 @@ pub struct OwnershipChallenge {
     pub response_hash: Option<BytesN<32>>,
     pub verified: bool,
     pub timestamp: u64,
+    /// Unix timestamp (seconds) after which this challenge is considered expired.
+    /// Computed as `timestamp + challenge_ttl_seconds` at creation time.
+    pub expires_at: u64,
 }

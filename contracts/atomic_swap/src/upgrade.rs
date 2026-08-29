@@ -355,6 +355,8 @@ pub fn build_v1_schema(env: &Env) -> ContractSchema {
     k!("SwapRenegotiations");
     k!("InsuranceClaimable");
     k!("InsurancePool");
+    k!("InsuranceReserved");
+    k!("InsuranceReservedTotal");
 
     ContractSchema {
         version: 1,

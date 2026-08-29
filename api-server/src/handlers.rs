@@ -1,15 +1,19 @@
 use axum::{
-    extract::{Path, Query},
+    extract::{Path, Query, State},
     http::{header, StatusCode},
     response::IntoResponse,
     Json,
 };
 use once_cell::sync::Lazy;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::time::{Duration, Instant};
 use tracing::instrument;
 use crate::cache;
-use crate::deduplication::{create_store, create_store_with_backend, DeduplicationBackend, DeduplicationStore};
+use crate::deduplication::{create_store, DeduplicationStore};
+use crate::graphql::SorobanQueryClient;
 use crate::schemas::*;
+use std::sync::Arc;
 use crate::webhook;
 
 // #523/#800: Per-handler idempotency store for batch swap operations. Uses a
@@ -30,6 +34,24 @@ static BATCH_SWAP_IDEMPOTENCY: Lazy<DeduplicationStore> = Lazy::new(|| match std
         create_store()
     }
 });
+
+// #520: Mirrors the contract's MAX_BATCH_SIZE cap on a single batch.
+const MAX_BATCH_SIZE: usize = 50;
+
+// #469: Mirrors the contract's ~7-day swap expiry (ledger timestamp + 604800).
+const SWAP_EXPIRY_SECONDS: u64 = 604800;
+
+/// Process-local swap ID counter standing in for the contract's `NextId`
+/// until the handlers are wired to a live Soroban RPC client.
+static NEXT_SWAP_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Current Unix timestamp in seconds (substitute for the ledger timestamp).
+fn now_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
 
 // ── IP Registry ───────────────────────────────────────────────────────────────
 
@@ -99,9 +121,14 @@ pub async fn get_ip(Path(ip_id): Path<u64>) -> impl IntoResponse {
 )]
 #[instrument(skip(body))]
 pub async fn transfer_ip(Json(body): Json<TransferIpRequest>) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
-    // #316: Invalidate cache on mutation
-    cache::invalidate(&cache::ip_key(body.ip_id));
     // TODO: Call Soroban RPC to invoke ip_registry.transfer_ip
+    // #316: Invalidate AFTER the write commits. Invalidating before the RPC
+    // call leaves a window where a concurrent read can repopulate the cache
+    // with pre-write state and serve it stale for the full TTL; a post-write
+    // invalidation clears any such entry. The full key set must go — a
+    // transfer changes owner list membership too, so `ip:list:*` (not just
+    // the record) is invalidated.
+    cache::invalidate_ip(body.ip_id);
     Err((
         StatusCode::NOT_FOUND,
         Json(ErrorResponse {
@@ -150,6 +177,7 @@ pub async fn verify_commitment(Json(body): Json<VerifyCommitmentRequest>) -> Res
 pub async fn list_ip_by_owner(
     Path(owner): Path<String>,
     Query(pagination): Query<PaginationParams>,
+    axum::extract::State(client): axum::extract::State<Arc<SorobanQueryClient>>,
 ) -> impl IntoResponse {
     let limit = pagination.limit.min(200);
     let offset = pagination.offset;
@@ -164,9 +192,17 @@ pub async fn list_ip_by_owner(
         ).into_response();
     }
 
-    // TODO: Call Soroban RPC to invoke ip_registry.list_ip_by_owner
-    // Stub: empty paginated response
-    let all_ids: Vec<u64> = vec![];
+    let all_ids = match client.list_ip_by_owner(&owner).await {
+        Ok(ids) => ids,
+        Err(error) => {
+            tracing::error!(%error, owner = %owner, "failed to list IPs by owner");
+            return (
+                StatusCode::BAD_GATEWAY,
+                [(header::CACHE_CONTROL, cache::no_cache_header())],
+                Json(serde_json::json!({ "error": "failed to query IP registry" })),
+            ).into_response();
+        }
+    };
     let total_count = all_ids.len() as u64;
     let page: Vec<u64> = all_ids
         .into_iter()
@@ -203,18 +239,19 @@ pub async fn list_ip_by_owner(
 pub async fn list_ip_by_owner_cursor(
     Path(owner): Path<String>,
     Query(pagination): Query<CursorPaginationParams>,
+    axum::extract::State(client): axum::extract::State<Arc<SorobanQueryClient>>,
 ) -> impl IntoResponse {
     let limit = pagination.limit.min(200);
 
     // Decode cursor if provided
-    let (last_id, offset) = match pagination.cursor {
+    let offset = match pagination.cursor {
         Some(cursor) => {
             match crate::schemas::cursor::decode(&cursor) {
-                Some(data) => (data.last_id, data.offset),
-                None => (0, 0), // Invalid cursor, start from beginning
+                Some(data) => data.offset,
+                None => 0, // Invalid cursor, start from beginning
             }
         }
-        None => (0, 0),
+        None => 0,
     };
 
     // #316: Check cache with cursor-based key
@@ -227,9 +264,17 @@ pub async fn list_ip_by_owner_cursor(
         ).into_response();
     }
 
-    // TODO: Call Soroban RPC to invoke ip_registry.list_ip_by_owner with cursor
-    // Stub: empty paginated response
-    let all_ids: Vec<u64> = vec![];
+    let all_ids = match client.list_ip_by_owner(&owner).await {
+        Ok(ids) => ids,
+        Err(error) => {
+            tracing::error!(%error, owner = %owner, "failed to list IPs by owner");
+            return (
+                StatusCode::BAD_GATEWAY,
+                [(header::CACHE_CONTROL, cache::no_cache_header())],
+                Json(serde_json::json!({ "error": "failed to query IP registry" })),
+            ).into_response();
+        }
+    };
     let total_count = all_ids.len() as u64;
 
     // Apply cursor-based pagination
@@ -296,7 +341,7 @@ pub async fn initiate_swap(Json(body): Json<InitiateSwapRequest>) -> Result<Json
     request_body = BatchInitiateSwapRequest,
     responses(
         (status = 200, description = "Swaps initiated, returns swap_ids", body = BatchInitiateSwapResponse),
-        (status = 400, description = "Validation error (mismatched lengths, invalid IP, etc.)", body = ErrorResponse),
+        (status = 400, description = "Validation error (mismatched lengths, empty/oversized batch, non-positive price, duplicate ip_ids, etc.)", body = ErrorResponse),
     )
 )]
 #[instrument(skip(body))]
@@ -341,14 +386,71 @@ pub async fn batch_initiate_swap(Json(body): Json<BatchInitiateSwapRequest>) -> 
         }
     }
 
-    // TODO: Call Soroban RPC to invoke atomic_swap.batch_initiate_swap
-    // On success, cache the result: BATCH_SWAP_IDEMPOTENCY.set(key, json_value).await;
-    Err((
-        StatusCode::BAD_REQUEST,
-        Json(ErrorResponse {
-            error: "batch_initiate_swap not yet implemented".to_string(),
-        }),
-    ))
+    // #520: Cap the batch size at the contract's MAX_BATCH_SIZE (50).
+    if body.ip_ids.len() > MAX_BATCH_SIZE {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!(
+                    "batch size {} exceeds maximum of {}",
+                    body.ip_ids.len(),
+                    MAX_BATCH_SIZE
+                ),
+            }),
+        ));
+    }
+
+    // #520: Every price must be positive (contract: require_positive_price).
+    if let Some((&ip_id, _)) = body
+        .ip_ids
+        .iter()
+        .zip(body.prices.iter())
+        .find(|(_, &price)| price <= 0)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("price must be positive for ip_id {}", ip_id),
+            }),
+        ));
+    }
+
+    // Reuse the batch semantics of the contract's `batch_initiate_swap`
+    // (validated in the contract's batch tests): every IP in the batch gets a
+    // fresh Pending swap with a ~7-day expiry, IDs allocated sequentially
+    // (contract NextId). Until the handlers are wired to a live Soroban RPC
+    // client, the records are served back through the #316 cache so
+    // GET /swap/{swap_id} can read them.
+    let expiry = now_timestamp() + SWAP_EXPIRY_SECONDS;
+    let mut swap_ids = Vec::with_capacity(body.ip_ids.len());
+    for (&ip_id, &price) in body.ip_ids.iter().zip(body.prices.iter()) {
+        let swap_id = NEXT_SWAP_ID.fetch_add(1, Ordering::Relaxed);
+        let record = SwapRecord {
+            ip_id,
+            ip_registry_id: body.ip_registry_id.clone(),
+            seller: body.seller.clone(),
+            buyer: body.buyer.clone(),
+            price,
+            token: body.token.clone(),
+            status: SwapStatus::Pending,
+            expiry,
+        };
+        cache::set_with_ttl(&cache::swap_key(swap_id), &record, SWAP_EXPIRY_SECONDS);
+        swap_ids.push(swap_id);
+    }
+
+    let response = BatchInitiateSwapResponse { swap_ids };
+
+    // #523: Cache the result under the idempotency key so replays return the
+    // same swap IDs instead of allocating new ones.
+    if let Some(ref key) = body.idempotency_key {
+        BATCH_SWAP_IDEMPOTENCY.insert(
+            key.clone(),
+            (serde_json::to_value(&response).unwrap(), Instant::now()),
+        );
+    }
+
+    Ok(Json(response))
 }
 
 /// Buyer accepts a pending swap.
@@ -366,9 +468,12 @@ pub async fn batch_initiate_swap(Json(body): Json<BatchInitiateSwapRequest>) -> 
 )]
 #[instrument(skip(body))]
 pub async fn accept_swap(Path(swap_id): Path<u64>, Json(body): Json<AcceptSwapRequest>) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
-    // #316: Invalidate swap cache on state change
-    cache::invalidate(&cache::swap_key(swap_id));
     // TODO: Call Soroban RPC to invoke atomic_swap.accept_swap
+    // #316: Invalidate AFTER the write commits (see `transfer_ip`) so a
+    // concurrent read cannot repopulate the cache with pre-write state. A
+    // state transition also changes seller/buyer list membership, so the
+    // swap record and both list prefixes are invalidated.
+    cache::invalidate_swap(swap_id);
     webhook::trigger_swap_status_changed(swap_id, Some("Pending".to_string()), "Accepted".to_string());
     Err((
         StatusCode::NOT_FOUND,
@@ -393,9 +498,13 @@ pub async fn accept_swap(Path(swap_id): Path<u64>, Json(body): Json<AcceptSwapRe
 )]
 #[instrument(skip(body))]
 pub async fn reveal_key(Path(swap_id): Path<u64>, Json(body): Json<RevealKeyRequest>) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
-    // #316: Invalidate swap cache on state change
-    cache::invalidate(&cache::swap_key(swap_id));
     // TODO: Call Soroban RPC to invoke atomic_swap.reveal_key
+    // #316: Invalidate AFTER the write commits (see `transfer_ip`). A
+    // completed swap changes seller/buyer list membership and both parties'
+    // reputation, so the record, both list prefixes, and the reputation
+    // cache are all invalidated.
+    cache::invalidate_swap(swap_id);
+    cache::invalidate_prefix("reputation:");
     webhook::trigger_swap_status_changed(swap_id, Some("Accepted".to_string()), "Completed".to_string());
     Err((
         StatusCode::NOT_FOUND,
@@ -420,9 +529,10 @@ pub async fn reveal_key(Path(swap_id): Path<u64>, Json(body): Json<RevealKeyRequ
 )]
 #[instrument(skip(body))]
 pub async fn cancel_swap(Path(swap_id): Path<u64>, Json(body): Json<CancelSwapRequest>) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
-    // #316: Invalidate swap cache on state change
-    cache::invalidate(&cache::swap_key(swap_id));
     // TODO: Call Soroban RPC to invoke atomic_swap.cancel_swap
+    // #316: Invalidate AFTER the write commits (see `transfer_ip`) — the
+    // swap record and both seller/buyer list prefixes.
+    cache::invalidate_swap(swap_id);
     webhook::trigger_swap_status_changed(swap_id, Some("Pending".to_string()), "Cancelled".to_string());
     Err((
         StatusCode::NOT_FOUND,
@@ -447,9 +557,10 @@ pub async fn cancel_swap(Path(swap_id): Path<u64>, Json(body): Json<CancelSwapRe
 )]
 #[instrument(skip(body))]
 pub async fn cancel_expired_swap(Path(swap_id): Path<u64>, Json(body): Json<CancelExpiredSwapRequest>) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
-    // #316: Invalidate swap cache on state change
-    cache::invalidate(&cache::swap_key(swap_id));
     // TODO: Call Soroban RPC to invoke atomic_swap.cancel_expired_swap
+    // #316: Invalidate AFTER the write commits (see `transfer_ip`) — the
+    // swap record and both seller/buyer list prefixes.
+    cache::invalidate_swap(swap_id);
     webhook::trigger_swap_status_changed(swap_id, Some("Accepted".to_string()), "Cancelled".to_string());
     Err((
         StatusCode::NOT_FOUND,
@@ -471,7 +582,10 @@ pub async fn cancel_expired_swap(Path(swap_id): Path<u64>, Json(body): Json<Canc
     )
 )]
 #[instrument]
-pub async fn get_swap(Path(swap_id): Path<u64>) -> impl IntoResponse {
+pub async fn get_swap(
+    State(rpc_client): State<Arc<dyn crate::graphql::SorobanRpcClient>>,
+    Path(swap_id): Path<u64>,
+) -> impl IntoResponse {
     // #316: Check cache first
     let cache_key = cache::swap_key(swap_id);
     if let Some(cached) = cache::get::<SwapRecord>(&cache_key) {
@@ -482,12 +596,49 @@ pub async fn get_swap(Path(swap_id): Path<u64>) -> impl IntoResponse {
         ).into_response();
     }
 
-    // TODO: Call Soroban RPC to invoke atomic_swap.get_swap
-    (
-        StatusCode::NOT_FOUND,
-        [(header::CACHE_CONTROL, cache::no_cache_header())],
-        Json(serde_json::json!({ "error": format!("Swap {} not found", swap_id) })),
-    ).into_response()
+    // #316: On cache miss, read through to the Soroban RPC layer and backfill
+    // the cache so subsequent lookups hit the fast path.
+    match rpc_client.get_swap_record(swap_id).await {
+        Ok(Some(record)) => {
+            let record: SwapRecord = record.into();
+            cache::set(&cache_key, &record);
+            (
+                StatusCode::OK,
+                [(header::CACHE_CONTROL, cache::cache_control_header())],
+                Json(serde_json::to_value(record).unwrap()),
+            ).into_response()
+        }
+        // RPC miss or error: the swap does not exist (or is currently unreadable).
+        _ => (
+            StatusCode::NOT_FOUND,
+            [(header::CACHE_CONTROL, cache::no_cache_header())],
+            Json(serde_json::json!({ "error": format!("Swap {} not found", swap_id) })),
+        ).into_response(),
+    }
+}
+
+/// Bridge the RPC layer's record shape (shared with GraphQL) to the REST
+/// schema returned by `GET /v1/swap/{swap_id}`.
+impl From<crate::graphql::SwapRecord> for SwapRecord {
+    fn from(record: crate::graphql::SwapRecord) -> Self {
+        Self {
+            ip_id: record.ip_id,
+            ip_registry_id: record.ip_registry_id,
+            seller: record.seller,
+            buyer: record.buyer,
+            // GraphQL stringifies i128 prices to stay JSON-safe.
+            price: record.price.parse().unwrap_or(0),
+            token: record.token,
+            status: match record.status {
+                crate::graphql::SwapStatus::Pending => SwapStatus::Pending,
+                crate::graphql::SwapStatus::Accepted => SwapStatus::Accepted,
+                crate::graphql::SwapStatus::Completed => SwapStatus::Completed,
+                crate::graphql::SwapStatus::Disputed => SwapStatus::Disputed,
+                crate::graphql::SwapStatus::Cancelled => SwapStatus::Cancelled,
+            },
+            expiry: record.expiry,
+        }
+    }
 }
 
 // ── Webhooks ──────────────────────────────────────────────────────────────────
