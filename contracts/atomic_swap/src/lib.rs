@@ -5414,9 +5414,9 @@ impl AtomicSwap {
 // #[cfg(test)]
 // mod upgrade_chaos_tests;
 
-// FIXME: pre-existing compile errors from merge conflict - re-enable after fix
-// #[cfg(test)]
-// mod escrow_tests;
+// #830: compile errors fixed — re-enabled
+#[cfg(test)]
+mod escrow_tests;
 
 // #781: re-enabled — was blocked by 3 pre-existing, unrelated compile errors
 // (a dropped `commit_ip` arg, and two obsolete `accept_swap_with_quantity`
@@ -5424,36 +5424,32 @@ impl AtomicSwap {
 #[cfg(test)]
 mod arbitration_tests;
 
-// FIXME: pre-existing compile errors from merge conflict - re-enable after fix
-// include!("multi_signer_tests.rs");
+// #824: compile errors fixed — re-enabled
+include!("multi_signer_tests.rs");
 
-// FIXME: pre-existing compile errors from merge conflict - re-enable after fix
-// (also has pre-existing runtime failures in test_batch_reveal_keys_* unrelated
-// to #781 — a protocol-fee transfer to protocol_config().treasury's hardcoded
-// placeholder address fails for lack of a trustline; same root cause noted in
-// docs/threat-model.md's #781 update, left unfixed here as out of scope).
-// #[cfg(test)]
-// mod batch_swap_features_tests;
+// #825: compile errors fixed and treasury runtime bug resolved — re-enabled
+#[cfg(test)]
+mod batch_swap_features_tests;
 
-// FIXME: pre-existing compile errors from merge conflict - re-enable after fix
-// #[cfg(test)]
-// mod batch_approval_tests;
+// #831: compile errors fixed — re-enabled
+#[cfg(test)]
+mod batch_approval_tests;
 
-// FIXME: pre-existing compile errors from merge conflict - re-enable after fix
-// #[cfg(test)]
-// mod batch_history_tests;
+// #832: compile errors fixed — re-enabled
+#[cfg(test)]
+mod batch_history_tests;
 
-// FIXME: pre-existing compile errors from merge conflict - re-enable after fix
-// #[cfg(test)]
-// mod prop_tests;
+// #828: compile errors fixed — re-enabled
+#[cfg(test)]
+mod prop_tests;
 
 // FIXME: pre-existing compile errors from merge conflict - re-enable after fix
 // #[cfg(test)]
 // mod benchmarks;
 
-// FIXME: pre-existing compile errors from merge conflict - re-enable after fix
-// #[cfg(test)]
-// mod chaos_tests;
+// #829: compile errors fixed — re-enabled
+#[cfg(test)]
+mod chaos_tests;
 
 #[cfg(test)]
 mod installment_tests {

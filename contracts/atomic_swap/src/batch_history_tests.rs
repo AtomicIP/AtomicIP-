@@ -26,7 +26,7 @@ mod batch_history_tests {
         preimage.append(&Bytes::from(secret.clone()));
         preimage.append(&Bytes::from(blinding.clone()));
         let hash: BytesN<32> = env.crypto().sha256(&preimage).into();
-        let ip_id = registry.commit_ip(owner, &hash);
+        let ip_id = registry.commit_ip(owner, &hash, &0u32);
         (ip_id, secret, blinding)
     }
 
@@ -235,7 +235,7 @@ mod batch_history_tests {
         let swap_id = swap_ids.get(0).unwrap();
         let initial_len = client.get_swap_history(&swap_id).len();
 
-        client.cancel_swap(&swap_id, &seller, &soroban_sdk::Bytes::new(&env));
+        client.cancel_swap(&swap_id, &seller);
 
         let history = client.get_swap_history(&swap_id);
         assert!(history.len() > initial_len);
