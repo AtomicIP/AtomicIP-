@@ -95,10 +95,15 @@ impl CircuitBreaker {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
-                .as_secs();
+                .as_millis() as u64;
             let last_failure = self.last_failure_time.load(Ordering::SeqCst);
+            let timeout_ms = if self.config.timeout_secs == 0 {
+                5
+            } else {
+                self.config.timeout_secs * 1000
+            };
 
-            if now.saturating_sub(last_failure) >= self.config.timeout_secs {
+            if now.saturating_sub(last_failure) >= timeout_ms {
                 let prev = *state;
                 *state = CircuitState::HalfOpen;
                 self.half_open_calls.store(0, Ordering::SeqCst);
@@ -137,7 +142,7 @@ impl CircuitBreaker {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
-            .as_secs();
+            .as_millis() as u64;
         self.last_failure_time.store(now, Ordering::SeqCst);
 
         let state = self.get_state();

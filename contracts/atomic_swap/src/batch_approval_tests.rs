@@ -26,7 +26,7 @@ mod batch_approval_tests {
         preimage.append(&Bytes::from(secret.clone()));
         preimage.append(&Bytes::from(blinding.clone()));
         let hash: BytesN<32> = env.crypto().sha256(&preimage).into();
-        let ip_id = registry.commit_ip(owner, &hash);
+        let ip_id = registry.commit_ip(owner, &hash, &0u32);
         (ip_id, secret, blinding)
     }
 

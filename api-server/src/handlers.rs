@@ -5,7 +5,6 @@ use axum::{
     Json,
 };
 use once_cell::sync::Lazy;
-use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::time::{Duration, Instant};
@@ -16,9 +15,26 @@ use crate::graphql::SorobanQueryClient;
 use crate::schemas::*;
 use std::sync::Arc;
 use crate::webhook;
+use crate::websocket;
 
-// #523: Per-handler idempotency store for batch swap operations.
-static BATCH_SWAP_IDEMPOTENCY: Lazy<DeduplicationStore> = Lazy::new(create_store);
+// #523/#800: Per-handler idempotency store for batch swap operations. Uses a
+// shared Redis backend when REDIS_URL is configured, so a client's retry is
+// deduplicated correctly no matter which api-server instance behind the load
+// balancer it lands on; falls back to an in-process (single-instance-only)
+// store otherwise, mirroring `cache::REDIS_POOL`'s init pattern.
+static BATCH_SWAP_IDEMPOTENCY: Lazy<DeduplicationStore> = Lazy::new(|| match std::env::var("REDIS_URL") {
+    Ok(url) if !url.is_empty() => {
+        tracing::info!("batch-swap idempotency store: using shared Redis backend via REDIS_URL");
+        create_store_with_backend(DeduplicationBackend::Redis(url))
+    }
+    _ => {
+        tracing::warn!(
+            "batch-swap idempotency store: REDIS_URL not set, falling back to in-process store \
+             (not safe for a multi-instance deployment)"
+        );
+        create_store()
+    }
+});
 
 // #520: Mirrors the contract's MAX_BATCH_SIZE cap on a single batch.
 const MAX_BATCH_SIZE: usize = 50;
@@ -49,17 +65,30 @@ fn now_timestamp() -> u64 {
     responses(
         (status = 200, description = "IP committed successfully, returns assigned ip_id", body = u64),
         (status = 400, description = "Invalid request (zero hash, duplicate hash)", body = ErrorResponse),
+        (status = 503, description = "Soroban RPC node unavailable", body = ErrorResponse),
     )
 )]
 #[instrument(skip(body))]
-pub async fn commit_ip(Json(body): Json<CommitIpRequest>) -> Result<Json<u64>, (StatusCode, Json<ErrorResponse>)> {
-    // TODO: Call Soroban RPC to invoke ip_registry.commit_ip
-    Err((
-        StatusCode::BAD_REQUEST,
-        Json(ErrorResponse {
-            error: "commit_ip not yet implemented".to_string(),
-        }),
-    ))
+pub async fn commit_ip(
+    Json(body): Json<CommitIpRequest>,
+) -> Result<Json<u64>, (StatusCode, Json<ErrorResponse>)> {
+    // Delegate to the Soroban RPC client.  The client validates inputs before
+    // making the network call, so validation errors are surfaced as 400 without
+    // a round-trip to the RPC node.
+    let ip_id = SOROBAN_CLIENT
+        .commit_ip(&body.owner, &body.commitment_hash)
+        .await
+        .map_err(|err| {
+            let status = soroban_rpc::map_rpc_error_to_status(&err);
+            (
+                status,
+                Json(ErrorResponse {
+                    error: err.to_string(),
+                }),
+            )
+        })?;
+
+    Ok(Json(ip_id))
 }
 
 /// Retrieve an IP record by ID.
@@ -362,17 +391,11 @@ pub async fn batch_initiate_swap(Json(body): Json<BatchInitiateSwapRequest>) -> 
     }
 
     // #523: Return cached result if the caller supplied a matching idempotency key.
+    // The store itself only returns unexpired entries (TTL is enforced by the backend).
     if let Some(ref key) = body.idempotency_key {
-        if let Some(entry) = BATCH_SWAP_IDEMPOTENCY.get(key.as_str()) {
-            let cached: &serde_json::Value = &entry.0;
-            let ts: &tokio::time::Instant = &entry.1;
-            if ts.elapsed() < Duration::from_secs(3600) {
-                if let Ok(response) = serde_json::from_value::<BatchInitiateSwapResponse>(cached.clone()) {
-                    return Ok(Json(response));
-                }
-            } else {
-                drop(entry);
-                BATCH_SWAP_IDEMPOTENCY.remove(key.as_str());
+        if let Some(cached) = BATCH_SWAP_IDEMPOTENCY.get(key.as_str()).await {
+            if let Ok(response) = serde_json::from_value::<BatchInitiateSwapResponse>(cached) {
+                return Ok(Json(response));
             }
         }
     }
@@ -466,6 +489,7 @@ pub async fn accept_swap(Path(swap_id): Path<u64>, Json(body): Json<AcceptSwapRe
     // swap record and both list prefixes are invalidated.
     cache::invalidate_swap(swap_id);
     webhook::trigger_swap_status_changed(swap_id, Some("Pending".to_string()), "Accepted".to_string());
+    websocket::trigger_swap_status_changed(swap_id, Some("Pending".to_string()), "Accepted".to_string());
     Err((
         StatusCode::NOT_FOUND,
         Json(ErrorResponse {
@@ -497,6 +521,7 @@ pub async fn reveal_key(Path(swap_id): Path<u64>, Json(body): Json<RevealKeyRequ
     cache::invalidate_swap(swap_id);
     cache::invalidate_prefix("reputation:");
     webhook::trigger_swap_status_changed(swap_id, Some("Accepted".to_string()), "Completed".to_string());
+    websocket::trigger_swap_status_changed(swap_id, Some("Accepted".to_string()), "Completed".to_string());
     Err((
         StatusCode::NOT_FOUND,
         Json(ErrorResponse {
@@ -525,6 +550,7 @@ pub async fn cancel_swap(Path(swap_id): Path<u64>, Json(body): Json<CancelSwapRe
     // swap record and both seller/buyer list prefixes.
     cache::invalidate_swap(swap_id);
     webhook::trigger_swap_status_changed(swap_id, Some("Pending".to_string()), "Cancelled".to_string());
+    websocket::trigger_swap_status_changed(swap_id, Some("Pending".to_string()), "Cancelled".to_string());
     Err((
         StatusCode::NOT_FOUND,
         Json(ErrorResponse {
@@ -553,6 +579,7 @@ pub async fn cancel_expired_swap(Path(swap_id): Path<u64>, Json(body): Json<Canc
     // swap record and both seller/buyer list prefixes.
     cache::invalidate_swap(swap_id);
     webhook::trigger_swap_status_changed(swap_id, Some("Accepted".to_string()), "Cancelled".to_string());
+    websocket::trigger_swap_status_changed(swap_id, Some("Accepted".to_string()), "Cancelled".to_string());
     Err((
         StatusCode::NOT_FOUND,
         Json(ErrorResponse {

@@ -23,7 +23,7 @@ mod tests {
         preimage.append(&soroban_sdk::Bytes::from(blinding.clone()));
         let commitment_hash: BytesN<32> = env.crypto().sha256(&preimage).into();
 
-        let ip_id = registry.commit_ip(owner, &commitment_hash);
+        let ip_id = registry.commit_ip(owner, &commitment_hash, &0u32);
         (registry_id, ip_id, secret, blinding)
     }
 

@@ -21,7 +21,15 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Check for disabled test modules
+        run: ./scripts/check-disabled-tests.sh
+
       - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
 
       - uses: actions/cache@v5
         with:
@@ -33,10 +41,31 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      - name: Check for stale merge-conflict FIXMEs
+        # benchmarks.rs and invariant_tests.rs are intentionally still disabled
+        # (tracked separately) and carry accurate FIXMEs; everything else must
+        # be clean, so a re-enabled module never ships with a stale FIXME again.
+        run: |
+          if grep -rn "FIXME.*merge conflict" --include='*.rs' . \
+            | grep -v 'benchmarks\.rs\|invariant_tests\.rs'; then
+            echo "Found FIXME comments referencing unresolved merge conflicts. Resolve or remove them." >&2
+            exit 1
+          fi
+
       - name: Build
         run: cargo build --workspace --verbose
 
-      - name: Test
+      - name: Test (Rust)
         run: cargo test --workspace --verbose
         env:
           REDIS_URL: redis://localhost:6379
+
+      - name: Test (JS)
+        run: npm test -- --coverage
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          files: ./coverage/lcov.info
+          flags: javascript
+          fail_ci_if_error: false

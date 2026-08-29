@@ -520,7 +520,7 @@ mod tests {
 
     #[test]
     fn test_validate_stellar_address_valid() {
-        let addr = "GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBQ5ECVVF7C3UFOCHJEAZD";
+        let addr = "GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBQ5ECVVF7C3XVQCRWGSGAX";
         assert!(RequestValidator::validate_stellar_address(addr, "address").is_ok());
     }
 
@@ -611,7 +611,7 @@ mod tests {
     #[test]
     fn test_validation_rule_address() {
         let rule = AddressValidationRule {
-            address: "GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBQ5ECVVF7C3UFOCHJEAZD".to_string(),
+            address: "GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBQ5ECVVF7C3XVQCRWGSGAX".to_string(),
             field_name: "address".to_string(),
         };
         assert!(rule.validate().is_ok());

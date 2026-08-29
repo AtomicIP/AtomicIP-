@@ -143,6 +143,20 @@ async fn mock_request(endpoint: &'static str) -> RequestResult {
     }
 }
 
+/// Simulates batch request processing with overhead scaling with batch size (#862).
+async fn mock_batch_request(endpoint: &'static str, batch_size: usize) -> RequestResult {
+    let start = Instant::now();
+    // Batch processing scales with batch size (validation, hashing, state verification)
+    let processing_micros = 100 + (50 * batch_size as u64);
+    tokio::time::sleep(Duration::from_micros(processing_micros)).await;
+    let latency_ms = start.elapsed().as_millis() as u64;
+    RequestResult {
+        latency_ms,
+        success: true,
+        status: 200,
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -193,6 +207,119 @@ mod tests {
             "p99 latency {} ms exceeds 500 ms threshold",
             report.p99_ms
         );
+    }
+
+    /// Load test: 100 concurrent batch_initiate_swap requests (small batch: 5 items per request) (#862).
+    #[tokio::test]
+    async fn load_batch_initiate_swap_small() {
+        let batch_size = 5;
+        let report = run_load(100, 10, move || {
+            mock_batch_request("/v1/swap/batch-initiate", batch_size)
+        })
+        .await;
+        println!("\n--- Batch Initiate Swap (Small: 5 items/req) ---");
+        report.print();
+
+        assert!(
+            report.p99_ms < 500,
+            "Small batch p99 latency {} ms exceeds 500 ms threshold",
+            report.p99_ms
+        );
+        assert_eq!(report.failed, 0);
+    }
+
+    /// Load test: 100 concurrent batch_initiate_swap requests (medium batch: 25 items per request) (#862).
+    #[tokio::test]
+    async fn load_batch_initiate_swap_medium() {
+        let batch_size = 25;
+        let report = run_load(100, 10, move || {
+            mock_batch_request("/v1/swap/batch-initiate", batch_size)
+        })
+        .await;
+        println!("\n--- Batch Initiate Swap (Medium: 25 items/req) ---");
+        report.print();
+
+        assert!(
+            report.p99_ms < 600,
+            "Medium batch p99 latency {} ms exceeds 600 ms threshold",
+            report.p99_ms
+        );
+        assert_eq!(report.failed, 0);
+    }
+
+    /// Load test: 100 concurrent near max-size batch_initiate_swap requests (100 items per request) (#862).
+    #[tokio::test]
+    async fn load_batch_initiate_swap_large_near_max() {
+        let batch_size = 100; // Near maximum allowed batch size
+        let report = run_load(100, 10, move || {
+            mock_batch_request("/v1/swap/batch-initiate", batch_size)
+        })
+        .await;
+        println!("\n--- Batch Initiate Swap (Large / Near Max: 100 items/req) ---");
+        report.print();
+
+        assert!(
+            report.p99_ms < 1000,
+            "Large batch p99 latency {} ms exceeds 1000 ms threshold",
+            report.p99_ms
+        );
+        assert_eq!(report.failed, 0);
+    }
+
+    /// Load test: Bulk commit IP throughput (50 items per batch) (#862).
+    #[tokio::test]
+    async fn load_bulk_commit_ip_throughput() {
+        let batch_size = 50;
+        let report = run_load(100, 10, move || {
+            mock_batch_request("/v1/bulk/commit-ip", batch_size)
+        })
+        .await;
+        println!("\n--- Bulk Commit IP (50 hashes/req) ---");
+        report.print();
+
+        assert!(
+            report.p99_ms < 800,
+            "Bulk commit p99 latency {} ms exceeds 800 ms threshold",
+            report.p99_ms
+        );
+        assert_eq!(report.failed, 0);
+    }
+
+    /// Comparative benchmark: Single-item vs Batch endpoints latency comparison (#862).
+    #[tokio::test]
+    async fn load_comparison_single_vs_batch() {
+        let total_items = 200;
+
+        // 1. Single item calls
+        let single_report = run_load(total_items, 20, || {
+            mock_request("/v1/swap/initiate")
+        })
+        .await;
+
+        // 2. Batch calls (4 requests of 50 items each = 200 items)
+        let batch_size = 50;
+        let batch_count = total_items / batch_size;
+        let batch_report = run_load(batch_count, 4, move || {
+            mock_batch_request("/v1/swap/batch-initiate", batch_size)
+        })
+        .await;
+
+        println!("\n=== Single-Item vs Batch Performance Comparison ===");
+        println!("Single-item: {} reqs, p50={}ms, p95={}ms, p99={}ms, duration={}ms, req/s={:.1}",
+            single_report.total_requests, single_report.p50_ms, single_report.p95_ms, single_report.p99_ms, single_report.duration_ms, single_report.throughput_rps);
+        println!("Batch (50 items/req): {} reqs ({} total items), p50={}ms, p95={}ms, p99={}ms, duration={}ms",
+            batch_report.total_requests, total_items, batch_report.p50_ms, batch_report.p95_ms, batch_report.p99_ms, batch_report.duration_ms);
+
+        let effective_items_per_sec = if batch_report.duration_ms > 0 {
+            (total_items as f64) / (batch_report.duration_ms as f64 / 1000.0)
+        } else {
+            0.0
+        };
+        println!("Effective Batch Item Throughput: {:.1} items/s vs Single Throughput {:.1} items/s",
+            effective_items_per_sec, single_report.throughput_rps);
+
+        assert!(batch_report.successful == batch_count);
+        assert!(single_report.successful == total_items);
     }
 
     /// Load test: mixed read/write workload (70% reads, 30% writes).
@@ -265,3 +392,4 @@ mod tests {
         assert_eq!(report.max_ms, 100);
     }
 }
+
