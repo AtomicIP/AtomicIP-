@@ -2736,6 +2736,17 @@ impl AtomicSwap {
         );
     }
 
+    // ── #254: Query approvals ─────────────────────────────────────────────────
+
+    /// Returns all approvers who have called `approve_swap` for the given swap.
+    /// Returns an empty Vec if no approvals have been recorded yet.
+    pub fn get_swap_approvals(env: Env, swap_id: u64) -> Vec<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SwapApprovals(swap_id))
+            .unwrap_or(Vec::new(&env))
+    }
+
     // ── #309: Batch swap initiation ───────────────────────────────────────────
 
     /// Seller initiates multiple patent sales in one call. Returns a Vec of swap IDs.
@@ -5414,9 +5425,9 @@ impl AtomicSwap {
 // #[cfg(test)]
 // mod upgrade_chaos_tests;
 
-// FIXME: pre-existing compile errors from merge conflict - re-enable after fix
-// #[cfg(test)]
-// mod escrow_tests;
+// #823: re-enabled — fixed commit_ip call missing pow_difficulty arg.
+#[cfg(test)]
+mod escrow_tests;
 
 // #781: re-enabled — was blocked by 3 pre-existing, unrelated compile errors
 // (a dropped `commit_ip` arg, and two obsolete `accept_swap_with_quantity`
@@ -5435,13 +5446,15 @@ mod arbitration_tests;
 // #[cfg(test)]
 // mod batch_swap_features_tests;
 
-// FIXME: pre-existing compile errors from merge conflict - re-enable after fix
-// #[cfg(test)]
-// mod batch_approval_tests;
+// #826: re-enabled — fixed commit_ip arg and added get_swap_approvals to
+// public API.
+#[cfg(test)]
+mod batch_approval_tests;
 
-// FIXME: pre-existing compile errors from merge conflict - re-enable after fix
-// #[cfg(test)]
-// mod batch_history_tests;
+// #827: re-enabled — fixed commit_ip arg, removed stale cancel_swap Bytes
+// arg, added explicit one-history-entry-per-swap assertion.
+#[cfg(test)]
+mod batch_history_tests;
 
 // FIXME: pre-existing compile errors from merge conflict - re-enable after fix
 // #[cfg(test)]

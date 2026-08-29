@@ -26,7 +26,7 @@ mod batch_history_tests {
         preimage.append(&Bytes::from(secret.clone()));
         preimage.append(&Bytes::from(blinding.clone()));
         let hash: BytesN<32> = env.crypto().sha256(&preimage).into();
-        let ip_id = registry.commit_ip(owner, &hash);
+        let ip_id = registry.commit_ip(owner, &hash, &0u32);
         (ip_id, secret, blinding)
     }
 
@@ -235,7 +235,7 @@ mod batch_history_tests {
         let swap_id = swap_ids.get(0).unwrap();
         let initial_len = client.get_swap_history(&swap_id).len();
 
-        client.cancel_swap(&swap_id, &seller, &soroban_sdk::Bytes::new(&env));
+        client.cancel_swap(&swap_id, &seller);
 
         let history = client.get_swap_history(&swap_id);
         assert!(history.len() > initial_len);
@@ -417,5 +417,61 @@ mod batch_history_tests {
 
         // Should return empty vector
         assert_eq!(history.len(), 0);
+    }
+
+    /// #827: Explicit assertion — each swap in a batch_initiate_swap produces
+    /// exactly ONE history entry (the Pending transition) at initiation time.
+    /// The batch call itself does NOT produce a single shared entry for the
+    /// whole batch; every swap gets its own independent record.
+    #[test]
+    fn test_batch_initiate_produces_one_history_entry_per_swap() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let admin = Address::generate(&env);
+
+        let registry_id = setup_registry(&env, &seller);
+        let token_id = setup_token(&env, &admin, &buyer, 10_000_000);
+        let contract_id = setup_contract(&env, &registry_id);
+        let client = AtomicSwapClient::new(&env, &contract_id);
+
+        let (ip1, _, _) = commit_ip(&env, &registry_id, &seller, 0x10);
+        let (ip2, _, _) = commit_ip(&env, &registry_id, &seller, 0x11);
+        let (ip3, _, _) = commit_ip(&env, &registry_id, &seller, 0x12);
+
+        let mut ip_ids = Vec::new(&env);
+        ip_ids.push_back(ip1);
+        ip_ids.push_back(ip2);
+        ip_ids.push_back(ip3);
+
+        let mut prices = Vec::new(&env);
+        prices.push_back(100i128);
+        prices.push_back(200i128);
+        prices.push_back(300i128);
+
+        let swap_ids =
+            client.batch_initiate_swap(&token_id, &ip_ids, &seller, &prices, &buyer, &0u32, &None);
+
+        // Each swap must have exactly 1 history entry — the Pending transition —
+        // not zero (missed) and not >1 (double-counted at batch level).
+        for i in 0..swap_ids.len() {
+            let swap_id = swap_ids.get(i).unwrap();
+            let history = client.get_swap_history(&swap_id);
+            assert_eq!(
+                history.len(),
+                1,
+                "swap {} should have exactly 1 history entry after batch initiation, got {}",
+                swap_id,
+                history.len()
+            );
+            assert_eq!(
+                history.get(0).unwrap().status,
+                SwapStatus::Pending,
+                "swap {} initial history entry should be Pending",
+                swap_id
+            );
+        }
     }
 }
