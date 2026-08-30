@@ -2,8 +2,12 @@ const {
   scoreMatch,
   findMatchesForBuyer,
   batchMatch,
+  reconcileMatchOnChain,
+  reconcileMatchBeforeSubmission,
+  isMatchStale,
   WEIGHTS,
   MIN_MATCH_SCORE,
+  MATCH_STALENESS_WINDOW_MS,
 } = require("../matching/swapMatchingEngine");
 
 const buyer = () => ({
@@ -117,5 +121,135 @@ describe("batchMatch", () => {
 
   test("throws on empty sellers array", () => {
     expect(() => batchMatch([buyer()], [])).toThrow(TypeError);
+  });
+});
+
+// ── #877: reconciliation between matches and on-chain swap state ──────────────
+
+describe("findMatchesForBuyer — match timestamps", () => {
+  test("each match is stamped with matchedAt for later staleness checks", () => {
+    const now = 1_700_000_000_000;
+    const results = findMatchesForBuyer(buyer(), [seller()], { now });
+    expect(results[0].matchedAt).toBe(now);
+  });
+});
+
+describe("isMatchStale", () => {
+  test("a fresh match is not stale", () => {
+    const now = 1_700_000_000_000;
+    const match = { matchedAt: now };
+    expect(isMatchStale(match, now + 1000)).toBe(false);
+  });
+
+  test("a match older than the staleness window is stale", () => {
+    const now = 1_700_000_000_000;
+    const match = { matchedAt: now };
+    expect(isMatchStale(match, now + MATCH_STALENESS_WINDOW_MS + 1)).toBe(true);
+  });
+
+  test("a match exactly at the staleness window boundary is not yet stale", () => {
+    const now = 1_700_000_000_000;
+    const match = { matchedAt: now };
+    expect(isMatchStale(match, now + MATCH_STALENESS_WINDOW_MS)).toBe(false);
+  });
+
+  test("a match with no matchedAt cannot be judged stale by time", () => {
+    expect(isMatchStale({})).toBe(false);
+  });
+
+  test("respects a custom window", () => {
+    const now = 1_700_000_000_000;
+    const match = { matchedAt: now };
+    expect(isMatchStale(match, now + 5000, 1000)).toBe(true);
+  });
+});
+
+describe("reconcileMatchOnChain", () => {
+  const freshMatch = () => findMatchesForBuyer(buyer(), [seller()])[0];
+
+  test("a match against a still-PENDING on-chain swap is matchable", async () => {
+    const getSwapState = jest.fn().mockResolvedValue("PENDING");
+    const result = await reconcileMatchOnChain(freshMatch(), getSwapState);
+    expect(result.matchable).toBe(true);
+    expect(result.onChainState).toBe("PENDING");
+    expect(getSwapState).toHaveBeenCalledWith("seller-1");
+  });
+
+  test("a match against an on-chain CANCELLED swap is no longer matchable", async () => {
+    const getSwapState = jest.fn().mockReturnValue("CANCELLED");
+    const result = await reconcileMatchOnChain(freshMatch(), getSwapState);
+    expect(result.matchable).toBe(false);
+    expect(result.reason).toMatch(/CANCELLED.*no longer be matched/);
+  });
+
+  test("supports a synchronous getSwapState as well as an async one", async () => {
+    const result = await reconcileMatchOnChain(freshMatch(), () => "ACTIVE");
+    expect(result.matchable).toBe(true);
+  });
+
+  test("prefers sellerListing.swapId over sellerId when present", async () => {
+    const match = { ...freshMatch() };
+    match.sellerListing = { ...match.sellerListing, swapId: "onchain-swap-42" };
+    const getSwapState = jest.fn().mockResolvedValue("PENDING");
+    await reconcileMatchOnChain(match, getSwapState);
+    expect(getSwapState).toHaveBeenCalledWith("onchain-swap-42");
+  });
+
+  test("throws if getSwapState is not a function", async () => {
+    await expect(reconcileMatchOnChain(freshMatch(), null)).rejects.toThrow(TypeError);
+  });
+});
+
+describe("reconcileMatchBeforeSubmission", () => {
+  test("a fresh, still-matchable match is submittable", async () => {
+    const now = 1_700_000_000_000;
+    const match = findMatchesForBuyer(buyer(), [seller()], { now })[0];
+    const result = await reconcileMatchBeforeSubmission(match, () => "PENDING", { now: now + 5 });
+    expect(result.submittable).toBe(true);
+  });
+
+  test("a match becoming stale between matching and submission is rejected without an on-chain call", async () => {
+    const now = 1_700_000_000_000;
+    const match = findMatchesForBuyer(buyer(), [seller()], { now })[0];
+    const getSwapState = jest.fn().mockResolvedValue("PENDING");
+
+    const result = await reconcileMatchBeforeSubmission(
+      match,
+      getSwapState,
+      { now: now + MATCH_STALENESS_WINDOW_MS + 1 }
+    );
+
+    expect(result.submittable).toBe(false);
+    expect(result.reason).toMatch(/staleness window/);
+    expect(getSwapState).not.toHaveBeenCalled();
+  });
+
+  test("a fresh match whose swap was cancelled on-chain in the interim is rejected", async () => {
+    const now = 1_700_000_000_000;
+    const match = findMatchesForBuyer(buyer(), [seller()], { now })[0];
+
+    const result = await reconcileMatchBeforeSubmission(
+      match,
+      () => "CANCELLED",
+      { now: now + 100 }
+    );
+
+    expect(result.submittable).toBe(false);
+    expect(result.onChainState).toBe("CANCELLED");
+  });
+
+  test("honors a custom staleWindowMs", async () => {
+    const now = 1_700_000_000_000;
+    const match = findMatchesForBuyer(buyer(), [seller()], { now })[0];
+    const getSwapState = jest.fn().mockResolvedValue("PENDING");
+
+    const result = await reconcileMatchBeforeSubmission(
+      match,
+      getSwapState,
+      { now: now + 2000, staleWindowMs: 1000 }
+    );
+
+    expect(result.submittable).toBe(false);
+    expect(getSwapState).not.toHaveBeenCalled();
   });
 });
