@@ -1,9 +1,17 @@
+const fs   = require("fs");
+const os   = require("os");
+const path = require("path");
+
 const {
   calculateReputationScore,
   batchCalculateReputation,
   recencyWeight,
   scoreTier,
   STARTING_SCORE,
+  MemoryReputationStore,
+  FileReputationStore,
+  persistReputationScore,
+  getPersistedReputationScore,
 } = require("../reputation/swapReputationScorer");
 
 const NOW = new Date("2024-06-01T00:00:00.000Z").getTime();
@@ -104,5 +112,82 @@ describe("batchCalculateReputation", () => {
 
   test("throws on empty input", () => {
     expect(() => batchCalculateReputation([])).toThrow(TypeError);
+  });
+});
+
+describe("persistence", () => {
+  describe("MemoryReputationStore", () => {
+    test("persists and retrieves a score within the same process", () => {
+      const store = new MemoryReputationStore();
+      const history = makeHistory(20);
+      persistReputationScore({ participantId: "p1", history }, store, NOW);
+
+      const persisted = getPersistedReputationScore("p1", store);
+      expect(persisted).not.toBeNull();
+      expect(persisted.participantId).toBe("p1");
+      expect(persisted.updatedAt).toBe(new Date(NOW).toISOString());
+    });
+
+    test("returns null for an unknown participant", () => {
+      const store = new MemoryReputationStore();
+      expect(getPersistedReputationScore("nobody", store)).toBeNull();
+    });
+  });
+
+  describe("FileReputationStore", () => {
+    let filePath;
+
+    beforeEach(() => {
+      filePath = path.join(
+        fs.mkdtempSync(path.join(os.tmpdir(), "reputation-store-")),
+        "scores.json"
+      );
+    });
+
+    afterEach(() => {
+      fs.rmSync(path.dirname(filePath), { recursive: true, force: true });
+    });
+
+    test("persists a score across process restarts", () => {
+      const history = makeHistory(20);
+
+      // "Before restart": compute and persist with one store instance.
+      const storeBefore = new FileReputationStore(filePath);
+      const written = persistReputationScore({ participantId: "p1", history }, storeBefore, NOW);
+
+      // "After restart": a brand-new store instance pointed at the same
+      // file, with no shared in-memory state, must still see the score.
+      const storeAfter = new FileReputationStore(filePath);
+      const reloaded = getPersistedReputationScore("p1", storeAfter);
+
+      expect(reloaded).toEqual(written);
+      expect(reloaded.score).toBe(written.score);
+    });
+
+    test("getAll returns every persisted participant after reload", () => {
+      const storeBefore = new FileReputationStore(filePath);
+      persistReputationScore({ participantId: "p1", history: makeHistory(20) }, storeBefore, NOW);
+      persistReputationScore({ participantId: "p2", history: makeHistory(3, "cancelled") }, storeBefore, NOW);
+
+      const storeAfter = new FileReputationStore(filePath);
+      const ids = storeAfter.getAll().map((r) => r.participantId).sort();
+      expect(ids).toEqual(["p1", "p2"]);
+    });
+
+    test("returns null for an unknown participant without creating the file early", () => {
+      const store = new FileReputationStore(filePath);
+      expect(getPersistedReputationScore("nobody", store)).toBeNull();
+      expect(fs.existsSync(filePath)).toBe(false);
+    });
+  });
+
+  test("persistReputationScore throws without a valid store", () => {
+    expect(() =>
+      persistReputationScore({ participantId: "p1", history: [] }, {})
+    ).toThrow(TypeError);
+  });
+
+  test("getPersistedReputationScore throws without a valid store", () => {
+    expect(() => getPersistedReputationScore("p1", {})).toThrow(TypeError);
   });
 });
