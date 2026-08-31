@@ -76,6 +76,8 @@ let ip_id = registry.commit_ip(&owner, &commitment_hash);
 
 Commit multiple IP hashes from the same owner in a single transaction. Reduces gas fees.
 
+> ⚠️ **Not yet implemented** — REST API handler is stubbed (see handlers.rs:752). Contract functionality exists but RPC integration is pending.
+
 ### Signature
 
 ```rust
@@ -261,6 +263,8 @@ match blinded {
 
 Retrieve an IP record by ID.
 
+> ⚠️ **Not yet implemented** — REST API handler is stubbed (see handlers.rs:117). Contract functionality exists but RPC integration is pending.
+
 ### Signature
 
 ```rust
@@ -330,6 +334,8 @@ println!("Timestamp: {}", record.timestamp);
 ## `verify_commitment`
 
 Verify that a secret and blinding factor match a stored commitment hash.
+
+> ⚠️ **Not yet implemented** — REST API handler is stubbed (see handlers.rs:167). Contract functionality exists but RPC integration is pending.
 
 ### Signature
 
@@ -443,6 +449,8 @@ for ip_id in ip_ids.iter() {
 ## `transfer_ip`
 
 Transfer IP ownership to a new address.
+
+> ⚠️ **Not yet implemented** — REST API handler is stubbed (see handlers.rs:138). Contract functionality exists but RPC integration is pending.
 
 ### Signature
 

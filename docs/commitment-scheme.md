@@ -694,3 +694,20 @@ Differential tests are in
 | `differential_818_full_reveal_accepts_valid_opening` | Full-reveal path accepts a correct SHA-256 opening |
 | `differential_818_paths_do_not_cross_accept` | Neither path accepts the other's commitment type |
 | `differential_818_random_secrets_satisfy_invariant` | 8 pseudo-random (secret, blinding) pairs all satisfy both accept and reject invariants |
+
+These tests enforce the invariant at the source code level and catch any divergence between the two paths.
+
+### Performance comparison
+
+Both verification paths are optimized for efficiency:
+
+| Path | Operation | CPU instructions | Notes |
+|---|---|---|---|
+| Full-reveal | `verify_commitment()` (SHA-256) | ≤ 200,000 | Constant-time comparison; linear in hash length |
+| ZK | `batch_verify_commitments()` single | ≤ 5,000,000 | Schnorr proof verification over Ristretto255 |
+| ZK | `batch_verify_commitments()` batch of 10 | ≤ 50,000,000 | Linear scaling: ~5M per proof (no amortization) |
+
+**Choosing a path:**
+- Use **full-reveal** (`verify_commitment`) for simpler workflows where disclosing the secret and blinding factor is acceptable
+- Use **ZK** (`batch_verify_commitments`) when privacy is required and you can afford the higher instruction cost
+- Both paths maintain the same accept/reject semantics for valid and invalid (secret, blinding) pairs

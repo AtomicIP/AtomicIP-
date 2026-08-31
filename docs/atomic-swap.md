@@ -207,6 +207,33 @@ swap_contract.reveal_key(swap_id, secret, blinding_factor);
 
 ---
 
+## Known Limitations / Test Coverage Gaps
+
+The following test modules currently have compile errors or merge conflicts that prevent them from being enabled. Integration and end-to-end test coverage is limited until these are resolved:
+
+| Test Module | Status | Issue | Notes |
+|---|---|---|---|
+| `tests` | Disabled | — | General contract unit tests; merge conflict compile errors pending resolution |
+| `regression_tests` | Disabled | — | Regression test suite; merge conflict compile errors pending resolution |
+| `benchmarks` | Disabled | #FIXME | Pre-existing merge conflict compile errors; performance benchmarking not yet available |
+
+**Enabled test modules with recent fixes:**
+- `batch_swap_features_tests` — re-enabled after treasury trustline fix (#825)
+- `batch_approval_tests` — re-enabled after compile errors fixed (#831)
+- `batch_history_tests` — re-enabled after compile errors fixed (#832)
+- `arbitration_tests` — re-enabled after compile errors fixed (#781)
+- `escrow_tests` — re-enabled after compile errors fixed (#830)
+- `prop_tests` — re-enabled after compile errors fixed (#828)
+- `chaos_tests` — re-enabled after compile errors fixed (#829)
+
+**Implications for integrators:**
+- The contract's atomic swap guarantees have been verified by the enabled test suite
+- Batch operations and dispute resolution paths are covered
+- Performance characteristics should be re-validated once benchmark tests are re-enabled
+- Readers should trust the documented guarantees as implemented, but be aware that some regression and edge-case coverage is currently incomplete
+
+---
+
 ## Gas Optimization
 
 - Use `initiate_swap` once per IP sale (not per negotiation attempt)
