@@ -272,11 +272,9 @@ safeguards.
 - Disputes must be filed within `dispute_period` ledgers of the triggering event; late filings are rejected by the contract
 - Repeated frivolous filings from the same address are rate-limited by the admin
 
-**Status**: ⚠️ Partially mitigated — evidence + bond are now enforced in code
-with a fixed minimum; bond forfeiture destination is the contract admin
-address rather than the protocol treasury (`protocol_config().treasury`
-resolves to a hardcoded placeholder today — a pre-existing, separate storage
-bug, not fixed by this change).
+**Status**: ✅ Mitigated — evidence + bond are enforced in code with a fixed
+minimum; bond forfeiture is sent to the protocol treasury via `protocol_config().treasury`
+(resolved in PR #942).
 
 ---
 
