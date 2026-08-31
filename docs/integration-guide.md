@@ -89,6 +89,174 @@ fn cancel_expired_swap(swap_id: u64, caller: Address)
 fn get_swap(swap_id: u64) -> Option<SwapRecord>
 ```
 
+## REST API Response Examples
+
+### List IPs by Owner
+
+**Request:**
+```bash
+curl -X GET "https://api.atomicip.local/v1/ips?owner=GCZXWVG5FGTWTJWY5M3DMX3S2Z4XYFABXJZLOWMVTQKJMHFJGDQGSVRQ" \
+  -H "Authorization: Bearer YOUR_API_KEY"
+```
+
+**Response (200 OK):**
+```json
+{
+  "data": [
+    {
+      "ip_id": 1,
+      "owner": "GCZXWVG5FGTWTJWY5M3DMX3S2Z4XYFABXJZLOWMVTQKJMHFJGDQGSVRQ",
+      "commitment_hash": "a7f3e4c2b1d9f8e6a5c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7b6c5d4e3f2",
+      "timestamp": 1725062400,
+      "revoked": false,
+      "created_at": "2024-08-31T10:00:00Z"
+    },
+    {
+      "ip_id": 2,
+      "owner": "GCZXWVG5FGTWTJWY5M3DMX3S2Z4XYFABXJZLOWMVTQKJMHFJGDQGSVRQ",
+      "commitment_hash": "b8e2f5d1c4a6e9f2a7b3c5d8e1f4a7b9c2d5e8f1a4b7c0d3e6f9a2b5c8d1e4",
+      "timestamp": 1725062401,
+      "revoked": false,
+      "created_at": "2024-08-31T10:00:01Z"
+    }
+  ],
+  "pagination": {
+    "total": 2,
+    "limit": 10,
+    "offset": 0
+  }
+}
+```
+
+### Get IP Record
+
+**Request:**
+```bash
+curl -X GET "https://api.atomicip.local/v1/ips/1" \
+  -H "Authorization: Bearer YOUR_API_KEY"
+```
+
+**Response (200 OK):**
+```json
+{
+  "data": {
+    "ip_id": 1,
+    "owner": "GCZXWVG5FGTWTJWY5M3DMX3S2Z4XYFABXJZLOWMVTQKJMHFJGDQGSVRQ",
+    "commitment_hash": "a7f3e4c2b1d9f8e6a5c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7b6c5d4e3f2",
+    "timestamp": 1725062400,
+    "revoked": false,
+    "created_at": "2024-08-31T10:00:00Z"
+  }
+}
+```
+
+**Response (404 Not Found):**
+```json
+{
+  "error": "IP_NOT_FOUND",
+  "message": "IP record with id 999 not found",
+  "timestamp": "2024-08-31T10:00:30Z"
+}
+```
+
+### Initiate Swap
+
+**Request:**
+```bash
+curl -X POST "https://api.atomicip.local/v1/swaps" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "ip_id": 1,
+    "seller": "GCZXWVG5FGTWTJWY5M3DMX3S2Z4XYFABXJZLOWMVTQKJMHFJGDQGSVRQ",
+    "buyer": "GBUXKEMW5M62XZPXP5AW3LCSJQXJGPKCQ5JSEZ6GVHGN7YYPDMDCEJR",
+    "token": "CBPX46DYDV5DS6GEU3C6D7EVDLHTCLVEQ5UNSXJV2CY5GMJWAKUYF47Y",
+    "price": "1000000000"
+  }'
+```
+
+**Response (201 Created):**
+```json
+{
+  "data": {
+    "swap_id": 42,
+    "ip_id": 1,
+    "seller": "GCZXWVG5FGTWTJWY5M3DMX3S2Z4XYFABXJZLOWMVTQKJMHFJGDQGSVRQ",
+    "buyer": "GBUXKEMW5M62XZPXP5AW3LCSJQXJGPKCQ5JSEZ6GVHGN7YYPDMDCEJR",
+    "token": "CBPX46DYDV5DS6GEU3C6D7EVDLHTCLVEQ5UNSXJV2CY5GMJWAKUYF47Y",
+    "price": "1000000000",
+    "status": "initiated",
+    "expires_at": "2024-09-07T10:00:00Z",
+    "created_at": "2024-08-31T10:00:00Z"
+  }
+}
+```
+
+**Response (400 Bad Request):**
+```json
+{
+  "error": "INVALID_IP_OWNER",
+  "message": "Seller does not own the IP record with id 1",
+  "timestamp": "2024-08-31T10:00:30Z"
+}
+```
+
+### Accept Swap
+
+**Request:**
+```bash
+curl -X POST "https://api.atomicip.local/v1/swaps/42/accept" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "buyer": "GBUXKEMW5M62XZPXP5AW3LCSJQXJGPKCQ5JSEZ6GVHGN7YYPDMDCEJR",
+    "tx_hash": "e01bb8ab13cbe8652e1b3e8b2857b8dfc8d0b12c0f2c1e3d4a5b6c7d8e9f0a1b"
+  }'
+```
+
+**Response (200 OK):**
+```json
+{
+  "data": {
+    "swap_id": 42,
+    "status": "accepted",
+    "escrow_amount": "1000000000",
+    "buyer_tx_hash": "e01bb8ab13cbe8652e1b3e8b2857b8dfc8d0b12c0f2c1e3d4a5b6c7d8e9f0a1b",
+    "updated_at": "2024-08-31T10:00:15Z"
+  }
+}
+```
+
+### Reveal Key (Complete Swap)
+
+**Request:**
+```bash
+curl -X POST "https://api.atomicip.local/v1/swaps/42/reveal" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "seller": "GCZXWVG5FGTWTJWY5M3DMX3S2Z4XYFABXJZLOWMVTQKJMHFJGDQGSVRQ",
+    "secret": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2",
+    "blinding_factor": "f0e1d2c3b4a59687a5b4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7b6c5d4e3",
+    "tx_hash": "c1aa7c91c2b5d8f4e1c9b3a7f0e2d4a6c8b1e3f5a7c9d1b3e5f7a9c1d3e5f7a9"
+  }'
+```
+
+**Response (200 OK):**
+```json
+{
+  "data": {
+    "swap_id": 42,
+    "status": "completed",
+    "ip_id": 1,
+    "new_owner": "GBUXKEMW5M62XZPXP5AW3LCSJQXJGPKCQ5JSEZ6GVHGN7YYPDMDCEJR",
+    "payment_released": "1000000000",
+    "seller_tx_hash": "c1aa7c91c2b5d8f4e1c9b3a7f0e2d4a6c8b1e3f5a7c9d1b3e5f7a9c1d3e5f7a9",
+    "completed_at": "2024-08-31T10:00:45Z"
+  }
+}
+```
+
 ## Integration Examples
 
 ### TypeScript/JavaScript (Stellar SDK)
