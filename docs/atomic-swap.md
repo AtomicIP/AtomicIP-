@@ -710,3 +710,98 @@ staleness check would otherwise have accepted it.
 - **Oracle contract availability.** If `oracle_address` is unreachable or
   returns malformed data, fetches fail closed (the call panics); there is no
   automatic failover to a secondary oracle.
+
+## #876: Dispute-to-Insurance Payout Link
+
+**Module:** `src/insurance/swapInsurance.js` (`evaluateDisputePayout`, `processDisputeResolutions`)
+
+`swapInsurance.js` and the dispute/arbitration flow (`arbitration_tests.rs`,
+`resolve_dispute`, and `src/batch/batchDisputeResolver.js`) used to be two
+disconnected systems — a dispute could resolve on-chain with no awareness
+that the swap it concerned was insured. `evaluateDisputePayout` closes that
+gap as an explicit API call: feed it a policy and a dispute resolution result
+and it decides whether a payout should fire, and if so files (and
+adjudicates) the claim itself.
+
+### Trigger condition
+
+Given a `resolveOne()` / `resolveBatchDisputes()` result item for the same
+swap as the policy:
+
+| Resolution  | Buyer recovers on-chain            | Payout triggered?                              |
+|-------------|-------------------------------------|-------------------------------------------------|
+| `REFUND`    | Full swap amount, via escrow        | No — the buyer is already made whole.            |
+| `RELEASE`   | Nothing (counterparty keeps it all) | Yes — for the full swap amount.                  |
+| `SPLIT`     | `initiatorAmount` (a partial share) | Yes — for the shortfall (`counterpartyAmount`).  |
+| `ESCALATE`  | Not yet determined                  | No — re-evaluate once escalation reaches a final ruling. |
+
+The claim is filed against `COVERAGE_EVENTS.NON_DELIVERY` by default (the
+event every policy tier covers), with the arbitration ruling itself supplied
+as the claim's evidence — a buyer who already went through on-chain/
+committee arbitration should not have to separately re-litigate the same
+facts to satisfy `fileClaim`'s evidence requirement.
+
+### Usage
+
+```js
+const { evaluateDisputePayout } = require("./src/insurance/swapInsurance");
+const { resolveBatchDisputes }  = require("./src/batch/batchDisputeResolver");
+
+const { results } = resolveBatchDisputes([dispute], [resolution]);
+const outcome = evaluateDisputePayout(policy, results[0]);
+// { triggered: true, shortfall: 10000, claim: { status: "APPROVED", payout, ... } }
+```
+
+A dispute-resolution consumer — an on-chain event listener for
+`resolve_dispute`, a webhook handler, or a direct caller of
+`batchDisputeResolver.js` — is expected to call `evaluateDisputePayout` (or
+its batch form, `processDisputeResolutions`, which matches resolutions to
+policies by `swapId`) as soon as a resolution is final.
+
+---
+
+## #877: Off-Chain Match Reconciliation with On-Chain State
+
+**Module:** `src/matching/swapMatchingEngine.js` (`reconcileMatchBeforeSubmission`)
+
+`findMatchesForBuyer`/`batchMatch` score matches off a point-in-time
+snapshot of listings. If the swap a seller listing represents is cancelled
+(or otherwise leaves a matchable state) on-chain after that snapshot but
+before the match is submitted, submitting against it would fail on-chain —
+or race a legitimate state change. `reconcileMatchBeforeSubmission`
+re-validates a match immediately before submission so a stale match can be
+dropped instead.
+
+### Staleness window
+
+Every match produced by `findMatchesForBuyer` is stamped with a `matchedAt`
+timestamp. `MATCH_STALENESS_WINDOW_MS` (30 seconds by default) bounds how
+long a caller may hold onto a match before submitting it:
+
+- **Within the window:** the match is re-validated against current on-chain
+  state via an injected `getSwapState(swapId)` lookup (sync or async, so the
+  check stays testable without a real RPC client). It's submittable only if
+  the swap is still in `MATCHABLE_STATES` (`PENDING`/`ACTIVE`).
+- **Past the window:** the match is rejected as stale on timing grounds
+  alone, without even making the on-chain call — a match this old should be
+  regenerated from fresh listings rather than trusted at all.
+
+This means a match can go stale for either of two independent reasons: it
+sat too long unsubmitted (timing), or the swap it targets moved on-chain in
+the interim (state). `reconcileMatchBeforeSubmission` checks both, in that
+order, since a timing failure makes the on-chain check moot.
+
+### Usage
+
+```js
+const { findMatchesForBuyer, reconcileMatchBeforeSubmission } = require("./src/matching/swapMatchingEngine");
+
+const matches = findMatchesForBuyer(buyer, sellers);
+const best    = matches[0];
+
+// getSwapState is supplied by the caller — e.g. an AtomicSwapClient.get_swap_status call.
+const { submittable, reason } = await reconcileMatchBeforeSubmission(best, getSwapState);
+if (!submittable) {
+  // re-match instead of submitting against `best`
+}
+```
