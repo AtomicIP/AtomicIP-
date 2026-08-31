@@ -120,6 +120,36 @@ The API server (`api-server/src/audit.rs`) maintains a hash-chained
   file and the HMAC key, so an outside auditor can run it without any
   cooperation from a live server instance.
 
+## Test Re-enablement Security Audit Checklist
+
+When re-enabling a previously-disabled test module (especially those related to fund safety, upgrade safety, or security-critical operations), the following security review must be performed:
+
+### Mandatory Review Items
+
+- [ ] **Security impact assessment**: Document why the test was originally disabled and verify the underlying issue is resolved
+- [ ] **Authorization checks**: Verify all entry points in the test's target code call `require_auth()` appropriately
+- [ ] **Fund safety**: If the test covers fund operations (escrow, transfers, swaps), ensure no edge cases allow fund loss or theft
+- [ ] **State invariants**: Confirm that the test validates critical state invariants (e.g., token conservation, ownership verification)
+- [ ] **Upgrade safety**: For any disabled tests related to contract upgrades, verify backwards compatibility and migration safety
+- [ ] **Threat model coverage**: Ensure the re-enabled test covers attack scenarios documented in `docs/threat-model.md`
+- [ ] **Code review**: Obtain at least one approval from a team member familiar with the affected module
+- [ ] **Manual testing**: Perform manual testing against testnet if the test covers user-facing functionality
+
+### Test Modules Requiring Security Sign-Off
+
+The following disabled test modules are security-critical and require the checklist above before re-enablement:
+
+- `upgrade_chaos_tests` (#19) — covers contract upgrade safety and state consistency
+- `escrow_tests` (#20) — covers fund safety and payment verification
+- `batch_swap_features_tests` (#22) — covers atomic swap correctness and fund recovery
+
+### Cross-Reference
+
+For complete threat analysis, refer to:
+- `docs/threat-model.md` for attack scenarios
+- `SECURITY.md` for API server audit log procedures
+- The PR that re-enables the test must include security sign-off notes
+
 ## Automated Security Scanning
 
 Every push and pull request is scanned automatically in CI/CD:
