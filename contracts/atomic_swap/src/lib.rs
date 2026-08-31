@@ -12,6 +12,8 @@ pub mod cross_contract;
 mod cross_contract_tests;
 #[cfg(test)]
 mod oracle_tests;
+#[cfg(test)]
+mod treasury_validation_tests;
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Bytes,
@@ -110,6 +112,8 @@ pub enum ContractError {
     /// under-collateralized; nothing is paid rather than paying a silent
     /// partial amount.
     InsufficientInsuranceReserve = 67,
+    /// #906: Treasury address validation - rejects zero or placeholder addresses
+    InvalidTreasuryAddress = 68,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
