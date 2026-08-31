@@ -1,7 +1,9 @@
 const {
   calculateSwapRoyalty,
+  distributeBatchRoyalties,
   validateRoyaltyConfig,
   MAX_ROYALTY_RATE_BPS,
+  MAX_BATCH_SIZE,
   BPS_DENOM,
 } = require("../batch/batchRoyaltyDistributor");
 
@@ -14,6 +16,12 @@ const sampleRoyaltyConfig = {
     { id: "ben-1", shareBps: 5000 }, // 50%
     { id: "ben-2", shareBps: 5000 }, // 50%
   ],
+};
+
+const sampleSwap = {
+  swapId: "swap-1",
+  salePrice: 1000,
+  royaltyConfig: sampleRoyaltyConfig,
 };
 
 // ── #916: calculateSwapRoyalty ────────────────────────────────────────────
@@ -122,5 +130,168 @@ describe("calculateSwapRoyalty — multiple beneficiaries", () => {
     expect(result.totalRoyalty).toBe(100);
     expect(result.payouts[0].amount).toBe(70); // creator
     expect(result.payouts[1].amount).toBe(30); // platform
+  });
+});
+
+// ── #915: distributeBatchRoyalties ────────────────────────────────────────
+
+describe("distributeBatchRoyalties — validation", () => {
+  test("throws on empty swaps array", () => {
+    expect(() => distributeBatchRoyalties([])).toThrow(TypeError);
+  });
+
+  test("throws on null swaps", () => {
+    expect(() => distributeBatchRoyalties(null)).toThrow(TypeError);
+  });
+
+  test("throws on batch exceeding MAX_BATCH_SIZE", () => {
+    const big = Array.from({ length: MAX_BATCH_SIZE + 1 }, (_, i) => ({
+      swapId: `s${i}`,
+      salePrice: 1000,
+      royaltyConfig: sampleRoyaltyConfig,
+    }));
+    expect(() => distributeBatchRoyalties(big)).toThrow(RangeError);
+  });
+
+  test("throws on missing swapId", () => {
+    const badSwap = {
+      salePrice: 1000,
+      royaltyConfig: sampleRoyaltyConfig,
+    };
+    expect(() => distributeBatchRoyalties([badSwap])).toThrow(TypeError);
+  });
+
+  test("throws on negative salePrice", () => {
+    const badSwap = {
+      swapId: "s-neg",
+      salePrice: -100,
+      royaltyConfig: sampleRoyaltyConfig,
+    };
+    expect(() => distributeBatchRoyalties([badSwap])).toThrow(RangeError);
+  });
+
+  test("throws on zero salePrice", () => {
+    const badSwap = {
+      swapId: "s-zero",
+      salePrice: 0,
+      royaltyConfig: sampleRoyaltyConfig,
+    };
+    expect(() => distributeBatchRoyalties([badSwap])).toThrow(RangeError);
+  });
+});
+
+describe("distributeBatchRoyalties — basic distribution", () => {
+  test("single swap batch returns correct structure", () => {
+    const result = distributeBatchRoyalties([sampleSwap]);
+    expect(result.batchSize).toBe(1);
+    expect(result.processed).toBe(1);
+    expect(result.failed).toBe(0);
+    expect(result.distributions).toHaveLength(1);
+    expect(result.aggregated).toHaveLength(2);
+  });
+
+  test("two swaps with same beneficiary aggregate correctly", () => {
+    const swaps = [
+      { swapId: "s1", salePrice: 1000, royaltyConfig: sampleRoyaltyConfig },
+      { swapId: "s2", salePrice: 2000, royaltyConfig: sampleRoyaltyConfig },
+    ];
+    const result = distributeBatchRoyalties(swaps);
+    expect(result.batchSize).toBe(2);
+    expect(result.processed).toBe(2);
+    expect(result.distributions).toHaveLength(2);
+    expect(result.aggregated).toHaveLength(2);
+
+    // Each beneficiary should have 2 swaps
+    result.aggregated.forEach((agg) => {
+      expect(agg.swapCount).toBe(2);
+    });
+  });
+
+  test("totalRoyaltiesGenerated is sum of all swap royalties", () => {
+    const swaps = [
+      { swapId: "s1", salePrice: 1000, royaltyConfig: sampleRoyaltyConfig }, // 5% = 50
+      { swapId: "s2", salePrice: 2000, royaltyConfig: sampleRoyaltyConfig }, // 5% = 100
+    ];
+    const result = distributeBatchRoyalties(swaps);
+    expect(result.totalRoyaltiesGenerated).toBe(150);
+  });
+});
+
+describe("distributeBatchRoyalties — partial failures", () => {
+  test("invalid swap is recorded in errors without failing batch", () => {
+    const swaps = [
+      sampleSwap,
+      { swapId: "bad-swap", salePrice: -100, royaltyConfig: sampleRoyaltyConfig },
+      { swapId: "s3", salePrice: 500, royaltyConfig: sampleRoyaltyConfig },
+    ];
+    const result = distributeBatchRoyalties(swaps);
+    expect(result.processed).toBe(2);
+    expect(result.failed).toBe(1);
+    expect(result.errors).toHaveLength(1);
+    expect(result.errors[0].swapId).toBe("bad-swap");
+  });
+
+  test("batch with all valid swaps has no errors", () => {
+    const swaps = [
+      sampleSwap,
+      { swapId: "s2", salePrice: 500, royaltyConfig: sampleRoyaltyConfig },
+      { swapId: "s3", salePrice: 1500, royaltyConfig: sampleRoyaltyConfig },
+    ];
+    const result = distributeBatchRoyalties(swaps);
+    expect(result.failed).toBe(0);
+    expect(result.errors).toHaveLength(0);
+  });
+
+  test("batchSize reflects total count regardless of failures", () => {
+    const swaps = [
+      sampleSwap,
+      { swapId: "invalid", salePrice: 0, royaltyConfig: sampleRoyaltyConfig },
+      { swapId: "s3", salePrice: 1000, royaltyConfig: sampleRoyaltyConfig },
+    ];
+    const result = distributeBatchRoyalties(swaps);
+    expect(result.batchSize).toBe(3);
+  });
+});
+
+describe("distributeBatchRoyalties — aggregation", () => {
+  test("aggregates same beneficiary across multiple swaps", () => {
+    const config = {
+      assetId: "asset-1",
+      rateBps: 1000, // 10%
+      beneficiaries: [{ id: "ben-all", shareBps: BPS_DENOM }],
+    };
+    const swaps = [
+      { swapId: "s1", salePrice: 1000, royaltyConfig: config },
+      { swapId: "s2", salePrice: 2000, royaltyConfig: config },
+      { swapId: "s3", salePrice: 3000, royaltyConfig: config },
+    ];
+    const result = distributeBatchRoyalties(swaps);
+    expect(result.aggregated).toHaveLength(1);
+    expect(result.aggregated[0].beneficiaryId).toBe("ben-all");
+    expect(result.aggregated[0].totalAmount).toBe(600); // 100 + 200 + 300
+    expect(result.aggregated[0].swapCount).toBe(3);
+  });
+
+  test("different beneficiaries get separate aggregates", () => {
+    const config1 = {
+      assetId: "asset-1",
+      rateBps: 1000,
+      beneficiaries: [{ id: "ben-a", shareBps: BPS_DENOM }],
+    };
+    const config2 = {
+      assetId: "asset-2",
+      rateBps: 1000,
+      beneficiaries: [{ id: "ben-b", shareBps: BPS_DENOM }],
+    };
+    const swaps = [
+      { swapId: "s1", salePrice: 1000, royaltyConfig: config1 },
+      { swapId: "s2", salePrice: 2000, royaltyConfig: config2 },
+    ];
+    const result = distributeBatchRoyalties(swaps);
+    expect(result.aggregated).toHaveLength(2);
+    const benA = result.aggregated.find((a) => a.beneficiaryId === "ben-a");
+    const benB = result.aggregated.find((a) => a.beneficiaryId === "ben-b");
+    expect(benA.totalAmount).toBe(100);
+    expect(benB.totalAmount).toBe(200);
   });
 });
