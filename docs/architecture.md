@@ -20,6 +20,59 @@ graph TD
     Stellar --- SwapContract
 ```
 
+## 🔗 JavaScript Processing Layer
+
+The `src/` directory contains Node.js batch processing, matching, reputation, insurance, and royalty modules that complement the on-chain contracts. These modules run off-chain and integrate with the REST API server.
+
+### JS Module Architecture
+
+```mermaid
+graph LR
+    APIServer["REST API Server<br/>(api-server)"]
+    
+    subgraph JsLayer["JavaScript Processing Layer (src/)"]
+        Batch["batch/"]
+        Insurance["insurance/"]
+        Matching["matching/"]
+        Reputation["reputation/"]
+        Royalty["royalty/"]
+    end
+    
+    subgraph Contracts["Soroban Contracts"]
+        IPReg["ip_registry contract"]
+        Swap["atomic_swap contract"]
+    end
+    
+    APIServer <--> JsLayer
+    JsLayer <--> Contracts
+    Contracts <--> Stellar["Stellar Network"]
+```
+
+### Module Responsibilities
+
+| Module | Purpose |
+|---|---|
+| **batch/** | Processes batch IP commitments and transfers in scheduled operations |
+| **insurance/** | Manages IP indemnity and coverage calculations |
+| **matching/** | Matches buyers and sellers; orchestrates market-making logic |
+| **reputation/** | Scores and tracks user reputation for trust-based operations |
+| **royalty/** | Calculates and distributes secondary sale royalties |
+
+### Integration Flow
+
+1. **Client Request** → REST API Server
+2. **API Server** → Delegates to appropriate JS module (`batch`, `matching`, `reputation`, etc.)
+3. **JS Module** → Reads/writes contract state via RPC calls to `ip_registry` or `atomic_swap`
+4. **Contracts** → Execute on-chain logic and emit events
+5. **Response** → Results flow back through API Server to client
+
+### Key Integration Points
+
+- **IP Registry Contract** — All modules read IP ownership and commitment status via `get_ip()` and `list_ip_by_owner()`
+- **Atomic Swap Contract** — `matching` and `batch` modules orchestrate swaps via `initiate_swap()`, `accept_swap()`, `reveal_key()`
+- **Reputation System** — Built on historical swap outcomes; written to off-chain database, queried by `matching` for buyer/seller scoring
+- **Royalty Distribution** — Triggered on successful swaps; calculated based on original creator and sale price
+
 ## 🔒 Security Architecture: Pedersen Commitments
 
 Atomic Patent uses **Pedersen Commitments** to allow users to timestamp ideas without revealing the content.
