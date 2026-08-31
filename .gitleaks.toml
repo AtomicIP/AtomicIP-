@@ -1,0 +1,63 @@
+[title]
+description = "Gitleaks configuration for secret detection"
+
+[extend]
+# Extend base ruleset with standard patterns
+useDefault = true
+
+[[rules]]
+id = "stellar-keypair"
+description = "Stellar keypair (starts with S and 56 characters)"
+regex = '''S[A-Z0-9]{55}'''
+secretGroup = 0
+entropy = 4.0
+keywords = ["stellar", "keypair", "secret"]
+
+[[rules]]
+id = "jwt-secret"
+description = "JSON Web Token secret"
+regex = '''(?i)(jwt|secret|key)[\s]*[=:|\s][\s]*["']?([a-zA-Z0-9_\-\.]{20,})["']?'''
+secretGroup = 2
+entropy = 3.5
+keywords = ["jwt", "secret", "token"]
+
+[[rules]]
+id = "api-key-generic"
+description = "Generic API key pattern"
+regex = '''(?i)(api[_-]?key|apikey)[\s]*[=:|\s][\s]*["']?([a-zA-Z0-9_\-\.]{16,})["']?'''
+secretGroup = 2
+entropy = 3.5
+keywords = ["api", "key"]
+
+[[rules]]
+id = "db-connection-string"
+description = "Database connection string"
+regex = '''(?i)(postgres|mysql|mongodb):[/]{0,2}[^\s]+:[^\s]+@[^\s]+'''
+entropy = 3.0
+keywords = ["database", "password"]
+
+[[rules]]
+id = "hmac-key"
+description = "HMAC key or signing key"
+regex = '''(?i)(hmac|signing)[_-]?key[\s]*[=:|\s][\s]*["']?([a-f0-9]{32,})["']?'''
+secretGroup = 2
+entropy = 3.5
+keywords = ["hmac", "signing", "key"]
+
+# Allowlist patterns to reduce false positives
+[allowlist]
+regexes = [
+  "example[_-]?key",
+  "test[_-]?key",
+  "dummy[_-]?secret",
+  "placeholder"
+]
+paths = [
+  "node_modules/",
+  "\.git/",
+  "\.cargo/",
+  "target/",
+  "coverage/",
+  "\.gitleaks\.toml"
+]
+commits = []

@@ -20,6 +20,13 @@ jobs:
           --health-retries 10
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Secret scanning (Gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Check for disabled test modules
         run: ./scripts/check-disabled-tests.sh
@@ -51,6 +58,12 @@ jobs:
             echo "Found FIXME comments referencing unresolved merge conflicts. Resolve or remove them." >&2
             exit 1
           fi
+
+      - name: Lint (JS)
+        run: npm run lint
+
+      - name: Format Check (JS)
+        run: npm run format:check
 
       - name: Build
         run: cargo build --workspace --verbose

@@ -465,6 +465,112 @@ network layer
 
 ---
 
+## JS Batch Processing Layer
+
+The `src/batch/*.js` modules handle off-chain batch operations including commitment scheduling, fee calculations, payment processing, and dispute resolution. These modules bridge user-facing operations to on-chain state, introducing a distinct trust boundary separate from the Soroban contract layer.
+
+### Architecture & Trust Boundary
+
+**Authority Model**:
+- JS batch processes **prepare** transactions and state updates but do **not** sign them directly with network keys
+- All signed transactions must be submitted through the API server (`api-server/src/`) which enforces:
+  - JWT-based authentication (issued by `auth.rs`)
+  - Signed request verification via `request_signing.rs`
+  - Audit-log tracking via `audit.rs`
+- JS layer is considered **untrusted for signature generation**; it only computes (unsigned) request payloads
+- API server holds exclusive signing authority; all fund transfers require its cryptographic validation
+
+### Trust Boundary Threats
+
+#### 1. Compromised Batch Processing Host
+
+**Scenario**: The machine running the batch processor is compromised (e.g., malware, supply chain attack). Attacker gains execution access to `src/batch/*.js` modules.
+
+**Impact**: Attacker can:
+- Compute unauthorized batch requests (e.g., false payment distributions, fabricated disputes)
+- Inject malicious state into Redis/persistent storage
+- Modify fee calculations or royalty distributions to favor attacker accounts
+- Observe plaintext fee/payment data before encryption
+
+**Mitigations**:
+- JS batch processes are **stateless calculators** — they do not hold or manage signing keys
+- All requests must be cryptographically signed by the API server (`request_signing.rs`) before submission
+- Requests that pass signature verification are logged atomically in the audit chain (`audit.rs`)
+- **Cannot steal funds**: even if a batch process generates a payment request to a false account, the API server must validate the request signature; a compromised batch layer cannot forge valid signatures
+- **Cannot forge transactions**: Batch processes cannot sign with the contract's or user's Stellar keypairs
+- Implement **immutable audit log**: `audit.rs` appends all validated requests to durable storage (fsync on every write); a compromised batch process cannot retroactively modify audit records because the API server is a separate process
+
+**Residual Risk**: If **both** the batch processing host **and** the API server host are compromised in a coordinated attack, the attacker could generate and approve malicious transactions. Mitigated by:
+- Running these components on separate hardware/VMs
+- Enforcing network segmentation between batch and API tiers
+- Rotating API signing keys regularly
+- Monitoring audit logs for anomalous transaction patterns
+
+#### 2. Batch State Injection
+
+**Scenario**: Attacker modifies Redis or persistent storage used by batch processors to corrupt queue state, fee calculations, or dispute tracking.
+
+**Impact**: 
+- Incorrect fee or royalty calculations leading to user funds being misallocated
+- Dispute records fabricated or deleted
+- Batch operations reordered or duplicated
+
+**Mitigations**:
+- All persistent state reads are validated against on-chain state when possible
+- Fee/royalty calculations are **deterministic**; recalculation always produces the same result
+- **Audit trail**: All state mutations are logged; `audit.rs` provides independent verification
+- Implement **read-after-write verification**: after a state change, re-read and validate to detect injections
+- Use **Redis transactions** and **Lua scripts** where supported to atomically update related state
+
+**Residual Risk**: ⚠️ Redis compromise can corrupt in-flight transaction queues until detection. Mitigate by:
+- Monitoring Redis for unexpected state changes
+- Replaying the audit log to reconstruct authoritative state
+- Implementing heartbeat checks on queue consistency
+
+#### 3. Replay Attack on Batch Requests
+
+**Scenario**: Attacker intercepts a signed batch request (e.g., a payment distribution) and replays it to the API server, causing duplicate processing.
+
+**Impact**: Duplicate payments, fee distributions applied multiple times, or dispute resolutions repeated.
+
+**Mitigations**:
+- API server enforces **request nonce / idempotency keys** via `request_signing.rs`
+- Each request includes a unique `request_id` and timestamp; duplicate submission with the same ID is rejected
+- Audit log tracks every processed request with its nonce; replay attempts are detected and logged
+- **Cannot be replayed across ledger boundaries**: each batch is bound to a ledger sequence number; re-broadcast to a later ledger is rejected as stale
+
+**Status**: ✅ Mitigated (if idempotency keys are enforced end-to-end)
+
+#### 4. Timing/Race Conditions in Batch Operations
+
+**Scenario**: Two batch processes operate concurrently on the same state (e.g., two fee calculators compute distributions for the same swap), or a batch process races with an on-chain operation.
+
+**Impact**: Double-counting of fees, inconsistent royalty distributions, or stale batch state overwriting recent on-chain updates.
+
+**Mitigations**:
+- Implement **distributed locks** (Redis SETNX or Lua scripts) to serialize access to shared state
+- Use **sequence numbers** to detect out-of-order operations
+- **Monotonic batch IDs**: each batch is assigned an immutable, monotonically-increasing ID; batch processing only proceeds for the highest unprocessed ID
+- **On-chain state as source of truth**: when in doubt, query the Soroban contract to verify the current state before applying a batch update
+- Implement **idempotency** at the request level so duplicate batch submissions do not cause duplicate on-chain effects
+
+**Status**: ✅ Mitigated (if locking and sequence numbers are enforced)
+
+### Implementation Checklist
+
+- [ ] **API server signing authority**: Verify that `request_signing.rs` is the sole entity that can sign fund-transfer requests; batch processes do not hold signing keys
+- [ ] **Audit logging**: Confirm all signed requests are logged to `audit.rs` with timestamps and sequence numbers
+- [ ] **Idempotency**: Ensure every batch request includes a nonce or request ID; API server rejects duplicate nonces
+- [ ] **Locking**: Implement Redis locks (or equivalent) to serialize concurrent batch operations on the same state
+- [ ] **On-chain validation**: Batch processors re-query the Soroban contract before applying state mutations to detect stale data
+- [ ] **Monitoring**: Alert on:
+  - Unexpected Redis state changes (batch queues, fee calculations, dispute records)
+  - Audit log gaps or anomalies (missing entries, out-of-order sequence numbers)
+  - Duplicate request nonces or idempotency key collisions
+- [ ] **Separate infrastructure**: Run batch processors and API server on separate hosts/VMs with network segmentation
+
+---
+
 ### Operator Recommendations
 
 | Concern | Required Action |
@@ -473,3 +579,4 @@ network layer
 | Blinded owner reuse | Document that each batch requires a fresh nonce; warn if SDK detects reuse |
 | Fee account exposure | Advise privacy-sensitive users to use a fresh throwaway account as the transaction fee payer |
 | Audit trail | `"ip_cmt_a"` events are emitted per commitment; monitor for unusual batch sizes that may indicate Sybil behaviour |
+| Batch infrastructure | Run batch processing and API server on separate hardware; enforce network segmentation; monitor Redis state and audit logs for anomalies |
