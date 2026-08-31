@@ -4,10 +4,12 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 
+/// Health status response returned by `/health`
 /// Memory usage past this percentage is reported as `unhealthy`.
 const MEMORY_UNHEALTHY_PERCENT: f64 = 90.0;
 /// Memory usage past this percentage (but below the unhealthy threshold) is
@@ -36,6 +38,7 @@ pub struct HealthStatus {
     pub checks: Vec<HealthCheck>,
 }
 
+/// Status of individual service components
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComponentHealth {
     pub contract_connectivity: ComponentStatus,
@@ -43,8 +46,11 @@ pub struct ComponentHealth {
     pub cache: ComponentStatus,
     pub memory: ComponentStatus,
     pub disk: ComponentStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soroban_rpc: Option<ComponentStatus>,
 }
 
+/// Individual component status
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComponentStatus {
     pub status: String,
@@ -52,6 +58,7 @@ pub struct ComponentStatus {
     pub last_checked: u64,
 }
 
+/// Structured health check entry
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthCheck {
     pub name: String,
@@ -59,6 +66,7 @@ pub struct HealthCheck {
     pub message: Option<String>,
 }
 
+/// Detailed health response including version
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetailedHealthResponse {
     pub status: String,
@@ -69,6 +77,7 @@ pub struct DetailedHealthResponse {
     pub checks: Vec<HealthCheck>,
 }
 
+/// Soroban RPC and system health checker
 /// Extracts `(host, port)` from a `scheme://[user[:pass]@]host:port[/path]`
 /// connection string, e.g. a `postgres://` URL.
 fn parse_host_port(url: &str) -> Option<(String, u16)> {
@@ -125,11 +134,14 @@ fn read_disk_used_percent() -> Option<f64> {
 
 pub struct HealthChecker {
     contract_status: Arc<RwLock<ComponentStatus>>,
+    contract_message: Arc<RwLock<Option<String>>>,
     database_status: Arc<RwLock<ComponentStatus>>,
     cache_status: Arc<RwLock<ComponentStatus>>,
     memory_status: Arc<RwLock<ComponentStatus>>,
     disk_status: Arc<RwLock<ComponentStatus>>,
+    is_process_down: Arc<AtomicBool>,
     start_time: std::time::SystemTime,
+    rpc_endpoint: Arc<RwLock<String>>,
 }
 
 impl HealthChecker {
@@ -145,6 +157,7 @@ impl HealthChecker {
                 latency_ms: 0,
                 last_checked: now,
             })),
+            contract_message: Arc::new(RwLock::new(None)),
             database_status: Arc::new(RwLock::new(ComponentStatus {
                 status: "unknown".to_string(),
                 latency_ms: 0,
@@ -165,10 +178,20 @@ impl HealthChecker {
                 latency_ms: 0,
                 last_checked: now,
             })),
+            is_process_down: Arc::new(AtomicBool::new(false)),
             start_time: std::time::SystemTime::now(),
+            rpc_endpoint: Arc::new(RwLock::new("http://localhost:8000/soroban/rpc".to_string())),
         }
     }
 
+    /// Set configured Soroban RPC endpoint
+    pub async fn set_rpc_endpoint(&self, endpoint: String) {
+        *self.rpc_endpoint.write().await = endpoint;
+    }
+
+    /// Check Soroban RPC reachability and contract connectivity
+    pub async fn check_contract_connectivity(&self) -> ComponentStatus {
+        let start = std::time::Instant::now();
     /// Probes the configured Soroban RPC endpoint with a lightweight
     /// `getHealth` JSON-RPC call. When `SOROBAN_RPC_URL` isn't set there is
     /// no contract dependency wired into this deployment, so it is reported
@@ -206,6 +229,17 @@ impl HealthChecker {
             .unwrap()
             .as_secs();
 
+        let status = if latency_ms >= 2000 {
+            *self.contract_message.write().await = Some(format!(
+                "Soroban RPC response slow: {}ms (threshold: 2000ms)",
+                latency_ms
+            ));
+            "degraded".to_string()
+        } else {
+            *self.contract_message.write().await = None;
+            "healthy".to_string()
+        };
+
         let component = ComponentStatus {
             status,
             latency_ms,
@@ -214,6 +248,87 @@ impl HealthChecker {
 
         *self.contract_status.write().await = component.clone();
         component
+    }
+
+    /// Explicit alias for Soroban RPC reachability check
+    pub async fn check_soroban_rpc(&self) -> ComponentStatus {
+        self.check_contract_connectivity().await
+    }
+
+    /// Check RPC reachability with specific probe parameters
+    pub async fn check_rpc_reachability_with_params(
+        &self,
+        latency_ms: u64,
+        is_circuit_open: bool,
+        is_reachable: bool,
+    ) -> ComponentStatus {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let (status, message) = if !is_reachable {
+            (
+                "unreachable".to_string(),
+                Some("Soroban RPC endpoint is unreachable".to_string()),
+            )
+        } else if is_circuit_open {
+            (
+                "circuit_open".to_string(),
+                Some("Soroban RPC circuit breaker is OPEN (fail-fast active)".to_string()),
+            )
+        } else if latency_ms >= 2000 {
+            (
+                "degraded".to_string(),
+                Some(format!(
+                    "Soroban RPC latency high: {}ms >= 2000ms threshold",
+                    latency_ms
+                )),
+            )
+        } else {
+            ("healthy".to_string(), None)
+        };
+
+        let component = ComponentStatus {
+            status,
+            latency_ms,
+            last_checked: now,
+        };
+
+        *self.contract_status.write().await = component.clone();
+        *self.contract_message.write().await = message;
+        component
+    }
+
+    /// Update contract connectivity / Soroban RPC status directly
+    pub async fn set_contract_status(&self, status: ComponentStatus, message: Option<String>) {
+        *self.contract_status.write().await = status;
+        *self.contract_message.write().await = message;
+    }
+
+    /// Update database status directly
+    pub async fn set_database_status(&self, status: ComponentStatus) {
+        *self.database_status.write().await = status;
+    }
+
+    /// Update cache status directly
+    pub async fn set_cache_status(&self, status: ComponentStatus) {
+        *self.cache_status.write().await = status;
+    }
+
+    /// Update memory status directly
+    pub async fn set_memory_status(&self, status: ComponentStatus) {
+        *self.memory_status.write().await = status;
+    }
+
+    /// Update disk status directly
+    pub async fn set_disk_status(&self, status: ComponentStatus) {
+        *self.disk_status.write().await = status;
+    }
+
+    /// Set process failure state
+    pub fn set_process_down(&self, down: bool) {
+        self.is_process_down.store(down, Ordering::Relaxed);
     }
 
     /// Probes `DATABASE_URL` with a raw TCP connect. This codebase has no
@@ -361,22 +476,39 @@ impl HealthChecker {
             .as_secs()
     }
 
+    /// Compute overall health status, distinguishing "degraded" from "down"
     pub async fn get_health(&self) -> HealthStatus {
         let contract = self.contract_status.read().await.clone();
+        let contract_msg = self.contract_message.read().await.clone();
         let database = self.database_status.read().await.clone();
         let cache = self.cache_status.read().await.clone();
         let memory = self.memory_status.read().await.clone();
         let disk = self.disk_status.read().await.clone();
 
-        let overall_status = if contract.status == "healthy"
-            && database.status == "healthy"
-            && cache.status == "healthy"
-            && memory.status == "healthy"
-            && disk.status == "healthy"
-        {
-            "healthy".to_string()
-        } else {
+        // Process failure conditions (API process itself failing / down)
+        let is_process_failing = self.is_process_down.load(Ordering::Relaxed)
+            || memory.status == "down"
+            || memory.status == "critical"
+            || disk.status == "down"
+            || disk.status == "critical"
+            || database.status == "down";
+
+        // Dependency degradation (Soroban RPC slow/circuit open/unreachable or cache degraded)
+        let is_rpc_degraded = contract.status == "degraded"
+            || contract.status == "circuit_open"
+            || contract.status == "slow"
+            || contract.status == "unreachable"
+            || contract.status == "unknown"
+            || contract.status != "healthy";
+
+        let is_cache_degraded = cache.status != "healthy";
+
+        let overall_status = if is_process_failing {
+            "down".to_string()
+        } else if is_rpc_degraded || is_cache_degraded || database.status != "healthy" {
             "degraded".to_string()
+        } else {
+            "healthy".to_string()
         };
 
         let now = std::time::SystemTime::now()
@@ -388,7 +520,7 @@ impl HealthChecker {
             HealthCheck {
                 name: "contract_connectivity".to_string(),
                 status: contract.status.clone(),
-                message: None,
+                message: contract_msg,
             },
             HealthCheck {
                 name: "database".to_string(),
@@ -417,11 +549,12 @@ impl HealthChecker {
             timestamp: now,
             uptime_seconds: self.get_uptime_seconds(),
             components: ComponentHealth {
-                contract_connectivity: contract,
+                contract_connectivity: contract.clone(),
                 database,
                 cache,
                 memory,
                 disk,
+                soroban_rpc: Some(contract),
             },
             checks,
         }
@@ -445,10 +578,11 @@ pub async fn health_handler(
 
     let health = checker.get_health().await;
 
-    let status_code = if health.status == "healthy" {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
+    // Distinguish degraded (RPC slow/circuit open) from down (process failing)
+    let status_code = match health.status.as_str() {
+        "healthy" => StatusCode::OK,
+        "degraded" => StatusCode::OK,
+        "down" | _ => StatusCode::SERVICE_UNAVAILABLE,
     };
 
     (status_code, Json(health)).into_response()
@@ -474,10 +608,10 @@ pub async fn detailed_health_handler(
         checks: health.checks,
     };
 
-    let status_code = if health.status == "healthy" {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
+    let status_code = match health.status.as_str() {
+        "healthy" => StatusCode::OK,
+        "degraded" => StatusCode::OK,
+        "down" | _ => StatusCode::SERVICE_UNAVAILABLE,
     };
 
     (status_code, Json(detailed)).into_response()
@@ -630,5 +764,127 @@ mod tests {
         assert!(health.checks.iter().any(|c| c.name == "cache"));
         assert!(health.checks.iter().any(|c| c.name == "memory"));
         assert!(health.checks.iter().any(|c| c.name == "disk"));
+    }
+
+    #[tokio::test]
+    async fn test_health_state_healthy() {
+        let checker = HealthChecker::new();
+        checker.check_rpc_reachability_with_params(120, false, true).await;
+        checker.check_database().await;
+        checker.check_cache().await;
+        checker.check_memory().await;
+        checker.check_disk().await;
+
+        let health = checker.get_health().await;
+        assert_eq!(health.status, "healthy");
+        assert_eq!(health.components.contract_connectivity.status, "healthy");
+        assert_eq!(health.components.contract_connectivity.latency_ms, 120);
+    }
+
+    #[tokio::test]
+    async fn test_health_state_degraded_rpc_slow() {
+        let checker = HealthChecker::new();
+        // Simulate high RPC latency (e.g. 2500ms >= 2000ms threshold)
+        checker.check_rpc_reachability_with_params(2500, false, true).await;
+        checker.check_database().await;
+        checker.check_cache().await;
+        checker.check_memory().await;
+        checker.check_disk().await;
+
+        let health = checker.get_health().await;
+        assert_eq!(health.status, "degraded");
+        assert_eq!(health.components.contract_connectivity.status, "degraded");
+        assert_eq!(health.components.contract_connectivity.latency_ms, 2500);
+
+        let contract_check = health
+            .checks
+            .iter()
+            .find(|c| c.name == "contract_connectivity")
+            .unwrap();
+        assert!(contract_check.message.is_some());
+        assert!(contract_check.message.as_ref().unwrap().contains("2500ms"));
+    }
+
+    #[tokio::test]
+    async fn test_health_state_degraded_circuit_open() {
+        let checker = HealthChecker::new();
+        // Simulate open circuit breaker for Soroban RPC
+        checker.check_rpc_reachability_with_params(0, true, true).await;
+        checker.check_database().await;
+        checker.check_cache().await;
+        checker.check_memory().await;
+        checker.check_disk().await;
+
+        let health = checker.get_health().await;
+        assert_eq!(health.status, "degraded");
+        assert_eq!(health.components.contract_connectivity.status, "circuit_open");
+
+        let contract_check = health
+            .checks
+            .iter()
+            .find(|c| c.name == "contract_connectivity")
+            .unwrap();
+        assert!(contract_check.message.is_some());
+        assert!(contract_check.message.as_ref().unwrap().contains("circuit breaker is OPEN"));
+    }
+
+    #[tokio::test]
+    async fn test_health_state_degraded_rpc_unreachable() {
+        let checker = HealthChecker::new();
+        // Simulate unreachable RPC endpoint
+        checker.check_rpc_reachability_with_params(0, false, false).await;
+        checker.check_database().await;
+        checker.check_cache().await;
+        checker.check_memory().await;
+        checker.check_disk().await;
+
+        let health = checker.get_health().await;
+        assert_eq!(health.status, "degraded");
+        assert_eq!(health.components.contract_connectivity.status, "unreachable");
+
+        let contract_check = health
+            .checks
+            .iter()
+            .find(|c| c.name == "contract_connectivity")
+            .unwrap();
+        assert!(contract_check.message.is_some());
+        assert!(contract_check.message.as_ref().unwrap().contains("unreachable"));
+    }
+
+    #[tokio::test]
+    async fn test_health_state_down_process_failing() {
+        let checker = HealthChecker::new();
+        checker.check_contract_connectivity().await;
+        checker.check_database().await;
+        checker.check_cache().await;
+        checker.check_memory().await;
+        checker.check_disk().await;
+
+        // Process itself failing
+        checker.set_process_down(true);
+
+        let health = checker.get_health().await;
+        assert_eq!(health.status, "down");
+    }
+
+    #[tokio::test]
+    async fn test_health_state_down_critical_component() {
+        let checker = HealthChecker::new();
+        checker.check_contract_connectivity().await;
+        checker.check_database().await;
+        checker.check_cache().await;
+        checker.check_disk().await;
+
+        // Memory critical failure
+        checker
+            .set_memory_status(ComponentStatus {
+                status: "critical".to_string(),
+                latency_ms: 0,
+                last_checked: 0,
+            })
+            .await;
+
+        let health = checker.get_health().await;
+        assert_eq!(health.status, "down");
     }
 }

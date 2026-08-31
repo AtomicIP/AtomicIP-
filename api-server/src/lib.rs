@@ -51,6 +51,7 @@ pub mod invariants;
 pub mod load_balancer;
 pub mod metrics;
 pub mod middleware_pipeline;
+pub mod request_queue;
 pub mod request_signing;
 pub mod rate_limit;
 pub mod schemas;

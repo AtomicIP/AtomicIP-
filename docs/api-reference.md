@@ -1331,3 +1331,28 @@ is not positive. Publishes `ins_fund` with an `InsurancePoolFundedEvent`.
 Unchanged. The premium remains 2% of the swap price, applied identically in
 `initiate_swap` and `batch_initiate_with_insurance`. The reservation model
 changes only how a claim is paid, not what a policy costs.
+
+---
+
+## Request Queuing, Backpressure & RPC Latency Expectations
+
+To protect downstream Soroban RPC nodes and prevent unbounded memory growth during traffic bursts, the API server applies queue-based backpressure and concurrency limiting (`request_queue.rs`).
+
+### Realistic Soroban RPC Latency Profile
+
+Soroban smart contract RPC operations (read calls, simulation, ledger entry queries, and transaction submission) operate under realistic network latency in the **200ms to 2000ms (2s)** range:
+
+| Operation Type | Typical Latency Range | Notes |
+|---|---|---|
+| Read queries / Cache hits | 50ms – 200ms | In-memory cache or fast RPC view call |
+| Contract simulation / estimation | 200ms – 600ms | Soroban VM execution overhead |
+| State verification / ledger fetch | 300ms – 800ms | RPC round-trip and ledger lookups |
+| Transaction submission & commit | 1000ms – 2000ms+ | Stellar network consensus & ledger closing |
+
+### Backpressure Limits & Queue Behavior
+
+- **Concurrency Limit (`max_concurrent_requests`, default: 100):** Maximum number of RPC-bound requests processed concurrently by the semaphore.
+- **Queue Capacity (`max_queue_size`, default: 1000):** Maximum total depth of queued plus active requests. When this threshold is exceeded, additional incoming requests are immediately rejected with **HTTP 503 Service Unavailable**.
+- **Request Timeout (`request_timeout`, default: 30s):** Maximum time a request is permitted to wait in the queue for a concurrency slot. If the timeout expires before a slot becomes available, the server returns **HTTP 408 Request Timeout**.
+- **Client Backoff & Retry Strategy:** Clients receiving `503 Service Unavailable` or `408 Request Timeout` should apply exponential backoff with randomized jitter before retrying.
+
