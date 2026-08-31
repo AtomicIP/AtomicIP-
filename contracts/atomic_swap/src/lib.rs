@@ -2736,6 +2736,17 @@ impl AtomicSwap {
         );
     }
 
+    // ── #254: Query approvals ─────────────────────────────────────────────────
+
+    /// Returns all approvers who have called `approve_swap` for the given swap.
+    /// Returns an empty Vec if no approvals have been recorded yet.
+    pub fn get_swap_approvals(env: Env, swap_id: u64) -> Vec<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SwapApprovals(swap_id))
+            .unwrap_or(Vec::new(&env))
+    }
+
     // ── #309: Batch swap initiation ───────────────────────────────────────────
 
     /// Seller initiates multiple patent sales in one call. Returns a Vec of swap IDs.

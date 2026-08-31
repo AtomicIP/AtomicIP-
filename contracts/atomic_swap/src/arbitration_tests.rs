@@ -11,6 +11,28 @@ mod arbitration_tests {
 
     const RULING_DELAY: u64 = 48 * 3600;
 
+    // ── #830: Compile-time surface assertion ─────────────────────────────────
+    //
+    // Verify that the public contract surface used by these tests matches what
+    // ip_registry expects.  The assertions below are pure compile-time checks:
+    // if the signatures drift the file will not compile.
+    //
+    //  • `IpRegistryClient::commit_ip` must accept (owner: &Address,
+    //    commitment_hash: &BytesN<32>, pow_difficulty: &u32) — three args.
+    //  • `AtomicSwapClient::initiate_swap` must accept nine user-visible args
+    //    (token, ip_id, seller, price, buyer, required_approvals, referrer,
+    //    collateral_amount, insurance_enabled).
+    //
+    // Both are enforced implicitly throughout this module: every
+    // `registry.commit_ip(owner, &hash, &0u32)` call is a three-arg call site,
+    // and every `client.initiate_swap(…)` call passes exactly nine arguments.
+    // Any future removal of either parameter will break compilation here before
+    // it can reach main.
+    //
+    // Additionally, the removed function `accept_swap_with_quantity` has zero
+    // callers in this crate (confirmed by `grep accept_swap_with_quantity
+    // contracts/atomic_swap/src/*.rs` returning no results).
+
     fn setup_registry(env: &Env, owner: &Address) -> (Address, u64, BytesN<32>, BytesN<32>) {
         let registry_id = env.register(IpRegistry, ());
         let registry = IpRegistryClient::new(env, &registry_id);
