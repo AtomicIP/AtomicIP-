@@ -52,6 +52,12 @@ jobs:
             exit 1
           fi
 
+      - name: Lint (JS)
+        run: npm run lint
+
+      - name: Format Check (JS)
+        run: npm run format:check
+
       - name: Build
         run: cargo build --workspace --verbose
 

@@ -7,7 +7,11 @@
   "scripts": {
     "test": "jest",
     "test:watch": "jest --watch",
-    "test:coverage": "jest --coverage"
+    "test:coverage": "jest --coverage",
+    "lint": "eslint src --max-warnings 0",
+    "lint:fix": "eslint src --fix",
+    "format": "prettier --write src",
+    "format:check": "prettier --check src"
   },
   "keywords": [
     "blockchain",
@@ -19,7 +23,9 @@
   "author": "Atomic Patent Contributors",
   "license": "MIT",
   "devDependencies": {
-    "jest": "^29.7.0"
+    "eslint": "^8.54.0",
+    "jest": "^29.7.0",
+    "prettier": "^3.1.0"
   },
   "jest": {
     "testEnvironment": "node",
