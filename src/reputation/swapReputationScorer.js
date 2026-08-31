@@ -13,7 +13,34 @@
  *  - Tenure bonus         (account age in days)
  *  - Volume bonus         (total swap count)
  *  - Cancellation penalty (cancelled swaps)
+ *
+ * Persistence — Issue #878
+ * ──────────────────────────────────────
+ * `calculateReputationScore` / `batchCalculateReputation` above are pure
+ * functions: given a history they return a score, nothing is written down.
+ * That's fine for the API/contract layer's own request-scoped caching
+ * (`api-server/src/cache.rs`, key prefix `reputation:`, TTL-based), but it
+ * means there is no durable record a score ever existed once that cache
+ * entry expires or the process restarts.
+ *
+ * This module fills that gap with a small `ReputationStore` interface —
+ * `get(participantId)`, `set(participantId, record)`, `getAll()` — so the
+ * scoring logic stays decoupled from *where* scores live:
+ *
+ *  - `MemoryReputationStore` — process-local Map, not durable. Default
+ *    choice for tests and short-lived scripts.
+ *  - `FileReputationStore`   — scores serialized to a JSON file on disk.
+ *    Durable across process restarts; intended as the default backend for
+ *    single-instance deployments/tooling that don't have a real DB handy.
+ *
+ * A production, multi-instance deployment should back this interface with
+ * the API server's shared store instead (e.g. the Redis-backed cache in
+ * `api-server/src/cache.rs`, or a proper DB table) by implementing the
+ * same three methods — nothing above this layer needs to change.
  */
+
+const fs   = require("fs");
+const path = require("path");
 
 const STARTING_SCORE     = 500;
 const MAX_SCORE          = 1000;
@@ -129,6 +156,101 @@ function batchCalculateReputation(inputs, nowMs = Date.now()) {
     .sort((a, b) => b.score - a.score);
 }
 
+/**
+ * In-memory reputation store. Not durable — data is lost when the process
+ * exits. Useful as the default in tests and short-lived scripts, and as a
+ * reference implementation of the `ReputationStore` interface.
+ */
+class MemoryReputationStore {
+  constructor() {
+    this._records = new Map();
+  }
+
+  get(participantId) {
+    return this._records.get(participantId) ?? null;
+  }
+
+  set(participantId, record) {
+    this._records.set(participantId, record);
+  }
+
+  getAll() {
+    return Array.from(this._records.values());
+  }
+}
+
+/**
+ * File-backed reputation store. Scores are serialized as JSON to disk, so
+ * they survive process restarts — the store re-reads from disk on every
+ * call rather than caching in memory, which keeps it correct if multiple
+ * short-lived processes share the same file.
+ */
+class FileReputationStore {
+  constructor(filePath) {
+    if (!filePath) throw new TypeError("filePath is required.");
+    this.filePath = filePath;
+  }
+
+  _readAll() {
+    try {
+      const raw = fs.readFileSync(this.filePath, "utf8");
+      return JSON.parse(raw);
+    } catch (err) {
+      if (err.code === "ENOENT") return {};
+      throw err;
+    }
+  }
+
+  _writeAll(records) {
+    const dir = path.dirname(this.filePath);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(this.filePath, JSON.stringify(records, null, 2));
+  }
+
+  get(participantId) {
+    const records = this._readAll();
+    return records[participantId] ?? null;
+  }
+
+  set(participantId, record) {
+    const records = this._readAll();
+    records[participantId] = record;
+    this._writeAll(records);
+  }
+
+  getAll() {
+    return Object.values(this._readAll());
+  }
+}
+
+/**
+ * Calculate a participant's reputation score and persist it to `store`.
+ *
+ * @param {object} input - same shape as `calculateReputationScore`.
+ * @param {{get, set, getAll}} store - a `ReputationStore` implementation.
+ * @returns {object} the calculated result (same shape as
+ *   `calculateReputationScore`), plus `updatedAt`.
+ */
+function persistReputationScore(input, store, nowMs = Date.now()) {
+  if (!store || typeof store.set !== "function")
+    throw new TypeError("store must implement the ReputationStore interface.");
+
+  const result = calculateReputationScore(input, nowMs);
+  const record = { ...result, updatedAt: new Date(nowMs).toISOString() };
+  store.set(result.participantId, record);
+  return record;
+}
+
+/**
+ * Look up a previously persisted reputation score. Returns `null` if the
+ * participant has no persisted record.
+ */
+function getPersistedReputationScore(participantId, store) {
+  if (!store || typeof store.get !== "function")
+    throw new TypeError("store must implement the ReputationStore interface.");
+  return store.get(participantId);
+}
+
 module.exports = {
   calculateReputationScore,
   batchCalculateReputation,
@@ -137,4 +259,8 @@ module.exports = {
   STARTING_SCORE,
   MAX_SCORE,
   MIN_SCORE,
+  MemoryReputationStore,
+  FileReputationStore,
+  persistReputationScore,
+  getPersistedReputationScore,
 };
