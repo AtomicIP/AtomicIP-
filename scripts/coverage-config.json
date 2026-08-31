@@ -1,0 +1,20 @@
+{
+  "coverage_tool": "cargo-llvm-cov",
+  "coverage_floor": 75,
+  "coverage_ratchet": true,
+  "artifacts": {
+    "html_report": "target/llvm-cov/html",
+    "lcov_report": "target/llvm-cov/lcov.info",
+    "summary": "target/llvm-cov/summary.txt"
+  },
+  "exclude_patterns": [
+    "**/test_*",
+    "**/*_test.rs",
+    "**/benchmarks.rs"
+  ],
+  "packages": [
+    "ip_registry",
+    "atomic_swap"
+  ],
+  "ratchet_increment": 2
+}
