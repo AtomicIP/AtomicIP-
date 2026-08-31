@@ -1,13 +1,24 @@
-/// Accessibility tests for Atomic Patent API (#564)
+/// Accessibility tests for Atomic Patent API (#564, #887)
 ///
-/// Verifies that the API is accessible to different types of clients:
-/// varying Accept headers, API versions, auth states, and payload shapes.
+/// Despite living in an API-only (backend) crate, "accessibility" here refers to
+/// API usability/interoperability — not WCAG compliance. Tests verify that the API
+/// is accessible to different types of clients by:
+/// - Supporting varying Accept headers and content types
+/// - Gracefully handling different API version requests
+/// - Working with minimal and maximal payload shapes
+/// - Providing machine-readable error responses that work with any client
+/// - Supporting public endpoints without authentication
+///
+/// These tests ensure the API doesn't accidentally break integration with
+/// clients that use older standards, missing headers, or edge-case request shapes.
 
 #[cfg(test)]
 mod accessibility_tests {
     use serde_json::json;
 
     // ── Accept Header Compatibility ───────────────────────────────────────────
+    // Tests verify that the API correctly handles Content-Type and Accept headers
+    // from various client types (browsers, mobile apps, older HTTP libraries, etc).
 
     /// Clients sending Accept: application/json must be supported.
     #[test]
@@ -32,6 +43,8 @@ mod accessibility_tests {
     }
 
     // ── API Versioning Accessibility ──────────────────────────────────────────
+    // Tests ensure backward compatibility by verifying that clients on older
+    // API versions continue to work, and that version negotiation is clear.
 
     /// Supported versions must include at least v1.
     #[test]
@@ -59,6 +72,8 @@ mod accessibility_tests {
     }
 
     // ── Public Endpoint Accessibility (no auth required) ─────────────────────
+    // Tests verify that certain critical endpoints (health, docs, version) are
+    // always accessible without authentication, even when the API is locked down.
 
     /// Health endpoint must be accessible without authentication.
     #[test]
@@ -76,6 +91,8 @@ mod accessibility_tests {
     }
 
     // ── Minimal Payload Accessibility ─────────────────────────────────────────
+    // Tests ensure that clients on limited bandwidth or with minimal payloads
+    // can still use the API without needing optional/advanced fields.
 
     /// commit_ip must work with only required fields (no optional fields).
     #[test]
@@ -126,6 +143,8 @@ mod accessibility_tests {
     }
 
     // ── Machine-Readable Error Accessibility ──────────────────────────────────
+    // Tests ensure that error responses are structured as JSON (not HTML error pages)
+    // so that programmatic clients can parse and handle failures correctly.
 
     /// Error responses must be valid JSON parseable by any client.
     #[test]
@@ -146,6 +165,8 @@ mod accessibility_tests {
     }
 
     // ── Pagination Accessibility ───────────────────────────────────────────────
+    // Tests verify that list endpoints work with clients that don't implement
+    // pagination (by using sensible defaults) and that pagination is properly signaled.
 
     /// List endpoints must support clients that omit pagination params (use defaults).
     #[test]
