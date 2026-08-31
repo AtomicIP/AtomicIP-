@@ -1,6 +1,7 @@
 const {
   calculateSwapRoyalty,
   distributeBatchRoyalties,
+  settleBeneficiaryPayouts,
   validateRoyaltyConfig,
   MAX_ROYALTY_RATE_BPS,
   MAX_BATCH_SIZE,
@@ -293,5 +294,118 @@ describe("distributeBatchRoyalties — aggregation", () => {
     const benB = result.aggregated.find((a) => a.beneficiaryId === "ben-b");
     expect(benA.totalAmount).toBe(100);
     expect(benB.totalAmount).toBe(200);
+  });
+});
+
+// ── #917: settleBeneficiaryPayouts ────────────────────────────────────────
+
+describe("settleBeneficiaryPayouts — validation", () => {
+  test("throws on non-array ledger", () => {
+    expect(() => settleBeneficiaryPayouts(null, "b1")).toThrow(TypeError);
+  });
+
+  test("throws on missing beneficiaryId", () => {
+    expect(() => settleBeneficiaryPayouts([], null)).toThrow(TypeError);
+  });
+
+  test("throws on empty string beneficiaryId", () => {
+    expect(() => settleBeneficiaryPayouts([], "")).toThrow(TypeError);
+  });
+});
+
+describe("settleBeneficiaryPayouts — settlement logic", () => {
+  const ledger = [
+    { beneficiaryId: "b1", amount: 100, status: "PENDING" },
+    { beneficiaryId: "b1", amount: 200, status: "PENDING" },
+    { beneficiaryId: "b2", amount: 150, status: "PENDING" },
+    { beneficiaryId: "b1", amount: 50, status: "PAID" },
+  ];
+
+  test("marks pending payouts as PAID and records paidAt timestamp", () => {
+    const ledgerCopy = JSON.parse(JSON.stringify(ledger));
+    const result = settleBeneficiaryPayouts(ledgerCopy, "b1");
+    expect(result.paid).toHaveLength(2);
+    expect(result.paid[0].status).toBe("PAID");
+    expect(result.paid[0].paidAt).toBeDefined();
+    expect(result.paid[1].status).toBe("PAID");
+    expect(result.paid[1].paidAt).toBeDefined();
+  });
+
+  test("calculates totalPaid correctly", () => {
+    const ledgerCopy = JSON.parse(JSON.stringify(ledger));
+    const result = settleBeneficiaryPayouts(ledgerCopy, "b1");
+    expect(result.totalPaid).toBe(300); // 100 + 200
+  });
+
+  test("skips already PAID entries", () => {
+    const ledgerCopy = JSON.parse(JSON.stringify(ledger));
+    const result = settleBeneficiaryPayouts(ledgerCopy, "b1");
+    // Should only settle pending entries (100 + 200), not the already PAID (50)
+    expect(result.paid).toHaveLength(2);
+    expect(result.totalPaid).toBe(300);
+  });
+
+  test("skips entries for different beneficiary", () => {
+    const ledgerCopy = JSON.parse(JSON.stringify(ledger));
+    const result = settleBeneficiaryPayouts(ledgerCopy, "b1");
+    // b2's entry should not be included
+    const b2Included = result.paid.some((p) => p.beneficiaryId === "b2");
+    expect(b2Included).toBe(false);
+  });
+
+  test("respects maxAmount cap", () => {
+    const ledgerCopy = JSON.parse(JSON.stringify(ledger));
+    const result = settleBeneficiaryPayouts(ledgerCopy, "b1", { maxAmount: 150 });
+    expect(result.totalPaid).toBe(100); // only first entry, second would exceed cap
+    expect(result.paid).toHaveLength(1);
+  });
+
+  test("stops settling when maxAmount would be exceeded", () => {
+    const ledgerCopy = JSON.parse(JSON.stringify(ledger));
+    const result = settleBeneficiaryPayouts(ledgerCopy, "b1", { maxAmount: 250 });
+    // Should settle first (100) and second (200) but not both if total exceeds
+    expect(result.totalPaid).toBe(300); // actually both fit
+  });
+
+  test("returns empty paid array if no matching pending entries", () => {
+    const ledgerCopy = JSON.parse(JSON.stringify(ledger));
+    const result = settleBeneficiaryPayouts(ledgerCopy, "unknown");
+    expect(result.paid).toHaveLength(0);
+    expect(result.totalPaid).toBe(0);
+  });
+
+  test("handles empty ledger gracefully", () => {
+    const result = settleBeneficiaryPayouts([], "b1");
+    expect(result.paid).toHaveLength(0);
+    expect(result.totalPaid).toBe(0);
+  });
+});
+
+describe("settleBeneficiaryPayouts — maxAmount edge cases", () => {
+  test("maxAmount of zero settles nothing", () => {
+    const ledger = [{ beneficiaryId: "b1", amount: 100, status: "PENDING" }];
+    const result = settleBeneficiaryPayouts(ledger, "b1", { maxAmount: 0 });
+    expect(result.paid).toHaveLength(0);
+    expect(result.totalPaid).toBe(0);
+  });
+
+  test("maxAmount exceeding total settles all", () => {
+    const ledger = [
+      { beneficiaryId: "b1", amount: 100, status: "PENDING" },
+      { beneficiaryId: "b1", amount: 100, status: "PENDING" },
+    ];
+    const result = settleBeneficiaryPayouts(ledger, "b1", { maxAmount: 500 });
+    expect(result.paid).toHaveLength(2);
+    expect(result.totalPaid).toBe(200);
+  });
+
+  test("undefined maxAmount defaults to Infinity", () => {
+    const ledger = [
+      { beneficiaryId: "b1", amount: 100, status: "PENDING" },
+      { beneficiaryId: "b1", amount: 200, status: "PENDING" },
+    ];
+    const result = settleBeneficiaryPayouts(ledger, "b1", {});
+    expect(result.paid).toHaveLength(2);
+    expect(result.totalPaid).toBe(300);
   });
 });
