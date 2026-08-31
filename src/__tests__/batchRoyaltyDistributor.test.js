@@ -2,6 +2,7 @@ const {
   calculateSwapRoyalty,
   distributeBatchRoyalties,
   settleBeneficiaryPayouts,
+  recordBatchToLedger,
   validateRoyaltyConfig,
   MAX_ROYALTY_RATE_BPS,
   MAX_BATCH_SIZE,
@@ -407,5 +408,136 @@ describe("settleBeneficiaryPayouts — maxAmount edge cases", () => {
     const result = settleBeneficiaryPayouts(ledger, "b1", {});
     expect(result.paid).toHaveLength(2);
     expect(result.totalPaid).toBe(300);
+  });
+});
+
+// ── #918: recordBatchToLedger ──────────────────────────────────────────────
+
+describe("recordBatchToLedger — validation", () => {
+  test("throws on non-array ledger", () => {
+    expect(() => recordBatchToLedger(null, [])).toThrow(TypeError);
+  });
+
+  test("throws on non-array distributions", () => {
+    expect(() => recordBatchToLedger([], null)).toThrow(TypeError);
+  });
+});
+
+describe("recordBatchToLedger — recording", () => {
+  const distributions = [
+    {
+      swapId: "s1",
+      assetId: "asset-1",
+      payouts: [
+        { beneficiaryId: "b1", amount: 100 },
+        { beneficiaryId: "b2", amount: 50 },
+      ],
+    },
+    {
+      swapId: "s2",
+      assetId: "asset-2",
+      payouts: [{ beneficiaryId: "b3", amount: 200 }],
+    },
+  ];
+
+  test("creates entries for all payouts", () => {
+    const ledger = [];
+    const entries = recordBatchToLedger(ledger, distributions);
+    expect(entries).toHaveLength(3); // 2 + 1 payouts
+  });
+
+  test("adds entries to existing ledger", () => {
+    const ledger = [{ existing: true }];
+    const entries = recordBatchToLedger(ledger, distributions);
+    expect(ledger).toHaveLength(4); // 1 existing + 3 new
+    expect(ledger[0].existing).toBe(true);
+    expect(entries).toHaveLength(3);
+  });
+
+  test("entry has correct structure", () => {
+    const ledger = [];
+    const entries = recordBatchToLedger(ledger, distributions);
+    const entry = entries[0];
+    expect(entry.entryId).toBeDefined();
+    expect(entry.swapId).toBe("s1");
+    expect(entry.assetId).toBe("asset-1");
+    expect(entry.beneficiaryId).toBe("b1");
+    expect(entry.amount).toBe(100);
+    expect(entry.status).toBe("PENDING");
+    expect(entry.createdAt).toBeDefined();
+  });
+
+  test("entryId is unique per payout", () => {
+    const ledger = [];
+    const entries = recordBatchToLedger(ledger, distributions);
+    const ids = entries.map((e) => e.entryId);
+    expect(new Set(ids).size).toBe(ids.length); // all unique
+  });
+
+  test("entryId includes swapId, assetId, and index", () => {
+    const ledger = [];
+    const entries = recordBatchToLedger(ledger, distributions);
+    expect(entries[0].entryId).toMatch(/s1-asset-1-\d+/);
+    expect(entries[1].entryId).toMatch(/s1-asset-1-\d+/);
+    expect(entries[2].entryId).toMatch(/s2-asset-2-\d+/);
+  });
+
+  test("createdAt is ISO timestamp", () => {
+    const ledger = [];
+    const entries = recordBatchToLedger(ledger, distributions);
+    entries.forEach((entry) => {
+      expect(entry.createdAt).toMatch(
+        /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/
+      );
+    });
+  });
+
+  test("all entries have PENDING status", () => {
+    const ledger = [];
+    const entries = recordBatchToLedger(ledger, distributions);
+    entries.forEach((entry) => {
+      expect(entry.status).toBe("PENDING");
+    });
+  });
+
+  test("returns the created entries separately", () => {
+    const ledger = [];
+    const entries = recordBatchToLedger(ledger, distributions);
+    expect(entries).toEqual(ledger.slice(0, 3)); // first 3 entries
+  });
+
+  test("handles empty distributions", () => {
+    const ledger = [{ existing: true }];
+    const entries = recordBatchToLedger(ledger, []);
+    expect(entries).toHaveLength(0);
+    expect(ledger).toHaveLength(1); // only existing entry
+  });
+
+  test("handles distribution with no payouts", () => {
+    const ledger = [];
+    const dists = [
+      { swapId: "s1", assetId: "a1", payouts: [] },
+      { swapId: "s2", assetId: "a2", payouts: [{ beneficiaryId: "b1", amount: 50 }] },
+    ];
+    const entries = recordBatchToLedger(ledger, dists);
+    expect(entries).toHaveLength(1); // only one payout
+  });
+});
+
+describe("recordBatchToLedger — timestamp consistency", () => {
+  test("all entries from same batch have same createdAt", () => {
+    const distributions = [
+      {
+        swapId: "s1",
+        assetId: "a1",
+        payouts: [
+          { beneficiaryId: "b1", amount: 100 },
+          { beneficiaryId: "b2", amount: 100 },
+        ],
+      },
+    ];
+    const ledger = [];
+    const entries = recordBatchToLedger(ledger, distributions);
+    expect(entries[0].createdAt).toBe(entries[1].createdAt);
   });
 });
