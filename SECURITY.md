@@ -150,6 +150,83 @@ For complete threat analysis, refer to:
 - `SECURITY.md` for API server audit log procedures
 - The PR that re-enables the test must include security sign-off notes
 
+## Secret Scanning & Incident Response
+
+### Automated Secret Detection
+
+Every commit is scanned automatically in CI/CD using **Gitleaks** to detect:
+
+- API keys, JWT secrets, and authentication tokens
+- Stellar keypairs and private keys
+- Database connection strings with embedded credentials
+- HMAC keys and other cryptographic material
+
+Configuration is defined in `.gitleaks.toml` with patterns for:
+- Stellar keypairs (S-prefixed 56-character strings)
+- JWT secrets and bearer tokens
+- Generic API keys (api_key, apikey patterns)
+- Database passwords in connection strings
+- HMAC signing keys
+
+**Scan Coverage**:
+- **Full history**: On initial CI setup or when requested, the entire git history is scanned
+- **PR diffs**: Every pull request scans only the changed lines against baseline
+- **Allowlist**: Common false positives (example_, test_, placeholder) are excluded
+
+### Incident Response: If a Secret is Found
+
+If a secret is detected in the commit history (either pre-emptively in CI or discovered post-facto):
+
+1. **Immediate Actions**:
+   - If the secret is a **Stellar keypair or API credential**: rotate the key immediately on the affected service (Stellar account, API server, database)
+   - If the secret is a **test/example key**: verify it is only for testing; verify the file is in `.gitignore` and will not be committed
+   - Open a **private security issue** (not public) to coordinate response
+
+2. **Remediation**:
+   - If the commit is on `main` or already published: use `git filter-repo` or `BFG Repo-Cleaner` to remove the secret from history
+   - Re-write the git history to remove the commit containing the secret
+   - Force-push the cleaned history (with security team approval)
+   - Notify users and stakeholders of the exposure window
+
+3. **Audit & Documentation**:
+   - Log the incident in the **security advisory** section: who discovered it, when, what was exposed, and the remediation steps
+   - Update threat model or security posture documentation if the incident reveals a new risk
+   - Review `.gitleaks.toml` configuration to ensure the secret pattern is detected by the scanner
+
+4. **Prevention**:
+   - Add the secret pattern to `.gitleaks.toml` if it is not already covered
+   - Ensure all developers run Gitleaks locally before committing (`gitleaks detect --source . -v`)
+   - Add a pre-commit hook to reject commits with detected secrets (see [Pre-Commit Hooks](#pre-commit-hooks))
+
+### Running Gitleaks Locally
+
+Before committing, scan your changes:
+
+```bash
+gitleaks detect --source . -v
+```
+
+To scan the full repository history:
+
+```bash
+gitleaks detect --source . --verbose
+```
+
+To ignore a specific secret (use sparingly):
+
+```bash
+echo "allowlist: [<SECRET_LINE>]" >> .gitleaks.toml
+```
+
+### Pre-Commit Hooks
+
+Add this to `.git/hooks/pre-commit` to block commits with secrets:
+
+```bash
+#!/bin/bash
+gitleaks detect --staged -v --exit-code 1
+```
+
 ## Automated Security Scanning
 
 Every push and pull request is scanned automatically in CI/CD:
