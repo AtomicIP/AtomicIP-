@@ -70,4 +70,6 @@ pub enum ContractError {
     // #354: Insurance reservation errors
     InsuranceNotReserved                  = 66,
     InsufficientInsuranceReserve          = 67,
+    // #906: Treasury address validation
+    InvalidTreasuryAddress                = 68,
 }

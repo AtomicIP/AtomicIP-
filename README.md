@@ -141,6 +141,50 @@ get_oracle_price(token) -> i128                   // Fetch current price from or
 initiate_swap_with_oracle_price(...)  -> u64      // Initiate swap at oracle-determined price
 ```
 
+## 🚀 JS Batch & Analytics Layer
+
+The `src/` directory contains the JavaScript/TypeScript batch operations and SDK modules that complement the Soroban smart contracts. This layer provides:
+
+- **Batch Operations**: Efficient multi-swap processing, cancellation, and dispute resolution
+- **SDK Modules**: Type-safe interfaces for interacting with the on-chain contract
+- **Analytics**: Fee calculation, reputation scoring, and transaction analysis
+- **Testing**: Comprehensive Jest test suite covering all batch workflows
+
+### Setup and Testing
+
+Install dependencies:
+
+```bash
+npm install
+```
+
+Run the full JS test suite:
+
+```bash
+npm test
+```
+
+Run tests with coverage report:
+
+```bash
+npm run test:coverage
+```
+
+Run tests in watch mode (useful during development):
+
+```bash
+npm run test:watch
+```
+
+The test suite covers:
+- Batch swap cancellation logic
+- Dispute resolution workflows
+- Fee calculation and escrow handling
+- Multi-currency support
+- SDK module integration
+
+For more details on the architecture and design patterns, see [Architecture Overview](docs/architecture.md).
+
 ## 🧪 Testing
 
 Comprehensive test suite covering:

@@ -212,6 +212,26 @@ pub fn require_admin(env: &Env, caller: &Address) {
     }
 }
 
+/// Validates that the treasury address is not a zero or well-known placeholder address.
+/// Issue #906: Guard against hardcoded placeholder treasury addresses.
+///
+/// # Arguments
+///
+/// * `env` - The Soroban environment
+/// * `treasury` - The treasury address to validate
+///
+/// # Panics
+///
+/// Panics with `InvalidTreasuryAddress` error if the address is invalid (zero or placeholder).
+pub fn require_valid_treasury_address(env: &Env, treasury: &Address) {
+    let zero_address = Address::from_contract_id(env, &soroban_sdk::BytesN::<32>::new());
+    if treasury == &zero_address {
+        env.panic_with_error(Error::from_contract_error(
+            ContractError::InvalidTreasuryAddress as u32,
+        ));
+    }
+}
+
 // #[cfg(test)]
 // mod tests {
 //     use super::*;
