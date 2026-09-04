@@ -79,6 +79,15 @@ function scoreAssetTypeMatch(buyer, seller) {
     : 0;
 }
 
+/**
+ * Compute great-circle distance between two lat/lon coordinates using the Haversine formula.
+ *
+ * @param {number} lat1
+ * @param {number} lon1
+ * @param {number} lat2
+ * @param {number} lon2
+ * @returns {number} distance in kilometres
+ */
 function haversineKm(lat1, lon1, lat2, lon2) {
   const R    = 6371;
   const dLat = ((lat2 - lat1) * Math.PI) / 180;
@@ -110,6 +119,13 @@ function scoreLocation(buyer, seller) {
   return Math.round(WEIGHTS.LOCATION * 0.5);
 }
 
+/**
+ * Compute the composite match score (0–100) between a buyer and a seller listing.
+ *
+ * @param {object} buyer   - buyer listing with price/category/condition/assetType/location fields
+ * @param {object} seller  - seller listing with the same shape
+ * @returns {{ score: number, breakdown: object }}
+ */
 function scoreMatch(buyer, seller) {
   const breakdown = {
     price:     scorePriceOverlap(buyer, seller),
@@ -122,6 +138,14 @@ function scoreMatch(buyer, seller) {
   return { score, breakdown };
 }
 
+/**
+ * Find and rank all sellers that are a good match for a single buyer listing.
+ *
+ * @param {object}   buyer
+ * @param {object[]} sellers
+ * @param {{ minScore?: number, maxResults?: number, now?: number }} [options]
+ * @returns {Array<{ sellerId, sellerListing, score, breakdown, matchedAt }>}
+ */
 function findMatchesForBuyer(buyer, sellers, options = {}) {
   validateListing(buyer, "buyer");
   if (!Array.isArray(sellers)) throw new TypeError("sellers must be an array.");
@@ -144,6 +168,14 @@ function findMatchesForBuyer(buyer, sellers, options = {}) {
     .slice(0, maxResults);
 }
 
+/**
+ * Match a batch of buyers against a pool of sellers.
+ *
+ * @param {object[]} buyers
+ * @param {object[]} sellers
+ * @param {{ minScore?: number, maxResults?: number, now?: number }} [options]
+ * @returns {{ totalBuyers: number, totalSellers: number, results: Array<{ buyerId, matches }> }}
+ */
 function batchMatch(buyers, sellers, options = {}) {
   if (!Array.isArray(buyers)  || buyers.length  === 0) throw new TypeError("buyers must be a non-empty array.");
   if (!Array.isArray(sellers) || sellers.length === 0) throw new TypeError("sellers must be a non-empty array.");

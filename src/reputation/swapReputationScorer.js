@@ -49,6 +49,16 @@ const RECENCY_HALF_LIFE  = 90;
 const MIN_SWAPS_FOR_FULL = 10;
 
 function recencyWeight(eventDateMs, nowMs = Date.now()) {
+/**
+ * Compute an exponential recency weight for an event.
+ * Events from `RECENCY_HALF_LIFE` days ago receive weight 0.5; older events
+ * receive less weight.
+ *
+ * @param {number} eventDateMs  - Unix timestamp (ms) of the event
+ * @param {number} [nowMs]      - reference time (default: Date.now())
+ * @returns {number} weight in (0, 1]
+ */
+function recencyWeight(eventDateMs, nowMs = Date.now()) {
   const agedays = (nowMs - eventDateMs) / 86_400_000;
   return Math.exp((-Math.LN2 * agedays) / RECENCY_HALF_LIFE);
 }
@@ -103,6 +113,20 @@ function cancellationPenalty(history, nowMs = Date.now()) {
   return -Math.round(Math.min(weightedCancels / 5, 1) * 150);
 }
 
+/**
+ * Map a numeric reputation score to a named tier.
+ *
+ * | Score   | Tier     |
+ * |---------|----------|
+ * | ≥ 850   | platinum |
+ * | ≥ 700   | gold     |
+ * | ≥ 550   | silver   |
+ * | ≥ 400   | bronze   |
+ * | < 400   | new      |
+ *
+ * @param {number} score  - reputation score (0–1000)
+ * @returns {"platinum"|"gold"|"silver"|"bronze"|"new"}
+ */
 function scoreTier(score) {
   if (score >= 850) return "platinum";
   if (score >= 700) return "gold";
@@ -146,7 +170,12 @@ function calculateReputationScore(input, nowMs = Date.now()) {
 }
 
 /**
- * Batch score multiple participants, sorted by score descending.
+ * Calculate reputation scores for multiple participants and return them
+ * sorted by score descending.
+ *
+ * @param {Array<{ participantId: string, history: object[], accountCreatedAt?: string }>} inputs
+ * @param {number} [nowMs]  - reference time (default: Date.now())
+ * @returns {Array<{ participantId, score, tier, breakdown, swapCount, dampened }>}
  */
 function batchCalculateReputation(inputs, nowMs = Date.now()) {
   if (!Array.isArray(inputs) || inputs.length === 0)
@@ -242,8 +271,12 @@ function persistReputationScore(input, store, nowMs = Date.now()) {
 }
 
 /**
- * Look up a previously persisted reputation score. Returns `null` if the
- * participant has no persisted record.
+ * Look up a previously persisted reputation score.
+ *
+ * @param {string} participantId
+ * @param {{ get: (id: string) => object|null }} store  - a `ReputationStore` implementation
+ * @returns {object|null} the stored reputation record, or `null` if the
+ *   participant has no persisted record yet.
  */
 function getPersistedReputationScore(participantId, store) {
   if (!store || typeof store.get !== "function")

@@ -95,6 +95,17 @@ Latest testnet deployment addresses are published in GitHub Actions deployment s
 - [API Reference](docs/api-reference.md)
 - [Security Policy](SECURITY.md)
 
+## 📝 JS Type Annotations: JSDoc vs TypeScript Migration
+
+The `src/` JavaScript modules use **JSDoc annotations** (`@param`, `@returns`, `@typedef`) rather than a full TypeScript migration. This was a deliberate choice (#883):
+
+- **No build step required.** JSDoc works with the existing ESM + Jest setup without adding `tsc`, `ts-jest`, or a compilation stage.
+- **IDE intelligence.** VS Code and WebStorm resolve JSDoc types for autocompletion, go-to-definition, and inline docs — the primary tooling benefit of TypeScript without the migration cost.
+- **API-server integration.** Rust integrators can read the `@param`/`@returns` shapes directly from the source to understand the expected JSON structures, without needing to run a TypeScript compiler.
+- **Low friction for contributors.** Adding JSDoc to existing JS files is a one-file change with no dependency on type infrastructure; a TypeScript migration would require per-file changes across the entire `src/` tree plus CI changes.
+
+**Future migration path:** if the project adopts TypeScript, the existing JSDoc annotations act as a specification that can be mechanically converted with `tsc --allowJs --declaration --emitDeclarationOnly`. The decision to migrate fully to TypeScript should be tracked as a separate issue and is not blocked by the current JSDoc coverage.
+
 ## 📦 Release Notes and Changelog
 
 Release notes are generated automatically from commit messages and PR metadata. Push a tag in the format `v*` (e.g., `v1.2.0`) to trigger the release workflow.

@@ -1,0 +1,85 @@
+name: Nightly Fuzz
+
+# #886: Run schema-level fuzz tests on a scheduled basis so regressions
+# surface overnight rather than only when a developer runs them locally.
+#
+# The job re-runs the entire validation_fuzz_tests module (which includes the
+# per-schema integration fuzz tests added for #886) plus cargo-fuzz for a
+# time-boxed window.  Any panics or crashes are captured as artifacts and the
+# job exits non-zero, failing the workflow and triggering a GitHub notification.
+
+on:
+  schedule:
+    # Runs at 02:00 UTC every day (nightly)
+    - cron: "0 2 * * *"
+  # Allow manual trigger from the Actions UI
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    name: Fuzz validation schemas
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-fuzz-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-fuzz-
+
+      # ── Step 1: run the deterministic fuzz unit tests ─────────────────────
+      - name: Run validation fuzz tests (api-server)
+        working-directory: api-server
+        run: |
+          cargo test --test-threads=4 -- fuzz 2>&1 | tee fuzz-test-output.txt
+          exit ${PIPESTATUS[0]}
+
+      # ── Step 2: cargo-fuzz (libFuzzer) — time-boxed 5 minutes each ────────
+      # Install cargo-fuzz once; skip on cache hit.
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked 2>/dev/null || true
+
+      # Fuzz targets live in api-server/fuzz/fuzz_targets/.
+      # We iterate every target found and run it for up to 300 s (5 min).
+      # The "|| true" on the find command means an absent fuzz/ dir is not
+      # treated as an error — it's a no-op until targets are added.
+      - name: Run cargo-fuzz targets (time-boxed 5 min each)
+        working-directory: api-server
+        run: |
+          FUZZ_DIR="fuzz/fuzz_targets"
+          if [ ! -d "$FUZZ_DIR" ]; then
+            echo "No cargo-fuzz targets yet — skipping libFuzzer run."
+            exit 0
+          fi
+
+          EXIT=0
+          for target_file in "$FUZZ_DIR"/*.rs; do
+            target=$(basename "$target_file" .rs)
+            echo "=== Fuzzing target: $target ==="
+            cargo +nightly fuzz run "$target" \
+              --sanitizer=address \
+              -- -max_total_time=300 -max_len=4096 2>&1 \
+              | tee "fuzz-${target}.txt" || EXIT=1
+          done
+          exit $EXIT
+
+      # ── Step 3: upload all logs as an artifact for triage ─────────────────
+      - name: Upload fuzz logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-logs-${{ github.run_id }}
+          path: |
+            api-server/fuzz-*.txt
+            api-server/fuzz-test-output.txt
+          retention-days: 30

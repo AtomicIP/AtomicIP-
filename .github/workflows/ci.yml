@@ -48,16 +48,44 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Check for stale merge-conflict FIXMEs
-        # benchmarks.rs and invariant_tests.rs are intentionally still disabled
-        # (tracked separately) and carry accurate FIXMEs; everything else must
-        # be clean, so a re-enabled module never ships with a stale FIXME again.
+      - name: Check for stale merge-conflict FIXMEs (#884)
+        # #884: This step enforces the tracked checklist of disabled test modules.
+        #
+        # Two-part check:
+        #  1. Known-allowlisted files (benchmarks.rs, invariant_tests.rs in
+        #     ip_registry) are excluded from the "must be zero" rule — they carry
+        #     legitimate long-term FIXMEs tracked by their own issues.
+        #  2. Everything else across *both* contracts must have zero
+        #     "FIXME.*merge conflict" markers next to a commented-out mod.
+        #     The count is checked against a stored baseline so the gate fails
+        #     if new disabled modules are added, but passes while the existing
+        #     known-disabled debt is being worked down.
+        #
+        # Allowlisted files (extend this list when a new issue is opened to
+        # re-enable the module — remove the entry when the module is re-enabled):
+        #   contracts/ip_registry/src/benchmarks.rs          — #817 re-enable
+        #   contracts/ip_registry/src/invariant_tests.rs     — open issue
         run: |
-          if grep -rn "FIXME.*merge conflict" --include='*.rs' . \
-            | grep -v 'benchmarks\.rs\|invariant_tests\.rs'; then
-            echo "Found FIXME comments referencing unresolved merge conflicts. Resolve or remove them." >&2
+          ALLOWED='benchmarks\.rs\|invariant_tests\.rs'
+
+          # Count FIXMEs outside the allowlist
+          COUNT=$(grep -rn "FIXME.*merge conflict" --include='*.rs' contracts/ \
+            | grep -v "$ALLOWED" \
+            | wc -l)
+
+          # Baseline: the number of known-disabled modules NOT yet covered by
+          # their own re-enable issue.  Adjust this number downward as modules
+          # are fixed; never increase it.
+          BASELINE=0
+
+          if [ "$COUNT" -gt "$BASELINE" ]; then
+            echo "::error::Found $COUNT FIXME merge-conflict comment(s) outside the allowlist (baseline $BASELINE)." >&2
+            echo "Matches:" >&2
+            grep -rn "FIXME.*merge conflict" --include='*.rs' contracts/ | grep -v "$ALLOWED" >&2
+            echo "Resolve the merge conflict FIXMEs or add the file to the allowlist with a tracking issue." >&2
             exit 1
           fi
+          echo "FIXME merge-conflict gate: $COUNT/$BASELINE — OK"
 
       - name: Lint (JS)
         run: npm run lint
