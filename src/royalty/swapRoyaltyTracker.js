@@ -15,6 +15,19 @@ const BPS_DENOM            = 10_000;
 const MAX_BENEFICIARIES    = 10;
 
 function validateRoyaltyConfig(config) {
+/**
+ * Validate a royalty configuration object. Throws if invalid.
+ *
+ * @param {object} config
+ * @param {string}   config.assetId        - the IP asset ID
+ * @param {number}   config.rateBps        - royalty rate in basis points (0–3000)
+ * @param {Array<{ id: string, shareBps: number }>} config.beneficiaries
+ *   - royalty recipients; shares must sum to exactly 10 000 bps
+ * @returns {void}
+ * @throws {TypeError}  if required fields are missing or of wrong type
+ * @throws {RangeError} if rateBps or beneficiary share totals are out of range
+ */
+function validateRoyaltyConfig(config) {
   if (!config || typeof config !== "object")
     throw new TypeError("royaltyConfig must be an object.");
   if (!config.assetId)
@@ -125,6 +138,14 @@ function processPayouts(ledger, beneficiaryId, options = {}) {
 
 /**
  * Query pending royalties owed to a beneficiary.
+ */
+function getPendingRoyalties(ledger, beneficiaryId) {
+/**
+ * Return all pending (unpaid) royalty ledger entries for a given beneficiary.
+ *
+ * @param {object[]} ledger        - royalty ledger (array of entries)
+ * @param {string}   beneficiaryId
+ * @returns {{ beneficiaryId: string, entries: object[], total: number }}
  */
 function getPendingRoyalties(ledger, beneficiaryId) {
   const entries = ledger.filter(

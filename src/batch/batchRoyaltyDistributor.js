@@ -48,9 +48,9 @@ function validateSwapEntry(swap, index) {
  * Calculate royalty payouts for a single swap.
  *
  * @param {string|number} swapId
- * @param {number}        salePrice
- * @param {object}        royaltyConfig  { assetId, rateBps, beneficiaries: [{ id, shareBps }] }
- * @returns {object}
+ * @param {number} salePrice  - final sale price of the swap
+ * @param {object} royaltyConfig  - { assetId, rateBps, beneficiaries: [{ id, shareBps }] }
+ * @returns {{ swapId, assetId, salePrice, totalRoyalty, rateBps, payouts }}
  */
 function calculateSwapRoyalty(swapId, salePrice, royaltyConfig) {
   const totalRoyalty = Math.floor((salePrice * royaltyConfig.rateBps) / BPS_DENOM);

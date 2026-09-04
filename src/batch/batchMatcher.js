@@ -133,6 +133,31 @@ const ALGORITHM_MAP = {
   [MATCHING_ALGORITHMS.PRICE_TIME_PRIORITY]: priceTimePriorityMatch,
 };
 
+/**
+ * Match buy and sell orders using the specified algorithm (default: price-time priority).
+ *
+ * @param {Array<BuyOrder>} buyOrders
+ * @param {Array<SellOrder>} sellOrders
+ * @param {{ algorithm?: string }} [options]
+ * @returns {MatchResult}
+ *
+ * @typedef {{ orderId: string|number, party: string, price: number, quantity: number, timestamp?: number, ipId?: number }} BuyOrder
+ * @typedef {{ orderId: string|number, party: string, price: number, quantity: number, timestamp?: number, ipId?: number }} SellOrder
+ *
+ * @typedef {Object} MatchResult
+ * @property {number}   batchSize
+ * @property {number}   buyOrderCount
+ * @property {number}   sellOrderCount
+ * @property {number}   matchedCount
+ * @property {number}   unmatchedBuyCount
+ * @property {number}   unmatchedSellCount
+ * @property {number}   totalMatchedQuantity
+ * @property {number}   totalMatchedValue
+ * @property {object[]} matches
+ * @property {object[]} unmatchedBuys
+ * @property {object[]} unmatchedSells
+ * @property {object[]} errors
+ */
 function matchOrders(buyOrders, sellOrders, options = {}) {
   validateBatch(buyOrders, sellOrders);
 
