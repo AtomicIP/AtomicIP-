@@ -832,3 +832,109 @@ if (!submittable) {
   // re-match instead of submitting against `best`
 }
 ```
+
+---
+
+## #879: Canonical Royalty Formula
+
+Both `src/royalty/swapRoyaltyTracker.js` and `src/batch/batchRoyaltyDistributor.js` delegate
+royalty arithmetic to the shared module `src/royalty/royaltyCalculation.js`, which defines
+the single canonical formula for all royalty calculations.
+
+### Formula
+
+```
+BPS_DENOM           = 10 000          (one basis point = 0.01%)
+MAX_ROYALTY_RATE    = 3 000 bps       (30% ceiling)
+
+totalRoyalty        = floor(salePrice × rateBps / BPS_DENOM)
+amount_i            = floor(totalRoyalty × shareBps_i / BPS_DENOM)   for each beneficiary i
+dust                = totalRoyalty − Σ amount_i                       (0 or 1, due to floor)
+payouts[0].amount  += dust                                             (assigned to first beneficiary)
+sellerProceeds      = salePrice − totalRoyalty
+```
+
+### Invariants
+
+- `Σ beneficiary.shareBps === BPS_DENOM` (shares must sum to 10 000)
+- `Σ payouts[i].amount === totalRoyalty` (dust assigned to first beneficiary ensures exact match)
+- `totalRoyalty + sellerProceeds === salePrice`
+- `totalRoyalty ≥ 0` (rateBps = 0 is valid — no royalty)
+
+### Example
+
+| Input | Value |
+|-------|-------|
+| `salePrice` | 12 345 |
+| `rateBps` | 1 000 (10%) |
+| `totalRoyalty` | `floor(12 345 × 1000 / 10 000)` = **1 234** |
+| Beneficiary A (60%) | `floor(1234 × 6000 / 10 000)` = 740 + 1 dust = **741** |
+| Beneficiary B (40%) | `floor(1234 × 4000 / 10 000)` = **493** |
+| `sellerProceeds` | 12 345 − 1 234 = **11 111** |
+
+### Consistency guarantee
+
+`royaltyConsistency.test.js` asserts that both modules produce identical `totalRoyalty`,
+`sellerProceeds`, and per-beneficiary `amount` values for the same inputs across a wide
+range of sale prices, rates, and beneficiary splits. This test runs as part of the standard
+`npm test` suite.
+
+---
+
+## #881: Encryption Wire Format and Key Rotation Compatibility
+
+### JS encryption wire format (`src/batch/batchEncryptor.js`)
+
+Every blob produced by `encryptBatchSwaps` uses the following byte layout:
+
+```
+Offset   Length   Content
+──────   ──────   ──────────────────────────────────────────────
+0        12       IV (random 96-bit nonce, generated per call)
+12       16       AES-GCM authentication tag (128-bit)
+28       N        Ciphertext (same byte length as plaintext)
+──────   ──────   ──────────────────────────────────────────────
+Total    28 + N
+```
+
+- **Algorithm**: AES-256-GCM (Node `crypto` built-in)
+- **Key length**: exactly 32 bytes (256-bit)
+- **IV**: fresh random 12 bytes per encryption call (never reused)
+- **Auth-tag**: 16-byte GCM tag; decryption fails automatically on any tampering
+
+### Contract-side storage (`DataKey::EncryptionKeyRotation(ip_id)`)
+
+The `rotate_commitment_key` function in `contracts/ip_registry/src/lib.rs` maintains a
+rotation history for each IP:
+
+```
+DataKey::EncryptionKeyRotation(ip_id)  →  Vec<BytesN<32>>
+```
+
+Each element is a 32-byte commitment hash (`BytesN<32>`) retired by a prior rotation.
+The commitment is derived as:
+
+```
+commitment = SHA-256(secret ∥ blinding_factor)
+```
+
+where both `secret` and `blinding_factor` are `BytesN<32>` (32 bytes each).
+
+### Cross-layer compatibility
+
+| Property | JS layer | Contract layer |
+|----------|----------|----------------|
+| Key / secret length | 32 bytes (`Buffer`) | `BytesN<32>` |
+| Commitment derivation | `SHA-256(secret ∥ blinding_factor)` | same |
+| Rotation history element | 32-byte hex string | `BytesN<32>` |
+| Key isolation | wrong key → GCM auth failure | unique commitment enforced |
+
+The IP owner's 32-byte **secret** doubles as both the Pedersen commitment input and the
+AES-256 encryption key. On rotation: the old commitment hash is appended to
+`EncryptionKeyRotation` history, the record's `commitment_hash` is updated to the new
+value, and the owner re-encrypts the IP payload with the new secret. Old ciphertexts
+remain decryptable with the old key (held by any authorised buyer who purchased before
+the rotation).
+
+`encryptionKeyRotationCompatibility.test.js` verifies this end-to-end and runs as part
+of the standard `npm test` suite.
