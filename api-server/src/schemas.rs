@@ -324,3 +324,42 @@ pub struct ExecuteBatchSwapsResponse {
     /// Execution mode (atomic or partial)
     pub atomic: bool,
 }
+
+/// #984: Request to enable 2FA for a user
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct Enable2faRequest {
+    pub user_id: String,
+}
+
+/// #984: Response when 2FA is enabled (returns secret and backup codes)
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct Enable2faResponse {
+    /// Base32-encoded TOTP secret for QR code
+    pub secret: String,
+    /// QR code URI for authenticator apps
+    pub qr_code_uri: String,
+    /// List of backup codes for account recovery
+    pub backup_codes: Vec<String>,
+}
+
+/// #984: Request to verify 2FA code
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct Verify2faRequest {
+    pub user_id: String,
+    /// 6-digit TOTP code from authenticator app
+    pub totp_code: String,
+}
+
+/// #984: Response indicating successful 2FA verification
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct Verify2faResponse {
+    pub success: bool,
+    pub message: String,
+}
+
+/// #984: Request to use backup code for account recovery
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct UseBackupCodeRequest {
+    pub user_id: String,
+    pub backup_code: String,
+}

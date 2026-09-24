@@ -874,3 +874,227 @@ pub async fn execute_batch_swaps(
         atomic: body.atomic,
     }))
 }
+
+// ── #984: Two-Factor Authentication ────────────────────────────────────────
+
+static TWO_FACTOR_STORE: once_cell::sync::Lazy<crate::auth_2fa::TwoFactorStore> =
+    once_cell::sync::Lazy::new(crate::auth_2fa::TwoFactorStore::new);
+
+/// #984: Enable 2FA for a user
+/// Returns TOTP secret for QR code and backup codes for account recovery
+#[utoipa::path(
+    post,
+    path = "/auth/2fa/enable",
+    tag = "Authentication",
+    request_body = Enable2faRequest,
+    responses(
+        (status = 200, description = "2FA enabled successfully, returns secret and backup codes", body = Enable2faResponse),
+        (status = 400, description = "Invalid user ID", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse),
+    )
+)]
+#[instrument(skip(body))]
+pub async fn enable_2fa(
+    Json(body): Json<Enable2faRequest>,
+) -> Result<Json<Enable2faResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if body.user_id.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "user_id must not be empty".to_string(),
+            }),
+        ));
+    }
+
+    // Generate TOTP secret
+    let secret = crate::auth_2fa::generate_totp_secret();
+    let backup_codes = crate::auth_2fa::generate_backup_codes(8);
+    let qr_code_uri = crate::auth_2fa::generate_qr_code_uri(&body.user_id, &secret, "AtomicPatent");
+
+    // Store TOTP secret (not verified until verify_2fa is called)
+    let config = crate::auth_2fa::TwoFactorConfig {
+        user_id: body.user_id.clone(),
+        totp: Some(crate::auth_2fa::TotpSecret {
+            secret: secret.clone(),
+            enabled_at: chrono::Utc::now().timestamp(),
+            verified: false,
+        }),
+        backup_codes: backup_codes
+            .iter()
+            .map(|code| crate::auth_2fa::BackupCode {
+                code: code.clone(),
+                used: false,
+                created_at: chrono::Utc::now().timestamp(),
+            })
+            .collect(),
+        created_at: chrono::Utc::now().timestamp(),
+        last_verified: None,
+    };
+
+    TWO_FACTOR_STORE.store_config(config).map_err(|err| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { error: err }),
+        )
+    })?;
+
+    Ok(Json(Enable2faResponse {
+        secret,
+        qr_code_uri,
+        backup_codes,
+    }))
+}
+
+/// #984: Verify 2FA code during login
+/// Returns success if TOTP code is valid and marks 2FA as verified
+#[utoipa::path(
+    post,
+    path = "/auth/2fa/verify",
+    tag = "Authentication",
+    request_body = Verify2faRequest,
+    responses(
+        (status = 200, description = "2FA code verified successfully", body = Verify2faResponse),
+        (status = 401, description = "Invalid 2FA code", body = ErrorResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 404, description = "2FA not configured for user", body = ErrorResponse),
+    )
+)]
+#[instrument(skip(body))]
+pub async fn verify_2fa(
+    Json(body): Json<Verify2faRequest>,
+) -> Result<Json<Verify2faResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if body.user_id.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "user_id must not be empty".to_string(),
+            }),
+        ));
+    }
+
+    if body.totp_code.len() != 6 || !body.totp_code.chars().all(|c| c.is_numeric()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "TOTP code must be 6 digits".to_string(),
+            }),
+        ));
+    }
+
+    // Get user's 2FA config
+    let mut config = match TWO_FACTOR_STORE
+        .get_config(&body.user_id)
+        .map_err(|err| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error: err }),
+            )
+        })?
+    {
+        Some(cfg) => cfg,
+        None => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: "2FA not configured for this user".to_string(),
+                }),
+            ))
+        }
+    };
+
+    // Get TOTP secret
+    let secret = match &config.totp {
+        Some(totp) => &totp.secret,
+        None => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: "2FA not configured for this user".to_string(),
+                }),
+            ))
+        }
+    };
+
+    // Verify TOTP code
+    match crate::auth_2fa::verify_totp_code(secret, &body.totp_code) {
+        Ok(true) => {
+            // Mark 2FA as verified
+            if let Some(ref mut totp) = config.totp {
+                totp.verified = true;
+            }
+            config.last_verified = Some(chrono::Utc::now().timestamp());
+
+            TWO_FACTOR_STORE.store_config(config).map_err(|err| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse { error: err }),
+                )
+            })?;
+
+            Ok(Json(Verify2faResponse {
+                success: true,
+                message: "2FA verified successfully".to_string(),
+            }))
+        }
+        Ok(false) => Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "Invalid TOTP code".to_string(),
+            }),
+        )),
+        Err(err) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { error: err }),
+        )),
+    }
+}
+
+/// #984: Use backup code for account recovery
+/// Allows account access if backup code is valid (marks code as used)
+#[utoipa::path(
+    post,
+    path = "/auth/2fa/backup-code",
+    tag = "Authentication",
+    request_body = UseBackupCodeRequest,
+    responses(
+        (status = 200, description = "Backup code accepted, account recovered", body = Verify2faResponse),
+        (status = 401, description = "Invalid or already used backup code", body = ErrorResponse),
+        (status = 404, description = "User not found", body = ErrorResponse),
+    )
+)]
+#[instrument(skip(body))]
+pub async fn use_backup_code(
+    Json(body): Json<UseBackupCodeRequest>,
+) -> Result<Json<Verify2faResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if body.user_id.is_empty() || body.backup_code.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "user_id and backup_code must not be empty".to_string(),
+            }),
+        ));
+    }
+
+    // Check if backup code exists and is valid
+    let used = crate::auth_2fa::mark_backup_code_used(&TWO_FACTOR_STORE, &body.user_id, &body.backup_code)
+        .map_err(|err| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error: err }),
+            )
+        })?;
+
+    if !used {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "Invalid or already used backup code".to_string(),
+            }),
+        ));
+    }
+
+    Ok(Json(Verify2faResponse {
+        success: true,
+        message: "Account recovered with backup code. Please update your 2FA settings.".to_string(),
+    }))
+}
