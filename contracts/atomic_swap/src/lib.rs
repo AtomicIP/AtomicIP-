@@ -16,6 +16,8 @@ mod oracle_tests;
 mod treasury_validation_tests;
 #[cfg(test)]
 mod invariant_tests;
+#[cfg(test)]
+mod e2e_tests;
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Bytes,
