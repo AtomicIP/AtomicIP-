@@ -40,6 +40,7 @@ impl FromRef<AppState> for Arc<rate_limit::RateLimitMiddleware> {
 
 mod auth;
 mod auth_2fa;
+mod session;
 mod batch;
 mod cache;
 mod circuit_breaker;
@@ -99,6 +100,8 @@ mod validation_fuzz_tests;
         handlers::enable_2fa,
         handlers::verify_2fa,
         handlers::use_backup_code,
+        handlers::check_session,
+        handlers::extend_session,
         batch::batch_handler,
         events::events_handler,
     ),
@@ -133,6 +136,10 @@ mod validation_fuzz_tests;
         schemas::Verify2faRequest,
         schemas::Verify2faResponse,
         schemas::UseBackupCodeRequest,
+        schemas::CheckSessionRequest,
+        schemas::CheckSessionResponse,
+        schemas::ExtendSessionRequest,
+        schemas::ExtendSessionResponse,
     )),
     tags(
         (name = "IP Registry", description = "Commit and query intellectual property records"),
@@ -384,6 +391,8 @@ fn build_app() -> Router {
         .route("/auth/2fa/enable", post(handlers::enable_2fa))
         .route("/auth/2fa/verify", post(handlers::verify_2fa))
         .route("/auth/2fa/backup-code", post(handlers::use_backup_code))
+        .route("/auth/session/status", post(handlers::check_session))
+        .route("/auth/extend-session", post(handlers::extend_session))
         .route("/openapi.json", get(openapi_handler))
         .with_state(state)
         .layer(middleware::from_fn_with_state(rate_limiter, rate_limit::rate_limit_middleware))

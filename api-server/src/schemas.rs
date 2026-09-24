@@ -363,3 +363,38 @@ pub struct UseBackupCodeRequest {
     pub user_id: String,
     pub backup_code: String,
 }
+
+/// #985: Request to check session status
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct CheckSessionRequest {
+    pub token: String,
+}
+
+/// #985: Response with current session status
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct CheckSessionResponse {
+    /// Whether session is active
+    pub active: bool,
+    /// Whether session is in grace period
+    pub in_grace_period: bool,
+    /// Minutes until timeout
+    pub minutes_until_timeout: i64,
+    /// Whether warning should be shown
+    pub show_warning: bool,
+    /// Message for user
+    pub message: Option<String>,
+}
+
+/// #985: Request to extend session
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ExtendSessionRequest {
+    pub token: String,
+}
+
+/// #985: Response when extending session
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ExtendSessionResponse {
+    pub success: bool,
+    pub new_expiry: i64,
+    pub message: String,
+}

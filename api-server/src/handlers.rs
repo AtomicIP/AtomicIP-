@@ -1098,3 +1098,115 @@ pub async fn use_backup_code(
         message: "Account recovered with backup code. Please update your 2FA settings.".to_string(),
     }))
 }
+
+// ── #985: Session Management ───────────────────────────────────────────────
+
+static SESSION_STORE: once_cell::sync::Lazy<crate::session::SessionStore> =
+    once_cell::sync::Lazy::new(|| crate::session::SessionStore::new(crate::session::SessionConfig::default()));
+
+/// #985: Check current session status
+/// Returns session status including timeout warnings and grace period info
+#[utoipa::path(
+    post,
+    path = "/auth/session/status",
+    tag = "Authentication",
+    request_body = CheckSessionRequest,
+    responses(
+        (status = 200, description = "Session status retrieved", body = CheckSessionResponse),
+        (status = 400, description = "Invalid token", body = ErrorResponse),
+        (status = 404, description = "Session not found", body = ErrorResponse),
+    )
+)]
+#[instrument(skip(body))]
+pub async fn check_session(
+    Json(body): Json<CheckSessionRequest>,
+) -> Result<Json<CheckSessionResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if body.token.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "token must not be empty".to_string(),
+            }),
+        ));
+    }
+
+    match SESSION_STORE.check_session_status(&body.token) {
+        Ok(status) => Ok(Json(CheckSessionResponse {
+            active: status.active,
+            in_grace_period: status.in_grace_period,
+            minutes_until_timeout: status.minutes_until_timeout,
+            show_warning: status.show_warning,
+            message: status.message,
+        })),
+        Err(_) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "Session not found".to_string(),
+            }),
+        )),
+    }
+}
+
+/// #985: Extend session expiration
+/// Extends the current session by resetting the idle timeout counter.
+/// Can be called during grace period after timeout.
+#[utoipa::path(
+    post,
+    path = "/auth/extend-session",
+    tag = "Authentication",
+    request_body = ExtendSessionRequest,
+    responses(
+        (status = 200, description = "Session extended successfully", body = ExtendSessionResponse),
+        (status = 400, description = "Invalid token", body = ErrorResponse),
+        (status = 404, description = "Session not found or grace period expired", body = ErrorResponse),
+    )
+)]
+#[instrument(skip(body))]
+pub async fn extend_session(
+    Json(body): Json<ExtendSessionRequest>,
+) -> Result<Json<ExtendSessionResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if body.token.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "token must not be empty".to_string(),
+            }),
+        ));
+    }
+
+    // First check if session exists and get status
+    match SESSION_STORE.check_session_status(&body.token) {
+        Ok(status) => {
+            // Allow extension if session is active OR in grace period
+            if !status.active && !status.in_grace_period {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    Json(ErrorResponse {
+                        error: "Session expired and grace period ended. Please log in again.".to_string(),
+                    }),
+                ));
+            }
+
+            // Extend the session
+            match SESSION_STORE.extend_session(&body.token) {
+                Ok(new_expiry) => {
+                    Ok(Json(ExtendSessionResponse {
+                        success: true,
+                        new_expiry,
+                        message: "Session extended successfully. You have another 30 minutes.".to_string(),
+                    }))
+                }
+                Err(err) => Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse { error: err }),
+                )),
+            }
+        }
+        Err(_) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "Session not found".to_string(),
+            }),
+        )),
+    }
+}
