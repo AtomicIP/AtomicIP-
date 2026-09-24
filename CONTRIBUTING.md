@@ -238,6 +238,50 @@ For security issues, see [SECURITY.md](SECURITY.md).
 - All tests and checks must pass before merging
 - Never bypass or force-push CI checks
 
+## Dependency Updates
+
+### Automated Updates (Dependabot)
+
+Dependabot automatically creates PRs for dependency updates every Monday:
+
+**Rust Dependencies (Cargo.toml)**
+- Scheduled weekly on Monday at 3:00 UTC
+- Groups patch, minor, and major updates
+- Auto-merges patch releases after CI passes
+- Minor/major updates require manual review
+
+**JavaScript Dependencies (package.json)**
+- Scheduled weekly on Monday at 3:00 UTC
+- Groups patch, minor, and major updates
+- Auto-merges patch releases after CI passes
+- Minor/major updates require manual review
+
+### Reviewing Dependency Updates
+
+When reviewing Dependabot PRs:
+
+1. **Check the changelog** of any non-patch updates
+2. **Run tests locally** if updating major versions:
+   ```bash
+   cargo test --workspace
+   npm test
+   ```
+3. **Look for breaking changes** in release notes
+4. **Approve and merge** patch updates quickly
+5. **Comment with concerns** if a major update looks risky
+
+### Manual Dependency Updates
+
+If you need to update dependencies manually:
+
+1. Update `Cargo.toml` (Rust) or `package.json` (JavaScript)
+2. Run: `cargo update` or `npm update`
+3. Test thoroughly: `./scripts/test.sh && npm test`
+4. Commit with message: `chore(deps): update dependency-name to X.Y.Z`
+5. Open PR for review
+
+Never force-update dependencies or ignore Dependabot PRs — stale dependencies create security risks and compatibility issues.
+
 ## Questions?
 
 - Check [docs/](docs/) for architecture and design

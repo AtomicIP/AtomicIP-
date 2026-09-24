@@ -120,6 +120,25 @@ Currently blocked modules (tracked separately, allowed to remain):
 - `contracts/ip_registry/src/benchmarks.rs` — Issue #817
 - `contracts/ip_registry/src/invariant_tests.rs` — Tracked separately
 
+### Automated Dependency Updates
+
+Dependabot automatically checks for updates to both Rust (`Cargo.toml`) and JavaScript (`package.json`) dependencies every Monday at 3:00 UTC. 
+
+**Update Strategy:**
+- Creates PRs weekly with dependency updates
+- Batches up to 10 open PRs at once
+- Auto-merges patch updates after CI passes (e.g., 1.2.3 → 1.2.4)
+- Requires review for minor/major version bumps (e.g., 1.2.0 → 1.3.0)
+- All update PRs must pass full test suite before merging
+
+**Guidelines:**
+- Review Dependabot PRs promptly to keep dependencies current
+- Check changelogs for breaking changes in major updates
+- Test thoroughly before approving significant version bumps
+- Merge security patches immediately
+
+See [CONTRIBUTING.md](CONTRIBUTING.md#dependency-updates) for contributor details.
+
 ## 📖 Documentation
 
 ### Core Documentation
