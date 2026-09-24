@@ -63,6 +63,8 @@ mod validation;
 mod validation_middleware;
 #[cfg(test)]
 mod validation_fuzz_tests;
+#[cfg(test)]
+mod snapshot_tests;
 
 #[derive(OpenApi)]
 #[openapi(
