@@ -82,6 +82,44 @@ stellar keys generate deployer --network testnet
 
 Latest testnet deployment addresses are published in GitHub Actions deployment summaries. Deployments are triggered automatically on release tags (`v*`).
 
+## 🔐 CI/CD and Branch Protection
+
+All pull requests must pass the following **required checks** before merging to `main`:
+
+| Check | Type | Purpose |
+|-------|------|---------|
+| **Gitleaks Secret Scan** | Automated | Prevents accidental credential commits |
+| **Merge Conflict FIXME Check** | Automated | Enforces "no lingering disabled modules" policy |
+| **Rust Build** | Automated | Verifies compilation across all workspaces |
+| **Rust Tests** | Automated | Validates smart contracts and API server |
+| **Rust Linting (Clippy)** | Automated | Catches common Rust mistakes |
+| **JavaScript Lint** | Automated | Enforces code style for SDK and tests |
+| **JavaScript Format** | Automated | Ensures consistent code formatting |
+| **JavaScript Tests** | Automated | Validates SDK functionality with coverage |
+| **At Least 1 Approval** | Manual | Requires team review |
+
+### Running Checks Locally
+
+Before pushing, run these checks locally to catch issues early:
+
+```bash
+# All checks
+./scripts/test.sh && npm test && cargo fmt --check && npm run format:check
+
+# Individual checks
+cargo build --workspace && cargo clippy --workspace
+cargo test --workspace
+npm run lint && npm run format:check && npm test
+```
+
+### Disabled Modules Policy
+
+Merge conflicts that leave disabled test modules (commented-out code) are **not permitted**. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full policy and resolution guidance.
+
+Currently blocked modules (tracked separately, allowed to remain):
+- `contracts/ip_registry/src/benchmarks.rs` — Issue #817
+- `contracts/ip_registry/src/invariant_tests.rs` — Tracked separately
+
 ## 📖 Documentation
 
 ### Core Documentation
