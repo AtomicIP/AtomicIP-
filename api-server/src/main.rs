@@ -88,6 +88,8 @@ mod validation_fuzz_tests;
         handlers::unregister_webhook,
         handlers::bulk_commit_ip,
         handlers::bulk_initiate_swap,
+        handlers::get_audit_logs,
+        handlers::get_suspicious_patterns,
         batch::batch_handler,
         events::events_handler,
     ),
@@ -115,6 +117,10 @@ mod validation_fuzz_tests;
         schemas::BulkInitiateSwapRequest,
         schemas::BulkInitiateSwapResponse,
         schemas::BulkOperationResult<schemas::IpRecord>,
+        handlers::AuditLogsResponse,
+        handlers::SuspiciousPatternsResponse,
+        audit::AuditEvent,
+        audit::SuspiciousPattern,
     )),
     tags(
         (name = "IP Registry", description = "Commit and query intellectual property records"),
@@ -122,6 +128,7 @@ mod validation_fuzz_tests;
         (name = "Webhooks", description = "Real-time event notifications"),
         (name = "Batch", description = "Batch API operations"),
         (name = "Events", description = "Server-Sent Events stream"),
+        (name = "Admin", description = "Administrative endpoints for monitoring and audit"),
     )
 )]
 pub struct ApiDoc;
@@ -233,6 +240,8 @@ async fn main() {
         .route("/ws",              get(ws_handler))
         .route("/events",          get(events_handler))
         .route("/batch",           post(batch::batch_handler))
+        .route("/v1/admin/audit/logs",               get(handlers::get_audit_logs))
+        .route("/v1/admin/audit/suspicious-patterns", get(handlers::get_suspicious_patterns))
         .route("/ip/{ip_id}",                     get(handlers::get_ip))
         .route("/ip/verify",                      post(handlers::verify_commitment))
         .route("/ip/owner/{owner}",               get(handlers::list_ip_by_owner))
@@ -342,6 +351,8 @@ fn build_app() -> Router {
         .route("/ws", get(ws_handler))
         .route("/events", get(events_handler))
         .route("/batch", post(batch::batch_handler))
+        .route("/v1/admin/audit/logs", get(handlers::get_audit_logs))
+        .route("/v1/admin/audit/suspicious-patterns", get(handlers::get_suspicious_patterns))
         .route("/v1/graphql", post(graphql_handler))
         .route("/v1/ip/commit", post(handlers::commit_ip).layer(signed.clone()))
         .route("/v1/ip/{ip_id}", get(handlers::get_ip))

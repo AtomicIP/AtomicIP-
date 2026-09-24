@@ -16,6 +16,7 @@ use crate::schemas::*;
 use std::sync::Arc;
 use crate::webhook;
 use crate::websocket;
+use crate::audit::{AuditLogStore, AuditLogQuery, SuspiciousPattern};
 
 // #523/#800: Per-handler idempotency store for batch swap operations. Uses a
 // shared Redis backend when REDIS_URL is configured, so a client's retry is
@@ -45,6 +46,23 @@ const SWAP_EXPIRY_SECONDS: u64 = 604800;
 /// Process-local swap ID counter standing in for the contract's `NextId`
 /// until the handlers are wired to a live Soroban RPC client.
 static NEXT_SWAP_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Audit log store for tracking all API access and sensitive operations
+static AUDIT_LOG_STORE: Lazy<Arc<AuditLogStore>> = Lazy::new(|| {
+    let audit_key = std::env::var("AUDIT_HMAC_KEY")
+        .unwrap_or_else(|_| "default_audit_key_for_testing".to_string());
+    let audit_path = std::env::var("AUDIT_LOG_PATH")
+        .unwrap_or_else(|_| "/tmp/api_audit.log".to_string());
+
+    match AuditLogStore::open(audit_key.into_bytes(), audit_path) {
+        Ok(store) => Arc::new(store),
+        Err(e) => {
+            tracing::warn!("Failed to initialize audit log store: {}", e);
+            Arc::new(AuditLogStore::open("temp_key".into(), "/tmp/api_audit_fallback.log")
+                .unwrap_or_else(|_| panic!("Failed to create fallback audit store")))
+        }
+    }
+});
 
 /// Current Unix timestamp in seconds (substitute for the ledger timestamp).
 fn now_timestamp() -> u64 {
@@ -803,4 +821,107 @@ pub async fn bulk_initiate_swap(Json(body): Json<BulkInitiateSwapRequest>) -> Re
     }
 
     Ok(Json(BulkInitiateSwapResponse { results }))
+}
+
+// ── Audit Logging (#987) ──────────────────────────────────────────────────────
+
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct AuditLogsResponse {
+    pub events: Vec<crate::audit::AuditEvent>,
+    pub total_count: u64,
+    pub has_more: bool,
+}
+
+/// Retrieve audit logs with optional filtering (admin-restricted).
+/// Returns all API access logs with detailed information.
+#[utoipa::path(
+    get,
+    path = "/v1/admin/audit/logs",
+    tag = "Admin",
+    params(
+        ("limit" = Option<u64>, Query, description = "Maximum number of logs to return (default: 50, max: 200)"),
+        ("offset" = Option<u64>, Query, description = "Offset for pagination"),
+        ("actor_hash" = Option<String>, Query, description = "Filter by actor hash"),
+        ("ip_id" = Option<u64>, Query, description = "Filter by IP ID"),
+        ("swap_id" = Option<u64>, Query, description = "Filter by Swap ID"),
+        ("success" = Option<bool>, Query, description = "Filter by success/failure"),
+    ),
+    responses(
+        (status = 200, description = "Audit logs retrieved successfully", body = AuditLogsResponse),
+        (status = 401, description = "Unauthorized - admin credentials required", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse),
+    )
+)]
+#[instrument(skip())]
+pub async fn get_audit_logs(
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<AuditLogsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    // TODO: Add admin authentication check
+    // For now, allow access for development
+
+    let limit = params
+        .get("limit")
+        .and_then(|l| l.parse::<u64>().ok())
+        .unwrap_or(50)
+        .min(200);
+
+    let offset = params
+        .get("offset")
+        .and_then(|o| o.parse::<u64>().ok())
+        .unwrap_or(0);
+
+    let actor_hash = params.get("actor_hash").cloned();
+    let ip_id = params.get("ip_id").and_then(|id| id.parse::<u64>().ok());
+    let swap_id = params.get("swap_id").and_then(|id| id.parse::<u64>().ok());
+    let success = params.get("success").and_then(|s| s.parse::<bool>().ok());
+
+    let query = AuditLogQuery {
+        limit,
+        offset,
+        category: None,
+        event_type: None,
+        actor_hash,
+        ip_id,
+        swap_id,
+        request_id: None,
+        trace_id: None,
+        success,
+        min_sequence: None,
+        max_sequence: None,
+    };
+
+    let response = AUDIT_LOG_STORE.query(&query).await;
+
+    Ok(Json(AuditLogsResponse {
+        events: response.events,
+        total_count: response.total_count,
+        has_more: response.has_more,
+    }))
+}
+
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct SuspiciousPatternsResponse {
+    pub patterns: Vec<SuspiciousPattern>,
+}
+
+/// Detect suspicious access patterns (admin-restricted).
+/// Returns actors with multiple failed attempts within a time window.
+#[utoipa::path(
+    get,
+    path = "/v1/admin/audit/suspicious-patterns",
+    tag = "Admin",
+    responses(
+        (status = 200, description = "Suspicious patterns detected", body = SuspiciousPatternsResponse),
+        (status = 401, description = "Unauthorized - admin credentials required", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse),
+    )
+)]
+#[instrument(skip())]
+pub async fn get_suspicious_patterns() -> Result<Json<SuspiciousPatternsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    // TODO: Add admin authentication check
+    // For now, allow access for development
+
+    let patterns = AUDIT_LOG_STORE.detect_suspicious_patterns().await;
+
+    Ok(Json(SuspiciousPatternsResponse { patterns }))
 }
