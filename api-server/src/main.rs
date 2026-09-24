@@ -36,6 +36,7 @@ mod auth;
 mod batch;
 mod cache;
 mod circuit_breaker;
+mod connection_pool;
 mod deduplication;
 mod events;
 mod graphql;
