@@ -20,6 +20,8 @@ mod invariant_tests;
 mod e2e_tests;
 #[cfg(test)]
 mod concurrent_tests;
+#[cfg(test)]
+mod mutation_testing_coverage;
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Bytes,
