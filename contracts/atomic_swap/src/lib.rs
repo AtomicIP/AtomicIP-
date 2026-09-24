@@ -245,6 +245,10 @@ pub enum DataKey {
     EscrowTimeout(u64),
     /// #980: Maps swap_id → ArbitratorDecision for escrow resolution.
     ArbitratorDecision(u64),
+    /// #981: Maps swap_id → SwapMetadata containing deal terms and versioning.
+    SwapMetadata(u64),
+    /// #981: Maps swap_id → Vec<Bytes> of historical metadata versions.
+    SwapMetadataHistory(u64),
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -5671,6 +5675,160 @@ impl AtomicSwap {
             (swap_id, current_time),
         );
     }
+
+    // ── Issue #981: Swap Metadata and Deal Terms ──────────────────────────────
+
+    /// Sets structured deal terms and metadata for a swap.
+    /// Enables transparency, compliance tracking, and deal context preservation.
+    ///
+    /// # Arguments
+    /// * `swap_id` - The swap to attach metadata to
+    /// * `terms` - Structured deal terms (serialized format)
+    /// * `metadata` - Additional metadata (contextual information)
+    /// * `terms_uri` - Optional URI reference to full deal document
+    ///
+    /// # Returns
+    /// The metadata version number
+    pub fn set_deal_terms(
+        env: Env,
+        swap_id: u64,
+        terms: Bytes,
+        metadata: Bytes,
+        terms_uri: Option<String>,
+    ) -> u32 {
+        let swap: Option<SwapRecord> = env.storage().persistent().get(&DataKey::Swap(swap_id));
+        if swap.is_none() {
+            panic_with_error(&env, ContractError::SwapNotFound);
+        }
+
+        let swap_record = swap.unwrap();
+
+        // Only seller can set deal terms
+        swap_record.seller.require_auth();
+
+        // Validate metadata size (1KB max as per IP Registry constraints)
+        const MAX_METADATA_SIZE: usize = 1024;
+        if terms.len() > MAX_METADATA_SIZE || metadata.len() > MAX_METADATA_SIZE {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::BatchTooLarge as u32,
+            ));
+        }
+
+        // Get existing metadata to increment version
+        let existing: Option<SwapMetadata> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SwapMetadata(swap_id));
+
+        let version = if let Some(meta) = existing.clone() {
+            meta.version.saturating_add(1)
+        } else {
+            1
+        };
+
+        let timestamp = env.ledger().timestamp();
+
+        // Create new metadata record
+        let new_metadata = SwapMetadata {
+            terms: terms.clone(),
+            version,
+            metadata: metadata.clone(),
+            created_at: timestamp,
+            terms_uri: terms_uri.clone(),
+        };
+
+        // Store current metadata
+        env.storage()
+            .persistent()
+            .set(&DataKey::SwapMetadata(swap_id), &new_metadata);
+
+        // Save to history for versioning
+        let mut history: Vec<SwapMetadata> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SwapMetadataHistory(swap_id))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        history.push_back(new_metadata);
+        env.storage()
+            .persistent()
+            .set(&DataKey::SwapMetadataHistory(swap_id), &history);
+
+        env.storage().instance().bump();
+        env.events().publish(
+            (soroban_sdk::symbol_short!("meta_set"),),
+            SwapMetadataUpdatedEvent {
+                swap_id,
+                version,
+                terms_hash: compute_hash(&env, &terms),
+                timestamp,
+            },
+        );
+
+        version
+    }
+
+    /// Retrieves the current deal terms and metadata for a swap.
+    ///
+    /// # Arguments
+    /// * `swap_id` - The swap to query
+    ///
+    /// # Returns
+    /// The SwapMetadata record, or None if not set
+    pub fn get_deal_terms(env: Env, swap_id: u64) -> Option<SwapMetadata> {
+        let swap: Option<SwapRecord> = env.storage().persistent().get(&DataKey::Swap(swap_id));
+        if swap.is_none() {
+            return None;
+        }
+
+        env.storage()
+            .persistent()
+            .get(&DataKey::SwapMetadata(swap_id))
+    }
+
+    /// Validates deal terms against expected format and content.
+    /// Can be used by buyers to verify seller's terms before accepting.
+    ///
+    /// # Arguments
+    /// * `swap_id` - The swap to validate
+    /// * `expected_terms_hash` - The expected sha256 hash of deal terms
+    ///
+    /// # Returns
+    /// true if current terms match expected hash, false otherwise
+    pub fn validate_deal_terms(env: Env, swap_id: u64, expected_terms_hash: BytesN<32>) -> bool {
+        let metadata = env
+            .storage()
+            .persistent()
+            .get::<DataKey, SwapMetadata>(&DataKey::SwapMetadata(swap_id));
+
+        if let Some(meta) = metadata {
+            compute_hash(&env, &meta.terms) == expected_terms_hash
+        } else {
+            false
+        }
+    }
+
+    /// Retrieves the full version history of deal terms for a swap.
+    ///
+    /// # Arguments
+    /// * `swap_id` - The swap to query
+    ///
+    /// # Returns
+    /// A vector of all SwapMetadata versions in chronological order
+    pub fn get_metadata_history(env: Env, swap_id: u64) -> Vec<SwapMetadata> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SwapMetadataHistory(swap_id))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+}
+
+// ── Helper Functions ──────────────────────────────────────────────────────────
+
+/// Compute SHA-256 hash of arbitrary bytes
+fn compute_hash(env: &Env, data: &Bytes) -> BytesN<32> {
+    use soroban_sdk::crypto::Sha256;
+    env.crypto().sha256(&data)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

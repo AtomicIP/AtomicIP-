@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, BytesN, Vec};
+use soroban_sdk::{contracttype, Address, Bytes, BytesN, String, Vec};
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
 
@@ -616,5 +616,31 @@ pub struct EscrowSwapResolvedEvent {
     pub swap_id: u64,
     pub arbiter: Address,
     pub decision: ArbitratorDecision,
+    pub timestamp: u64,
+}
+
+// ── #981: Swap Metadata and Deal Terms ─────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SwapMetadata {
+    /// Versioned structured deal terms for compliance and transparency
+    pub terms: Bytes,
+    /// Version number for tracking deal term updates
+    pub version: u32,
+    /// Metadata blob containing deal context and conditions
+    pub metadata: Bytes,
+    /// Unix timestamp when metadata was set
+    pub created_at: u64,
+    /// Optional: reference URI for the full deal document
+    pub terms_uri: Option<String>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SwapMetadataUpdatedEvent {
+    pub swap_id: u64,
+    pub version: u32,
+    pub terms_hash: BytesN<32>,
     pub timestamp: u64,
 }
