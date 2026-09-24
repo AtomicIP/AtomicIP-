@@ -211,6 +211,9 @@ pub enum DataKey {
     MerkleRoot(Address),
     // Issue #812: Flag indicating the cached Merkle root for an owner is stale
     MerkleRootStale(Address),
+    // Issue #979: Commitment linking for related IPs
+    CommitmentLinks(u64), // maps ip_id -> Vec<CommitmentLink> of linked commitments
+    LinkedCommitments(u64), // maps linked_ip_id -> Vec<u64> of ip_ids linking to it (reverse index)
 }
 
 // ── Upgrade Compatibility Manifest (#791) ───────────────────────────────────
@@ -250,13 +253,14 @@ const CURRENT_FUNCTIONS: &[&str] = &[
     "generate_merkle_proof", "get_anonymous_owner", "get_arbitration", "get_batch_escrow",
     "get_batch_metadata", "get_blinded_owner_batch", "get_commitment_compression", "get_commitment_shard",
     "get_compressed_bytes", "get_compressed_commitment", "get_dispute", "get_encrypted_commitment",
-    "get_ip", "get_ip_access_grants", "get_ip_audit_trail", "get_ip_lineage",
+    "get_commitment_back_references", "get_ip", "get_ip_access_grants", "get_ip_audit_trail", "get_ip_lineage",
     "get_ip_notary_signature", "get_ip_strength", "get_ip_suggested_price", "get_ip_version_chain",
+    "get_linked_commitments",
     "get_ip_versions", "get_key_rotation_history", "get_licenses", "get_ownership_challenge",
     "get_partial_disclosure", "get_pow_difficulty", "get_renewal_count", "get_reputation",
     "get_stake", "get_threshold_config", "get_threshold_signatures", "grant_ip_access",
     "grant_license", "initialize", "initiate_dispute", "is_delegate",
-    "is_ip_owner", "issue_ownership_challenge", "list_ip_by_category", "list_ip_by_owner",
+    "is_ip_owner", "issue_ownership_challenge", "link_commitment", "list_ip_by_category", "list_ip_by_owner",
     "list_ip_by_shard", "list_owner_categories", "merge_duplicate_commitment", "nominate_arbitrator",
     "notarize_ip_timestamp", "open_arbitration", "register_category_path", "release_batch_escrow",
     "remove_co_owner", "renew_ip", "renew_ip_commitment", "require_threshold_signatures",
@@ -284,7 +288,7 @@ const CURRENT_STORAGE_KEYS: &[&str] = &[
     "OwnerReputation", "ArbitrationCase", "NextArbitrationId", "ArbitratorPool",
     "CompressedCommitment", "BatchVerifyResult", "CompressionSelection", "HierarchyNode",
     "OwnerCategories", "CategoryDepth", "ThresholdConfig", "ThresholdSignatures", "BatchMetadata",
-    "EncryptedCommitment", "BatchEscrow",
+    "EncryptedCommitment", "BatchEscrow", "CommitmentLinks", "LinkedCommitments",
 ];
 
 /// (error name, error code) pairs defined by the currently deployed contract.
@@ -5670,6 +5674,135 @@ impl IpRegistry {
                 }
             }
         }
+    }
+
+    // ── Issue #979: Commitment Linking ─────────────────────────────────────────
+
+    /// Links a commitment to a related IP (derivative work or improvement).
+    /// Supports bidirectional linking for IP genealogy tracking.
+    ///
+    /// # Arguments
+    /// * `commitment_id` - The source IP ID
+    /// * `linked_commitment_id` - The target IP ID to link to
+    /// * `link_type` - Classification of the relationship (e.g., "derivative", "improvement")
+    ///
+    /// # Returns
+    /// The link creation timestamp (ledger seconds)
+    pub fn link_commitment(
+        env: Env,
+        commitment_id: u64,
+        linked_commitment_id: u64,
+        link_type: Bytes,
+    ) -> u64 {
+        // Verify both commitments exist
+        let record: Option<IpRecord> =
+            env.storage().persistent().get(&DataKey::IpRecord(commitment_id));
+        if record.is_none() {
+            panic_with_error(&env, ContractError::IpNotFound);
+        }
+
+        let linked_record: Option<IpRecord> =
+            env.storage().persistent().get(&DataKey::IpRecord(linked_commitment_id));
+        if linked_record.is_none() {
+            panic_with_error(&env, ContractError::IpNotFound);
+        }
+
+        // Prevent self-linking
+        if commitment_id == linked_commitment_id {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::InvalidOwnershipPercentage as u32,
+            ));
+        }
+
+        let timestamp = env.ledger().timestamp();
+
+        // Create the link record
+        let link = CommitmentLink {
+            linked_ip_id: linked_commitment_id,
+            link_type: link_type.clone(),
+            created_at: timestamp,
+        };
+
+        // Get existing links for the source commitment
+        let mut links: Vec<CommitmentLink> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CommitmentLinks(commitment_id))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        // Check if link already exists (avoid duplicates)
+        let exists = links
+            .iter()
+            .any(|l| l.linked_ip_id == linked_commitment_id && l.link_type == link_type);
+
+        if !exists {
+            links.push_back(link);
+            env.storage()
+                .persistent()
+                .set(&DataKey::CommitmentLinks(commitment_id), &links);
+            env.storage().instance().bump();
+        }
+
+        // Also add reverse link for bidirectional tracking
+        let mut reverse_links: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LinkedCommitments(linked_commitment_id))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        if !reverse_links.contains(&commitment_id) {
+            reverse_links.push_back(commitment_id);
+            env.storage()
+                .persistent()
+                .set(&DataKey::LinkedCommitments(linked_commitment_id), &reverse_links);
+        }
+
+        env.events().publish(
+            (symbol_short!("link"),),
+            (commitment_id, linked_commitment_id, timestamp),
+        );
+
+        timestamp
+    }
+
+    /// Retrieves all commitments linked to a given IP (forward links).
+    ///
+    /// # Arguments
+    /// * `commitment_id` - The IP ID to query
+    ///
+    /// # Returns
+    /// A vector of CommitmentLink records representing related IPs
+    pub fn get_linked_commitments(env: Env, commitment_id: u64) -> Vec<CommitmentLink> {
+        let record: Option<IpRecord> =
+            env.storage().persistent().get(&DataKey::IpRecord(commitment_id));
+        if record.is_none() {
+            panic_with_error(&env, ContractError::IpNotFound);
+        }
+
+        env.storage()
+            .persistent()
+            .get(&DataKey::CommitmentLinks(commitment_id))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Retrieves all commitments that link to a given IP (reverse links).
+    ///
+    /// # Arguments
+    /// * `commitment_id` - The IP ID to query
+    ///
+    /// # Returns
+    /// A vector of IP IDs that have linked to this commitment
+    pub fn get_commitment_back_references(env: Env, commitment_id: u64) -> Vec<u64> {
+        let record: Option<IpRecord> =
+            env.storage().persistent().get(&DataKey::IpRecord(commitment_id));
+        if record.is_none() {
+            panic_with_error(&env, ContractError::IpNotFound);
+        }
+
+        env.storage()
+            .persistent()
+            .get(&DataKey::LinkedCommitments(commitment_id))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 }
 

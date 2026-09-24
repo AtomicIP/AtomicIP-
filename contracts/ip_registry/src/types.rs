@@ -111,3 +111,12 @@ pub struct OwnershipChallenge {
     /// Computed as `timestamp + challenge_ttl_seconds` at creation time.
     pub expires_at: u64,
 }
+
+/// Issue #979: Represents a commitment link between related IPs
+#[contracttype]
+#[derive(Clone)]
+pub struct CommitmentLink {
+    pub linked_ip_id: u64,
+    pub link_type: soroban_sdk::Bytes,
+    pub created_at: u64,
+}
