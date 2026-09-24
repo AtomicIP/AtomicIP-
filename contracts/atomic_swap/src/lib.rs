@@ -239,6 +239,12 @@ pub enum DataKey {
     PendingRuling(u64),
     /// #781: Maps swap_id → DisputeBonds deposited by buyer/seller.
     DisputeBond(u64),
+    /// #980: Maps swap_id → arbiter Address for escrow swap arbitration.
+    EscrowArbiter(u64),
+    /// #980: Maps swap_id → timeout timestamp for automatic escrow release.
+    EscrowTimeout(u64),
+    /// #980: Maps swap_id → ArbitratorDecision for escrow resolution.
+    ArbitratorDecision(u64),
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -5402,6 +5408,267 @@ impl AtomicSwap {
                 swap_ids,
                 count: len as u32,
             },
+        );
+    }
+
+    // ── Issue #980: Escrow Swap with Third-Party Arbitration ──────────────────
+
+    /// Initiates an escrow swap with third-party arbitration.
+    /// The arbiter has authority to resolve disputes and make fund allocation decisions.
+    ///
+    /// # Arguments
+    /// * `swap_id` - The swap to convert to escrow mode
+    /// * `arbiter` - The arbitrator address who will resolve disputes
+    /// * `timeout_seconds` - Seconds after which funds auto-release if no dispute
+    ///
+    /// # Returns
+    /// The arbitration setup timestamp
+    pub fn escrow_swap(env: Env, swap_id: u64, arbiter: Address, timeout_seconds: u64) -> u64 {
+        let swap: Option<SwapRecord> = env.storage().persistent().get(&DataKey::Swap(swap_id));
+        if swap.is_none() {
+            panic_with_error(&env, ContractError::SwapNotFound);
+        }
+
+        let swap_record = swap.unwrap();
+
+        // Only allow escrow setup on pending or accepted swaps
+        if swap_record.status != SwapStatus::Pending && swap_record.status != SwapStatus::Accepted {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::NotPending as u32,
+            ));
+        }
+
+        // Verify arbiter is a valid address
+        arbiter.require_auth();
+
+        let timestamp = env.ledger().timestamp();
+        let timeout = timestamp.saturating_add(timeout_seconds);
+
+        // Store arbitrator and timeout
+        env.storage()
+            .persistent()
+            .set(&DataKey::EscrowArbiter(swap_id), &arbiter);
+        env.storage()
+            .persistent()
+            .set(&DataKey::EscrowTimeout(swap_id), &timeout);
+
+        // Update swap mode to Escrow if it's currently Atomic
+        if swap_record.status == SwapStatus::Accepted {
+            env.storage()
+                .persistent()
+                .set(&DataKey::SwapMode(swap_id), &SwapMode::Escrow);
+        }
+
+        env.storage().instance().bump();
+        env.events().publish(
+            (soroban_sdk::symbol_short!("escr_init"),),
+            (swap_id, arbiter.clone(), timeout),
+        );
+
+        timestamp
+    }
+
+    /// Arbiter resolves an escrow dispute by making a binding decision.
+    ///
+    /// # Arguments
+    /// * `swap_id` - The swap in dispute
+    /// * `decision` - The arbitrator's decision (RefundToBuyer, ConfirmToSeller, or PartialRefund)
+    pub fn arbitrator_decide(env: Env, swap_id: u64, decision: ArbitratorDecision) {
+        let swap: Option<SwapRecord> = env.storage().persistent().get(&DataKey::Swap(swap_id));
+        if swap.is_none() {
+            panic_with_error(&env, ContractError::SwapNotFound);
+        }
+
+        let swap_record = swap.unwrap();
+
+        // Get the designated arbiter
+        let arbiter: Option<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EscrowArbiter(swap_id));
+        if arbiter.is_none() {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::NotArbitrator as u32,
+            ));
+        }
+
+        let arbiter_addr = arbiter.unwrap();
+        arbiter_addr.require_auth();
+
+        // Ensure swap is in a disputable state
+        if swap_record.status != SwapStatus::Disputed
+            && swap_record.status != SwapStatus::Accepted
+        {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::NotDisputed as u32,
+            ));
+        }
+
+        let timestamp = env.ledger().timestamp();
+
+        // Store the decision
+        env.storage()
+            .persistent()
+            .set(&DataKey::ArbitratorDecision(swap_id), &decision);
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("escr_rsv"),),
+            EscrowSwapResolvedEvent {
+                swap_id,
+                arbiter: arbiter_addr,
+                decision: decision.clone(),
+                timestamp,
+            },
+        );
+
+        env.storage().instance().bump();
+    }
+
+    /// Executes the arbitrator's decision, transferring funds accordingly.
+    /// Can only be called after arbitrator_decide has made a decision.
+    ///
+    /// # Arguments
+    /// * `swap_id` - The escrow swap to execute
+    pub fn execute_arbitrator_decision(env: Env, swap_id: u64) {
+        let swap: Option<SwapRecord> = env.storage().persistent().get(&DataKey::Swap(swap_id));
+        if swap.is_none() {
+            panic_with_error(&env, ContractError::SwapNotFound);
+        }
+
+        let decision: Option<ArbitratorDecision> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ArbitratorDecision(swap_id));
+        if decision.is_none() {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::ConditionNotMet as u32,
+            ));
+        }
+
+        let swap_record = swap.unwrap();
+        let decision_val = decision.unwrap();
+
+        // Execute based on decision
+        match decision_val {
+            ArbitratorDecision::RefundToBuyer => {
+                // Refund entire amount to buyer
+                if swap_record.price > 0 {
+                    let token_client =
+                        token::Client::new(&env, &swap_record.token);
+                    token_client.transfer(
+                        &env.current_contract_address(),
+                        &swap_record.buyer,
+                        &swap_record.price,
+                    );
+                }
+            }
+            ArbitratorDecision::ConfirmToSeller => {
+                // Release full amount to seller
+                if swap_record.price > 0 {
+                    let token_client =
+                        token::Client::new(&env, &swap_record.token);
+                    token_client.transfer(
+                        &env.current_contract_address(),
+                        &swap_record.seller,
+                        &swap_record.price,
+                    );
+                }
+            }
+            ArbitratorDecision::PartialRefund(buyer_amount) => {
+                // Split: buyer gets buyer_amount, seller gets remainder
+                let seller_amount = swap_record.price.saturating_sub(buyer_amount);
+                let token_client =
+                    token::Client::new(&env, &swap_record.token);
+
+                if buyer_amount > 0 {
+                    token_client.transfer(
+                        &env.current_contract_address(),
+                        &swap_record.buyer,
+                        &buyer_amount,
+                    );
+                }
+                if seller_amount > 0 {
+                    token_client.transfer(
+                        &env.current_contract_address(),
+                        &swap_record.seller,
+                        &seller_amount,
+                    );
+                }
+            }
+        }
+
+        // Mark swap as completed
+        let mut updated_swap = swap_record.clone();
+        updated_swap.status = SwapStatus::Completed;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Swap(swap_id), &updated_swap);
+
+        env.storage().instance().bump();
+    }
+
+    /// Auto-releases escrow funds if timeout is reached without dispute resolution.
+    ///
+    /// # Arguments
+    /// * `swap_id` - The escrow swap to auto-release
+    pub fn auto_release_escrow(env: Env, swap_id: u64) {
+        let swap: Option<SwapRecord> = env.storage().persistent().get(&DataKey::Swap(swap_id));
+        if swap.is_none() {
+            panic_with_error(&env, ContractError::SwapNotFound);
+        }
+
+        let timeout: Option<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EscrowTimeout(swap_id));
+        if timeout.is_none() {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::NotInAccepted as u32,
+            ));
+        }
+
+        let timeout_val = timeout.unwrap();
+        let current_time = env.ledger().timestamp();
+
+        // Verify timeout has been reached
+        if current_time < timeout_val {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::ArbitrationNotTimedOut as u32,
+            ));
+        }
+
+        let swap_record = swap.unwrap();
+
+        // If no decision was made by arbiter, auto-release to seller
+        let decision: Option<ArbitratorDecision> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ArbitratorDecision(swap_id));
+
+        if decision.is_none() {
+            // Auto-release: full amount to seller
+            if swap_record.price > 0 {
+                let token_client =
+                    token::Client::new(&env, &swap_record.token);
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &swap_record.seller,
+                    &swap_record.price,
+                );
+            }
+        }
+
+        // Mark swap as completed
+        let mut updated_swap = swap_record.clone();
+        updated_swap.status = SwapStatus::Completed;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Swap(swap_id), &updated_swap);
+
+        env.storage().instance().bump();
+        env.events().publish(
+            (soroban_sdk::symbol_short!("escr_aut"),),
+            (swap_id, current_time),
         );
     }
 }

@@ -596,3 +596,25 @@ pub struct BatchTimeoutAutoResolvedEvent {
     pub swap_ids: Vec<u64>,
     pub count: u32,
 }
+
+// ── #980: Escrow Arbitrator Decision ───────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum ArbitratorDecision {
+    /// Release funds to buyer (IP ownership transfer fails or is disputed)
+    RefundToBuyer,
+    /// Release funds to seller (IP ownership transfer is valid)
+    ConfirmToSeller,
+    /// Partial refund: both parties get a split amount
+    PartialRefund(i128), // i128 is the amount refunded to buyer, rest to seller
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct EscrowSwapResolvedEvent {
+    pub swap_id: u64,
+    pub arbiter: Address,
+    pub decision: ArbitratorDecision,
+    pub timestamp: u64,
+}
