@@ -17,7 +17,7 @@ struct AppState {
     ws_broadcaster:   Arc<websocket::EventBroadcaster>,
     sse_broadcaster:  Arc<events::EventBroadcaster>,
     health_checker:   Arc<health::HealthChecker>,
-    rpc_client:       Arc<dyn graphql::SorobanRpcClient>,
+    rate_limiter:     Arc<rate_limit::RateLimitMiddleware>,
 }
 
 impl FromRef<AppState> for Arc<health::HealthChecker> {
@@ -29,6 +29,12 @@ impl FromRef<AppState> for Arc<health::HealthChecker> {
 impl FromRef<AppState> for Arc<dyn graphql::SorobanRpcClient> {
     fn from_ref(state: &AppState) -> Self {
         state.rpc_client.clone()
+    }
+}
+
+impl FromRef<AppState> for Arc<rate_limit::RateLimitMiddleware> {
+    fn from_ref(state: &AppState) -> Self {
+        state.rate_limiter.clone()
     }
 }
 
@@ -198,6 +204,8 @@ async fn main() {
         subscription_broadcaster.clone(),
     );
 
+    let rate_limiter = Arc::new(rate_limit::RateLimitMiddleware::new(rate_limit::RateLimitConfig::default()));
+
     let state = AppState {
         schema,
         query_client,
@@ -205,10 +213,8 @@ async fn main() {
         ws_broadcaster:  Arc::new(websocket::EventBroadcaster::new()),
         sse_broadcaster: Arc::new(events::create_event_broadcaster().0),
         health_checker:  Arc::new(health::HealthChecker::new()),
-        rpc_client: rpc_client.clone(),
+        rate_limiter: rate_limiter.clone(),
     };
-
-    let rate_limiter = rate_limit::RateLimitMiddleware::new(rate_limit::RateLimitConfig::default());
     let request_queue = Arc::new(request_queue::RequestQueue::new(
         request_queue::QueueConfig::default(),
     ));

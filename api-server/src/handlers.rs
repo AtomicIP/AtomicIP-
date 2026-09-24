@@ -57,6 +57,8 @@ fn now_timestamp() -> u64 {
 // ── IP Registry ───────────────────────────────────────────────────────────────
 
 /// Timestamp a new IP commitment. Returns the assigned IP ID.
+///
+/// #983: Per-user commitment rate limiting (10 commits/minute) is enforced on successful commits.
 #[utoipa::path(
     post,
     path = "/v1/ip/commit",
@@ -65,11 +67,13 @@ fn now_timestamp() -> u64 {
     responses(
         (status = 200, description = "IP committed successfully, returns assigned ip_id", body = u64),
         (status = 400, description = "Invalid request (zero hash, duplicate hash)", body = ErrorResponse),
+        (status = 429, description = "User commitment rate limit exceeded (10 commits/minute)", body = ErrorResponse),
         (status = 503, description = "Soroban RPC node unavailable", body = ErrorResponse),
     )
 )]
 #[instrument(skip(body))]
 pub async fn commit_ip(
+    State(rate_limiter): State<Arc<crate::rate_limit::RateLimitMiddleware>>,
     Json(body): Json<CommitIpRequest>,
 ) -> Result<Json<u64>, (StatusCode, Json<ErrorResponse>)> {
     // Delegate to the Soroban RPC client.  The client validates inputs before
@@ -87,6 +91,20 @@ pub async fn commit_ip(
                 }),
             )
         })?;
+
+    // #983: Check per-user commitment rate limit after successful commit
+    let (allowed, _remaining, reset_after) = rate_limiter.check_commitment_rate_limit(&body.owner).await;
+    if !allowed {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ErrorResponse {
+                error: format!(
+                    "User commitment rate limit exceeded (10 commits/minute). Retry after {} seconds",
+                    reset_after.as_secs().max(1)
+                ),
+            }),
+        ));
+    }
 
     Ok(Json(ip_id))
 }
