@@ -55,6 +55,14 @@ pub enum DataKey {
     MerkleRoot(Address),  // Issue #435: cached Merkle root for an owner's commitment set
     NotaryPublicKey,      // Issue #428: stores the trusted notary Ed25519 public key (32 bytes)
     CommitmentHashes, // Issue #429: stores Vec<BytesN<32>> of all commitment hashes for rollback protection
+    /// #974: Merkle root metadata for batch commitments
+    MerkleRootRecord(u64),
+    /// #975: Time-lock metadata for time-locked commitments
+    TimeLockRecord(u64),
+    /// #976: Amendment history for commitment amendments
+    AmendmentHistory(u64),
+    /// #977: Privacy level for each commitment
+    CommitmentPrivacy(u64),
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -72,6 +80,8 @@ pub struct IpRecord {
     pub notary_signature: Option<Bytes>, // Issue #345: notary signature for timestamp notarization
     pub expiry_timestamp: u64,           // 0 = no expiry
     pub grace_period_seconds: u64,       // seconds after expiry before permanent deletion
+    pub unlock_time: u64,                // #975: time-lock release timestamp, 0 = no time-lock
+    pub privacy_level: u32,              // #977: 0=Public, 1=Private, 2=Restricted, 3=Confidential
 }
 
 #[contracttype]
@@ -110,4 +120,64 @@ pub struct OwnershipChallenge {
     /// Unix timestamp (seconds) after which this challenge is considered expired.
     /// Computed as `timestamp + challenge_ttl_seconds` at creation time.
     pub expires_at: u64,
+}
+
+/// #974: Merkle tree proof for batch commitments
+#[contracttype]
+#[derive(Clone)]
+pub struct MerkleProof {
+    pub leaf_index: u32,
+    pub proof_path: soroban_sdk::Vec<BytesN<32>>,
+}
+
+/// #974: Merkle root record for tracking batch commitments
+#[contracttype]
+#[derive(Clone)]
+pub struct MerkleRootRecord {
+    pub root_id: u64,
+    pub root_hash: BytesN<32>,
+    pub owner: Address,
+    pub timestamp: u64,
+    pub leaf_count: u32,
+}
+
+/// #975: Time-lock record for time-locked commitments
+#[contracttype]
+#[derive(Clone)]
+pub struct TimeLockRecord {
+    pub commitment_id: u64,
+    pub unlock_time: u64,
+    pub revealed: bool,
+}
+
+/// #976: Amendment record for tracking commitment amendments
+#[contracttype]
+#[derive(Clone)]
+pub struct CommitmentAmendment {
+    pub amendment_id: u64,
+    pub commitment_id: u64,
+    pub old_hash: BytesN<32>,
+    pub new_hash: BytesN<32>,
+    pub timestamp: u64,
+    pub amender: Address,
+}
+
+/// #977: Privacy level enumeration for access control
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum PrivacyLevel {
+    Public = 0,
+    Private = 1,
+    Restricted = 2,
+    Confidential = 3,
+}
+
+/// #977: Commitment privacy metadata
+#[contracttype]
+#[derive(Clone)]
+pub struct CommitmentPrivacy {
+    pub commitment_id: u64,
+    pub privacy_level: u32,
+    pub allowed_addresses: soroban_sdk::Vec<Address>,
 }
