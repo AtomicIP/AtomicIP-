@@ -644,3 +644,33 @@ pub struct SwapMetadataUpdatedEvent {
     pub terms_hash: BytesN<32>,
     pub timestamp: u64,
 }
+
+// ── #982: Batch Execution ─────────────────────────────────────────────────────
+
+/// Execution mode for batch swaps - determines atomicity semantics.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum BatchExecutionMode {
+    /// Atomic: all-or-nothing. Fails if any swap fails.
+    Atomic,
+    /// Partial: best-effort. Executes all possible swaps, skips failures.
+    Partial,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct BatchSwapExecutedEvent {
+    pub batch_id: BytesN<32>,
+    pub swap_ids: Vec<u64>,
+    pub successful: u32,
+    pub failed: u32,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct BatchExecutionFailedEvent {
+    pub batch_id: BytesN<32>,
+    pub failed_swap_ids: Vec<u64>,
+    pub reason: String,
+}
