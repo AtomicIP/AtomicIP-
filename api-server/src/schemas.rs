@@ -301,3 +301,26 @@ pub struct BulkOperationResult<T> {
     pub data: Option<T>,
     pub error: Option<String>,
 }
+
+/// #982: Execute batch swaps request with execution mode
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ExecuteBatchSwapsRequest {
+    /// Vector of swap IDs to execute (max 50)
+    pub swap_ids: Vec<u64>,
+    /// If true: atomic all-or-nothing execution
+    /// If false: partial execution allowed (individual failures tolerated)
+    pub atomic: bool,
+}
+
+/// #982: Execute batch swaps response with per-swap results
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ExecuteBatchSwapsResponse {
+    /// Per-swap execution results: true = success, false = failure/skipped
+    pub results: Vec<bool>,
+    /// Total number of successful executions
+    pub successful_count: u32,
+    /// Total number of swaps processed
+    pub total_count: u32,
+    /// Execution mode (atomic or partial)
+    pub atomic: bool,
+}

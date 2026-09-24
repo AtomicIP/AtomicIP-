@@ -88,6 +88,7 @@ mod validation_fuzz_tests;
         handlers::unregister_webhook,
         handlers::bulk_commit_ip,
         handlers::bulk_initiate_swap,
+        handlers::execute_batch_swaps,
         batch::batch_handler,
         events::events_handler,
     ),
@@ -115,6 +116,8 @@ mod validation_fuzz_tests;
         schemas::BulkInitiateSwapRequest,
         schemas::BulkInitiateSwapResponse,
         schemas::BulkOperationResult<schemas::IpRecord>,
+        schemas::ExecuteBatchSwapsRequest,
+        schemas::ExecuteBatchSwapsResponse,
     )),
     tags(
         (name = "IP Registry", description = "Commit and query intellectual property records"),
@@ -362,6 +365,7 @@ fn build_app() -> Router {
         .route("/v1/webhooks/{id}", axum::routing::delete(handlers::unregister_webhook))
         .route("/v1/bulk/commit-ip", post(handlers::bulk_commit_ip))
         .route("/v1/bulk/initiate-swap", post(handlers::bulk_initiate_swap))
+        .route("/v1/swaps/execute-batch", post(handlers::execute_batch_swaps))
         .route("/openapi.json", get(openapi_handler))
         .with_state(state)
         .layer(middleware::from_fn_with_state(rate_limiter, rate_limit::rate_limit_middleware))
