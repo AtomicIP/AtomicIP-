@@ -40,6 +40,33 @@ pub struct VerifyCommitmentResponse {
     pub valid: bool,
 }
 
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct BatchRevealCommitment {
+    pub ip_id: u64,
+    /// 32-byte secret, hex-encoded.
+    pub secret: String,
+    /// 32-byte blinding factor, hex-encoded.
+    pub blinding_factor: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct BatchRevealCommitmentsRequest {
+    pub commitments: Vec<BatchRevealCommitment>,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct BatchRevealResult {
+    pub ip_id: u64,
+    pub valid: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct BatchRevealCommitmentsResponse {
+    pub results: Vec<BatchRevealResult>,
+}
+
 /// #317: Pagination query parameters shared across list endpoints.
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct PaginationParams {

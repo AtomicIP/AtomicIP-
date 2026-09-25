@@ -9,6 +9,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::time::{Duration, Instant};
 use tracing::instrument;
+use sha2::{Digest, Sha256};
 use crate::cache;
 use crate::deduplication::{create_store, DeduplicationStore};
 use crate::graphql::SorobanQueryClient;
@@ -207,6 +208,66 @@ pub async fn verify_commitment(Json(body): Json<VerifyCommitmentRequest>) -> Res
             error: format!("IP record {} not found", body.ip_id),
         }),
     ))
+}
+
+/// Reveal and verify multiple IP commitments in one request.
+#[utoipa::path(
+    post,
+    path = "/v1/ip/reveal-batch",
+    tag = "IP Registry",
+    request_body = BatchRevealCommitmentsRequest,
+    responses(
+        (status = 200, description = "Commitments verified with per-item results", body = BatchRevealCommitmentsResponse),
+        (status = 400, description = "Invalid or oversized batch", body = ErrorResponse),
+    )
+)]
+#[instrument(skip(body))]
+pub async fn batch_reveal_commitments(
+    Json(body): Json<BatchRevealCommitmentsRequest>,
+) -> Result<Json<BatchRevealCommitmentsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if body.commitments.is_empty() || body.commitments.len() > MAX_BATCH_SIZE {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("commitments must contain between 1 and {} items", MAX_BATCH_SIZE),
+            }),
+        ));
+    }
+
+    let results = body
+        .commitments
+        .into_iter()
+        .map(|item| {
+            let ip_id = item.ip_id;
+            let (valid, error) = match (
+                hex::decode(&item.secret),
+                hex::decode(&item.blinding_factor),
+            ) {
+                (Ok(secret), Ok(blinding_factor)) if secret.len() == 32 && blinding_factor.len() == 32 => {
+                    match cache::get::<IpRecord>(&cache::ip_key(ip_id)) {
+                        Some(record) => {
+                            let mut hasher = Sha256::new();
+                            hasher.update(&secret);
+                            hasher.update(&blinding_factor);
+                            let computed = hex::encode(hasher.finalize());
+                            (
+                                computed.eq_ignore_ascii_case(&record.commitment_hash),
+                                None,
+                            )
+                        }
+                        None => (false, Some(format!("IP record {} not found", ip_id))),
+                    }
+                }
+                _ => (
+                    false,
+                    Some("secret and blinding_factor must be 32-byte hex values".to_string()),
+                ),
+            };
+            BatchRevealResult { ip_id, valid, error }
+        })
+        .collect();
+
+    Ok(Json(BatchRevealCommitmentsResponse { results }))
 }
 
 /// List all IP IDs owned by a Stellar address.
