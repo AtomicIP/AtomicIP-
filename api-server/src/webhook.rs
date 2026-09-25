@@ -27,6 +27,8 @@ pub struct WebhookPayload {
     pub timestamp: u64,
 }
 
+pub const SWAP_STATUS_CHANGED_EVENT: &str = "swap.status_changed";
+
 /// In-memory webhook registry.
 static REGISTRY: Lazy<DashMap<Uuid, WebhookConfig>> = Lazy::new(DashMap::new);
 
@@ -54,6 +56,10 @@ pub fn register(url: String, events: Vec<String>) -> WebhookConfig {
     config
 }
 
+pub fn supports_event(events: &[String], event: &str) -> bool {
+    events.iter().any(|registered| registered == event || registered == "*")
+}
+
 /// Unregister a webhook by ID.
 pub fn unregister(id: Uuid) -> bool {
     if REGISTRY.remove(&id).is_some() {
@@ -72,7 +78,7 @@ pub fn list_all() -> Vec<WebhookConfig> {
 /// Trigger webhook delivery for a swap status change.
 pub fn trigger_swap_status_changed(swap_id: u64, old_status: Option<String>, new_status: String) {
     let payload = WebhookPayload {
-        event: "swap.status_changed".to_string(),
+        event: SWAP_STATUS_CHANGED_EVENT.to_string(),
         swap_id,
         old_status,
         new_status,
@@ -84,7 +90,7 @@ pub fn trigger_swap_status_changed(swap_id: u64, old_status: Option<String>, new
 
     for entry in REGISTRY.iter() {
         let config = entry.value();
-        if config.events.contains(&"swap.status_changed".to_string()) || config.events.contains(&"*".to_string()) {
+        if supports_event(&config.events, SWAP_STATUS_CHANGED_EVENT) {
             let config = config.clone();
             let payload = payload.clone();
             tokio::spawn(async move {

@@ -635,6 +635,203 @@ pub async fn get_swap(
     }
 }
 
+/// Return the amount currently held in escrow and whether it has been released.
+#[utoipa::path(
+    get,
+    path = "/v1/swap/{swap_id}/escrow",
+    tag = "Atomic Swap",
+    params(("swap_id" = u64, Path, description = "Swap identifier")),
+    responses(
+        (status = 200, description = "Escrow status", body = EscrowStatusResponse),
+        (status = 404, description = "Swap not found", body = ErrorResponse),
+        (status = 502, description = "Escrow status unavailable", body = ErrorResponse),
+    )
+)]
+#[instrument]
+pub async fn get_swap_escrow(
+    State(rpc_client): State<Arc<dyn crate::graphql::SorobanRpcClient>>,
+    Path(swap_id): Path<u64>,
+) -> impl IntoResponse {
+    let record = match rpc_client.get_swap_record(swap_id).await {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": format!("Swap {} not found", swap_id) })),
+            ).into_response();
+        }
+        Err(_) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": "failed to query swap" })),
+            ).into_response();
+        }
+    };
+    let status: SwapRecord = record.into();
+    let deposited_amount = match rpc_client.get_swap_escrow(swap_id).await {
+        Ok(Some(amount)) => amount,
+        Ok(None) => 0,
+        Err(error) => {
+            tracing::error!(%error, swap_id, "failed to query escrow status");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": "failed to query escrow status" })),
+            ).into_response();
+        }
+    };
+    let released = matches!(&status.status, SwapStatus::Completed | SwapStatus::Cancelled);
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(EscrowStatusResponse {
+            swap_id,
+            status: status.status,
+            deposited_amount,
+            released,
+        }).unwrap()),
+    ).into_response()
+}
+
+/// Return the immutable on-chain state-transition history for a swap.
+#[utoipa::path(
+    get,
+    path = "/v1/swap/{swap_id}/history",
+    tag = "Atomic Swap",
+    params(("swap_id" = u64, Path, description = "Swap identifier")),
+    responses((status = 200, description = "Swap history", body = [SwapHistoryEntry]))
+)]
+#[instrument]
+pub async fn get_swap_history(
+    State(rpc_client): State<Arc<dyn crate::graphql::SorobanRpcClient>>,
+    Path(swap_id): Path<u64>,
+) -> impl IntoResponse {
+    match rpc_client.get_swap_history(swap_id).await {
+        Ok(entries) => {
+            let entries: Vec<SwapHistoryEntry> = entries
+                .into_iter()
+                .map(|entry| SwapHistoryEntry {
+                    status: match entry.status {
+                        crate::graphql::SwapStatus::Pending => SwapStatus::Pending,
+                        crate::graphql::SwapStatus::Accepted => SwapStatus::Accepted,
+                        crate::graphql::SwapStatus::Completed => SwapStatus::Completed,
+                        crate::graphql::SwapStatus::Disputed => SwapStatus::Disputed,
+                        crate::graphql::SwapStatus::Cancelled => SwapStatus::Cancelled,
+                    },
+                    timestamp: entry.timestamp,
+                })
+                .collect();
+            (StatusCode::OK, Json(serde_json::to_value(entries).unwrap())).into_response()
+        }
+        Err(error) => {
+            tracing::error!(%error, swap_id, "failed to query swap history");
+            (StatusCode::BAD_GATEWAY, Json(serde_json::json!({
+                "error": "failed to query swap history"
+            }))).into_response()
+        }
+    }
+}
+
+/// Return all evidence submissions associated with a swap dispute.
+#[utoipa::path(
+    get,
+    path = "/v1/swap/{swap_id}/disputes",
+    tag = "Atomic Swap",
+    params(("swap_id" = u64, Path, description = "Swap identifier")),
+    responses((status = 200, description = "Dispute evidence history", body = [DisputeEvidenceEntry]))
+)]
+#[instrument]
+pub async fn get_swap_disputes(
+    State(rpc_client): State<Arc<dyn crate::graphql::SorobanRpcClient>>,
+    Path(swap_id): Path<u64>,
+) -> impl IntoResponse {
+    match rpc_client.get_dispute_evidence(swap_id).await {
+        Ok(entries) => {
+            let entries: Vec<DisputeEvidenceEntry> = entries
+                .into_iter()
+                .map(|entry| DisputeEvidenceEntry {
+                    swap_id: entry.swap_id,
+                    submitter: entry.submitter,
+                    evidence_hash: entry.evidence_hash,
+                    timestamp: entry.timestamp,
+                })
+                .collect();
+            (StatusCode::OK, Json(serde_json::to_value(entries).unwrap())).into_response()
+        }
+        Err(error) => {
+            tracing::error!(%error, swap_id, "failed to query dispute evidence");
+            (StatusCode::BAD_GATEWAY, Json(serde_json::json!({
+                "error": "failed to query dispute evidence"
+            }))).into_response()
+        }
+    }
+}
+
+/// List swaps using party/IP selectors and optional status, asset, and price filters.
+#[utoipa::path(
+    get,
+    path = "/v1/swaps",
+    tag = "Atomic Swap",
+    params(SwapFilterParams),
+    responses(
+        (status = 200, description = "Filtered swaps", body = SwapListResponse),
+        (status = 400, description = "At least one seller, buyer, or ip_id selector is required", body = ErrorResponse),
+    )
+)]
+#[instrument]
+pub async fn list_swaps(
+    State(rpc_client): State<Arc<dyn crate::graphql::SorobanRpcClient>>,
+    Query(filters): Query<SwapFilterParams>,
+) -> impl IntoResponse {
+    let limit = filters.limit.clamp(1, 200);
+    let connection = if let Some(seller) = filters.seller.as_deref() {
+        rpc_client.get_swaps_by_seller(seller, limit, filters.cursor.clone()).await
+    } else if let Some(buyer) = filters.buyer.as_deref() {
+        rpc_client.get_swaps_by_buyer(buyer, limit, filters.cursor.clone()).await
+    } else if let Some(ip_id) = filters.ip_id {
+        rpc_client.get_swaps_by_ip(ip_id, limit, filters.cursor.clone()).await
+    } else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "At least one of seller, buyer, or ip_id is required"
+            })),
+        ).into_response();
+    };
+
+    let connection = match connection {
+        Ok(connection) => connection,
+        Err(error) => {
+            tracing::error!(%error, "failed to query swaps");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": "failed to query swaps" })),
+            ).into_response();
+        }
+    };
+
+    let crate::graphql::SwapConnection { swap_ids, has_next_page, cursor } = connection;
+    let mut swaps = Vec::new();
+    for swap_id in swap_ids {
+        if let Ok(Some(record)) = rpc_client.get_swap_record(swap_id).await {
+            let record: SwapRecord = record.into();
+            let price_matches = filters.min_price.map_or(true, |min| record.price >= min)
+                && filters.max_price.map_or(true, |max| record.price <= max);
+            let matches = filters.status.as_ref().map_or(true, |status| record.status == *status)
+                && filters.token.as_ref().map_or(true, |token| record.token == *token)
+                && price_matches;
+            if matches {
+                swaps.push(record);
+            }
+        }
+    }
+
+    let response = SwapListResponse {
+        swaps,
+        next_cursor: cursor,
+        has_more: has_next_page,
+    };
+    (StatusCode::OK, Json(serde_json::to_value(response).unwrap())).into_response()
+}
+
 /// Bridge the RPC layer's record shape (shared with GraphQL) to the REST
 /// schema returned by `GET /v1/swap/{swap_id}`.
 impl From<crate::graphql::SwapRecord> for SwapRecord {
@@ -681,8 +878,22 @@ pub async fn register_webhook(Json(body): Json<RegisterWebhookRequest>) -> Resul
             }),
         ));
     }
+    let url = reqwest::Url::parse(&body.url).map_err(|_| (
+        StatusCode::BAD_REQUEST,
+        Json(ErrorResponse {
+            error: "Webhook URL must be a valid HTTP(S) URL".to_string(),
+        }),
+    ))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Webhook URL must use HTTP or HTTPS".to_string(),
+            }),
+        ));
+    }
 
-    let config = webhook::register(body.url, body.events);
+    let config = webhook::register(url.to_string(), body.events);
 
     Ok(Json(WebhookResponse {
         id: config.id.to_string(),
