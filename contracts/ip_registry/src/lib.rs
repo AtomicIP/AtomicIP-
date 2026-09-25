@@ -5024,6 +5024,10 @@ impl IpRegistry {
 
         for req in requests.iter() {
             let record = require_ip_exists(&env, req.ip_id);
+            // Revealing plaintext openings is an authenticated operation.
+            // Delegated callers use `reveal_partial_by_delegate`, which
+            // verifies the delegation chain before accepting the reveal.
+            record.owner.require_auth();
 
             let mut preimage = Bytes::new(&env);
             preimage.append(&req.secret.into());
