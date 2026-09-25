@@ -94,7 +94,20 @@ pub async fn commit_ip(
             Json(ErrorResponse { error }),
         )
     })?;
+    crate::analytics::record_commitment(&crate::commitments::get_tags(ip_id));
     Ok(Json(ip_id))
+}
+
+/// Return aggregate commitment and swap usage statistics.
+#[utoipa::path(
+    get,
+    path = "/v1/analytics/commitments",
+    tag = "Analytics",
+    responses((status = 200, description = "Commitment and swap analytics"))
+)]
+#[instrument]
+pub async fn commitment_analytics() -> impl IntoResponse {
+    Json(crate::analytics::snapshot())
 }
 
 /// List IP commitment IDs organized under a tag.
@@ -469,6 +482,7 @@ pub async fn batch_initiate_swap(Json(body): Json<BatchInitiateSwapRequest>) -> 
             expiry,
         };
         cache::set_with_ttl(&cache::swap_key(swap_id), &record, SWAP_EXPIRY_SECONDS);
+        crate::analytics::record_swap_initiated();
         swap_ids.push(swap_id);
     }
 
@@ -508,6 +522,7 @@ pub async fn accept_swap(Path(swap_id): Path<u64>, Json(body): Json<AcceptSwapRe
     // swap record and both list prefixes are invalidated.
     cache::invalidate_swap(swap_id);
     webhook::trigger_swap_status_changed(swap_id, Some("Pending".to_string()), "Accepted".to_string());
+    crate::analytics::record_swap_status("Accepted");
     websocket::trigger_swap_status_changed(swap_id, Some("Pending".to_string()), "Accepted".to_string());
     Err((
         StatusCode::NOT_FOUND,
@@ -540,6 +555,7 @@ pub async fn reveal_key(Path(swap_id): Path<u64>, Json(body): Json<RevealKeyRequ
     cache::invalidate_swap(swap_id);
     cache::invalidate_prefix("reputation:");
     webhook::trigger_swap_status_changed(swap_id, Some("Accepted".to_string()), "Completed".to_string());
+    crate::analytics::record_swap_status("Completed");
     websocket::trigger_swap_status_changed(swap_id, Some("Accepted".to_string()), "Completed".to_string());
     Err((
         StatusCode::NOT_FOUND,
@@ -569,6 +585,7 @@ pub async fn cancel_swap(Path(swap_id): Path<u64>, Json(body): Json<CancelSwapRe
     // swap record and both seller/buyer list prefixes.
     cache::invalidate_swap(swap_id);
     webhook::trigger_swap_status_changed(swap_id, Some("Pending".to_string()), "Cancelled".to_string());
+    crate::analytics::record_swap_status("Cancelled");
     websocket::trigger_swap_status_changed(swap_id, Some("Pending".to_string()), "Cancelled".to_string());
     Err((
         StatusCode::NOT_FOUND,
@@ -598,6 +615,7 @@ pub async fn cancel_expired_swap(Path(swap_id): Path<u64>, Json(body): Json<Canc
     // swap record and both seller/buyer list prefixes.
     cache::invalidate_swap(swap_id);
     webhook::trigger_swap_status_changed(swap_id, Some("Accepted".to_string()), "Cancelled".to_string());
+    crate::analytics::record_swap_status("Cancelled");
     websocket::trigger_swap_status_changed(swap_id, Some("Accepted".to_string()), "Cancelled".to_string());
     Err((
         StatusCode::NOT_FOUND,

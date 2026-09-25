@@ -36,6 +36,7 @@ mod auth;
 mod batch;
 mod cache;
 mod commitments;
+mod analytics;
 mod circuit_breaker;
 mod deduplication;
 mod events;
@@ -79,6 +80,7 @@ mod validation_fuzz_tests;
         handlers::list_ip_by_owner,
         handlers::list_ip_by_owner_cursor,
         handlers::list_commitments_by_tag,
+        handlers::commitment_analytics,
         handlers::initiate_swap,
         handlers::batch_initiate_swap,
         handlers::accept_swap,
@@ -241,6 +243,7 @@ async fn main() {
         .route("/ip/owner/{owner}",               get(handlers::list_ip_by_owner))
         .route("/ip/owner/{owner}/cursor",        get(handlers::list_ip_by_owner_cursor))
         .route("/ip/tag/{tag}",                   get(handlers::list_commitments_by_tag))
+        .route("/analytics/commitments",          get(handlers::commitment_analytics))
         .route("/swap/initiate",                  post(handlers::initiate_swap).layer(signed.clone()))
         .route("/swap/batch-initiate",            post(handlers::batch_initiate_swap))
         .route("/swap/{swap_id}/accept",          post(handlers::accept_swap).layer(signed.clone()))
@@ -354,6 +357,7 @@ fn build_app() -> Router {
         .route("/v1/ip/owner/{owner}", get(handlers::list_ip_by_owner))
         .route("/v1/ip/owner/{owner}/cursor", get(handlers::list_ip_by_owner_cursor))
         .route("/v1/ip/tag/{tag}", get(handlers::list_commitments_by_tag))
+        .route("/v1/analytics/commitments", get(handlers::commitment_analytics))
         .route("/v1/ip/owner/{owner}/cursor", get(handlers::list_ip_by_owner_cursor))
         .route("/v1/swap/initiate", post(handlers::initiate_swap))
         .route("/v1/swap/batch-initiate", post(handlers::batch_initiate_swap))
