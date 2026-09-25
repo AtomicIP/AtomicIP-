@@ -55,14 +55,10 @@ pub enum DataKey {
     MerkleRoot(Address),  // Issue #435: cached Merkle root for an owner's commitment set
     NotaryPublicKey,      // Issue #428: stores the trusted notary Ed25519 public key (32 bytes)
     CommitmentHashes, // Issue #429: stores Vec<BytesN<32>> of all commitment hashes for rollback protection
-    /// #974: Merkle root metadata for batch commitments
-    MerkleRootRecord(u64),
-    /// #975: Time-lock metadata for time-locked commitments
-    TimeLockRecord(u64),
-    /// #976: Amendment history for commitment amendments
-    AmendmentHistory(u64),
-    /// #977: Privacy level for each commitment
-    CommitmentPrivacy(u64),
+    /// Issue #973: Maps ip_id -> encrypted metadata (title, description, tags)
+    IpMetadata(u64),
+    /// Issue #973: Maps tag hash -> Vec<u64> of IP IDs with that tag (for search)
+    MetadataTagIndex(BytesN<32>),
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -122,62 +118,32 @@ pub struct OwnershipChallenge {
     pub expires_at: u64,
 }
 
-/// #974: Merkle tree proof for batch commitments
+/// Issue #973: Encrypted metadata for commitment discovery and discoverability.
+/// Stores encrypted title, description, and searchable tags for each IP commitment.
+/// The metadata is encrypted to preserve privacy while enabling search.
 #[contracttype]
 #[derive(Clone)]
-pub struct MerkleProof {
-    pub leaf_index: u32,
-    pub proof_path: soroban_sdk::Vec<BytesN<32>>,
-}
-
-/// #974: Merkle root record for tracking batch commitments
-#[contracttype]
-#[derive(Clone)]
-pub struct MerkleRootRecord {
-    pub root_id: u64,
-    pub root_hash: BytesN<32>,
-    pub owner: Address,
+pub struct IpMetadata {
+    pub ip_id: u64,
+    /// Encrypted bytes containing metadata (title, description, tags)
+    /// Format: AES-GCM encrypted JSON with nonce prepended
+    pub encrypted_data: Bytes,
+    /// Encryption nonce used for this metadata
+    pub nonce: BytesN<12>,
+    /// Timestamp when metadata was created/updated
     pub timestamp: u64,
-    pub leaf_count: u32,
+    /// Tags for search indexing (hashes of tag strings)
+    pub tag_hashes: soroban_sdk::Vec<BytesN<32>>,
 }
 
-/// #975: Time-lock record for time-locked commitments
+/// Issue #973: Result object for paginated metadata search
 #[contracttype]
 #[derive(Clone)]
-pub struct TimeLockRecord {
-    pub commitment_id: u64,
-    pub unlock_time: u64,
-    pub revealed: bool,
-}
-
-/// #976: Amendment record for tracking commitment amendments
-#[contracttype]
-#[derive(Clone)]
-pub struct CommitmentAmendment {
-    pub amendment_id: u64,
-    pub commitment_id: u64,
-    pub old_hash: BytesN<32>,
-    pub new_hash: BytesN<32>,
-    pub timestamp: u64,
-    pub amender: Address,
-}
-
-/// #977: Privacy level enumeration for access control
-#[contracttype]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-#[repr(u32)]
-pub enum PrivacyLevel {
-    Public = 0,
-    Private = 1,
-    Restricted = 2,
-    Confidential = 3,
-}
-
-/// #977: Commitment privacy metadata
-#[contracttype]
-#[derive(Clone)]
-pub struct CommitmentPrivacy {
-    pub commitment_id: u64,
-    pub privacy_level: u32,
-    pub allowed_addresses: soroban_sdk::Vec<Address>,
+pub struct MetadataSearchResult {
+    pub ip_ids: soroban_sdk::Vec<u64>,
+    pub total_count: u32,
+    pub offset: u32,
+    pub limit: u32,
+    /// Cursor for next page (if any)
+    pub next_cursor: Option<BytesN<32>>,
 }

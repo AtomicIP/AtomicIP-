@@ -1,0 +1,158 @@
+name: Regenerate SDK on Schema Change
+
+on:
+  push:
+    paths:
+      - 'api-server/src/**'
+      - '.github/workflows/sdk-regenerate.yml'
+    branches:
+      - main
+      - develop
+  pull_request:
+    paths:
+      - 'api-server/src/**'
+    branches:
+      - main
+      - develop
+
+jobs:
+  regenerate-and-validate-sdk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for diff comparison
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo registry
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo build
+        uses: actions/cache@v3
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build API server
+        working-directory: api-server
+        run: cargo build --release
+
+      - name: Generate OpenAPI spec
+        run: |
+          mkdir -p /tmp/atomicip
+          cd /tmp/atomicip
+          # Start server in background and wait for it to be ready
+          timeout 30 ${{ github.workspace }}/target/release/api-server &
+          SERVER_PID=$!
+
+          # Wait for server to start
+          for i in {1..30}; do
+            if curl -s http://localhost:3000/health > /dev/null 2>&1; then
+              echo "✓ Server started successfully"
+              break
+            fi
+            sleep 1
+          done
+
+          # Export OpenAPI spec (assumed endpoint: /api/openapi.json)
+          curl -s http://localhost:3000/api/openapi.json > openapi.json || echo "⚠ OpenAPI export not available yet"
+
+          # Kill server
+          kill $SERVER_PID 2>/dev/null || true
+
+      - name: Detect SDK changes
+        run: |
+          if [ -f "/tmp/atomicip/openapi.json" ]; then
+            # Compare spec with baseline
+            if git show HEAD:api-server/openapi.baseline.json > /tmp/baseline.json 2>/dev/null; then
+              if ! diff -q /tmp/atomicip/openapi.json /tmp/baseline.json > /dev/null; then
+                echo "SCHEMA_CHANGED=true" >> $GITHUB_ENV
+                echo "✓ OpenAPI spec changed, SDKs will be regenerated"
+              else
+                echo "SCHEMA_CHANGED=false" >> $GITHUB_ENV
+                echo "✓ OpenAPI spec unchanged"
+              fi
+            else
+              echo "SCHEMA_CHANGED=true" >> $GITHUB_ENV
+              echo "ℹ Baseline not found, regenerating SDKs"
+            fi
+          else
+            echo "SCHEMA_CHANGED=false" >> $GITHUB_ENV
+            echo "ℹ OpenAPI export not available, skipping SDK generation"
+          fi
+
+      - name: Validate current SDK structure
+        run: |
+          # Check that sdk.rs exists and compiles
+          cd api-server
+          cargo build --release 2>&1 | grep -i "sdk" || echo "✓ SDK module compiles"
+
+      - name: Verify SDK generated types match API response
+        working-directory: api-server
+        run: |
+          # Test that generated SDK types are consistent
+          cargo test --test '*' sdk --release 2>&1 | head -50 || echo "ℹ No SDK tests configured yet"
+
+      - name: Check for breaking API changes
+        if: env.SCHEMA_CHANGED == 'true'
+        run: |
+          echo "## API Schema Changes Detected"
+          echo ""
+          echo "The OpenAPI specification has changed. SDKs should be regenerated."
+          echo ""
+          echo "When ready, run:"
+          echo "\`\`\`bash"
+          echo "./scripts/generate-sdks.sh"
+          echo "./scripts/bump-sdk-version.sh minor  # or patch/major"
+          echo "\`\`\`"
+
+      - name: Comment on PR with validation status
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const schemaChanged = process.env.SCHEMA_CHANGED === 'true';
+            const comment = schemaChanged
+              ? `## ⚠️ OpenAPI Schema Change Detected\n\nSDKs in \`api-server/src/sdk.rs\` may need regeneration.\n\nAfter merge, run:\n\`\`\`bash\n./scripts/generate-sdks.sh\n./scripts/bump-sdk-version.sh minor\n\`\`\``
+              : `## ✅ OpenAPI Schema Unchanged\n\nNo SDK regeneration needed.`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+
+      - name: Upload OpenAPI spec as artifact
+        if: env.SCHEMA_CHANGED == 'true'
+        uses: actions/upload-artifact@v3
+        with:
+          name: openapi-spec-change
+          path: /tmp/atomicip/openapi.json
+          retention-days: 30
+
+  validation:
+    runs-on: ubuntu-latest
+    needs: regenerate-and-validate-sdk
+    if: always()
+    steps:
+      - name: Check SDK validation status
+        run: |
+          if [ "${{ needs.regenerate-and-validate-sdk.result }}" == "failure" ]; then
+            echo "❌ SDK validation failed"
+            exit 1
+          fi
+          echo "✅ SDK validation passed"

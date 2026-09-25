@@ -580,3 +580,38 @@ The `src/batch/*.js` modules handle off-chain batch operations including commitm
 | Fee account exposure | Advise privacy-sensitive users to use a fresh throwaway account as the transaction fee payer |
 | Audit trail | `"ip_cmt_a"` events are emitted per commitment; monitor for unusual batch sizes that may indicate Sybil behaviour |
 | Batch infrastructure | Run batch processing and API server on separate hardware; enforce network segmentation; monitor Redis state and audit logs for anomalies |
+
+---
+
+## Changelog
+
+### #781: Dispute-Arbitration Hardening (2026-09-24)
+
+**Summary**: Implemented multi-signature committee oversight for disputed swaps, replacing single-arbitrator model with M-of-N threshold signing, time-locked rulings, and non-refundable dispute bonds.
+
+**Changes**:
+- **Committee-based arbitration**: Disputes now require approval from at least M of N committee members (minimum 2-of-3 per threat model), not a single admin
+- **Time-locked rulings**: Committee rulings enter a 48-hour pending state before execution; can be cancelled within the window if unanimous (threshold) signers agree
+- **Dispute bonds**: Buyer and seller each deposit a non-refundable bond (max of 1 XLM or 10% of swap price) when submitting dispute evidence; winning party's bond is refunded, losing party's is forfeited
+- **Error hardening**: New error codes: `NotACommitteeSigner` (55), `DuplicateSigner` (56), `InsufficientSignatures` (57), `CommitteeSizeTooSmall` (58), `EvidenceRequired` (59), `RulingAlreadyPending` (60), `NoPendingRuling` (62), `TimelockNotElapsed` (63), `RulingFinalized` (64)
+- **Regression test added**: `regression_tests.rs::regression_781_arbitration_hardening_error_codes` verifies error round-tripping and end-to-end arbitration flow
+
+**Threat Mitigations**:
+- **Reduced arbitrator trust**: Committee requirement spreads trust across multiple actors; single arbitrator cannot unilaterally resolve disputes
+- **Dispute bond disincentive**: Non-refundable bonds make frivolous disputes costly; legitimate disputes are resolved at lower cost when evidence supports a clear outcome
+- **Timelock prevents silent takeover**: 48-hour delay allows community/oversight to detect and contest questionable rulings before funds are moved
+
+**Residual Risks**:
+- ⚠️ **Committee compromise**: If majority of committee signers are compromised, rulings can be fabricated. Mitigated by:
+  - Keeping committee size large (e.g., 5+ members)
+  - Requiring public disclosure of committee roster
+  - Periodic key rotation
+  - Independent monitoring of ruling patterns
+- ⚠️ **Treasury address bug**: Per code comments, `protocol_config().treasury` is a hardcoded placeholder; dispute bond forfeitures are sent to admin address instead. This PR does not fix the storage bug but documents it in code comments.
+
+**Testing**: Regression test suite covers:
+- Error code construction and round-tripping through `Error::from_contract_error`
+- Committee threshold enforcement (3 signers, 2-of-3 requirement)
+- Ruling entry, cancellation, and execution paths
+- Time-lock delay verification
+- Swap status transitions through arbitration flow
