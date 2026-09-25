@@ -114,6 +114,8 @@ pub enum ContractError {
     InsufficientInsuranceReserve = 67,
     /// #906: Treasury address validation - rejects zero or placeholder addresses
     InvalidTreasuryAddress = 68,
+    HashlockNotMet = 69,
+    TimelockExpired = 70,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -250,6 +252,10 @@ pub enum SwapCondition {
     KeyValid,
     PriceBelow(i128),
     TimeAfter(u64),
+    /// The SHA-256 hash of the secret that must be revealed to complete.
+    Hashlock(BytesN<32>),
+    /// Unix timestamp after which the buyer may reclaim an accepted swap.
+    Timelock(u64),
 }
 
 #[contracttype]
@@ -610,6 +616,8 @@ impl AtomicSwap {
                 }
                 SwapCondition::PriceBelow(threshold) => swap.price < threshold,
                 SwapCondition::TimeAfter(ts) => env.ledger().timestamp() >= ts,
+                SwapCondition::Hashlock(_) => true,
+                SwapCondition::Timelock(ts) => env.ledger().timestamp() < ts,
             };
             if !ok {
                 env.panic_with_error(Error::from_contract_error(
@@ -859,6 +867,17 @@ impl AtomicSwap {
                     LEDGER_BUMP,
                     LEDGER_BUMP,
                 );
+            }
+
+            for i in 0..swap.conditions.len() {
+                if let Some(SwapCondition::Hashlock(expected)) = swap.conditions.get(i) {
+                    let hash: BytesN<32> = env.crypto().sha256(&secret.clone().into()).into();
+                    if hash != expected {
+                        env.panic_with_error(Error::from_contract_error(
+                            ContractError::HashlockNotMet as u32,
+                        ));
+                    }
+                }
             }
             env.panic_with_error(Error::from_contract_error(ContractError::InvalidKey as u32));
         }
@@ -2270,6 +2289,37 @@ impl AtomicSwap {
                         buyer: swap.buyer.clone(),
                         collateral_amount: collateral,
                     },
+                );
+            }
+
+            /// Refund an accepted hash-time-locked swap after its timelock.
+            pub fn refund_htlc(env: Env, swap_id: u64, caller: Address) {
+                let mut swap = require_swap_exists(&env, swap_id);
+                require_swap_status(&env, &swap, SwapStatus::Accepted, ContractError::NotInAccepted);
+                require_buyer(&env, &caller, &swap);
+                caller.require_auth();
+
+                let expired = swap.conditions.iter().any(|condition| {
+                    matches!(condition, SwapCondition::Timelock(timestamp) if env.ledger().timestamp() >= timestamp)
+                });
+                if !expired {
+                    env.panic_with_error(Error::from_contract_error(
+                        ContractError::TimelockExpired as u32,
+                    ));
+                }
+
+                swap.status = SwapStatus::Cancelled;
+                swap::save_swap(&env, swap_id, &swap);
+                env.storage().persistent().remove(&DataKey::ActiveSwap(swap.ip_id));
+                token::Client::new(&env, &swap.token).transfer(
+                    &env.current_contract_address(),
+                    &swap.buyer,
+                    &swap.price,
+                );
+                Self::append_history(&env, swap_id, SwapStatus::Cancelled);
+                env.events().publish(
+                    (soroban_sdk::symbol_short!("htlc_ref"),),
+                    SwapCancelledEvent { swap_id, canceller: caller },
                 );
             }
         }
