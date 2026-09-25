@@ -122,6 +122,7 @@ pub enum ContractError {
     InvalidPrivacyLevel = 44,
     /// #977: Access denied due to privacy level restrictions.
     AccessDenied = 45,
+    InvalidCommitmentPrefix = 46,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -234,6 +235,7 @@ pub enum DataKey {
     // Issue #979: Commitment linking for related IPs
     CommitmentLinks(u64), // maps ip_id -> Vec<CommitmentLink> of linked commitments
     LinkedCommitments(u64), // maps linked_ip_id -> Vec<u64> of ip_ids linking to it (reverse index)
+    CommitmentVerificationHistory(u64), // append-only verification results
 }
 
 // ── Upgrade Compatibility Manifest (#791) ───────────────────────────────────
@@ -273,7 +275,7 @@ const CURRENT_FUNCTIONS: &[&str] = &[
     "generate_merkle_proof", "get_anonymous_owner", "get_arbitration", "get_batch_escrow",
     "get_batch_metadata", "get_blinded_owner_batch", "get_commitment_compression", "get_commitment_shard",
     "get_compressed_bytes", "get_compressed_commitment", "get_dispute", "get_encrypted_commitment",
-    "get_commitment_back_references", "get_ip", "get_ip_access_grants", "get_ip_audit_trail", "get_ip_lineage",
+    "get_commitment_back_references", "get_commitment_verification_history", "get_ip", "get_ip_access_grants", "get_ip_audit_trail", "get_ip_lineage",
     "get_ip_notary_signature", "get_ip_strength", "get_ip_suggested_price", "get_ip_version_chain",
     "get_linked_commitments",
     "get_ip_versions", "get_key_rotation_history", "get_licenses", "get_ownership_challenge",
@@ -282,6 +284,7 @@ const CURRENT_FUNCTIONS: &[&str] = &[
     "grant_license", "initialize", "initiate_dispute", "is_delegate",
     "is_ip_owner", "issue_ownership_challenge", "link_commitment", "list_ip_by_category", "list_ip_by_owner",
     "list_ip_by_shard", "list_owner_categories", "merge_duplicate_commitment", "nominate_arbitrator",
+    "search_commitments_by_prefix",
     "notarize_ip_timestamp", "open_arbitration", "register_category_path", "release_batch_escrow",
     "remove_co_owner", "renew_ip", "renew_ip_commitment", "require_threshold_signatures",
     "resolve_dispute", "respond_to_ownership_challenge", "reveal_and_verify_commitments", "reveal_partial",
@@ -309,6 +312,7 @@ const CURRENT_STORAGE_KEYS: &[&str] = &[
     "CompressedCommitment", "BatchVerifyResult", "CompressionSelection", "HierarchyNode",
     "OwnerCategories", "CategoryDepth", "ThresholdConfig", "ThresholdSignatures", "BatchMetadata",
     "EncryptedCommitment", "BatchEscrow", "CommitmentLinks", "LinkedCommitments",
+    "CommitmentVerificationHistory",
 ];
 
 /// (error name, error code) pairs defined by the currently deployed contract.
@@ -375,6 +379,22 @@ pub const MAX_DELEGATION_DEPTH: u32 = 5;
 pub struct AuditEntry {
     pub action: soroban_sdk::Symbol, // e.g. "committed", "revoked", "transferred"
     pub actor: Address,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CommitmentSearchResult {
+    pub ip_ids: Vec<u64>,
+    pub total_count: u32,
+    pub offset: u32,
+    pub limit: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CommitmentVerificationEntry {
+    pub verified: bool,
     pub timestamp: u64,
 }
 
@@ -2097,6 +2117,52 @@ impl IpRegistry {
         require_ip_exists(&env, ip_id)
     }
 
+    /// Find IP records whose commitment hash starts with `prefix`.
+    pub fn search_commitments_by_prefix(
+        env: Env,
+        prefix: Bytes,
+        offset: u32,
+        limit: u32,
+    ) -> CommitmentSearchResult {
+        if prefix.is_empty() || prefix.len() > 32 {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::InvalidCommitmentPrefix as u32,
+            ));
+        }
+        let limit = if limit == 0 { 100 } else { limit.min(100) };
+        let next_id: u64 = env.storage().persistent().get(&DataKey::NextId).unwrap_or(1);
+        let mut matching = Vec::new(&env);
+        for ip_id in 1..next_id {
+            if let Some(record) = env.storage().persistent().get::<_, IpRecord>(&DataKey::IpRecord(ip_id)) {
+                let hash = record.commitment_hash.to_array();
+                let mut matches = true;
+                for index in 0..prefix.len() {
+                    if hash[index as usize] != prefix.get(index).unwrap() {
+                        matches = false;
+                        break;
+                    }
+                }
+                if matches {
+                    matching.push_back(ip_id);
+                }
+            }
+        }
+
+        let total_count = matching.len() as u32;
+        let start = offset.min(total_count) as usize;
+        let end = (start + limit as usize).min(matching.len());
+        let mut ip_ids = Vec::new(&env);
+        for index in start..end {
+            ip_ids.push_back(matching.get(index as u32).unwrap());
+        }
+        CommitmentSearchResult {
+            ip_ids,
+            total_count,
+            offset,
+            limit,
+        }
+    }
+
     // ── Issue #454: Threshold Signatures ───────────────────────────────────
     pub fn require_threshold_signatures(
         env: Env,
@@ -2384,7 +2450,9 @@ impl IpRegistry {
         let computed_hash: BytesN<32> = env.crypto().sha256(&preimage).into();
 
         // Constant-time comparison to prevent timing side-channel attacks
-        constant_time_bytes_32_eq(&record.commitment_hash, &computed_hash)
+        let verified = constant_time_bytes_32_eq(&record.commitment_hash, &computed_hash);
+        Self::append_verification_entry(&env, ip_id, verified);
+        verified
     }
 
     /// List all IP IDs owned by an address.
@@ -4090,6 +4158,23 @@ impl IpRegistry {
         );
     }
 
+    fn append_verification_entry(env: &Env, ip_id: u64, verified: bool) {
+        let key = DataKey::CommitmentVerificationHistory(ip_id);
+        let mut history: Vec<CommitmentVerificationEntry> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(Vec::new(env));
+        history.push_back(CommitmentVerificationEntry {
+            verified,
+            timestamp: env.ledger().timestamp(),
+        });
+        env.storage().persistent().set(&key, &history);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, LEDGER_BUMP, LEDGER_BUMP);
+    }
+
     /// Retrieve the immutable audit trail for an IP.
     /// Returns all audit entries in chronological order.
     pub fn get_ip_audit_trail(env: Env, ip_id: u64) -> Vec<AuditEntry> {
@@ -4097,6 +4182,18 @@ impl IpRegistry {
         env.storage()
             .persistent()
             .get(&DataKey::IpAuditTrail(ip_id))
+            .unwrap_or(Vec::new(&env))
+    }
+
+    /// Retrieve every successful and failed verification attempt in order.
+    pub fn get_commitment_verification_history(
+        env: Env,
+        ip_id: u64,
+    ) -> Vec<CommitmentVerificationEntry> {
+        require_ip_exists(&env, ip_id);
+        env.storage()
+            .persistent()
+            .get(&DataKey::CommitmentVerificationHistory(ip_id))
             .unwrap_or(Vec::new(&env))
     }
 
