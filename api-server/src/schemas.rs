@@ -121,8 +121,8 @@ pub mod cursor {
     }
 
     /// Get the next cursor for the following page.
-    pub fn next_cursor(last_id: u64, current_offset: u64, items_per_page: u64) -> String {
-        new(last_id, current_offset + items_per_page)
+    pub fn next_cursor(last_id: u64) -> String {
+        new(last_id)
     }
 }
 
@@ -137,13 +137,12 @@ mod cursor_tests {
         let encoded = cursor::encode(&data);
         let decoded = cursor::decode(&encoded).unwrap();
         assert_eq!(decoded.last_id, 100);
-        assert_eq!(decoded.offset, 50);
     }
 
     #[test]
     fn test_cursor_new_and_next() {
-        let cursor = cursor::new(50, 0);
-        let next = cursor::next_cursor(50, 0, 20);
+        let cursor = cursor::new(50);
+        let next = cursor::next_cursor(50);
         assert_ne!(cursor, next);
     }
 

@@ -81,7 +81,8 @@ pub async fn compression_middleware(
         return response;
     };
 
-    let Ok(collected) = response.body_mut().collect().await else {
+    let body = std::mem::replace(response.body_mut(), Body::empty());
+    let Ok(collected) = body.collect().await else {
         return response;
     };
     let body = collected.to_bytes();

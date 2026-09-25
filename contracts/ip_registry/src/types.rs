@@ -40,6 +40,15 @@ pub struct MerkleProofCache {
     pub proof: soroban_sdk::Vec<BytesN<32>>,
 }
 
+/// Hash function used to derive a commitment from secret material.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommitmentAlgorithm {
+    Pedersen,
+    Sha256,
+    Blake3,
+}
+
 // ── Storage Keys ────────────────────────────────────────────────────────────
 
 #[contracttype]
