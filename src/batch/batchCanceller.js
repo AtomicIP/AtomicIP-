@@ -144,6 +144,24 @@ function cancelBatchSwaps(swaps, cancellations = null, options = {}) {
 
   const totalRefunded = results.reduce((s, r) => s + r.refundAmount, 0);
   const totalAmount   = results.reduce((s, r) => s + r.amount, 0);
+  const rolledBack = options.atomic === true && errors.length > 0;
+
+  if (rolledBack) {
+    return {
+      batchSize:       swaps.length,
+      cancelledCount:  0,
+      failedCount:     errors.length,
+      totalRefunded:   0,
+      totalAmount:     0,
+      rolledBack:      true,
+      rollbackResults: results.map((result) => ({
+        swapId: result.swapId,
+        restoredState: result.previousState,
+      })),
+      results:         [],
+      errors,
+    };
+  }
 
   return {
     batchSize:       swaps.length,
@@ -151,6 +169,8 @@ function cancelBatchSwaps(swaps, cancellations = null, options = {}) {
     failedCount:     errors.length,
     totalRefunded:   +totalRefunded.toFixed(8),
     totalAmount:     +totalAmount.toFixed(8),
+    rolledBack:     false,
+    rollbackResults: [],
     results,
     errors,
   };

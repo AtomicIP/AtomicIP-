@@ -21,10 +21,11 @@ const DISPUTE_STATES = Object.freeze({
 });
 
 const RESOLUTION_TYPES = Object.freeze({
-  REFUND:   "REFUND",
-  RELEASE:  "RELEASE",
-  SPLIT:    "SPLIT",
-  ESCALATE: "ESCALATE",
+  REFUND:       "REFUND",
+  RELEASE:      "RELEASE",
+  SPLIT:        "SPLIT",
+  MULTI_PARTY:  "MULTI_PARTY",
+  ESCALATE:     "ESCALATE",
 });
 
 const MAX_BATCH_SIZE       = 50;
@@ -53,9 +54,28 @@ function validateResolution(resolution, dispute) {
     throw new TypeError(`Resolution for swap ${dispute.swapId}: invalid type '${resolution.type}'.`);
   if (resolution.type === RESOLUTION_TYPES.SPLIT) {
     const ratio = resolution.splitRatio ?? DEFAULT_SPLIT_RATIO;
-    if (ratio < VALID_SPLIT_RANGE[0] || ratio > VALID_SPLIT_RANGE[1])
+    if (typeof ratio !== "number" || !Number.isFinite(ratio) ||
+        ratio < VALID_SPLIT_RANGE[0] || ratio > VALID_SPLIT_RANGE[1])
       throw new RangeError(
         `Dispute ${dispute.swapId}: splitRatio must be between ${VALID_SPLIT_RANGE[0]} and ${VALID_SPLIT_RANGE[1]}.`
+      );
+  }
+  if (resolution.type === RESOLUTION_TYPES.MULTI_PARTY) {
+    const allocations = resolution.allocations;
+    if (!allocations || typeof allocations !== "object" || Array.isArray(allocations))
+      throw new TypeError(`Dispute ${dispute.swapId}: allocations must map parties to amounts.`);
+    const parties = Object.keys(allocations);
+    if (parties.length < 2)
+      throw new RangeError(`Dispute ${dispute.swapId}: multi-party resolution requires at least two parties.`);
+    const total = parties.reduce((sum, party) => {
+      const amount = allocations[party];
+      if (typeof amount !== "number" || !Number.isFinite(amount) || amount < 0)
+        throw new RangeError(`Dispute ${dispute.swapId}: allocation for '${party}' must be a non-negative number.`);
+      return sum + amount;
+    }, 0);
+    if (Math.abs(total - dispute.amount) > 1e-8)
+      throw new RangeError(
+        `Dispute ${dispute.swapId}: allocations must total ${dispute.amount}.`
       );
   }
 }
@@ -101,6 +121,27 @@ function resolveOne(dispute, resolution) {
         splitRatio,
         initiatorAmount:    initiatorShare,
         counterpartyAmount: counterpartyShare,
+        reason,
+        resolvedAt:         new Date().toISOString(),
+      };
+    }
+
+    case RESOLUTION_TYPES.MULTI_PARTY: {
+      const participantAmounts = Object.fromEntries(
+        Object.entries(resolution.allocations).map(([party, amount]) => [
+          party,
+          +amount.toFixed(8),
+        ])
+      );
+      return {
+        swapId:             dispute.swapId,
+        originalState:      dispute.state,
+        newState:           DISPUTE_STATES.RESOLVED,
+        resolutionType:     type,
+        participantAmounts,
+        totalAllocated:     dispute.amount,
+        initiatorAmount:    participantAmounts[dispute.initiator] ?? 0,
+        counterpartyAmount: participantAmounts[dispute.counterparty] ?? 0,
         reason,
         resolvedAt:         new Date().toISOString(),
       };
@@ -174,8 +215,10 @@ function resolveBatchDisputes(disputes, resolutions) {
                                   .reduce((s, r) => s + r.initiatorAmount, 0);
   const totalReleased  = resolved.filter((r) => r.resolutionType === RESOLUTION_TYPES.RELEASE)
                                   .reduce((s, r) => s + r.counterpartyAmount, 0);
-  const totalSplit     = resolved.filter((r) => r.resolutionType === RESOLUTION_TYPES.SPLIT)
-                                  .reduce((s, r) => s + r.initiatorAmount + r.counterpartyAmount, 0);
+  const totalSplit     = resolved.filter((r) =>
+    r.resolutionType === RESOLUTION_TYPES.SPLIT ||
+    r.resolutionType === RESOLUTION_TYPES.MULTI_PARTY
+  ).reduce((s, r) => s + r.totalAllocated, 0);
 
   return {
     batchSize:       disputes.length,
