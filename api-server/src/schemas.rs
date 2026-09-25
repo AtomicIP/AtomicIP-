@@ -80,6 +80,23 @@ fn default_export_format() -> String {
     "json".to_string()
 }
 
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct WatchlistRequest {
+    pub user_id: String,
+    pub ip_id: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, IntoParams)]
+pub struct WatchlistQuery {
+    pub user_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct WatchlistResponse {
+    pub user_id: String,
+    pub ip_ids: Vec<u64>,
+}
+
 /// #317: Pagination query parameters shared across list endpoints.
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct PaginationParams {

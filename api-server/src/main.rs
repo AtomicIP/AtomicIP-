@@ -90,6 +90,9 @@ mod snapshot_tests;
         handlers::verify_commitment,
         handlers::batch_reveal_commitments,
         handlers::export_commitments,
+        handlers::add_to_watchlist,
+        handlers::get_watchlist,
+        handlers::remove_from_watchlist,
         handlers::list_ip_by_owner,
         handlers::list_ip_by_owner_cursor,
         handlers::initiate_swap,
@@ -123,6 +126,9 @@ mod snapshot_tests;
         schemas::BatchRevealResult,
         schemas::BatchRevealCommitmentsResponse,
         schemas::ExportCommitmentsParams,
+        schemas::WatchlistRequest,
+        schemas::WatchlistQuery,
+        schemas::WatchlistResponse,
         schemas::ListIpByOwnerResponse,
         schemas::InitiateSwapRequest,
         schemas::BatchInitiateSwapRequest,
@@ -282,6 +288,8 @@ async fn main() {
         .route("/ip/verify",                      post(handlers::verify_commitment))
         .route("/ip/reveal-batch",                post(handlers::batch_reveal_commitments))
         .route("/ip/export",                     get(handlers::export_commitments))
+        .route("/watchlist",                    post(handlers::add_to_watchlist).get(handlers::get_watchlist))
+        .route("/watchlist/{user_id}/{ip_id}",  axum::routing::delete(handlers::remove_from_watchlist))
         .route("/ip/owner/{owner}",               get(handlers::list_ip_by_owner))
         .route("/ip/owner/{owner}/cursor",        get(handlers::list_ip_by_owner_cursor))
         .route("/swap/initiate",                  post(handlers::initiate_swap).layer(signed.clone()))
@@ -402,6 +410,8 @@ fn build_app() -> Router {
         .route("/v1/ip/verify", post(handlers::verify_commitment))
         .route("/v1/ip/reveal-batch", post(handlers::batch_reveal_commitments))
         .route("/v1/ip/export", get(handlers::export_commitments))
+        .route("/v1/watchlist", post(handlers::add_to_watchlist).get(handlers::get_watchlist))
+        .route("/v1/watchlist/{user_id}/{ip_id}", axum::routing::delete(handlers::remove_from_watchlist))
         .route("/v1/ip/owner/{owner}", get(handlers::list_ip_by_owner))
         .route("/v1/ip/owner/{owner}/cursor", get(handlers::list_ip_by_owner_cursor))
         .route("/v1/ip/owner/{owner}/cursor", get(handlers::list_ip_by_owner_cursor))

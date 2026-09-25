@@ -7,6 +7,8 @@ use axum::{
 };
 use once_cell::sync::Lazy;
 use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::time::{Duration, Instant};
 use tracing::instrument;
@@ -48,6 +50,8 @@ const SWAP_EXPIRY_SECONDS: u64 = 604800;
 /// Process-local swap ID counter standing in for the contract's `NextId`
 /// until the handlers are wired to a live Soroban RPC client.
 static NEXT_SWAP_ID: AtomicU64 = AtomicU64::new(0);
+static WATCHLISTS: Lazy<Mutex<HashMap<String, BTreeSet<u64>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// Audit log store for tracking all API access and sensitive operations
 static AUDIT_LOG_STORE: Lazy<Arc<AuditLogStore>> = Lazy::new(|| {
@@ -268,6 +272,100 @@ pub async fn batch_reveal_commitments(
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse { error: "ip_ids must not be empty".to_string() }),
             ));
+        }
+
+        /// Add a commitment to a user's watchlist.
+        #[utoipa::path(
+            post,
+            path = "/v1/watchlist",
+            tag = "IP Registry",
+            request_body = WatchlistRequest,
+            responses(
+                (status = 200, description = "Commitment added to watchlist", body = WatchlistResponse),
+                (status = 400, description = "Invalid user ID", body = ErrorResponse),
+            )
+        )]
+        #[instrument(skip(body))]
+        pub async fn add_to_watchlist(
+            Json(body): Json<WatchlistRequest>,
+        ) -> Result<Json<WatchlistResponse>, (StatusCode, Json<ErrorResponse>)> {
+            if body.user_id.trim().is_empty() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse { error: "user_id must not be empty".to_string() }),
+                ));
+            }
+            let mut watchlists = WATCHLISTS.lock().map_err(|_| {
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "watchlist unavailable".to_string() }))
+            })?;
+            let ids = watchlists.entry(body.user_id.clone()).or_default();
+            ids.insert(body.ip_id);
+            Ok(Json(WatchlistResponse {
+                user_id: body.user_id,
+                ip_ids: ids.iter().copied().collect(),
+            }))
+        }
+
+        /// List all commitments on a user's watchlist.
+        #[utoipa::path(
+            get,
+            path = "/v1/watchlist",
+            tag = "IP Registry",
+            params(WatchlistQuery),
+            responses((status = 200, description = "User watchlist", body = WatchlistResponse))
+        )]
+        #[instrument]
+        pub async fn get_watchlist(
+            Query(query): Query<WatchlistQuery>,
+        ) -> Result<Json<WatchlistResponse>, (StatusCode, Json<ErrorResponse>)> {
+            if query.user_id.trim().is_empty() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse { error: "user_id must not be empty".to_string() }),
+                ));
+            }
+            let watchlists = WATCHLISTS.lock().map_err(|_| {
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "watchlist unavailable".to_string() }))
+            })?;
+            Ok(Json(WatchlistResponse {
+                user_id: query.user_id.clone(),
+                ip_ids: watchlists
+                    .get(&query.user_id)
+                    .map(|ids| ids.iter().copied().collect())
+                    .unwrap_or_default(),
+            }))
+        }
+
+        /// Remove a commitment from a user's watchlist.
+        #[utoipa::path(
+            delete,
+            path = "/v1/watchlist/{user_id}/{ip_id}",
+            tag = "IP Registry",
+            params(
+                ("user_id" = String, Path, description = "User identifier"),
+                ("ip_id" = u64, Path, description = "IP commitment identifier")
+            ),
+            responses((status = 200, description = "Commitment removed", body = WatchlistResponse))
+        )]
+        #[instrument]
+        pub async fn remove_from_watchlist(
+            Path((user_id, ip_id)): Path<(String, u64)>,
+        ) -> Result<Json<WatchlistResponse>, (StatusCode, Json<ErrorResponse>)> {
+            if user_id.trim().is_empty() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse { error: "user_id must not be empty".to_string() }),
+                ));
+            }
+            let mut watchlists = WATCHLISTS.lock().map_err(|_| {
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "watchlist unavailable".to_string() }))
+            })?;
+            let ids = watchlists.entry(user_id.clone()).or_default();
+            ids.remove(&ip_id);
+            Ok(Json(WatchlistResponse {
+                user_id,
+                ip_ids: ids.iter().copied().collect(),
+            }))
         }
 
         let mut records = Vec::with_capacity(ids.len());
