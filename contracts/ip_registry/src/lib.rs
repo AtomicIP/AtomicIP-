@@ -228,6 +228,9 @@ pub enum DataKey {
     MerkleRoot(Address),
     // Issue #812: Flag indicating the cached Merkle root for an owner is stale
     MerkleRootStale(Address),
+    // Issue #979: Commitment linking for related IPs
+    CommitmentLinks(u64), // maps ip_id -> Vec<CommitmentLink> of linked commitments
+    LinkedCommitments(u64), // maps linked_ip_id -> Vec<u64> of ip_ids linking to it (reverse index)
 }
 
 // ── Upgrade Compatibility Manifest (#791) ───────────────────────────────────
@@ -267,13 +270,14 @@ const CURRENT_FUNCTIONS: &[&str] = &[
     "generate_merkle_proof", "get_anonymous_owner", "get_arbitration", "get_batch_escrow",
     "get_batch_metadata", "get_blinded_owner_batch", "get_commitment_compression", "get_commitment_shard",
     "get_compressed_bytes", "get_compressed_commitment", "get_dispute", "get_encrypted_commitment",
-    "get_ip", "get_ip_access_grants", "get_ip_audit_trail", "get_ip_lineage",
+    "get_commitment_back_references", "get_ip", "get_ip_access_grants", "get_ip_audit_trail", "get_ip_lineage",
     "get_ip_notary_signature", "get_ip_strength", "get_ip_suggested_price", "get_ip_version_chain",
+    "get_linked_commitments",
     "get_ip_versions", "get_key_rotation_history", "get_licenses", "get_ownership_challenge",
     "get_partial_disclosure", "get_pow_difficulty", "get_renewal_count", "get_reputation",
     "get_stake", "get_threshold_config", "get_threshold_signatures", "grant_ip_access",
     "grant_license", "initialize", "initiate_dispute", "is_delegate",
-    "is_ip_owner", "issue_ownership_challenge", "list_ip_by_category", "list_ip_by_owner",
+    "is_ip_owner", "issue_ownership_challenge", "link_commitment", "list_ip_by_category", "list_ip_by_owner",
     "list_ip_by_shard", "list_owner_categories", "merge_duplicate_commitment", "nominate_arbitrator",
     "notarize_ip_timestamp", "open_arbitration", "register_category_path", "release_batch_escrow",
     "remove_co_owner", "renew_ip", "renew_ip_commitment", "require_threshold_signatures",
@@ -301,7 +305,7 @@ const CURRENT_STORAGE_KEYS: &[&str] = &[
     "OwnerReputation", "ArbitrationCase", "NextArbitrationId", "ArbitratorPool",
     "CompressedCommitment", "BatchVerifyResult", "CompressionSelection", "HierarchyNode",
     "OwnerCategories", "CategoryDepth", "ThresholdConfig", "ThresholdSignatures", "BatchMetadata",
-    "EncryptedCommitment", "BatchEscrow",
+    "EncryptedCommitment", "BatchEscrow", "CommitmentLinks", "LinkedCommitments",
 ];
 
 /// (error name, error code) pairs defined by the currently deployed contract.

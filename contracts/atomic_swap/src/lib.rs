@@ -239,6 +239,22 @@ pub enum DataKey {
     PendingRuling(u64),
     /// #781: Maps swap_id → DisputeBonds deposited by buyer/seller.
     DisputeBond(u64),
+    /// #980: Maps swap_id → arbiter Address for escrow swap arbitration.
+    EscrowArbiter(u64),
+    /// #980: Maps swap_id → timeout timestamp for automatic escrow release.
+    EscrowTimeout(u64),
+    /// #980: Maps swap_id → ArbitratorDecision for escrow resolution.
+    ArbitratorDecision(u64),
+    /// #981: Maps swap_id → SwapMetadata containing deal terms and versioning.
+    SwapMetadata(u64),
+    /// #981: Maps swap_id → Vec<Bytes> of historical metadata versions.
+    SwapMetadataHistory(u64),
+    /// #982: Maps batch_id → Vec<u64> of swap IDs in a batch execution.
+    BatchSwapList(BytesN<32>),
+    /// #982: Maps batch_id → Vec<bool> tracking execution results per swap.
+    BatchSwapResults(BytesN<32>),
+    /// #982: Maps batch_id → BatchExecutionMode (Atomic or Partial).
+    BatchExecutionMode(BytesN<32>),
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
