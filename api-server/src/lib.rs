@@ -39,6 +39,8 @@ pub mod auth;
 pub mod audit;
 pub mod batch;
 pub mod cache;
+pub mod commitments;
+pub mod analytics;
 pub mod circuit_breaker;
 pub mod compression;
 pub mod deduplication;

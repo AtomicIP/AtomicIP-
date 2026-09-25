@@ -7,6 +7,15 @@ pub struct CommitIpRequest {
     pub owner: String,
     /// 32-byte Pedersen commitment hash, hex-encoded
     pub commitment_hash: String,
+    /// Optional labels used to organize the commitment.
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct CommitmentTagsResponse {
+    pub ip_id: u64,
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -89,6 +98,13 @@ pub struct PaginatedResponse<T> {
     pub has_more: bool,
     /// Total count of items (if available).
     pub total_count: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct MarketplaceResponse {
+    pub swap_ids: Vec<u64>,
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
 }
 
 /// Cursor encoding/decoding utilities.
