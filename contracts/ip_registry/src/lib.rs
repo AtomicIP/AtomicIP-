@@ -130,6 +130,7 @@ pub const NUM_SHARDS: u32 = 16;
 /// touches a bounded amount of storage regardless of how many commitments
 /// have ever landed in that shard.
 pub const SUB_SHARD_CAPACITY: u32 = 512;
+const LEGACY_SHARD_CURSOR_FLAG: u32 = 1 << 31;
 
 /// Issue #785: Maximum number of legacy (pre-sub-sharding) entries migrated
 /// into the bounded layout per call. Keeps migration cost bounded per
@@ -3450,7 +3451,7 @@ impl IpRegistry {
         let legacy_key = DataKey::ShardIps(shard_id);
         let pos = cursor.unwrap_or_else(|| {
             if env.storage().persistent().has(&legacy_key) {
-                0
+                LEGACY_SHARD_CURSOR_FLAG
             } else {
                 1
             }
@@ -3461,13 +3462,24 @@ impl IpRegistry {
         // only shrinks after the fix ships (migrate_legacy_shard_batch is
         // the only writer to it), so its size is bounded by whatever had
         // already accumulated before deployment, not by ongoing growth.
-        if pos == 0 {
+        if pos & LEGACY_SHARD_CURSOR_FLAG != 0 {
             let legacy: Vec<u64> = env
                 .storage()
                 .persistent()
                 .get(&legacy_key)
                 .unwrap_or(Vec::new(&env));
-            return (legacy, Some(1));
+            let offset = pos & !LEGACY_SHARD_CURSOR_FLAG;
+            let page_end = core::cmp::min(offset + SUB_SHARD_CAPACITY, legacy.len());
+            let mut page = Vec::new(&env);
+            for i in offset..page_end {
+                page.push_back(legacy.get(i).unwrap());
+            }
+            let next_cursor = if page_end < legacy.len() {
+                Some(LEGACY_SHARD_CURSOR_FLAG | page_end)
+            } else {
+                Some(1)
+            };
+            return (page, next_cursor);
         }
 
         let sub_index = pos - 1;
