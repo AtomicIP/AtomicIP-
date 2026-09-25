@@ -1,4 +1,25 @@
 
+## Slow request visibility
+
+The API server records every request in Prometheus as
+`http_request_duration_seconds`. Requests at or above the configured slow
+request threshold also increment `http_slow_requests_total` and emit a
+structured `slow request detected` warning containing the method, path, status,
+latency, and threshold.
+
+The default threshold is 1,000 ms. Set `SLOW_REQUEST_THRESHOLD_MS` to a
+positive number of milliseconds when starting the server:
+
+```sh
+SLOW_REQUEST_THRESHOLD_MS=500 cargo run --manifest-path api-server/Cargo.toml
+```
+
+Example Prometheus query:
+
+```promql
+sum by (path) (rate(http_slow_requests_total[5m]))
+```
+
 ### batchCompressor baseline — 2026-09-04
 
 > Node v24.14.0 · 200 iterations per scenario · zlib deflate (Node built-in)

@@ -11,6 +11,17 @@ use tracing::info;
 
 use once_cell::sync::Lazy;
 use std::sync::Mutex;
+use std::env;
+
+const DEFAULT_SLOW_REQUEST_THRESHOLD_MS: u64 = 1_000;
+
+fn slow_request_threshold_ms() -> u64 {
+    env::var("SLOW_REQUEST_THRESHOLD_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value: &u64| *value > 0)
+        .unwrap_or(DEFAULT_SLOW_REQUEST_THRESHOLD_MS)
+}
 
 static PROMETHEUS_HANDLE: Lazy<Mutex<metrics_exporter_prometheus::PrometheusHandle>> = Lazy::new(|| {
     let recorder = metrics_exporter_prometheus::PrometheusBuilder::new()
@@ -31,6 +42,10 @@ static PROMETHEUS_HANDLE: Lazy<Mutex<metrics_exporter_prometheus::PrometheusHand
     describe_counter!(
         "http_errors_total",
         "Total number of HTTP error responses"
+    );
+    describe_counter!(
+        "http_slow_requests_total",
+        "HTTP requests slower than SLOW_REQUEST_THRESHOLD_MS"
     );
     
     Mutex::new(handle)
@@ -97,6 +112,24 @@ pub async fn track(req: Request, next: Next) -> Response {
         client_ip = %client_ip,
         "request completed"
     );
+
+    let latency_ms = latency.as_millis() as u64;
+    if latency_ms >= slow_request_threshold_ms() {
+        counter!(
+            "http_slow_requests_total",
+            "method" => method.clone(),
+            "path" => path.clone(),
+        )
+        .increment(1);
+        tracing::warn!(
+            method = %method,
+            path = %path,
+            status = status,
+            latency_ms,
+            threshold_ms = slow_request_threshold_ms(),
+            "slow request detected"
+        );
+    }
 
     response
 }
