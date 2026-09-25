@@ -6,18 +6,18 @@
  */
 
 const MAX_BATCH_SIZE = 100;
-const RESOURCE_TYPES = ["network", "compute", "storage"];
+const RESOURCE_TYPES = ['network', 'compute', 'storage'];
 
 function validateNumber(value, name) {
-  if (typeof value !== "number" || !Number.isFinite(value) || value < 0)
-    throw new RangeError(`${name} must be a finite non-negative number.`);
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0)
+  {throw new RangeError(`${name} must be a finite non-negative number.`);}
 }
 
 function calculateBatchCosts(operations, rates = {}) {
   if (!Array.isArray(operations) || operations.length === 0)
-    throw new TypeError("operations must be a non-empty array.");
+  {throw new TypeError('operations must be a non-empty array.');}
   if (operations.length > MAX_BATCH_SIZE)
-    throw new RangeError(`Batch size ${operations.length} exceeds maximum of ${MAX_BATCH_SIZE}.`);
+  {throw new RangeError(`Batch size ${operations.length} exceeds maximum of ${MAX_BATCH_SIZE}.`);}
 
   const unitRates = Object.fromEntries(
     RESOURCE_TYPES.map((type) => {
@@ -28,8 +28,8 @@ function calculateBatchCosts(operations, rates = {}) {
   );
 
   const costs = operations.map((operation, index) => {
-    if (!operation || typeof operation !== "object")
-      throw new TypeError(`Operation at index ${index} must be an object.`);
+    if (!operation || typeof operation !== 'object')
+    {throw new TypeError(`Operation at index ${index} must be an object.`);}
     const usage = Object.fromEntries(
       RESOURCE_TYPES.map((type) => {
         const value = operation[type] ?? 0;
@@ -45,14 +45,14 @@ function calculateBatchCosts(operations, rates = {}) {
       id: operation.id ?? index,
       usage,
       breakdown,
-      total: +total.toFixed(8),
+      total: +total.toFixed(8)
     };
   });
 
   const byResource = Object.fromEntries(
     RESOURCE_TYPES.map((type) => [
       type,
-      +costs.reduce((sum, cost) => sum + cost.breakdown[type], 0).toFixed(8),
+      +costs.reduce((sum, cost) => sum + cost.breakdown[type], 0).toFixed(8)
     ])
   );
   return {
@@ -60,7 +60,7 @@ function calculateBatchCosts(operations, rates = {}) {
     rates: unitRates,
     byResource,
     total: +Object.values(byResource).reduce((sum, value) => sum + value, 0).toFixed(8),
-    costs,
+    costs
   };
 }
 

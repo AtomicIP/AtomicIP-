@@ -6,11 +6,11 @@
  */
 
 const STATES = Object.freeze([
-  "QUEUED",
-  "RUNNING",
-  "COMPLETED",
-  "FAILED",
-  "CANCELLED",
+  'QUEUED',
+  'RUNNING',
+  'COMPLETED',
+  'FAILED',
+  'CANCELLED'
 ]);
 
 class BatchStatusTracker {
@@ -19,23 +19,23 @@ class BatchStatusTracker {
   }
 
   create(batchId, operationIds) {
-    if (typeof batchId !== "string" || !batchId)
-      throw new TypeError("batchId must be a non-empty string.");
+    if (typeof batchId !== 'string' || !batchId)
+    {throw new TypeError('batchId must be a non-empty string.');}
     if (!Array.isArray(operationIds) || operationIds.length === 0)
-      throw new TypeError("operationIds must be a non-empty array.");
+    {throw new TypeError('operationIds must be a non-empty array.');}
     if (this.batches.has(batchId))
-      throw new Error(`Batch ${batchId} already exists.`);
+    {throw new Error(`Batch ${batchId} already exists.`);}
 
     const status = {
       batchId,
-      state: "QUEUED",
+      state: 'QUEUED',
       total: operationIds.length,
       completed: 0,
       failed: 0,
       cancelled: 0,
-      operations: operationIds.map((id) => ({ id, state: "QUEUED" })),
+      operations: operationIds.map((id) => ({ id, state: 'QUEUED' })),
       createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
     };
     this.batches.set(batchId, status);
     return this.getStatus(batchId);
@@ -43,20 +43,20 @@ class BatchStatusTracker {
 
   update(batchId, operationId, state, details = {}) {
     if (!STATES.includes(state))
-      throw new TypeError(`Invalid batch state '${state}'.`);
+    {throw new TypeError(`Invalid batch state '${state}'.`);}
     const batch = this.batches.get(batchId);
-    if (!batch) throw new Error(`Batch ${batchId} was not found.`);
+    if (!batch) {throw new Error(`Batch ${batchId} was not found.`);}
     const operation = batch.operations.find(({ id }) => id === operationId);
-    if (!operation) throw new Error(`Operation ${operationId} was not found in batch ${batchId}.`);
+    if (!operation) {throw new Error(`Operation ${operationId} was not found in batch ${batchId}.`);}
 
     operation.state = state;
     Object.assign(operation, details);
-    batch.state = state === "RUNNING" ? "RUNNING" : batch.state;
-    batch.completed = batch.operations.filter((item) => item.state === "COMPLETED").length;
-    batch.failed = batch.operations.filter((item) => item.state === "FAILED").length;
-    batch.cancelled = batch.operations.filter((item) => item.state === "CANCELLED").length;
+    batch.state = state === 'RUNNING' ? 'RUNNING' : batch.state;
+    batch.completed = batch.operations.filter((item) => item.state === 'COMPLETED').length;
+    batch.failed = batch.operations.filter((item) => item.state === 'FAILED').length;
+    batch.cancelled = batch.operations.filter((item) => item.state === 'CANCELLED').length;
     if (batch.completed + batch.failed + batch.cancelled === batch.total) {
-      batch.state = batch.failed > 0 ? "FAILED" : batch.cancelled === batch.total ? "CANCELLED" : "COMPLETED";
+      batch.state = batch.failed > 0 ? 'FAILED' : batch.cancelled === batch.total ? 'CANCELLED' : 'COMPLETED';
     }
     batch.updatedAt = new Date().toISOString();
     return this.getStatus(batchId);

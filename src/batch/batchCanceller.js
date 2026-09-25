@@ -10,59 +10,59 @@
  *  - Refund eligibility is determined per cancellation policy
  */
 
-const CANCELLABLE_STATES = new Set(["PENDING", "ACTIVE"]);
-const CANCELLED_STATE    = "CANCELLED";
+const CANCELLABLE_STATES = new Set(['PENDING', 'ACTIVE']);
+const CANCELLED_STATE    = 'CANCELLED';
 const MAX_BATCH_SIZE     = 100;
 const MAX_REASON_LENGTH  = 256;
 
 const REFUND_POLICIES = Object.freeze({
-  FULL:    "FULL",    // full refund to initiator
-  PARTIAL: "PARTIAL", // partial refund (e.g. minus fees already incurred)
-  NONE:    "NONE",    // no refund (e.g. penalty cancellation)
+  FULL:    'FULL',    // full refund to initiator
+  PARTIAL: 'PARTIAL', // partial refund (e.g. minus fees already incurred)
+  NONE:    'NONE'    // no refund (e.g. penalty cancellation)
 });
 
 // ── Validators ────────────────────────────────────────────────────────────────
 
 function validateSwap(swap, index) {
-  if (!swap || typeof swap !== "object")
-    throw new TypeError(`Swap at index ${index} must be an object.`);
+  if (!swap || typeof swap !== 'object')
+  {throw new TypeError(`Swap at index ${index} must be an object.`);}
   if (!swap.swapId)
-    throw new TypeError(`Swap at index ${index}: swapId is required.`);
+  {throw new TypeError(`Swap at index ${index}: swapId is required.`);}
   if (!swap.state)
-    throw new TypeError(`Swap ${swap.swapId}: state is required.`);
-  if (typeof swap.amount !== "number" || swap.amount <= 0)
-    throw new RangeError(`Swap ${swap.swapId}: amount must be a positive number.`);
+  {throw new TypeError(`Swap ${swap.swapId}: state is required.`);}
+  if (typeof swap.amount !== 'number' || swap.amount <= 0)
+  {throw new RangeError(`Swap ${swap.swapId}: amount must be a positive number.`);}
 }
 
 function validateCancellation(cancellation, swap) {
-  if (cancellation && typeof cancellation !== "object")
-    throw new TypeError(`Cancellation for swap ${swap.swapId} must be an object or null.`);
-  const reason = cancellation?.reason ?? "";
-  if (typeof reason !== "string")
-    throw new TypeError(`Swap ${swap.swapId}: reason must be a string.`);
+  if (cancellation && typeof cancellation !== 'object')
+  {throw new TypeError(`Cancellation for swap ${swap.swapId} must be an object or null.`);}
+  const reason = cancellation?.reason ?? '';
+  if (typeof reason !== 'string')
+  {throw new TypeError(`Swap ${swap.swapId}: reason must be a string.`);}
   if (reason.length > MAX_REASON_LENGTH)
-    throw new RangeError(
-      `Swap ${swap.swapId}: reason must not exceed ${MAX_REASON_LENGTH} characters.`
-    );
+  {throw new RangeError(
+    `Swap ${swap.swapId}: reason must not exceed ${MAX_REASON_LENGTH} characters.`
+  );}
   const policy = cancellation?.refundPolicy;
   if (policy && !Object.values(REFUND_POLICIES).includes(policy))
-    throw new TypeError(
-      `Swap ${swap.swapId}: invalid refundPolicy '${policy}'.`
-    );
+  {throw new TypeError(
+    `Swap ${swap.swapId}: invalid refundPolicy '${policy}'.`
+  );}
 }
 
 // ── Refund calculation ────────────────────────────────────────────────────────
 
 function calculateRefund(amount, policy = REFUND_POLICIES.FULL, feePaid = 0) {
   switch (policy) {
-    case REFUND_POLICIES.FULL:
-      return amount;
-    case REFUND_POLICIES.PARTIAL:
-      return Math.max(0, +(amount - feePaid).toFixed(8));
-    case REFUND_POLICIES.NONE:
-      return 0;
-    default:
-      return amount;
+  case REFUND_POLICIES.FULL:
+    return amount;
+  case REFUND_POLICIES.PARTIAL:
+    return Math.max(0, +(amount - feePaid).toFixed(8));
+  case REFUND_POLICIES.NONE:
+    return 0;
+  default:
+    return amount;
   }
 }
 
@@ -77,7 +77,7 @@ function cancelOne(swap, cancellation, now) {
 
   const policy    = cancellation?.refundPolicy ?? REFUND_POLICIES.FULL;
   const feePaid   = cancellation?.feePaid ?? 0;
-  const reason    = cancellation?.reason ?? "";
+  const reason    = cancellation?.reason ?? '';
   const refund    = calculateRefund(swap.amount, policy, feePaid);
 
   return {
@@ -88,7 +88,7 @@ function cancelOne(swap, cancellation, now) {
     refundAmount:  refund,
     refundPolicy:  policy,
     reason,
-    cancelledAt:   new Date(now).toISOString(),
+    cancelledAt:   new Date(now).toISOString()
   };
 }
 
@@ -117,24 +117,24 @@ function cancelOne(swap, cancellation, now) {
  */
 function cancelBatchSwaps(swaps, cancellations = null, options = {}) {
   if (!Array.isArray(swaps) || swaps.length === 0)
-    throw new TypeError("swaps must be a non-empty array.");
+  {throw new TypeError('swaps must be a non-empty array.');}
   if (swaps.length > MAX_BATCH_SIZE)
-    throw new RangeError(`Batch size ${swaps.length} exceeds maximum of ${MAX_BATCH_SIZE}.`);
+  {throw new RangeError(`Batch size ${swaps.length} exceeds maximum of ${MAX_BATCH_SIZE}.`);}
 
   const now = options.now ?? Date.now();
-   const selectedIds = options.swapIds ?? null;
-   if (selectedIds !== null && (!Array.isArray(selectedIds) || selectedIds.length === 0))
-     throw new TypeError("options.swapIds must be a non-empty array when provided.");
-   if (selectedIds !== null && selectedIds.some((id) => typeof id !== "string" || !id))
-     throw new TypeError("options.swapIds must contain non-empty strings.");
-   const selectedSet = selectedIds === null ? null : new Set(selectedIds);
+  const selectedIds = options.swapIds ?? null;
+  if (selectedIds !== null && (!Array.isArray(selectedIds) || selectedIds.length === 0))
+  {throw new TypeError('options.swapIds must be a non-empty array when provided.');}
+  if (selectedIds !== null && selectedIds.some((id) => typeof id !== 'string' || !id))
+  {throw new TypeError('options.swapIds must contain non-empty strings.');}
+  const selectedSet = selectedIds === null ? null : new Set(selectedIds);
 
   const cancelArr = cancellations === null
     ? Array(swaps.length).fill(null)
     : cancellations;
 
   if (!Array.isArray(cancelArr) || cancelArr.length !== swaps.length)
-    throw new TypeError("cancellations must be null or an array matching swaps length.");
+  {throw new TypeError('cancellations must be null or an array matching swaps length.');}
 
   const results = [];
   const errors  = [];
@@ -166,7 +166,7 @@ function cancelBatchSwaps(swaps, cancellations = null, options = {}) {
     totalAmount:     +totalAmount.toFixed(8),
     results,
     errors,
-    skipped,
+    skipped
   };
 }
 
@@ -175,5 +175,5 @@ module.exports = {
   CANCELLABLE_STATES,
   REFUND_POLICIES,
   MAX_BATCH_SIZE,
-  CANCELLED_STATE,
+  CANCELLED_STATE
 };
