@@ -231,6 +231,8 @@ pub enum DataKey {
     MerkleRoot(Address),
     // Issue #812: Flag indicating the cached Merkle root for an owner is stale
     MerkleRootStale(Address),
+    /// Issue #812: cached proof path tied to the root used to generate it.
+    MerkleProof(u64),
     // Issue #979: Commitment linking for related IPs
     CommitmentLinks(u64), // maps ip_id -> Vec<CommitmentLink> of linked commitments
     LinkedCommitments(u64), // maps linked_ip_id -> Vec<u64> of ip_ids linking to it (reverse index)
@@ -308,7 +310,7 @@ const CURRENT_STORAGE_KEYS: &[&str] = &[
     "OwnerReputation", "ArbitrationCase", "NextArbitrationId", "ArbitratorPool",
     "CompressedCommitment", "BatchVerifyResult", "CompressionSelection", "HierarchyNode",
     "OwnerCategories", "CategoryDepth", "ThresholdConfig", "ThresholdSignatures", "BatchMetadata",
-    "EncryptedCommitment", "BatchEscrow", "CommitmentLinks", "LinkedCommitments",
+    "EncryptedCommitment", "BatchEscrow", "MerkleProof", "CommitmentLinks", "LinkedCommitments",
 ];
 
 /// (error name, error code) pairs defined by the currently deployed contract.
@@ -3320,6 +3322,16 @@ impl IpRegistry {
     /// Panics if the IP does not exist.
     pub fn generate_merkle_proof(env: Env, ip_id: u64) -> Vec<BytesN<32>> {
         let record = require_ip_exists(&env, ip_id);
+        let root = Self::get_merkle_root(env.clone(), record.owner.clone());
+        if let Some(cached) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, MerkleProofCache>(&DataKey::MerkleProof(ip_id))
+        {
+            if cached.root == root {
+                return cached.proof;
+            }
+        }
 
         let ip_ids: Vec<u64> = env
             .storage()
@@ -3345,7 +3357,18 @@ impl IpRegistry {
             }
         }
 
-        Self::build_merkle_proof(&env, &leaves, found_index)
+        let proof = Self::build_merkle_proof(&env, &leaves, found_index);
+        let cached = MerkleProofCache {
+            root,
+            proof: proof.clone(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::MerkleProof(ip_id), &cached);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::MerkleProof(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+        proof
     }
 
     /// Build a Merkle proof for the leaf at `index` in `leaves`.
