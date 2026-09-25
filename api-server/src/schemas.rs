@@ -100,6 +100,13 @@ pub struct PaginatedResponse<T> {
     pub total_count: Option<u64>,
 }
 
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct MarketplaceResponse {
+    pub swap_ids: Vec<u64>,
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
+}
+
 /// Cursor encoding/decoding utilities.
 pub mod cursor {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
