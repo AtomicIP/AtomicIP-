@@ -59,6 +59,7 @@ r2d2 = "0.8"
 [dev-dependencies]
 testcontainers = { version = "0.27", features = ["blocking"] }
 testcontainers-modules = { version = "0.15", features = ["redis"] }
+insta = { version = "1.38", features = ["json"] }
 
 [features]
 redis-integration-tests = []

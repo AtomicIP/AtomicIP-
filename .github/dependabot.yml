@@ -1,0 +1,57 @@
+version: 2
+updates:
+  # Cargo (Rust) dependencies
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "03:00"
+    open-pull-requests-limit: 10
+    allow:
+      - dependency-type: "all"
+    reviewers:
+      - "Lex-Studios"
+    assignees:
+      - "Lex-Studios"
+    labels:
+      - "dependencies"
+      - "rust"
+    commit-message:
+      prefix: "chore(deps):"
+      prefix-development: "chore(deps-dev):"
+      include: "scope"
+    pull-request-branch-name:
+      separator: "/"
+    rebase-strategy: "auto"
+    # Auto-merge patch and minor updates for dependencies
+    auto-merge: true
+    # Only auto-merge for patch versions of stable dependencies
+    # Minor updates require review
+
+  # npm (JavaScript) dependencies
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "03:00"
+    open-pull-requests-limit: 10
+    allow:
+      - dependency-type: "all"
+    reviewers:
+      - "Lex-Studios"
+    assignees:
+      - "Lex-Studios"
+    labels:
+      - "dependencies"
+      - "javascript"
+    commit-message:
+      prefix: "chore(deps):"
+      prefix-development: "chore(deps-dev):"
+      include: "scope"
+    pull-request-branch-name:
+      separator: "/"
+    rebase-strategy: "auto"
+    # Auto-merge patch and minor updates for dependencies
+    auto-merge: true
