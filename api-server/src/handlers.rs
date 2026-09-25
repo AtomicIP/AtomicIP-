@@ -16,6 +16,7 @@ use crate::schemas::*;
 use std::sync::Arc;
 use crate::webhook;
 use crate::websocket;
+use crate::auth::AuthExtension;
 
 // #523/#800: Per-handler idempotency store for batch swap operations. Uses a
 // shared Redis backend when REDIS_URL is configured, so a client's retry is
@@ -173,6 +174,52 @@ pub async fn verify_commitment(Json(body): Json<VerifyCommitmentRequest>) -> Res
     ))
 }
 
+/// Link another Stellar account to the authenticated user's account group.
+#[utoipa::path(
+    post,
+    path = "/v1/accounts/link",
+    tag = "Accounts",
+    request_body = LinkStellarAccountRequest,
+    responses((status = 200, description = "Account linked", body = LinkedStellarAccountsResponse))
+)]
+#[instrument(skip(body))]
+pub async fn link_account(
+    AuthExtension(claims): AuthExtension,
+    Json(body): Json<LinkStellarAccountRequest>,
+) -> Result<Json<LinkedStellarAccountsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let message = format!("atomicip:link:{}:{}", claims.sub, body.account);
+    match crate::auth::verify_stellar_signature(&body.account, &message, &body.signature) {
+        Ok(true) => crate::auth::link_stellar_account(&claims.sub, &body.account)
+            .map(|accounts| Json(LinkedStellarAccountsResponse { accounts }))
+            .map_err(|error| {
+                let response = error.into_response();
+                (response.status(), Json(ErrorResponse { error: "invalid account".to_string() }))
+            }),
+        Ok(false) => Err((StatusCode::UNAUTHORIZED, Json(ErrorResponse {
+            error: "account signature does not prove ownership".to_string(),
+        }))),
+        Err(_) => Err((StatusCode::BAD_REQUEST, Json(ErrorResponse {
+            error: "invalid Stellar account or signature".to_string(),
+        }))),
+    }
+}
+
+/// List the authenticated user's primary and linked Stellar accounts.
+#[utoipa::path(
+    get,
+    path = "/v1/accounts",
+    tag = "Accounts",
+    responses((status = 200, description = "Linked accounts", body = LinkedStellarAccountsResponse))
+)]
+#[instrument]
+pub async fn list_linked_accounts(
+    AuthExtension(claims): AuthExtension,
+) -> Json<LinkedStellarAccountsResponse> {
+    Json(LinkedStellarAccountsResponse {
+        accounts: crate::auth::linked_stellar_accounts(&claims.sub),
+    })
+}
+
 /// List all IP IDs owned by a Stellar address.
 /// Supports `limit` and `offset` query parameters for pagination (#317).
 #[utoipa::path(
@@ -193,7 +240,7 @@ pub async fn list_ip_by_owner(
     Query(pagination): Query<PaginationParams>,
     axum::extract::State(client): axum::extract::State<Arc<SorobanQueryClient>>,
 ) -> impl IntoResponse {
-    let limit = pagination.limit.min(200);
+    let limit = pagination.limit.clamp(1, 200);
     let offset = pagination.offset;
 
     // #316: Check cache
@@ -255,14 +302,20 @@ pub async fn list_ip_by_owner_cursor(
     Query(pagination): Query<CursorPaginationParams>,
     axum::extract::State(client): axum::extract::State<Arc<SorobanQueryClient>>,
 ) -> impl IntoResponse {
-    let limit = pagination.limit.min(200);
+    let limit = pagination.limit.clamp(1, 200);
 
     // Decode cursor if provided
     let offset = match pagination.cursor {
         Some(cursor) => {
             match crate::schemas::cursor::decode(&cursor) {
                 Some(data) => data.offset,
-                None => 0, // Invalid cursor, start from beginning
+                None => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        [(header::CACHE_CONTROL, cache::no_cache_header())],
+                        Json(serde_json::json!({ "error": "invalid pagination cursor" })),
+                    ).into_response();
+                }
             }
         }
         None => 0,

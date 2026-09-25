@@ -75,6 +75,8 @@ mod validation_fuzz_tests;
         handlers::get_ip,
         handlers::transfer_ip,
         handlers::verify_commitment,
+        handlers::link_account,
+        handlers::list_linked_accounts,
         handlers::list_ip_by_owner,
         handlers::list_ip_by_owner_cursor,
         handlers::initiate_swap,
@@ -97,6 +99,8 @@ mod validation_fuzz_tests;
         schemas::TransferIpRequest,
         schemas::VerifyCommitmentRequest,
         schemas::VerifyCommitmentResponse,
+        schemas::LinkStellarAccountRequest,
+        schemas::LinkedStellarAccountsResponse,
         schemas::ListIpByOwnerResponse,
         schemas::InitiateSwapRequest,
         schemas::BatchInitiateSwapRequest,
@@ -118,6 +122,7 @@ mod validation_fuzz_tests;
     )),
     tags(
         (name = "IP Registry", description = "Commit and query intellectual property records"),
+        (name = "Accounts", description = "Manage Stellar accounts linked to an authenticated user"),
         (name = "Atomic Swap", description = "Trustless patent sale via atomic swap"),
         (name = "Webhooks", description = "Real-time event notifications"),
         (name = "Batch", description = "Batch API operations"),
@@ -235,6 +240,8 @@ async fn main() {
         .route("/batch",           post(batch::batch_handler))
         .route("/ip/{ip_id}",                     get(handlers::get_ip))
         .route("/ip/verify",                      post(handlers::verify_commitment))
+        .route("/accounts",                       get(handlers::list_linked_accounts))
+        .route("/accounts/link",                  post(handlers::link_account))
         .route("/ip/owner/{owner}",               get(handlers::list_ip_by_owner))
         .route("/ip/owner/{owner}/cursor",        get(handlers::list_ip_by_owner_cursor))
         .route("/swap/initiate",                  post(handlers::initiate_swap).layer(signed.clone()))
@@ -347,6 +354,8 @@ fn build_app() -> Router {
         .route("/v1/ip/{ip_id}", get(handlers::get_ip))
         .route("/v1/ip/transfer", post(handlers::transfer_ip).layer(signed.clone()))
         .route("/v1/ip/verify", post(handlers::verify_commitment))
+        .route("/v1/accounts", get(handlers::list_linked_accounts).layer(middleware::from_fn(auth::require_auth)))
+        .route("/v1/accounts/link", post(handlers::link_account).layer(middleware::from_fn(auth::require_auth)))
         .route("/v1/ip/owner/{owner}", get(handlers::list_ip_by_owner))
         .route("/v1/ip/owner/{owner}/cursor", get(handlers::list_ip_by_owner_cursor))
         .route("/v1/ip/owner/{owner}/cursor", get(handlers::list_ip_by_owner_cursor))

@@ -40,6 +40,20 @@ pub struct VerifyCommitmentResponse {
     pub valid: bool,
 }
 
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct LinkStellarAccountRequest {
+    /// Stellar address to add to the authenticated user's account group.
+    pub account: String,
+    /// Hex-encoded signature over `atomicip:link:{primary}:{account}`.
+    pub signature: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct LinkedStellarAccountsResponse {
+    /// The authenticated user's primary account followed by linked accounts.
+    pub accounts: Vec<String>,
+}
+
 /// #317: Pagination query parameters shared across list endpoints.
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct PaginationParams {
