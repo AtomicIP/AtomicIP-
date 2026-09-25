@@ -172,6 +172,9 @@ pub trait SorobanRpcClient: Send + Sync {
     async fn get_swaps_by_buyer(&self, buyer: &str, limit: u64, cursor: Option<String>) -> Result<SwapConnection, String>;
     async fn get_swaps_by_ip(&self, ip_id: u64, limit: u64, cursor: Option<String>) -> Result<SwapConnection, String>;
     async fn get_dispute_evidence(&self, swap_id: u64) -> Result<Vec<DisputeEvidence>, String>;
+    async fn get_swap_escrow(&self, _swap_id: u64) -> Result<Option<i128>, String> {
+        Err("escrow status is not available from this RPC client".to_string())
+    }
     async fn get_reputation(&self, address: &str) -> Result<Option<Reputation>, String>;
 }
 

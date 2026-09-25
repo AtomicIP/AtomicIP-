@@ -208,6 +208,14 @@ pub struct SwapListResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct EscrowStatusResponse {
+    pub swap_id: u64,
+    pub status: SwapStatus,
+    pub deposited_amount: i128,
+    pub released: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct InitiateSwapRequest {
     pub ip_registry_id: String,
     pub ip_id: u64,

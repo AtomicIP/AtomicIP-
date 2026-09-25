@@ -635,6 +635,62 @@ pub async fn get_swap(
     }
 }
 
+/// Return the amount currently held in escrow and whether it has been released.
+#[utoipa::path(
+    get,
+    path = "/v1/swap/{swap_id}/escrow",
+    tag = "Atomic Swap",
+    params(("swap_id" = u64, Path, description = "Swap identifier")),
+    responses(
+        (status = 200, description = "Escrow status", body = EscrowStatusResponse),
+        (status = 404, description = "Swap not found", body = ErrorResponse),
+        (status = 502, description = "Escrow status unavailable", body = ErrorResponse),
+    )
+)]
+#[instrument]
+pub async fn get_swap_escrow(
+    State(rpc_client): State<Arc<dyn crate::graphql::SorobanRpcClient>>,
+    Path(swap_id): Path<u64>,
+) -> impl IntoResponse {
+    let record = match rpc_client.get_swap_record(swap_id).await {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": format!("Swap {} not found", swap_id) })),
+            ).into_response();
+        }
+        Err(_) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": "failed to query swap" })),
+            ).into_response();
+        }
+    };
+    let status: SwapRecord = record.into();
+    let deposited_amount = match rpc_client.get_swap_escrow(swap_id).await {
+        Ok(Some(amount)) => amount,
+        Ok(None) => 0,
+        Err(error) => {
+            tracing::error!(%error, swap_id, "failed to query escrow status");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": "failed to query escrow status" })),
+            ).into_response();
+        }
+    };
+    let released = matches!(&status.status, SwapStatus::Completed | SwapStatus::Cancelled);
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(EscrowStatusResponse {
+            swap_id,
+            status: status.status,
+            deposited_amount,
+            released,
+        }).unwrap()),
+    ).into_response()
+}
+
 /// List swaps using party/IP selectors and optional status, asset, and price filters.
 #[utoipa::path(
     get,
