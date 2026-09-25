@@ -635,6 +635,73 @@ pub async fn get_swap(
     }
 }
 
+/// List swaps using party/IP selectors and optional status, asset, and price filters.
+#[utoipa::path(
+    get,
+    path = "/v1/swaps",
+    tag = "Atomic Swap",
+    params(SwapFilterParams),
+    responses(
+        (status = 200, description = "Filtered swaps", body = SwapListResponse),
+        (status = 400, description = "At least one seller, buyer, or ip_id selector is required", body = ErrorResponse),
+    )
+)]
+#[instrument]
+pub async fn list_swaps(
+    State(rpc_client): State<Arc<dyn crate::graphql::SorobanRpcClient>>,
+    Query(filters): Query<SwapFilterParams>,
+) -> impl IntoResponse {
+    let limit = filters.limit.clamp(1, 200);
+    let connection = if let Some(seller) = filters.seller.as_deref() {
+        rpc_client.get_swaps_by_seller(seller, limit, filters.cursor.clone()).await
+    } else if let Some(buyer) = filters.buyer.as_deref() {
+        rpc_client.get_swaps_by_buyer(buyer, limit, filters.cursor.clone()).await
+    } else if let Some(ip_id) = filters.ip_id {
+        rpc_client.get_swaps_by_ip(ip_id, limit, filters.cursor.clone()).await
+    } else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "At least one of seller, buyer, or ip_id is required"
+            })),
+        ).into_response();
+    };
+
+    let connection = match connection {
+        Ok(connection) => connection,
+        Err(error) => {
+            tracing::error!(%error, "failed to query swaps");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": "failed to query swaps" })),
+            ).into_response();
+        }
+    };
+
+    let crate::graphql::SwapConnection { swap_ids, has_next_page, cursor } = connection;
+    let mut swaps = Vec::new();
+    for swap_id in swap_ids {
+        if let Ok(Some(record)) = rpc_client.get_swap_record(swap_id).await {
+            let record: SwapRecord = record.into();
+            let price_matches = filters.min_price.map_or(true, |min| record.price >= min)
+                && filters.max_price.map_or(true, |max| record.price <= max);
+            let matches = filters.status.as_ref().map_or(true, |status| record.status == *status)
+                && filters.token.as_ref().map_or(true, |token| record.token == *token)
+                && price_matches;
+            if matches {
+                swaps.push(record);
+            }
+        }
+    }
+
+    let response = SwapListResponse {
+        swaps,
+        next_cursor: cursor,
+        has_more: has_next_page,
+    };
+    (StatusCode::OK, Json(serde_json::to_value(response).unwrap())).into_response()
+}
+
 /// Bridge the RPC layer's record shape (shared with GraphQL) to the REST
 /// schema returned by `GET /v1/swap/{swap_id}`.
 impl From<crate::graphql::SwapRecord> for SwapRecord {

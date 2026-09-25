@@ -161,7 +161,7 @@ mod cursor_tests {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 #[serde(rename_all = "PascalCase")]
 pub enum SwapStatus {
     Pending,
@@ -183,6 +183,28 @@ pub struct SwapRecord {
     pub status: SwapStatus,
     /// Ledger timestamp after which buyer may cancel an Accepted swap
     pub expiry: u64,
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct SwapFilterParams {
+    pub seller: Option<String>,
+    pub buyer: Option<String>,
+    pub ip_id: Option<u64>,
+    pub status: Option<SwapStatus>,
+    pub token: Option<String>,
+    pub min_price: Option<i128>,
+    pub max_price: Option<i128>,
+    #[serde(default = "default_limit")]
+    pub limit: u64,
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct SwapListResponse {
+    pub swaps: Vec<SwapRecord>,
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
