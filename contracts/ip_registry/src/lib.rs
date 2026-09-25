@@ -16,6 +16,9 @@ use types::*;
 
 mod zk_commitment;
 
+/// Issue #973: Commitment metadata storage and search.
+mod metadata;
+
 #[cfg(test)]
 mod test;
 
@@ -37,6 +40,9 @@ mod invariant_tests;
 
 #[cfg(test)]
 mod upgrade_tests;
+
+#[cfg(test)]
+mod commitment_property_tests;
 
 // ── Error Codes ────────────────────────────────────────────────────────────
 
@@ -102,6 +108,20 @@ pub enum ContractError {
     /// storage key, or error code that the current contract relies on, or it
     /// reassigns an existing error code to a different meaning.
     IncompatibleUpgrade = 38,
+    /// #975: Time-lock has not yet expired.
+    TimeLockNotExpired = 39,
+    /// #975: Invalid time-lock configuration.
+    InvalidTimeLock = 40,
+    /// #974: Invalid Merkle tree proof.
+    InvalidMerkleProof = 41,
+    /// #976: Invalid amendment signature.
+    InvalidAmendmentSignature = 42,
+    /// #976: Commitment has already been amended.
+    CommitmentAlreadyAmended = 43,
+    /// #977: Invalid privacy level.
+    InvalidPrivacyLevel = 44,
+    /// #977: Access denied due to privacy level restrictions.
+    AccessDenied = 45,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -211,6 +231,9 @@ pub enum DataKey {
     MerkleRoot(Address),
     // Issue #812: Flag indicating the cached Merkle root for an owner is stale
     MerkleRootStale(Address),
+    // Issue #979: Commitment linking for related IPs
+    CommitmentLinks(u64), // maps ip_id -> Vec<CommitmentLink> of linked commitments
+    LinkedCommitments(u64), // maps linked_ip_id -> Vec<u64> of ip_ids linking to it (reverse index)
 }
 
 // ── Upgrade Compatibility Manifest (#791) ───────────────────────────────────
@@ -250,13 +273,14 @@ const CURRENT_FUNCTIONS: &[&str] = &[
     "generate_merkle_proof", "get_anonymous_owner", "get_arbitration", "get_batch_escrow",
     "get_batch_metadata", "get_blinded_owner_batch", "get_commitment_compression", "get_commitment_shard",
     "get_compressed_bytes", "get_compressed_commitment", "get_dispute", "get_encrypted_commitment",
-    "get_ip", "get_ip_access_grants", "get_ip_audit_trail", "get_ip_lineage",
+    "get_commitment_back_references", "get_ip", "get_ip_access_grants", "get_ip_audit_trail", "get_ip_lineage",
     "get_ip_notary_signature", "get_ip_strength", "get_ip_suggested_price", "get_ip_version_chain",
+    "get_linked_commitments",
     "get_ip_versions", "get_key_rotation_history", "get_licenses", "get_ownership_challenge",
     "get_partial_disclosure", "get_pow_difficulty", "get_renewal_count", "get_reputation",
     "get_stake", "get_threshold_config", "get_threshold_signatures", "grant_ip_access",
     "grant_license", "initialize", "initiate_dispute", "is_delegate",
-    "is_ip_owner", "issue_ownership_challenge", "list_ip_by_category", "list_ip_by_owner",
+    "is_ip_owner", "issue_ownership_challenge", "link_commitment", "list_ip_by_category", "list_ip_by_owner",
     "list_ip_by_shard", "list_owner_categories", "merge_duplicate_commitment", "nominate_arbitrator",
     "notarize_ip_timestamp", "open_arbitration", "register_category_path", "release_batch_escrow",
     "remove_co_owner", "renew_ip", "renew_ip_commitment", "require_threshold_signatures",
@@ -284,7 +308,7 @@ const CURRENT_STORAGE_KEYS: &[&str] = &[
     "OwnerReputation", "ArbitrationCase", "NextArbitrationId", "ArbitratorPool",
     "CompressedCommitment", "BatchVerifyResult", "CompressionSelection", "HierarchyNode",
     "OwnerCategories", "CategoryDepth", "ThresholdConfig", "ThresholdSignatures", "BatchMetadata",
-    "EncryptedCommitment", "BatchEscrow",
+    "EncryptedCommitment", "BatchEscrow", "CommitmentLinks", "LinkedCommitments",
 ];
 
 /// (error name, error code) pairs defined by the currently deployed contract.
@@ -766,6 +790,8 @@ impl IpRegistry {
             notary_signature: None,
             expiry_timestamp: 0,
             grace_period_seconds: 0,
+            unlock_time: 0,
+            privacy_level: 0,
         };
 
         env.storage()
@@ -913,6 +939,8 @@ impl IpRegistry {
                 notary_signature: None,
                 expiry_timestamp: 0,
                 grace_period_seconds: 0,
+                unlock_time: 0,
+                privacy_level: 0,
             };
 
             env.storage()
@@ -1072,6 +1100,8 @@ impl IpRegistry {
                 notary_signature: None,
                 expiry_timestamp: 0,
                 grace_period_seconds: 0,
+                unlock_time: 0,
+                privacy_level: 0,
             };
 
             env.storage()
@@ -1163,6 +1193,471 @@ impl IpRegistry {
             results.push_back(Self::get_anonymous_owner(env.clone(), hash));
         }
         results
+    }
+
+    // ── Issue #974: Merkle Tree Batch Commitments ──────────────────────────
+
+    /// Generate a Merkle tree root for a batch of commitments.
+    ///
+    /// Creates a Merkle tree from the provided commitment hashes and returns the root hash.
+    /// This allows proving multiple commitments exist in a single transaction.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `owner` - The address of the IP owner
+    /// * `commitment_hashes` - Vector of commitment hashes to include in tree
+    ///
+    /// # Returns
+    ///
+    /// `u64` - The root ID for tracking this Merkle tree
+    pub fn batch_commit_merkle(
+        env: Env,
+        owner: Address,
+        commitment_hashes: Vec<BytesN<32>>,
+    ) -> u64 {
+        owner.require_auth();
+
+        require!(
+            commitment_hashes.len() > 0,
+            ContractError::BatchSizeMismatch
+        );
+
+        let root_hash = Self::compute_merkle_root(&env, &commitment_hashes);
+        let timestamp = env.ledger().timestamp();
+
+        let root_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NextId)
+            .unwrap_or(1);
+
+        let merkle_record = MerkleRootRecord {
+            root_id,
+            root_hash: root_hash.clone(),
+            owner: owner.clone(),
+            timestamp,
+            leaf_count: commitment_hashes.len() as u32,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::MerkleRootRecord(root_id), &merkle_record);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::MerkleRootRecord(root_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events()
+            .publish((symbol_short!("merkle_root"),), (root_id, timestamp, root_hash));
+
+        root_id
+    }
+
+    /// Verify a Merkle proof for a commitment within a batch.
+    ///
+    /// Verifies that a leaf hash is part of the Merkle tree rooted at root_id
+    /// using the provided proof path.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `root_id` - The ID of the Merkle root
+    /// * `leaf_hash` - The commitment hash to verify
+    /// * `proof` - The Merkle proof path
+    ///
+    /// # Returns
+    ///
+    /// `bool` - True if proof is valid, false otherwise
+    pub fn verify_merkle_proof(
+        env: Env,
+        root_id: u64,
+        leaf_hash: BytesN<32>,
+        proof: MerkleProof,
+    ) -> bool {
+        let record: Option<MerkleRootRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MerkleRootRecord(root_id));
+
+        if record.is_none() {
+            return false;
+        }
+
+        let record = record.unwrap();
+        let mut current_hash = leaf_hash;
+
+        for sibling in proof.proof_path.iter() {
+            let mut combined = soroban_sdk::Bytes::new(&env);
+            combined.append(&current_hash.clone().into());
+            combined.append(&sibling.clone().into());
+            current_hash = env.crypto().sha256(&combined).into();
+        }
+
+        current_hash == record.root_hash
+    }
+
+    fn compute_merkle_root(env: &Env, hashes: &Vec<BytesN<32>>) -> BytesN<32> {
+        if hashes.len() == 1 {
+            return hashes.get(0).unwrap();
+        }
+
+        let mut current_level = hashes.clone();
+
+        while current_level.len() > 1 {
+            let mut next_level = Vec::new(env);
+
+            for i in (0..current_level.len()).step_by(2) {
+                let left = current_level.get(i as u32).unwrap();
+                let right = if i + 1 < current_level.len() {
+                    current_level.get((i + 1) as u32).unwrap()
+                } else {
+                    left.clone()
+                };
+
+                let mut combined = soroban_sdk::Bytes::new(env);
+                combined.append(&left.clone().into());
+                combined.append(&right.clone().into());
+                let parent: BytesN<32> = env.crypto().sha256(&combined).into();
+                next_level.push_back(parent);
+            }
+
+            current_level = next_level;
+        }
+
+        current_level.get(0).unwrap()
+    }
+
+    // ── Issue #975: Time-Lock Commitments ──────────────────────────────────
+
+    /// Create a time-locked commitment that can only be revealed after unlock_time.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `owner` - The address of the IP owner
+    /// * `commitment_hash` - The commitment hash
+    /// * `unlock_time` - Unix timestamp (seconds) after which commitment can be revealed
+    ///
+    /// # Returns
+    ///
+    /// `u64` - The IP ID of the created commitment
+    pub fn create_time_locked_commitment(
+        env: Env,
+        owner: Address,
+        commitment_hash: BytesN<32>,
+        unlock_time: u64,
+    ) -> u64 {
+        owner.require_auth();
+
+        let current_time = env.ledger().timestamp();
+        require!(unlock_time > current_time, ContractError::InvalidTimeLock);
+        require_non_zero_commitment(&env, &commitment_hash);
+        require_unique_commitment(&env, &commitment_hash);
+
+        let id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NextId)
+            .unwrap_or(1);
+
+        let record = IpRecord {
+            ip_id: id,
+            owner: owner.clone(),
+            commitment_hash: commitment_hash.clone(),
+            timestamp: current_time,
+            revoked: false,
+            co_owners: Vec::new(&env),
+            parent_ip_id: None,
+            notary_signature: None,
+            expiry_timestamp: 0,
+            grace_period_seconds: 0,
+            unlock_time,
+            privacy_level: 0,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::IpRecord(id), &record);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::IpRecord(id), LEDGER_BUMP, LEDGER_BUMP);
+
+        let timelock = TimeLockRecord {
+            commitment_id: id,
+            unlock_time,
+            revealed: false,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::TimeLockRecord(id), &timelock);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::TimeLockRecord(id), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::CommitmentOwner(commitment_hash.clone()), &owner);
+        env.storage()
+            .persistent()
+            .set(&DataKey::NextId, &(id + 1));
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::NextId, LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish(
+            (symbol_short!("timelock_crt"),),
+            (id, unlock_time, current_time),
+        );
+
+        id
+    }
+
+    /// Unlock and reveal a time-locked commitment.
+    ///
+    /// Only callable after unlock_time has passed.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `commitment_id` - The IP ID of the time-locked commitment
+    ///
+    /// # Returns
+    ///
+    /// `bool` - True if unlocked successfully
+    pub fn unlock_commitment(env: Env, commitment_id: u64) -> bool {
+        let timelock: Option<TimeLockRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TimeLockRecord(commitment_id));
+
+        if timelock.is_none() {
+            return false;
+        }
+
+        let mut lock = timelock.unwrap();
+        let current_time = env.ledger().timestamp();
+
+        if current_time < lock.unlock_time {
+            panic_with_error!(&env, ContractError::TimeLockNotExpired);
+        }
+
+        lock.revealed = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::TimeLockRecord(commitment_id), &lock);
+
+        env.events()
+            .publish((symbol_short!("timelock_unlock"),), (commitment_id, current_time));
+
+        true
+    }
+
+    // ── Issue #976: Commitment Amendment ───────────────────────────────────
+
+    /// Amend an existing commitment by updating its hash.
+    ///
+    /// Requires the owner's signature for authorization.
+    /// Maintains a history of all amendments.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `commitment_id` - The IP ID to amend
+    /// * `new_hash` - The new commitment hash
+    ///
+    /// # Returns
+    ///
+    /// `bool` - True if amendment succeeds
+    pub fn amend_commitment(
+        env: Env,
+        commitment_id: u64,
+        new_hash: BytesN<32>,
+    ) -> bool {
+        let mut record: Option<IpRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IpRecord(commitment_id));
+
+        if record.is_none() {
+            return false;
+        }
+
+        let mut ip_record = record.unwrap();
+        ip_record.owner.require_auth();
+
+        require_non_zero_commitment(&env, &new_hash);
+
+        let old_hash = ip_record.commitment_hash.clone();
+        let amendment_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NextId)
+            .unwrap_or(1);
+
+        let amendment = CommitmentAmendment {
+            amendment_id,
+            commitment_id,
+            old_hash: old_hash.clone(),
+            new_hash: new_hash.clone(),
+            timestamp: env.ledger().timestamp(),
+            amender: ip_record.owner.clone(),
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::AmendmentHistory(amendment_id), &amendment);
+        env.storage()
+            .persistent()
+            .extend_ttl(
+                &DataKey::AmendmentHistory(amendment_id),
+                LEDGER_BUMP,
+                LEDGER_BUMP,
+            );
+
+        ip_record.commitment_hash = new_hash.clone();
+        env.storage()
+            .persistent()
+            .set(&DataKey::IpRecord(commitment_id), &ip_record);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::IpRecord(commitment_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::CommitmentOwner(old_hash));
+        env.storage()
+            .persistent()
+            .set(&DataKey::CommitmentOwner(new_hash), &ip_record.owner);
+
+        env.events().publish(
+            (symbol_short!("amend_cmt"),),
+            (commitment_id, amendment_id),
+        );
+
+        true
+    }
+
+    // ── Issue #977: Commitment Privacy Levels ──────────────────────────────
+
+    /// Set privacy level for a commitment.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `commitment_id` - The IP ID to set privacy for
+    /// * `privacy_level` - 0=Public, 1=Private, 2=Restricted, 3=Confidential
+    /// * `allowed_addresses` - Addresses allowed to access (for Restricted level)
+    ///
+    /// # Returns
+    ///
+    /// `bool` - True if privacy level set successfully
+    pub fn set_commitment_privacy(
+        env: Env,
+        commitment_id: u64,
+        privacy_level: u32,
+        allowed_addresses: Vec<Address>,
+    ) -> bool {
+        require!(
+            privacy_level <= 3,
+            ContractError::InvalidPrivacyLevel
+        );
+
+        let mut record: Option<IpRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IpRecord(commitment_id));
+
+        if record.is_none() {
+            return false;
+        }
+
+        let mut ip_record = record.unwrap();
+        ip_record.owner.require_auth();
+
+        ip_record.privacy_level = privacy_level;
+        env.storage()
+            .persistent()
+            .set(&DataKey::IpRecord(commitment_id), &ip_record);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::IpRecord(commitment_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        let privacy = CommitmentPrivacy {
+            commitment_id,
+            privacy_level,
+            allowed_addresses,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::CommitmentPrivacy(commitment_id), &privacy);
+        env.storage()
+            .persistent()
+            .extend_ttl(
+                &DataKey::CommitmentPrivacy(commitment_id),
+                LEDGER_BUMP,
+                LEDGER_BUMP,
+            );
+
+        env.events()
+            .publish((symbol_short!("privacy_set"),), (commitment_id, privacy_level));
+
+        true
+    }
+
+    /// Check if an address has access to a commitment based on privacy level.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `commitment_id` - The IP ID to check access for
+    /// * `requester` - The address requesting access
+    ///
+    /// # Returns
+    ///
+    /// `bool` - True if access is granted
+    pub fn check_commitment_access(env: Env, commitment_id: u64, requester: Address) -> bool {
+        let record: Option<IpRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IpRecord(commitment_id));
+
+        if record.is_none() {
+            return false;
+        }
+
+        let ip_record = record.unwrap();
+
+        if ip_record.privacy_level == 0 {
+            return true;
+        }
+
+        if ip_record.owner == requester {
+            return true;
+        }
+
+        if ip_record.privacy_level == 1 {
+            return false;
+        }
+
+        let privacy: Option<CommitmentPrivacy> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CommitmentPrivacy(commitment_id));
+
+        if privacy.is_none() {
+            return false;
+        }
+
+        let privacy_data = privacy.unwrap();
+        for allowed in privacy_data.allowed_addresses.iter() {
+            if allowed == requester {
+                return true;
+            }
+        }
+
+        false
     }
 
     // ── Issue #465: Batch Escrow ────────────────────────────────────────────
@@ -2459,6 +2954,8 @@ impl IpRegistry {
             notary_signature: None,
             expiry_timestamp: 0,
             grace_period_seconds: 0,
+            unlock_time: 0,
+            privacy_level: 0,
         };
 
         // Store the new version
@@ -4805,6 +5302,8 @@ impl IpRegistry {
             notary_signature: None,
             expiry_timestamp: 0,
             grace_period_seconds: 0,
+            unlock_time: 0,
+            privacy_level: 0,
         };
 
         env.storage()
@@ -5670,6 +6169,68 @@ impl IpRegistry {
                 }
             }
         }
+    }
+
+    /// Issue #973: Store encrypted metadata for a commitment to improve discoverability.
+    ///
+    /// Stores encrypted metadata (title, description, tags) for an IP commitment.
+    /// The metadata is AES-GCM encrypted to preserve privacy while enabling search.
+    ///
+    /// # Arguments
+    /// * `env` - Soroban environment
+    /// * `ip_id` - The IP ID to attach metadata to
+    /// * `encrypted_data` - AES-GCM encrypted metadata blob
+    /// * `nonce` - 12-byte encryption nonce
+    /// * `tag_hashes` - Vec of SHA256 hashes of searchable tags
+    pub fn store_commitment_metadata(
+        env: Env,
+        ip_id: u64,
+        encrypted_data: Bytes,
+        nonce: BytesN<12>,
+        tag_hashes: Vec<BytesN<32>>,
+    ) {
+        // Verify IP exists
+        if env
+            .storage()
+            .persistent()
+            .get::<_, IpRecord>(&DataKey::IpRecord(ip_id))
+            .is_none()
+        {
+            env.panic_with_error(Error::from_contract_error(ContractError::IpNotFound as u32));
+        }
+
+        metadata::store_metadata(&env, ip_id, encrypted_data, nonce, tag_hashes);
+    }
+
+    /// Issue #973: Search for commitments by metadata tag with pagination.
+    ///
+    /// # Arguments
+    /// * `env` - Soroban environment
+    /// * `tag_hash` - SHA256 hash of the tag string to search for
+    /// * `offset` - Starting index in results (pagination)
+    /// * `limit` - Maximum number of results per page
+    ///
+    /// # Returns
+    /// MetadataSearchResult with paginated IP IDs and cursor for next page
+    pub fn search_commitment_metadata(
+        env: Env,
+        tag_hash: BytesN<32>,
+        offset: u32,
+        limit: u32,
+    ) -> types::MetadataSearchResult {
+        metadata::search_by_metadata(&env, tag_hash, offset, limit)
+    }
+
+    /// Issue #973: Retrieve encrypted metadata for a specific commitment.
+    ///
+    /// # Arguments
+    /// * `env` - Soroban environment
+    /// * `ip_id` - The IP ID to retrieve metadata for
+    ///
+    /// # Returns
+    /// Option<IpMetadata> containing the encrypted metadata if it exists
+    pub fn get_commitment_metadata(env: Env, ip_id: u64) -> Option<types::IpMetadata> {
+        metadata::get_metadata(&env, ip_id)
     }
 }
 

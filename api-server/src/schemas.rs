@@ -317,3 +317,100 @@ pub struct BulkOperationResult<T> {
     pub data: Option<T>,
     pub error: Option<String>,
 }
+
+/// #982: Execute batch swaps request with execution mode
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ExecuteBatchSwapsRequest {
+    /// Vector of swap IDs to execute (max 50)
+    pub swap_ids: Vec<u64>,
+    /// If true: atomic all-or-nothing execution
+    /// If false: partial execution allowed (individual failures tolerated)
+    pub atomic: bool,
+}
+
+/// #982: Execute batch swaps response with per-swap results
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ExecuteBatchSwapsResponse {
+    /// Per-swap execution results: true = success, false = failure/skipped
+    pub results: Vec<bool>,
+    /// Total number of successful executions
+    pub successful_count: u32,
+    /// Total number of swaps processed
+    pub total_count: u32,
+    /// Execution mode (atomic or partial)
+    pub atomic: bool,
+}
+
+/// #984: Request to enable 2FA for a user
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct Enable2faRequest {
+    pub user_id: String,
+}
+
+/// #984: Response when 2FA is enabled (returns secret and backup codes)
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct Enable2faResponse {
+    /// Base32-encoded TOTP secret for QR code
+    pub secret: String,
+    /// QR code URI for authenticator apps
+    pub qr_code_uri: String,
+    /// List of backup codes for account recovery
+    pub backup_codes: Vec<String>,
+}
+
+/// #984: Request to verify 2FA code
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct Verify2faRequest {
+    pub user_id: String,
+    /// 6-digit TOTP code from authenticator app
+    pub totp_code: String,
+}
+
+/// #984: Response indicating successful 2FA verification
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct Verify2faResponse {
+    pub success: bool,
+    pub message: String,
+}
+
+/// #984: Request to use backup code for account recovery
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct UseBackupCodeRequest {
+    pub user_id: String,
+    pub backup_code: String,
+}
+
+/// #985: Request to check session status
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct CheckSessionRequest {
+    pub token: String,
+}
+
+/// #985: Response with current session status
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct CheckSessionResponse {
+    /// Whether session is active
+    pub active: bool,
+    /// Whether session is in grace period
+    pub in_grace_period: bool,
+    /// Minutes until timeout
+    pub minutes_until_timeout: i64,
+    /// Whether warning should be shown
+    pub show_warning: bool,
+    /// Message for user
+    pub message: Option<String>,
+}
+
+/// #985: Request to extend session
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ExtendSessionRequest {
+    pub token: String,
+}
+
+/// #985: Response when extending session
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ExtendSessionResponse {
+    pub success: bool,
+    pub new_expiry: i64,
+    pub message: String,
+}
