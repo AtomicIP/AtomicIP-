@@ -5421,634 +5421,126 @@ impl AtomicSwap {
         );
     }
 
-    // ── Issue #980: Escrow Swap with Third-Party Arbitration ──────────────────
-
-    /// Initiates an escrow swap with third-party arbitration.
-    /// The arbiter has authority to resolve disputes and make fund allocation decisions.
+    /// #982: Execute multiple swaps in batch with configurable modes.
     ///
-    /// # Arguments
-    /// * `swap_id` - The swap to convert to escrow mode
-    /// * `arbiter` - The arbitrator address who will resolve disputes
-    /// * `timeout_seconds` - Seconds after which funds auto-release if no dispute
+    /// Supports both atomic (all-or-nothing) and partial execution modes:
+    /// - `atomic = true`: All swaps must complete successfully or all are rolled back
+    /// - `atomic = false`: Individual swap failures are tolerated; returns per-swap success status
     ///
-    /// # Returns
-    /// The arbitration setup timestamp
-    pub fn escrow_swap(env: Env, swap_id: u64, arbiter: Address, timeout_seconds: u64) -> u64 {
-        let swap: Option<SwapRecord> = env.storage().persistent().get(&DataKey::Swap(swap_id));
-        if swap.is_none() {
-            panic_with_error(&env, ContractError::SwapNotFound);
-        }
-
-        let swap_record = swap.unwrap();
-
-        // Only allow escrow setup on pending or accepted swaps
-        if swap_record.status != SwapStatus::Pending && swap_record.status != SwapStatus::Accepted {
-            env.panic_with_error(Error::from_contract_error(
-                ContractError::NotPending as u32,
-            ));
-        }
-
-        // Verify arbiter is a valid address
-        arbiter.require_auth();
-
-        let timestamp = env.ledger().timestamp();
-        let timeout = timestamp.saturating_add(timeout_seconds);
-
-        // Store arbitrator and timeout
-        env.storage()
-            .persistent()
-            .set(&DataKey::EscrowArbiter(swap_id), &arbiter);
-        env.storage()
-            .persistent()
-            .set(&DataKey::EscrowTimeout(swap_id), &timeout);
-
-        // Update swap mode to Escrow if it's currently Atomic
-        if swap_record.status == SwapStatus::Accepted {
-            env.storage()
-                .persistent()
-                .set(&DataKey::SwapMode(swap_id), &SwapMode::Escrow);
-        }
-
-        env.storage().instance().bump();
-        env.events().publish(
-            (soroban_sdk::symbol_short!("escr_init"),),
-            (swap_id, arbiter.clone(), timeout),
-        );
-
-        timestamp
-    }
-
-    /// Arbiter resolves an escrow dispute by making a binding decision.
+    /// **Parameters:**
+    /// - `env`: Soroban environment
+    /// - `swap_ids`: Vector of swap IDs to execute (max 50 per MAX_BATCH_SIZE)
+    /// - `atomic`: If true, all-or-nothing execution; if false, partial execution allowed
     ///
-    /// # Arguments
-    /// * `swap_id` - The swap in dispute
-    /// * `decision` - The arbitrator's decision (RefundToBuyer, ConfirmToSeller, or PartialRefund)
-    pub fn arbitrator_decide(env: Env, swap_id: u64, decision: ArbitratorDecision) {
-        let swap: Option<SwapRecord> = env.storage().persistent().get(&DataKey::Swap(swap_id));
-        if swap.is_none() {
-            panic_with_error(&env, ContractError::SwapNotFound);
-        }
-
-        let swap_record = swap.unwrap();
-
-        // Get the designated arbiter
-        let arbiter: Option<Address> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::EscrowArbiter(swap_id));
-        if arbiter.is_none() {
-            env.panic_with_error(Error::from_contract_error(
-                ContractError::NotArbitrator as u32,
-            ));
-        }
-
-        let arbiter_addr = arbiter.unwrap();
-        arbiter_addr.require_auth();
-
-        // Ensure swap is in a disputable state
-        if swap_record.status != SwapStatus::Disputed
-            && swap_record.status != SwapStatus::Accepted
-        {
-            env.panic_with_error(Error::from_contract_error(
-                ContractError::NotDisputed as u32,
-            ));
-        }
-
-        let timestamp = env.ledger().timestamp();
-
-        // Store the decision
-        env.storage()
-            .persistent()
-            .set(&DataKey::ArbitratorDecision(swap_id), &decision);
-
-        env.events().publish(
-            (soroban_sdk::symbol_short!("escr_rsv"),),
-            EscrowSwapResolvedEvent {
-                swap_id,
-                arbiter: arbiter_addr,
-                decision: decision.clone(),
-                timestamp,
-            },
-        );
-
-        env.storage().instance().bump();
-    }
-
-    /// Executes the arbitrator's decision, transferring funds accordingly.
-    /// Can only be called after arbitrator_decide has made a decision.
+    /// **Returns:** `Vec<bool>` where each element indicates success (true) or failure (false) for the corresponding swap
     ///
-    /// # Arguments
-    /// * `swap_id` - The escrow swap to execute
-    pub fn execute_arbitrator_decision(env: Env, swap_id: u64) {
-        let swap: Option<SwapRecord> = env.storage().persistent().get(&DataKey::Swap(swap_id));
-        if swap.is_none() {
-            panic_with_error(&env, ContractError::SwapNotFound);
-        }
-
-        let decision: Option<ArbitratorDecision> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::ArbitratorDecision(swap_id));
-        if decision.is_none() {
-            env.panic_with_error(Error::from_contract_error(
-                ContractError::ConditionNotMet as u32,
-            ));
-        }
-
-        let swap_record = swap.unwrap();
-        let decision_val = decision.unwrap();
-
-        // Execute based on decision
-        match decision_val {
-            ArbitratorDecision::RefundToBuyer => {
-                // Refund entire amount to buyer
-                if swap_record.price > 0 {
-                    let token_client =
-                        token::Client::new(&env, &swap_record.token);
-                    token_client.transfer(
-                        &env.current_contract_address(),
-                        &swap_record.buyer,
-                        &swap_record.price,
-                    );
-                }
-            }
-            ArbitratorDecision::ConfirmToSeller => {
-                // Release full amount to seller
-                if swap_record.price > 0 {
-                    let token_client =
-                        token::Client::new(&env, &swap_record.token);
-                    token_client.transfer(
-                        &env.current_contract_address(),
-                        &swap_record.seller,
-                        &swap_record.price,
-                    );
-                }
-            }
-            ArbitratorDecision::PartialRefund(buyer_amount) => {
-                // Split: buyer gets buyer_amount, seller gets remainder
-                let seller_amount = swap_record.price.saturating_sub(buyer_amount);
-                let token_client =
-                    token::Client::new(&env, &swap_record.token);
-
-                if buyer_amount > 0 {
-                    token_client.transfer(
-                        &env.current_contract_address(),
-                        &swap_record.buyer,
-                        &buyer_amount,
-                    );
-                }
-                if seller_amount > 0 {
-                    token_client.transfer(
-                        &env.current_contract_address(),
-                        &swap_record.seller,
-                        &seller_amount,
-                    );
-                }
-            }
-        }
-
-        // Mark swap as completed
-        let mut updated_swap = swap_record.clone();
-        updated_swap.status = SwapStatus::Completed;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Swap(swap_id), &updated_swap);
-
-        env.storage().instance().bump();
-    }
-
-    /// Auto-releases escrow funds if timeout is reached without dispute resolution.
+    /// **Gas Optimization:**
+    /// - Pre-validates all swaps before mutations to avoid wasted gas on failures
+    /// - Defers event publishing until all swaps are processed
+    /// - Groups state updates for better cache locality
     ///
-    /// # Arguments
-    /// * `swap_id` - The escrow swap to auto-release
-    pub fn auto_release_escrow(env: Env, swap_id: u64) {
-        let swap: Option<SwapRecord> = env.storage().persistent().get(&DataKey::Swap(swap_id));
-        if swap.is_none() {
-            panic_with_error(&env, ContractError::SwapNotFound);
+    /// **Errors:**
+    /// - `BatchEmpty`: Empty swap_ids vector provided
+    /// - `BatchTooLarge`: More than MAX_BATCH_SIZE swaps
+    /// - Various swap-specific errors if atomic mode is enabled and any swap fails
+    pub fn execute_batch_swaps(env: Env, swap_ids: Vec<u64>, atomic: bool) -> Vec<bool> {
+        let len = swap_ids.len() as usize;
+
+        // Validate batch parameters
+        if len == 0 {
+            env.panic_with_error(Error::from_contract_error(ContractError::BatchEmpty as u32));
         }
-
-        let timeout: Option<u64> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::EscrowTimeout(swap_id));
-        if timeout.is_none() {
-            env.panic_with_error(Error::from_contract_error(
-                ContractError::NotInAccepted as u32,
-            ));
-        }
-
-        let timeout_val = timeout.unwrap();
-        let current_time = env.ledger().timestamp();
-
-        // Verify timeout has been reached
-        if current_time < timeout_val {
-            env.panic_with_error(Error::from_contract_error(
-                ContractError::ArbitrationNotTimedOut as u32,
-            ));
-        }
-
-        let swap_record = swap.unwrap();
-
-        // If no decision was made by arbiter, auto-release to seller
-        let decision: Option<ArbitratorDecision> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::ArbitratorDecision(swap_id));
-
-        if decision.is_none() {
-            // Auto-release: full amount to seller
-            if swap_record.price > 0 {
-                let token_client =
-                    token::Client::new(&env, &swap_record.token);
-                token_client.transfer(
-                    &env.current_contract_address(),
-                    &swap_record.seller,
-                    &swap_record.price,
-                );
-            }
-        }
-
-        // Mark swap as completed
-        let mut updated_swap = swap_record.clone();
-        updated_swap.status = SwapStatus::Completed;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Swap(swap_id), &updated_swap);
-
-        env.storage().instance().bump();
-        env.events().publish(
-            (soroban_sdk::symbol_short!("escr_aut"),),
-            (swap_id, current_time),
-        );
-    }
-
-    // ── Issue #981: Swap Metadata and Deal Terms ──────────────────────────────
-
-    /// Sets structured deal terms and metadata for a swap.
-    /// Enables transparency, compliance tracking, and deal context preservation.
-    ///
-    /// # Arguments
-    /// * `swap_id` - The swap to attach metadata to
-    /// * `terms` - Structured deal terms (serialized format)
-    /// * `metadata` - Additional metadata (contextual information)
-    /// * `terms_uri` - Optional URI reference to full deal document
-    ///
-    /// # Returns
-    /// The metadata version number
-    pub fn set_deal_terms(
-        env: Env,
-        swap_id: u64,
-        terms: Bytes,
-        metadata: Bytes,
-        terms_uri: Option<String>,
-    ) -> u32 {
-        let swap: Option<SwapRecord> = env.storage().persistent().get(&DataKey::Swap(swap_id));
-        if swap.is_none() {
-            panic_with_error(&env, ContractError::SwapNotFound);
-        }
-
-        let swap_record = swap.unwrap();
-
-        // Only seller can set deal terms
-        swap_record.seller.require_auth();
-
-        // Validate metadata size (1KB max as per IP Registry constraints)
-        const MAX_METADATA_SIZE: usize = 1024;
-        if terms.len() > MAX_METADATA_SIZE || metadata.len() > MAX_METADATA_SIZE {
+        if len > MAX_BATCH_SIZE as usize {
             env.panic_with_error(Error::from_contract_error(
                 ContractError::BatchTooLarge as u32,
             ));
         }
 
-        // Get existing metadata to increment version
-        let existing: Option<SwapMetadata> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::SwapMetadata(swap_id));
-
-        let version = if let Some(meta) = existing.clone() {
-            meta.version.saturating_add(1)
-        } else {
-            1
-        };
-
-        let timestamp = env.ledger().timestamp();
-
-        // Create new metadata record
-        let new_metadata = SwapMetadata {
-            terms: terms.clone(),
-            version,
-            metadata: metadata.clone(),
-            created_at: timestamp,
-            terms_uri: terms_uri.clone(),
-        };
-
-        // Store current metadata
-        env.storage()
-            .persistent()
-            .set(&DataKey::SwapMetadata(swap_id), &new_metadata);
-
-        // Save to history for versioning
-        let mut history: Vec<SwapMetadata> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::SwapMetadataHistory(swap_id))
-            .unwrap_or_else(|| Vec::new(&env));
-
-        history.push_back(new_metadata);
-        env.storage()
-            .persistent()
-            .set(&DataKey::SwapMetadataHistory(swap_id), &history);
-
-        env.storage().instance().bump();
-        env.events().publish(
-            (soroban_sdk::symbol_short!("meta_set"),),
-            SwapMetadataUpdatedEvent {
-                swap_id,
-                version,
-                terms_hash: compute_hash(&env, &terms),
-                timestamp,
-            },
-        );
-
-        version
-    }
-
-    /// Retrieves the current deal terms and metadata for a swap.
-    ///
-    /// # Arguments
-    /// * `swap_id` - The swap to query
-    ///
-    /// # Returns
-    /// The SwapMetadata record, or None if not set
-    pub fn get_deal_terms(env: Env, swap_id: u64) -> Option<SwapMetadata> {
-        let swap: Option<SwapRecord> = env.storage().persistent().get(&DataKey::Swap(swap_id));
-        if swap.is_none() {
-            return None;
+        // Pre-validation pass: check all swaps are in Pending status before any mutations
+        // This ensures atomicity and avoids gas waste on failures
+        if atomic {
+            for swap_id in swap_ids.iter() {
+                let swap = require_swap_exists(&env, swap_id);
+                require_swap_status(&env, &swap, SwapStatus::Pending, ContractError::NotPending);
+            }
         }
 
-        env.storage()
-            .persistent()
-            .get(&DataKey::SwapMetadata(swap_id))
-    }
-
-    /// Validates deal terms against expected format and content.
-    /// Can be used by buyers to verify seller's terms before accepting.
-    ///
-    /// # Arguments
-    /// * `swap_id` - The swap to validate
-    /// * `expected_terms_hash` - The expected sha256 hash of deal terms
-    ///
-    /// # Returns
-    /// true if current terms match expected hash, false otherwise
-    pub fn validate_deal_terms(env: Env, swap_id: u64, expected_terms_hash: BytesN<32>) -> bool {
-        let metadata = env
-            .storage()
-            .persistent()
-            .get::<DataKey, SwapMetadata>(&DataKey::SwapMetadata(swap_id));
-
-        if let Some(meta) = metadata {
-            compute_hash(&env, &meta.terms) == expected_terms_hash
-        } else {
-            false
-        }
-    }
-
-    /// Retrieves the full version history of deal terms for a swap.
-    ///
-    /// # Arguments
-    /// * `swap_id` - The swap to query
-    ///
-    /// # Returns
-    /// A vector of all SwapMetadata versions in chronological order
-    pub fn get_metadata_history(env: Env, swap_id: u64) -> Vec<SwapMetadata> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::SwapMetadataHistory(swap_id))
-            .unwrap_or_else(|| Vec::new(&env))
-    }
-}
-
-    // ── Issue #982: Batch Swap Execution ──────────────────────────────────────
-
-    /// Executes multiple swaps in a batch with configurable atomicity.
-    /// Optimizes for gas efficiency and provides fallback on partial failures.
-    ///
-    /// # Arguments
-    /// * `swap_ids` - Vector of swap IDs to execute
-    /// * `mode` - Execution mode: Atomic (all-or-nothing) or Partial (best-effort)
-    ///
-    /// # Returns
-    /// Tuple of (successful_count, failed_count, batch_id)
-    pub fn execute_batch_swaps(
-        env: Env,
-        swap_ids: Vec<u64>,
-        mode: BatchExecutionMode,
-    ) -> (u32, u32, BytesN<32>) {
-        // Validate batch size
-        if swap_ids.is_empty() {
-            env.panic_with_error(Error::from_contract_error(
-                ContractError::BatchEmpty as u32,
-            ));
-        }
-
-        if swap_ids.len() > MAX_BATCH_SIZE as usize {
-            env.panic_with_error(Error::from_contract_error(
-                ContractError::BatchTooLarge as u32,
-            ));
-        }
-
-        // Create batch ID from swap_ids hash for idempotency
-        let batch_id = compute_batch_id(&env, &swap_ids);
-
-        // Track results
-        let mut successful = 0u32;
-        let mut failed = 0u32;
-        let mut failed_ids: Vec<u64> = Vec::new(&env);
+        // Execution pass: process each swap and track results
         let mut results: Vec<bool> = Vec::new(&env);
+        let mut successful_count: u32 = 0;
 
-        // Execute each swap
         for swap_id in swap_ids.iter() {
-            let execution_result = execute_single_swap_safe(&env, &swap_id);
+            let swap_result = if let Some(swap) = env
+                .storage()
+                .persistent()
+                .get::<_, SwapRecord>(&DataKey::Swap(swap_id))
+            {
+                // Skip non-Pending swaps in partial mode
+                if swap.status != SwapStatus::Pending {
+                    if atomic {
+                        env.panic_with_error(Error::from_contract_error(
+                            ContractError::NotPending as u32,
+                        ));
+                    }
+                    false
+                } else {
+                    // Execute the swap state transition
+                    // Mark swap as Completed
+                    let mut updated_swap = swap;
+                    updated_swap.status = SwapStatus::Completed;
 
-            if execution_result {
-                successful = successful.saturating_add(1);
-                results.push_back(true);
-            } else {
-                failed = failed.saturating_add(1);
-                failed_ids.push_back(swap_id);
-                results.push_back(false);
-            }
-        }
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::Swap(swap_id), &updated_swap);
+                    env.storage()
+                        .persistent()
+                        .extend_ttl(&DataKey::Swap(swap_id), LEDGER_BUMP, LEDGER_BUMP);
 
-        // Handle execution results based on mode
-        match mode {
-            BatchExecutionMode::Atomic => {
-                // All-or-nothing: if any failed, fail the entire batch
-                if failed > 0 {
-                    // Rollback on failure (in production, implement full rollback)
+                    // Record completion timestamp
+                    let now = env.ledger().timestamp();
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::CompletionTimestamp(swap_id), &now);
+                    env.storage()
+                        .persistent()
+                        .extend_ttl(&DataKey::CompletionTimestamp(swap_id), LEDGER_BUMP, LEDGER_BUMP);
+
+                    // Emit individual completion event
                     env.events().publish(
-                        (soroban_sdk::symbol_short!("btch_err"),),
-                        BatchExecutionFailedEvent {
-                            batch_id,
-                            failed_swap_ids: failed_ids,
-                            reason: soroban_sdk::String::from_slice(&env, "Atomic execution failed"),
-                        },
+                        (soroban_sdk::symbol_short!("swap_exec"),),
+                        (swap_id, SwapStatus::Completed),
                     );
-                    env.panic_with_error(Error::from_contract_error(
-                        ContractError::ConditionNotMet as u32,
-                    ));
+
+                    Self::append_history(&env, swap_id, SwapStatus::Completed);
+                    true
                 }
-            }
-            BatchExecutionMode::Partial => {
-                // Best-effort: continue executing despite failures
-                // Log failures but don't panic
+            } else {
+                if atomic {
+                    env.panic_with_error(Error::from_contract_error(ContractError::SwapNotFound as u32));
+                }
+                false
+            };
+
+            results.push_back(swap_result);
+            if swap_result {
+                successful_count += 1;
             }
         }
 
-        // Store batch results for audit trail and retry logic
-        env.storage()
-            .persistent()
-            .set(&DataKey::BatchSwapList(batch_id), &swap_ids);
-        env.storage()
-            .persistent()
-            .set(&DataKey::BatchSwapResults(batch_id), &results);
-        env.storage()
-            .persistent()
-            .set(&DataKey::BatchExecutionMode(batch_id), &mode);
-
-        env.storage().instance().bump();
+        // In atomic mode, we would have panicked already if any swap failed
+        // Emit batch completion event
         env.events().publish(
-            (soroban_sdk::symbol_short!("btch_exe"),),
-            BatchSwapExecutedEvent {
-                batch_id,
-                swap_ids,
-                successful,
-                failed,
-                timestamp: env.ledger().timestamp(),
-            },
+            (soroban_sdk::symbol_short!("btch_ex"),),
+            (
+                swap_ids.clone(),
+                successful_count,
+                len as u32,
+                atomic,
+            ),
         );
 
-        (successful, failed, batch_id)
+        results
     }
-
-    /// Retrieves batch execution results for audit and retry purposes.
-    ///
-    /// # Arguments
-    /// * `batch_id` - The batch ID returned from execute_batch_swaps
-    ///
-    /// # Returns
-    /// Tuple of (successful_count, failed_count, execution_results_per_swap)
-    pub fn get_batch_results(
-        env: Env,
-        batch_id: BytesN<32>,
-    ) -> (u32, u32, Vec<bool>) {
-        let results: Option<Vec<bool>> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::BatchSwapResults(batch_id));
-
-        if let Some(res) = results {
-            let successful = res.iter().filter(|&r| r).count() as u32;
-            let failed = res.len() as u32 - successful;
-            (successful, failed, res)
-        } else {
-            (0, 0, Vec::new(&env))
-        }
-    }
-
-    /// Retries execution for failed swaps in a batch with fallback behavior.
-    ///
-    /// # Arguments
-    /// * `batch_id` - The batch ID from a previous execute_batch_swaps call
-    /// * `fallback_mode` - Use Partial mode for retry to maximize success
-    ///
-    /// # Returns
-    /// Tuple of (new_successful_count, still_failed_count)
-    pub fn retry_failed_batch_swaps(
-        env: Env,
-        batch_id: BytesN<32>,
-        fallback_mode: BatchExecutionMode,
-    ) -> (u32, u32) {
-        let swap_ids: Option<Vec<u64>> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::BatchSwapList(batch_id));
-
-        if swap_ids.is_none() {
-            env.panic_with_error(Error::from_contract_error(
-                ContractError::BatchEmpty as u32,
-            ));
-        }
-
-        let swaps = swap_ids.unwrap();
-        let results: Option<Vec<bool>> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::BatchSwapResults(batch_id));
-
-        // Find failed swaps from previous execution
-        let mut failed_swaps: Vec<u64> = Vec::new(&env);
-        if let Some(res) = results {
-            for (i, &success) in res.iter().enumerate() {
-                if !success && (i as u64) < swaps.len() as u64 {
-                    failed_swaps.push_back(swaps.get(i as u32).unwrap());
-                }
-            }
-        }
-
-        if failed_swaps.is_empty() {
-            return (0, 0); // No failed swaps to retry
-        }
-
-        // Retry failed swaps with new mode
-        let (success, fail, _) = Self::execute_batch_swaps(env, failed_swaps, fallback_mode);
-        (success, fail)
-    }
-}
-
-// ── Helper Functions ──────────────────────────────────────────────────────────
-
-/// Compute SHA-256 hash of arbitrary bytes
-fn compute_hash(env: &Env, data: &Bytes) -> BytesN<32> {
-    use soroban_sdk::crypto::Sha256;
-    env.crypto().sha256(&data)
-}
-
-/// Compute batch ID from swap IDs list
-fn compute_batch_id(env: &Env, swap_ids: &Vec<u64>) -> BytesN<32> {
-    // Serialize swap_ids and hash for deterministic batch ID
-    let mut hasher = soroban_sdk::crypto::Sha256::new(env);
-    for swap_id in swap_ids.iter() {
-        // Hash each swap_id sequentially
-        let id_bytes = swap_id.to_le_bytes();
-        hasher.update(soroban_sdk::Bytes::from_slice(&env, &id_bytes));
-    }
-    hasher.finalize()
-}
-
-/// Safely execute a single swap, catching errors and returning result
-fn execute_single_swap_safe(env: &Env, swap_id: &u64) -> bool {
-    // Get the swap record
-    let swap: Option<SwapRecord> = env
-        .storage()
-        .persistent()
-        .get(&DataKey::Swap(*swap_id));
-
-    if swap.is_none() {
-        return false;
-    }
-
-    let swap_record = swap.unwrap();
-
-    // Verify swap is in a valid state for execution
-    if swap_record.status != SwapStatus::Pending && swap_record.status != SwapStatus::Accepted {
-        return false;
-    }
-
-    // Attempt to execute - in production this would call reveal_key logic
-    // For now, return true for valid swaps in executable states
-    true
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

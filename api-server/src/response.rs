@@ -334,4 +334,252 @@ mod tests {
         assert!(!response.pagination.has_next);
         assert!(response.pagination.has_prev);
     }
+
+    // ── Consistency Tests for Error Response Shape ──────────────────────────
+
+    #[test]
+    fn test_error_response_canonical_shape_bad_request() {
+        let response = ResponseFormatter::bad_request("Invalid input", "INVALID_INPUT");
+
+        // Verify canonical shape
+        assert_eq!(response.status, 400);
+        assert!(response.error.is_some());
+        assert!(response.data.is_none());
+
+        let error = response.error.unwrap();
+        assert!(!error.code.is_empty(), "Error code must not be empty");
+        assert!(!error.message.is_empty(), "Error message must not be empty");
+        assert_eq!(error.code, "INVALID_INPUT");
+        assert_eq!(error.message, "Invalid input");
+    }
+
+    #[test]
+    fn test_error_response_canonical_shape_unauthorized() {
+        let response = ResponseFormatter::unauthorized("Not authenticated");
+
+        assert_eq!(response.status, 401);
+        assert!(response.error.is_some());
+        assert!(response.data.is_none());
+
+        let error = response.error.unwrap();
+        assert_eq!(error.code, "UNAUTHORIZED");
+        assert!(!error.message.is_empty());
+    }
+
+    #[test]
+    fn test_error_response_canonical_shape_forbidden() {
+        let response = ResponseFormatter::forbidden("Access denied");
+
+        assert_eq!(response.status, 403);
+        assert!(response.error.is_some());
+        assert!(response.data.is_none());
+
+        let error = response.error.unwrap();
+        assert_eq!(error.code, "FORBIDDEN");
+        assert!(!error.message.is_empty());
+    }
+
+    #[test]
+    fn test_error_response_canonical_shape_not_found() {
+        let response = ResponseFormatter::not_found("Resource not found");
+
+        assert_eq!(response.status, 404);
+        assert!(response.error.is_some());
+        assert!(response.data.is_none());
+
+        let error = response.error.unwrap();
+        assert_eq!(error.code, "NOT_FOUND");
+        assert_eq!(error.message, "Resource not found");
+    }
+
+    #[test]
+    fn test_error_response_canonical_shape_conflict() {
+        let response = ResponseFormatter::conflict("Resource already exists");
+
+        assert_eq!(response.status, 409);
+        assert!(response.error.is_some());
+        assert!(response.data.is_none());
+
+        let error = response.error.unwrap();
+        assert_eq!(error.code, "CONFLICT");
+        assert!(!error.message.is_empty());
+    }
+
+    #[test]
+    fn test_error_response_canonical_shape_internal_error() {
+        let response = ResponseFormatter::internal_error("Internal server error");
+
+        assert_eq!(response.status, 500);
+        assert!(response.error.is_some());
+        assert!(response.data.is_none());
+
+        let error = response.error.unwrap();
+        assert_eq!(error.code, "INTERNAL_ERROR");
+        assert!(!error.message.is_empty());
+    }
+
+    #[test]
+    fn test_error_response_always_has_error_details() {
+        // All error responses must have ErrorDetails
+        let responses: Vec<ApiResponse<()>> = vec![
+            ResponseFormatter::bad_request("Error", "ERROR"),
+            ResponseFormatter::unauthorized("Unauth"),
+            ResponseFormatter::forbidden("Forbidden"),
+            ResponseFormatter::not_found("Not found"),
+            ResponseFormatter::conflict("Conflict"),
+            ResponseFormatter::internal_error("Internal"),
+        ];
+
+        for response in responses {
+            assert!(
+                response.error.is_some(),
+                "Error response must always have error details"
+            );
+            assert!(
+                response.data.is_none(),
+                "Error response must not have data field populated"
+            );
+            assert!(
+                response.status >= 400,
+                "Error response must have 4xx or 5xx status"
+            );
+
+            let error = response.error.unwrap();
+            assert!(
+                !error.code.is_empty(),
+                "Error code must not be empty in error response"
+            );
+            assert!(
+                !error.message.is_empty(),
+                "Error message must not be empty in error response"
+            );
+        }
+    }
+
+    #[test]
+    fn test_error_response_with_validation_details() {
+        let mut details = HashMap::new();
+        details.insert(
+            "email".to_string(),
+            vec!["Email is required".to_string(), "Email must be valid".to_string()],
+        );
+        details.insert(
+            "age".to_string(),
+            vec!["Age must be >= 18".to_string()],
+        );
+
+        let response = ResponseFormatter::bad_request_with_details(
+            "Validation failed",
+            "VALIDATION_ERROR",
+            details.clone(),
+        );
+
+        assert_eq!(response.status, 400);
+        assert!(response.error.is_some());
+
+        let error = response.error.unwrap();
+        assert_eq!(error.code, "VALIDATION_ERROR");
+        assert!(error.details.is_some());
+
+        let returned_details = error.details.unwrap();
+        assert_eq!(returned_details.len(), 2);
+        assert!(returned_details.contains_key("email"));
+        assert!(returned_details.contains_key("age"));
+        assert_eq!(returned_details["email"].len(), 2);
+        assert_eq!(returned_details["age"].len(), 1);
+    }
+
+    #[test]
+    fn test_success_response_never_has_error_field() {
+        let success = ResponseFormatter::success("test_data", "Success");
+        assert!(success.error.is_none(), "Success response must not have error field");
+        assert!(success.data.is_some(), "Success response must have data field");
+        assert_eq!(success.status, 200);
+    }
+
+    #[test]
+    fn test_created_response_never_has_error_field() {
+        let created = ResponseFormatter::created("new_resource", "Created");
+        assert!(created.error.is_none(), "Created response must not have error field");
+        assert!(created.data.is_some(), "Created response must have data field");
+        assert_eq!(created.status, 201);
+    }
+
+    #[test]
+    fn test_all_responses_have_metadata() {
+        let success = ResponseFormatter::success("data", "Success");
+        assert!(!success.meta.request_id.is_empty());
+        assert!(success.meta.timestamp > 0);
+        assert!(!success.meta.version.is_empty());
+
+        let error = ResponseFormatter::bad_request("Error", "ERROR");
+        assert!(!error.meta.request_id.is_empty());
+        assert!(error.meta.timestamp > 0);
+        assert!(!error.meta.version.is_empty());
+    }
+
+    #[test]
+    fn test_error_code_format_consistency() {
+        // All error codes should be UPPERCASE_SNAKE_CASE
+        let error_codes = vec![
+            "UNAUTHORIZED",
+            "FORBIDDEN",
+            "NOT_FOUND",
+            "CONFLICT",
+            "INTERNAL_ERROR",
+            "INVALID_INPUT",
+        ];
+
+        for code in error_codes {
+            assert!(
+                code.chars().all(|c| c.is_ascii_uppercase() || c == '_'),
+                "Error code '{}' must be UPPERCASE_SNAKE_CASE",
+                code
+            );
+        }
+    }
+
+    #[test]
+    fn test_paginated_response_has_correct_shape() {
+        let data = vec![1, 2, 3];
+        let response = ResponseFormatter::paginated(data, 100, 1, 10, "Success");
+
+        // Verify response structure
+        assert_eq!(response.status, 200);
+        assert!(!response.message.is_empty());
+        assert_eq!(response.data.len(), 3);
+
+        // Verify pagination metadata
+        assert_eq!(response.pagination.total, 100);
+        assert_eq!(response.pagination.page, 1);
+        assert_eq!(response.pagination.per_page, 10);
+        assert_eq!(response.pagination.total_pages, 10);
+        assert!(response.pagination.has_next);
+        assert!(!response.pagination.has_prev);
+    }
+
+    #[test]
+    fn test_different_error_codes_are_distinct() {
+        let bad_request = ResponseFormatter::bad_request("Bad", "BAD_REQUEST");
+        let unauthorized = ResponseFormatter::unauthorized("Unauth");
+        let forbidden = ResponseFormatter::forbidden("Forbidden");
+        let not_found = ResponseFormatter::not_found("Not found");
+        let conflict = ResponseFormatter::conflict("Conflict");
+        let internal = ResponseFormatter::internal_error("Internal");
+
+        let codes: Vec<String> = vec![
+            bad_request.error.unwrap().code,
+            unauthorized.error.unwrap().code,
+            forbidden.error.unwrap().code,
+            not_found.error.unwrap().code,
+            conflict.error.unwrap().code,
+            internal.error.unwrap().code,
+        ];
+
+        // All codes should be unique
+        let mut sorted_codes = codes.clone();
+        sorted_codes.sort();
+        sorted_codes.dedup();
+        assert_eq!(sorted_codes.len(), codes.len(), "All error codes must be unique");
+    }
 }

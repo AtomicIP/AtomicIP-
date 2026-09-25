@@ -55,6 +55,10 @@ pub enum DataKey {
     MerkleRoot(Address),  // Issue #435: cached Merkle root for an owner's commitment set
     NotaryPublicKey,      // Issue #428: stores the trusted notary Ed25519 public key (32 bytes)
     CommitmentHashes, // Issue #429: stores Vec<BytesN<32>> of all commitment hashes for rollback protection
+    /// Issue #973: Maps ip_id -> encrypted metadata (title, description, tags)
+    IpMetadata(u64),
+    /// Issue #973: Maps tag hash -> Vec<u64> of IP IDs with that tag (for search)
+    MetadataTagIndex(BytesN<32>),
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -72,6 +76,8 @@ pub struct IpRecord {
     pub notary_signature: Option<Bytes>, // Issue #345: notary signature for timestamp notarization
     pub expiry_timestamp: u64,           // 0 = no expiry
     pub grace_period_seconds: u64,       // seconds after expiry before permanent deletion
+    pub unlock_time: u64,                // #975: time-lock release timestamp, 0 = no time-lock
+    pub privacy_level: u32,              // #977: 0=Public, 1=Private, 2=Restricted, 3=Confidential
 }
 
 #[contracttype]
@@ -112,11 +118,32 @@ pub struct OwnershipChallenge {
     pub expires_at: u64,
 }
 
-/// Issue #979: Represents a commitment link between related IPs
+/// Issue #973: Encrypted metadata for commitment discovery and discoverability.
+/// Stores encrypted title, description, and searchable tags for each IP commitment.
+/// The metadata is encrypted to preserve privacy while enabling search.
 #[contracttype]
 #[derive(Clone)]
-pub struct CommitmentLink {
-    pub linked_ip_id: u64,
-    pub link_type: soroban_sdk::Bytes,
-    pub created_at: u64,
+pub struct IpMetadata {
+    pub ip_id: u64,
+    /// Encrypted bytes containing metadata (title, description, tags)
+    /// Format: AES-GCM encrypted JSON with nonce prepended
+    pub encrypted_data: Bytes,
+    /// Encryption nonce used for this metadata
+    pub nonce: BytesN<12>,
+    /// Timestamp when metadata was created/updated
+    pub timestamp: u64,
+    /// Tags for search indexing (hashes of tag strings)
+    pub tag_hashes: soroban_sdk::Vec<BytesN<32>>,
+}
+
+/// Issue #973: Result object for paginated metadata search
+#[contracttype]
+#[derive(Clone)]
+pub struct MetadataSearchResult {
+    pub ip_ids: soroban_sdk::Vec<u64>,
+    pub total_count: u32,
+    pub offset: u32,
+    pub limit: u32,
+    /// Cursor for next page (if any)
+    pub next_cursor: Option<BytesN<32>>,
 }
