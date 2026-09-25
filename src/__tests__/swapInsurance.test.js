@@ -32,6 +32,27 @@ describe("assessRiskFactor", () => {
     const best = assessRiskFactor({ swapValue: 1, sellerReputationScore: 1000, sellerSwapCount: 100 });
     expect(best).toBeGreaterThanOrEqual(0.5);
   });
+  test("risk factor responds to claim, dispute, volatility, and liquidity signals", () => {
+    const lowRisk = assessRiskFactor({
+      swapValue: 1000,
+      previousClaimsCount: 0,
+      completionRate: 1,
+      disputeRate: 0,
+      priceVolatilityPct: 0,
+      assetLiquidityScore: 100,
+    });
+    const highRisk = assessRiskFactor({
+      swapValue: 1000,
+      previousClaimsCount: 5,
+      completionRate: 0.5,
+      disputeRate: 0.4,
+      priceVolatilityPct: 80,
+      assetLiquidityScore: 0,
+    });
+
+    expect(highRisk).toBeGreaterThan(lowRisk);
+    expect(highRisk).toBeLessThanOrEqual(3.0);
+  });
 });
 
 describe("calculatePremium", () => {
