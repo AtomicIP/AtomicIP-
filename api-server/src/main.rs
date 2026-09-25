@@ -93,6 +93,7 @@ mod snapshot_tests;
         handlers::add_to_watchlist,
         handlers::get_watchlist,
         handlers::remove_from_watchlist,
+        handlers::find_similar_commitments,
         handlers::list_ip_by_owner,
         handlers::list_ip_by_owner_cursor,
         handlers::initiate_swap,
@@ -129,6 +130,9 @@ mod snapshot_tests;
         schemas::WatchlistRequest,
         schemas::WatchlistQuery,
         schemas::WatchlistResponse,
+        schemas::SimilarCommitmentsParams,
+        schemas::SimilarCommitment,
+        schemas::SimilarCommitmentsResponse,
         schemas::ListIpByOwnerResponse,
         schemas::InitiateSwapRequest,
         schemas::BatchInitiateSwapRequest,
@@ -290,6 +294,7 @@ async fn main() {
         .route("/ip/export",                     get(handlers::export_commitments))
         .route("/watchlist",                    post(handlers::add_to_watchlist).get(handlers::get_watchlist))
         .route("/watchlist/{user_id}/{ip_id}",  axum::routing::delete(handlers::remove_from_watchlist))
+        .route("/ip/similar",                  get(handlers::find_similar_commitments))
         .route("/ip/owner/{owner}",               get(handlers::list_ip_by_owner))
         .route("/ip/owner/{owner}/cursor",        get(handlers::list_ip_by_owner_cursor))
         .route("/swap/initiate",                  post(handlers::initiate_swap).layer(signed.clone()))
@@ -412,6 +417,7 @@ fn build_app() -> Router {
         .route("/v1/ip/export", get(handlers::export_commitments))
         .route("/v1/watchlist", post(handlers::add_to_watchlist).get(handlers::get_watchlist))
         .route("/v1/watchlist/{user_id}/{ip_id}", axum::routing::delete(handlers::remove_from_watchlist))
+        .route("/v1/ip/similar", get(handlers::find_similar_commitments))
         .route("/v1/ip/owner/{owner}", get(handlers::list_ip_by_owner))
         .route("/v1/ip/owner/{owner}/cursor", get(handlers::list_ip_by_owner_cursor))
         .route("/v1/ip/owner/{owner}/cursor", get(handlers::list_ip_by_owner_cursor))

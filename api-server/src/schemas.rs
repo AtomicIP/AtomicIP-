@@ -9,7 +9,7 @@ pub struct CommitIpRequest {
     pub commitment_hash: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct IpRecord {
     pub ip_id: u64,
     pub owner: String,
@@ -95,6 +95,38 @@ pub struct WatchlistQuery {
 pub struct WatchlistResponse {
     pub user_id: String,
     pub ip_ids: Vec<u64>,
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct SimilarCommitmentsParams {
+    /// 32-byte commitment hash, hex-encoded.
+    pub commitment_hash: String,
+    /// Maximum Hamming distance from the query hash (default: 32).
+    #[serde(default = "default_similarity_distance")]
+    pub max_distance: u16,
+    /// Maximum number of results (default: 20, max: 100).
+    #[serde(default = "default_similarity_limit")]
+    pub limit: u16,
+}
+
+fn default_similarity_distance() -> u16 {
+    32
+}
+
+fn default_similarity_limit() -> u16 {
+    20
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct SimilarCommitment {
+    pub ip_id: u64,
+    pub commitment_hash: String,
+    pub distance: u16,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct SimilarCommitmentsResponse {
+    pub results: Vec<SimilarCommitment>,
 }
 
 /// #317: Pagination query parameters shared across list endpoints.

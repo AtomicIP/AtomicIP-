@@ -21,6 +21,7 @@ use std::sync::Arc;
 use crate::webhook;
 use crate::websocket;
 use crate::audit::{AuditLogStore, AuditLogQuery, SuspiciousPattern};
+use dashmap::DashMap;
 
 // #523/#800: Per-handler idempotency store for batch swap operations. Uses a
 // shared Redis backend when REDIS_URL is configured, so a client's retry is
@@ -52,6 +53,7 @@ const SWAP_EXPIRY_SECONDS: u64 = 604800;
 static NEXT_SWAP_ID: AtomicU64 = AtomicU64::new(0);
 static WATCHLISTS: Lazy<Mutex<HashMap<String, BTreeSet<u64>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+static COMMITMENT_INDEX: Lazy<DashMap<u64, IpRecord>> = Lazy::new(DashMap::new);
 
 /// Audit log store for tracking all API access and sensitive operations
 static AUDIT_LOG_STORE: Lazy<Arc<AuditLogStore>> = Lazy::new(|| {
@@ -464,6 +466,7 @@ pub async fn batch_reveal_commitments(
                 (Ok(secret), Ok(blinding_factor)) if secret.len() == 32 && blinding_factor.len() == 32 => {
                     match cache::get::<IpRecord>(&cache::ip_key(ip_id)) {
                         Some(record) => {
+                            COMMITMENT_INDEX.insert(ip_id, record.clone());
                             let mut hasher = Sha256::new();
                             hasher.update(&secret);
                             hasher.update(&blinding_factor);
@@ -486,6 +489,57 @@ pub async fn batch_reveal_commitments(
         .collect();
 
     Ok(Json(BatchRevealCommitmentsResponse { results }))
+}
+
+/// Find indexed commitments by Hamming distance from a supplied hash.
+#[utoipa::path(
+    get,
+    path = "/v1/ip/similar",
+    tag = "IP Registry",
+    params(SimilarCommitmentsParams),
+    responses(
+        (status = 200, description = "Similar commitments ordered by distance", body = SimilarCommitmentsResponse),
+        (status = 400, description = "Invalid commitment hash", body = ErrorResponse),
+    )
+)]
+#[instrument]
+pub async fn find_similar_commitments(
+    Query(params): Query<SimilarCommitmentsParams>,
+) -> Result<Json<SimilarCommitmentsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let query_hash = hex::decode(&params.commitment_hash).map_err(|_| {
+        (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: "commitment_hash must be hex".to_string() }))
+    })?;
+    if query_hash.len() != 32 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse { error: "commitment_hash must be exactly 32 bytes".to_string() }),
+        ));
+    }
+    let max_distance = params.max_distance.min(256);
+    let limit = params.limit.clamp(1, 100) as usize;
+    let mut results: Vec<SimilarCommitment> = COMMITMENT_INDEX
+        .iter()
+        .filter_map(|entry| {
+            let record = entry.value();
+            let candidate = hex::decode(&record.commitment_hash).ok()?;
+            if candidate.len() != query_hash.len() {
+                return None;
+            }
+            let distance = query_hash
+                .iter()
+                .zip(candidate.iter())
+                .map(|(left, right)| (left ^ right).count_ones() as u16)
+                .sum::<u16>();
+            (distance <= max_distance).then(|| SimilarCommitment {
+                ip_id: record.ip_id,
+                commitment_hash: record.commitment_hash.clone(),
+                distance,
+            })
+        })
+        .collect();
+    results.sort_by_key(|result| (result.distance, result.ip_id));
+    results.truncate(limit);
+    Ok(Json(SimilarCommitmentsResponse { results }))
 }
 
 /// List all IP IDs owned by a Stellar address.
