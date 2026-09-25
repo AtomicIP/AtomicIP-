@@ -35,6 +35,7 @@
 //! - `X-Timestamp`: Unix timestamp of the request
 //! - `X-Public-Key`: Stellar public key
 
+pub mod account_recovery;
 pub mod auth;
 pub mod audit;
 pub mod batch;

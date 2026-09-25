@@ -9,11 +9,17 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use utoipa::{IntoParams, ToSchema};
+use std::collections::HashMap;
 
 type HmacSha256 = Hmac<Sha256>;
 const GENESIS_SIGNATURE: &str = "0";
 const LOCK_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(2);
+
+/// Threshold for suspicious access detection (failed attempts in 5 minutes)
+const SUSPICIOUS_THRESHOLD: usize = 5;
+/// Time window for tracking suspicious patterns (5 minutes)
+const SUSPICIOUS_WINDOW_SECS: i64 = 300;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -245,6 +251,15 @@ pub struct AuditChainVerification {
     pub broken_at_sequence: Option<u64>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
+pub struct SuspiciousPattern {
+    pub actor_hash: String,
+    pub ip_address: Option<String>,
+    pub failed_attempts: usize,
+    pub last_attempt_time: i64,
+    pub pattern_type: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AuditLogError {
     MissingHmacKey,
@@ -380,6 +395,46 @@ impl AuditLogStore {
     /// any other instance sharing this backing store.
     pub fn verify_persisted(&self) -> Result<AuditChainVerification, AuditLogError> {
         verify_persisted_chain(&self.path, &self.key)
+    }
+
+    /// Detects suspicious access patterns (brute force attempts, etc.)
+    pub async fn detect_suspicious_patterns(&self) -> Vec<SuspiciousPattern> {
+        let events = self.events.read().await;
+        let now = Utc::now().timestamp();
+        let window_start = now - SUSPICIOUS_WINDOW_SECS;
+
+        let mut actor_failures: HashMap<String, Vec<i64>> = HashMap::new();
+
+        for event in events.iter() {
+            if !event.success {
+                if let Some(actor) = &event.actor_hash {
+                    let timestamps = actor_failures
+                        .entry(actor.clone())
+                        .or_insert_with(Vec::new);
+
+                    if event.timestamp >= window_start {
+                        timestamps.push(event.timestamp);
+                    }
+                }
+            }
+        }
+
+        let mut suspicious = Vec::new();
+        for (actor_hash, attempts) in actor_failures {
+            if attempts.len() >= SUSPICIOUS_THRESHOLD {
+                if let Some(last_attempt) = attempts.last() {
+                    suspicious.push(SuspiciousPattern {
+                        actor_hash,
+                        ip_address: None,
+                        failed_attempts: attempts.len(),
+                        last_attempt_time: *last_attempt,
+                        pattern_type: "brute_force".to_string(),
+                    });
+                }
+            }
+        }
+
+        suspicious
     }
 }
 

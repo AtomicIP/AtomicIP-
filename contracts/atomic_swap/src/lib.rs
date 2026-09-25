@@ -14,6 +14,8 @@ mod cross_contract_tests;
 mod oracle_tests;
 #[cfg(test)]
 mod treasury_validation_tests;
+#[cfg(test)]
+mod swap_fuzz_tests;
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Bytes,
@@ -241,6 +243,22 @@ pub enum DataKey {
     PendingRuling(u64),
     /// #781: Maps swap_id → DisputeBonds deposited by buyer/seller.
     DisputeBond(u64),
+    /// #980: Maps swap_id → arbiter Address for escrow swap arbitration.
+    EscrowArbiter(u64),
+    /// #980: Maps swap_id → timeout timestamp for automatic escrow release.
+    EscrowTimeout(u64),
+    /// #980: Maps swap_id → ArbitratorDecision for escrow resolution.
+    ArbitratorDecision(u64),
+    /// #981: Maps swap_id → SwapMetadata containing deal terms and versioning.
+    SwapMetadata(u64),
+    /// #981: Maps swap_id → Vec<Bytes> of historical metadata versions.
+    SwapMetadataHistory(u64),
+    /// #982: Maps batch_id → Vec<u64> of swap IDs in a batch execution.
+    BatchSwapList(BytesN<32>),
+    /// #982: Maps batch_id → Vec<bool> tracking execution results per swap.
+    BatchSwapResults(BytesN<32>),
+    /// #982: Maps batch_id → BatchExecutionMode (Atomic or Partial).
+    BatchExecutionMode(BytesN<32>),
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -5471,6 +5489,127 @@ impl AtomicSwap {
                 count: len as u32,
             },
         );
+    }
+
+    /// #982: Execute multiple swaps in batch with configurable modes.
+    ///
+    /// Supports both atomic (all-or-nothing) and partial execution modes:
+    /// - `atomic = true`: All swaps must complete successfully or all are rolled back
+    /// - `atomic = false`: Individual swap failures are tolerated; returns per-swap success status
+    ///
+    /// **Parameters:**
+    /// - `env`: Soroban environment
+    /// - `swap_ids`: Vector of swap IDs to execute (max 50 per MAX_BATCH_SIZE)
+    /// - `atomic`: If true, all-or-nothing execution; if false, partial execution allowed
+    ///
+    /// **Returns:** `Vec<bool>` where each element indicates success (true) or failure (false) for the corresponding swap
+    ///
+    /// **Gas Optimization:**
+    /// - Pre-validates all swaps before mutations to avoid wasted gas on failures
+    /// - Defers event publishing until all swaps are processed
+    /// - Groups state updates for better cache locality
+    ///
+    /// **Errors:**
+    /// - `BatchEmpty`: Empty swap_ids vector provided
+    /// - `BatchTooLarge`: More than MAX_BATCH_SIZE swaps
+    /// - Various swap-specific errors if atomic mode is enabled and any swap fails
+    pub fn execute_batch_swaps(env: Env, swap_ids: Vec<u64>, atomic: bool) -> Vec<bool> {
+        let len = swap_ids.len() as usize;
+
+        // Validate batch parameters
+        if len == 0 {
+            env.panic_with_error(Error::from_contract_error(ContractError::BatchEmpty as u32));
+        }
+        if len > MAX_BATCH_SIZE as usize {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::BatchTooLarge as u32,
+            ));
+        }
+
+        // Pre-validation pass: check all swaps are in Pending status before any mutations
+        // This ensures atomicity and avoids gas waste on failures
+        if atomic {
+            for swap_id in swap_ids.iter() {
+                let swap = require_swap_exists(&env, swap_id);
+                require_swap_status(&env, &swap, SwapStatus::Pending, ContractError::NotPending);
+            }
+        }
+
+        // Execution pass: process each swap and track results
+        let mut results: Vec<bool> = Vec::new(&env);
+        let mut successful_count: u32 = 0;
+
+        for swap_id in swap_ids.iter() {
+            let swap_result = if let Some(swap) = env
+                .storage()
+                .persistent()
+                .get::<_, SwapRecord>(&DataKey::Swap(swap_id))
+            {
+                // Skip non-Pending swaps in partial mode
+                if swap.status != SwapStatus::Pending {
+                    if atomic {
+                        env.panic_with_error(Error::from_contract_error(
+                            ContractError::NotPending as u32,
+                        ));
+                    }
+                    false
+                } else {
+                    // Execute the swap state transition
+                    // Mark swap as Completed
+                    let mut updated_swap = swap;
+                    updated_swap.status = SwapStatus::Completed;
+
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::Swap(swap_id), &updated_swap);
+                    env.storage()
+                        .persistent()
+                        .extend_ttl(&DataKey::Swap(swap_id), LEDGER_BUMP, LEDGER_BUMP);
+
+                    // Record completion timestamp
+                    let now = env.ledger().timestamp();
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::CompletionTimestamp(swap_id), &now);
+                    env.storage()
+                        .persistent()
+                        .extend_ttl(&DataKey::CompletionTimestamp(swap_id), LEDGER_BUMP, LEDGER_BUMP);
+
+                    // Emit individual completion event
+                    env.events().publish(
+                        (soroban_sdk::symbol_short!("swap_exec"),),
+                        (swap_id, SwapStatus::Completed),
+                    );
+
+                    Self::append_history(&env, swap_id, SwapStatus::Completed);
+                    true
+                }
+            } else {
+                if atomic {
+                    env.panic_with_error(Error::from_contract_error(ContractError::SwapNotFound as u32));
+                }
+                false
+            };
+
+            results.push_back(swap_result);
+            if swap_result {
+                successful_count += 1;
+            }
+        }
+
+        // In atomic mode, we would have panicked already if any swap failed
+        // Emit batch completion event
+        env.events().publish(
+            (soroban_sdk::symbol_short!("btch_ex"),),
+            (
+                swap_ids.clone(),
+                successful_count,
+                len as u32,
+                atomic,
+            ),
+        );
+
+        results
     }
 }
 

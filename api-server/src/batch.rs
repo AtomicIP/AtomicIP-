@@ -3,9 +3,30 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
+/// Configuration for batch request handling
+pub struct BatchConfig {
+    /// Maximum number of requests per batch (default: 100)
+    pub max_requests: usize,
+    /// Maximum total size in bytes per batch (default: 5MB)
+    pub max_batch_size_bytes: usize,
+}
+
+impl Default for BatchConfig {
+    fn default() -> Self {
+        Self {
+            max_requests: 100,
+            max_batch_size_bytes: 5 * 1024 * 1024, // 5MB
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct BatchRequest {
     pub requests: Vec<SingleRequest>,
+    /// Optional: Set to "atomic" to rollback all requests on any failure
+    /// Note: Atomic support requires coordinated database transaction handling
+    #[serde(default)]
+    pub mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -38,8 +59,19 @@ pub struct ErrorResponse {
 }
 
 /// Batch endpoint for multiple API requests
+///
 /// Supports up to 100 requests per batch to reduce round trips.
-/// Each request is processed independently and results are returned in order.
+/// Requests are processed sequentially by default and results are returned in order.
+///
+/// ## Modes:
+/// - **best-effort** (default): Process each request independently. Failure in one doesn't affect others.
+/// - **atomic**: All requests succeed together or all fail together (requires coordinated database transactions).
+///
+/// ## Limits:
+/// - Maximum 100 requests per batch
+/// - Maximum 5MB total payload
+/// - Request IDs must be unique
+/// - Only supports GET, POST, PUT, DELETE, PATCH methods
 #[utoipa::path(
     post,
     path = "/batch",
@@ -53,12 +85,14 @@ pub struct ErrorResponse {
 pub async fn batch_handler(
     Json(batch_request): Json<BatchRequest>,
 ) -> Result<Json<BatchResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let config = BatchConfig::default();
+
     // Validate batch size
-    if batch_request.requests.is_empty() || batch_request.requests.len() > 100 {
+    if batch_request.requests.is_empty() || batch_request.requests.len() > config.max_requests {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
-                error: "Batch size must be between 1 and 100 requests".to_string(),
+                error: format!("Batch size must be between 1 and {} requests", config.max_requests),
             }),
         ));
     }

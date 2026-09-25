@@ -449,6 +449,40 @@ impl RateLimitMiddleware {
             .insert(user_id.into(), tier);
     }
 
+    /// #983: Check per-user commitment rate limit (10 commits/minute).
+    /// Returns (allowed, remaining, reset_after) for rate limit headers.
+    pub async fn check_commitment_rate_limit(
+        &self,
+        user: &str,
+    ) -> (bool, u32, Duration) {
+        let commitment_quota = BucketQuota::new(10, 10); // 10 commits/minute, burst of 10
+        let now = Instant::now();
+
+        let store_key = format!("commit:{user}");
+        let result = self
+            .store
+            .refill_and_consume(&[(store_key, commitment_quota)], now, self.config.idle_ttl)
+            .await;
+
+        let allowed = result.allowed;
+        let tokens = result.tokens.get(0).copied().unwrap_or(0.0);
+        let remaining = tokens.max(0.0) as u32;
+
+        let reset_after = if allowed {
+            let wait = Duration::from_secs_f64(
+                ((10.0 - tokens) / commitment_quota.refill_per_second()).max(0.0),
+            );
+            wait
+        } else {
+            let wait = Duration::from_secs_f64(
+                ((1.0 - tokens) / commitment_quota.refill_per_second()).max(0.0),
+            );
+            wait
+        };
+
+        (allowed, remaining, reset_after)
+    }
+
     async fn check(&self, ip: &str, user: Option<&str>, now: Instant) -> Decision {
         let (tier, violation_key, bucket_keys, early_denial) = {
             let mut local = self.local.lock().unwrap();

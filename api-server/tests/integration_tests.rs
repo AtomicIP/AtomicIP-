@@ -710,3 +710,282 @@ mod commit_ip_handler_tests {
         assert_ne!(id_a, id_b, "sequential commits must return distinct ip_ids");
     }
 }
+
+// ── #926: Multi-Instance Load Balancer Integration Tests ─────────────────────
+
+#[cfg(test)]
+mod load_balancer_multi_instance_tests {
+    use api_server::load_balancer::{LoadBalancer, InstanceHealth};
+
+    /// Test load balancer with multiple API server instances
+    #[test]
+    fn test_load_balancer_multiple_instances_distribution() {
+        let instances = vec![
+            "http://api-server-1.internal:8001".to_string(),
+            "http://api-server-2.internal:8002".to_string(),
+            "http://api-server-3.internal:8003".to_string(),
+        ];
+
+        let lb = LoadBalancer::new(instances.clone());
+
+        // Verify round-robin distribution across all instances
+        let mut requests = vec![];
+        for _ in 0..9 {
+            requests.push(lb.get_next_instance());
+        }
+
+        // Should cycle through each instance 3 times (9 total / 3 instances)
+        assert_eq!(requests[0], Some(instances[0].clone()), "first request → instance 1");
+        assert_eq!(requests[1], Some(instances[1].clone()), "second request → instance 2");
+        assert_eq!(requests[2], Some(instances[2].clone()), "third request → instance 3");
+        assert_eq!(requests[3], Some(instances[0].clone()), "fourth request → instance 1 (cycle)");
+        assert_eq!(requests[8], Some(instances[2].clone()), "ninth request → instance 3");
+    }
+
+    /// Test failover when instance becomes unhealthy
+    #[test]
+    fn test_load_balancer_failover_to_healthy_instances() {
+        let instances = vec![
+            "http://api-server-1.internal:8001".to_string(),
+            "http://api-server-2.internal:8002".to_string(),
+            "http://api-server-3.internal:8003".to_string(),
+        ];
+
+        let lb = LoadBalancer::new(instances.clone());
+
+        // Simulate instance 1 becoming unhealthy (10 requests, 2 errors)
+        for _ in 0..10 {
+            lb.record_request(&instances[0]);
+        }
+        for _ in 0..2 {
+            lb.record_error(&instances[0]);
+        }
+
+        let health = lb.get_instance_health();
+        assert_eq!(health.len(), 3, "should track all 3 instances");
+
+        // Instance 1 should be marked as unhealthy (error rate > 10%)
+        let instance_1_health = &health[0];
+        assert_eq!(instance_1_health.request_count, 10);
+        assert_eq!(instance_1_health.error_count, 2);
+        assert!(!instance_1_health.healthy, "instance with 20% error rate should be unhealthy");
+
+        // Get healthy instances should exclude instance 1
+        let healthy = lb.get_healthy_instances();
+        assert_eq!(healthy.len(), 2, "should have 2 healthy instances");
+        assert!(healthy.iter().all(|h| h.healthy), "all returned instances must be healthy");
+    }
+
+    /// Test least-connections algorithm across multiple instances
+    #[test]
+    fn test_load_balancer_least_connections_multi_instance() {
+        let instances = vec![
+            "http://api-server-1.internal:8001".to_string(),
+            "http://api-server-2.internal:8002".to_string(),
+            "http://api-server-3.internal:8003".to_string(),
+        ];
+
+        let lb = LoadBalancer::new(instances.clone());
+
+        // Load instance 1 with 5 requests
+        for _ in 0..5 {
+            lb.record_request(&instances[0]);
+        }
+
+        // Load instance 2 with 3 requests
+        for _ in 0..3 {
+            lb.record_request(&instances[1]);
+        }
+
+        // Instance 3 has 0 requests
+
+        // Least-loaded should be instance 3
+        let least_loaded = lb.get_least_loaded_instance();
+        assert_eq!(
+            least_loaded,
+            Some(instances[2].clone()),
+            "least-connections should select instance with fewest requests"
+        );
+    }
+
+    /// Test multi-region scenario with instances in different regions
+    #[test]
+    fn test_load_balancer_multi_region_distribution() {
+        let instances = vec![
+            // US-East Region
+            "http://api-server-us-east-1.internal:8001".to_string(),
+            "http://api-server-us-east-2.internal:8002".to_string(),
+            // EU-West Region
+            "http://api-server-eu-west-1.internal:8003".to_string(),
+            "http://api-server-eu-west-2.internal:8004".to_string(),
+            // APAC Region
+            "http://api-server-apac-1.internal:8005".to_string(),
+        ];
+
+        let lb = LoadBalancer::new(instances.clone());
+
+        // Generate 10 requests and collect distribution
+        let mut distribution = std::collections::HashMap::new();
+        for _ in 0..10 {
+            if let Some(instance) = lb.get_next_instance() {
+                *distribution.entry(instance).or_insert(0) += 1;
+            }
+        }
+
+        // With round-robin, each instance should get roughly equal distribution
+        assert_eq!(
+            distribution.len(),
+            5,
+            "all 5 instances should receive requests"
+        );
+
+        // 10 requests across 5 instances = 2 per instance
+        for count in distribution.values() {
+            assert_eq!(*count, 2, "round-robin should distribute evenly");
+        }
+    }
+
+    /// Test health status propagation across multi-instance setup
+    #[test]
+    fn test_load_balancer_health_status_propagation() {
+        let instances = vec![
+            "http://api-server-1.internal:8001".to_string(),
+            "http://api-server-2.internal:8002".to_string(),
+            "http://api-server-3.internal:8003".to_string(),
+        ];
+
+        let lb = LoadBalancer::new(instances.clone());
+
+        // Instance 1: 5 requests, 0 errors → healthy
+        for _ in 0..5 {
+            lb.record_request(&instances[0]);
+        }
+
+        // Instance 2: 8 requests, 1 error → healthy (12.5% error)
+        for _ in 0..8 {
+            lb.record_request(&instances[1]);
+        }
+        lb.record_error(&instances[1]);
+
+        // Instance 3: 3 requests, 1 error → unhealthy (33% error)
+        for _ in 0..3 {
+            lb.record_request(&instances[2]);
+        }
+        for _ in 0..1 {
+            lb.record_error(&instances[2]);
+        }
+
+        let health = lb.get_instance_health();
+
+        // Verify health status for each instance
+        assert!(health[0].healthy, "instance 1 with 0% error should be healthy");
+        assert!(health[1].healthy, "instance 2 with <10% error should be healthy");
+        assert!(!health[2].healthy, "instance 3 with >10% error should be unhealthy");
+
+        // Verify healthy instances list
+        let healthy = lb.get_healthy_instances();
+        assert_eq!(healthy.len(), 2);
+        assert!(
+            healthy.iter().all(|h| h.url != instances[2]),
+            "unhealthy instance should not be in healthy list"
+        );
+    }
+
+    /// Test request recording and error tracking across instances
+    #[test]
+    fn test_load_balancer_request_error_tracking() {
+        let instances = vec![
+            "http://api-server-1.internal:8001".to_string(),
+            "http://api-server-2.internal:8002".to_string(),
+        ];
+
+        let lb = LoadBalancer::new(instances.clone());
+
+        // Simulate traffic pattern
+        for _ in 0..5 {
+            lb.record_request(&instances[0]);
+            lb.record_request(&instances[1]);
+        }
+
+        // Simulate errors on instance 1
+        for _ in 0..2 {
+            lb.record_error(&instances[0]);
+        }
+
+        let health = lb.get_instance_health();
+
+        // Verify request and error counts
+        assert_eq!(health[0].request_count, 5, "instance 1 should have 5 requests");
+        assert_eq!(health[0].error_count, 2, "instance 1 should have 2 errors");
+        assert_eq!(health[1].request_count, 5, "instance 2 should have 5 requests");
+        assert_eq!(health[1].error_count, 0, "instance 2 should have 0 errors");
+    }
+
+    /// Test load balancer behavior with large number of instances
+    #[test]
+    fn test_load_balancer_many_instances() {
+        // Create 20 instances (simulating a large deployment)
+        let instances: Vec<String> = (1..=20)
+            .map(|i| format!("http://api-server-{:02}.internal:800{}", i, i % 100))
+            .collect();
+
+        let lb = LoadBalancer::new(instances.clone());
+
+        // Distribute 100 requests
+        let mut distribution = std::collections::HashMap::new();
+        for _ in 0..100 {
+            if let Some(instance) = lb.get_next_instance() {
+                *distribution.entry(instance).or_insert(0) += 1;
+            }
+        }
+
+        // All 20 instances should receive requests
+        assert_eq!(
+            distribution.len(),
+            20,
+            "all instances should receive requests"
+        );
+
+        // With round-robin, 100 requests / 20 instances = 5 per instance
+        for count in distribution.values() {
+            assert_eq!(*count, 5, "round-robin should distribute evenly");
+        }
+    }
+
+    /// Test concurrent request handling simulation
+    #[test]
+    fn test_load_balancer_concurrent_request_simulation() {
+        let instances = vec![
+            "http://api-server-1.internal:8001".to_string(),
+            "http://api-server-2.internal:8002".to_string(),
+            "http://api-server-3.internal:8003".to_string(),
+        ];
+
+        let lb = std::sync::Arc::new(LoadBalancer::new(instances.clone()));
+        let mut handles = vec![];
+
+        // Simulate 3 concurrent threads, each making 10 requests
+        for _ in 0..3 {
+            let lb_clone = lb.clone();
+            let handle = std::thread::spawn(move || {
+                for _ in 0..10 {
+                    if let Some(instance) = lb_clone.get_next_instance() {
+                        lb_clone.record_request(&instance);
+                    }
+                }
+            });
+            handles.push(handle);
+        }
+
+        // Wait for all threads
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // Total: 30 requests across 3 instances = 10 per instance
+        let health = lb.get_instance_health();
+        for h in health {
+            assert_eq!(h.request_count, 10, "concurrent distribution should be even");
+        }
+    }
+}

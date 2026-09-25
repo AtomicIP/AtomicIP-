@@ -425,6 +425,24 @@ pub fn reputation_cache_control_header() -> &'static str {
     "public, max-age=300, stale-while-revalidate=60"
 }
 
+// ── ETag Generation for Conditional Requests ───────────────────────────────────
+
+/// Generate an ETag hash for content.
+/// Uses SHA256 hash of the content to create a strong ETag.
+pub fn generate_etag(content: &str) -> String {
+    use sha2::{Sha256, Digest};
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    let hash = hasher.finalize();
+    format!("\"{}\"", hex::encode(&hash[..8]))
+}
+
+/// Check if client's ETag matches server's ETag.
+/// Returns true if they match (content unchanged).
+pub fn etag_matches(client_etag: Option<&str>, server_etag: &str) -> bool {
+    client_etag.map_or(false, |tag| tag == server_etag)
+}
+
 // ── Cache Statistics ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
