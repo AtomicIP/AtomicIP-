@@ -9,10 +9,8 @@ use axum::{
 use chrono::{Duration, Utc};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
-use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::sync::Mutex;
 
 /// JWT claims.
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -26,24 +24,27 @@ pub struct Claims {
 /// Extension key for authenticated claims.
 pub struct AuthExtension(pub Claims);
 
-/// JWT secret — in production this should come from env.
-static JWT_SECRET: Lazy<Mutex<Vec<u8>>> = Lazy::new(|| {
-    let secret = rand::random::<[u8; 32]>().to_vec();
-    Mutex::new(secret)
-});
+const JWT_SECRET_ENV: &str = "JWT_SECRET";
+const MIN_JWT_SECRET_BYTES: usize = 32;
 
-fn encoding_key() -> EncodingKey {
-    let secret = JWT_SECRET.lock().unwrap();
-    EncodingKey::from_secret(&secret)
+fn jwt_secret() -> Result<Vec<u8>, AuthError> {
+    let secret = std::env::var(JWT_SECRET_ENV).map_err(|_| AuthError::Configuration)?;
+    if secret.as_bytes().len() < MIN_JWT_SECRET_BYTES {
+        return Err(AuthError::Configuration);
+    }
+    Ok(secret.into_bytes())
 }
 
-fn decoding_key() -> DecodingKey {
-    let secret = JWT_SECRET.lock().unwrap();
-    DecodingKey::from_secret(&secret)
+fn encoding_key() -> Result<EncodingKey, AuthError> {
+    Ok(EncodingKey::from_secret(&jwt_secret()?))
+}
+
+fn decoding_key() -> Result<DecodingKey, AuthError> {
+    Ok(DecodingKey::from_secret(&jwt_secret()?))
 }
 
 /// Issue an access token (15 min) and refresh token (7 days).
-pub fn issue_tokens(public_key: &str) -> Result<(String, String), jsonwebtoken::errors::Error> {
+pub fn issue_tokens(public_key: &str) -> Result<(String, String), AuthError> {
     let now = Utc::now();
 
     let access_claims = Claims {
@@ -60,8 +61,11 @@ pub fn issue_tokens(public_key: &str) -> Result<(String, String), jsonwebtoken::
         token_type: "refresh".to_string(),
     };
 
-    let access = encode(&Header::default(), &access_claims, &encoding_key())?;
-    let refresh = encode(&Header::default(), &refresh_claims, &encoding_key())?;
+    let key = encoding_key()?;
+    let access = encode(&Header::default(), &access_claims, &key)
+        .map_err(|_| AuthError::TokenCreation)?;
+    let refresh = encode(&Header::default(), &refresh_claims, &key)
+        .map_err(|_| AuthError::TokenCreation)?;
 
     Ok((access, refresh))
 }
@@ -71,7 +75,8 @@ pub fn refresh_access_token(refresh_token: &str) -> Result<String, AuthError> {
     let mut validation = Validation::new(Algorithm::HS256);
     validation.validate_exp = true;
 
-    let token_data = decode::<Claims>(refresh_token, &decoding_key(), &validation)
+    let key = decoding_key()?;
+    let token_data = decode::<Claims>(refresh_token, &key, &validation)
         .map_err(|_| AuthError::InvalidToken)?;
 
     if token_data.claims.token_type != "refresh" {
@@ -86,7 +91,7 @@ pub fn refresh_access_token(refresh_token: &str) -> Result<String, AuthError> {
         token_type: "access".to_string(),
     };
 
-    encode(&Header::default(), &new_claims, &encoding_key())
+    encode(&Header::default(), &new_claims, &encoding_key()?)
         .map_err(|_| AuthError::TokenCreation)
 }
 
@@ -139,7 +144,8 @@ pub async fn require_auth(mut req: Request, next: Next) -> Result<Response, Auth
     let mut validation = Validation::new(Algorithm::HS256);
     validation.validate_exp = true;
 
-    let token_data = decode::<Claims>(token, &decoding_key(), &validation)
+    let key = decoding_key()?;
+    let token_data = decode::<Claims>(token, &key, &validation)
         .map_err(|_| AuthError::InvalidToken)?;
 
     if token_data.claims.token_type != "access" {
@@ -158,6 +164,7 @@ pub enum AuthError {
     InvalidPublicKey,
     InvalidSignature,
     TokenCreation,
+    Configuration,
 }
 
 impl IntoResponse for AuthError {
@@ -168,6 +175,10 @@ impl IntoResponse for AuthError {
             AuthError::InvalidPublicKey => (StatusCode::BAD_REQUEST, "Invalid public key"),
             AuthError::InvalidSignature => (StatusCode::BAD_REQUEST, "Invalid signature format"),
             AuthError::TokenCreation => (StatusCode::INTERNAL_SERVER_ERROR, "Token creation failed"),
+            AuthError::Configuration => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "JWT_SECRET must be configured with at least 32 bytes",
+            ),
         };
         let body = serde_json::json!({ "error": msg });
         (status, Json(body)).into_response()
