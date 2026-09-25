@@ -51,7 +51,7 @@ const MAX_ROYALTY_RATE_BPS = 3_000; // 30% ceiling
  */
 function computeRoyaltyPayouts(salePrice, rateBps, beneficiaries) {
   // ── Validation ────────────────────────────────────────────────────────────
-  if (typeof salePrice !== "number" || salePrice <= 0)
+  if (typeof salePrice !== "number" || salePrice < 0)
     throw new RangeError("salePrice must be a positive number.");
   if (typeof rateBps !== "number" || rateBps < 0 || rateBps > MAX_ROYALTY_RATE_BPS)
     throw new RangeError(`rateBps must be between 0 and ${MAX_ROYALTY_RATE_BPS}.`);
@@ -59,12 +59,12 @@ function computeRoyaltyPayouts(salePrice, rateBps, beneficiaries) {
     throw new TypeError("beneficiaries must be a non-empty array.");
 
   // ── Core arithmetic ───────────────────────────────────────────────────────
-  const totalRoyalty = Math.floor((salePrice * rateBps) / BPS_DENOM);
+  const totalRoyalty = salePrice === 0 ? 0 : Math.floor((salePrice * rateBps) / BPS_DENOM);
 
   const payouts = beneficiaries.map((b) => ({
     beneficiaryId: b.id,
     shareBps:      b.shareBps,
-    amount:        Math.floor((totalRoyalty * b.shareBps) / BPS_DENOM),
+    amount:        salePrice === 0 ? 0 : Math.floor((totalRoyalty * b.shareBps) / BPS_DENOM),
   }));
 
   // Assign rounding dust (≤ 1 token unit) to the first beneficiary so that
