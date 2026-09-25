@@ -1916,6 +1916,22 @@ impl AtomicSwap {
             env.panic_with_error(Error::from_contract_error(ContractError::InvalidKey as u32));
         }
 
+        if swap.required_approvals > 0 {
+            let approvals: Vec<Address> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::SwapApprovals(swap_id))
+                .unwrap_or(Vec::new(&env));
+            if (approvals.len() as u32) < swap.required_approvals {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::NeedApprovals as u32,
+                ));
+            }
+        }
+        if !swap.conditions.is_empty() {
+            Self::evaluate_conditions(&env, &swap, false);
+        }
+
         let partial_price = swap.price * quantity as i128 / swap.quantity as i128;
 
         token::Client::new(&env, &swap.token).transfer(
