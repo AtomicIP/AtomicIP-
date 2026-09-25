@@ -71,6 +71,24 @@ describe("cancelBatchSwaps — refund policies", () => {
 });
 
 describe("cancelBatchSwaps — state and counts", () => {
+  test("cancels only selected swap IDs and leaves the rest untouched", () => {
+    const result = cancelBatchSwaps(
+      [pendingSwap("selected"), activeSwap("left-alone"), pendingSwap("also-left")],
+      null,
+      { swapIds: ["selected"] }
+    );
+
+    expect(result.cancelledCount).toBe(1);
+    expect(result.skippedCount).toBe(2);
+    expect(result.results.map((item) => item.swapId)).toEqual(["selected"]);
+    expect(result.skipped.map((item) => item.swapId)).toEqual(["left-alone", "also-left"]);
+  });
+
+  test("rejects an empty partial-cancellation selection", () => {
+    expect(() => cancelBatchSwaps([pendingSwap("s1")], null, { swapIds: [] }))
+      .toThrow(TypeError);
+  });
+
   test("sets newState to CANCELLED", () => {
     const result = cancelBatchSwaps([pendingSwap("s1")]);
     expect(result.results[0].newState).toBe(CANCELLED_STATE);

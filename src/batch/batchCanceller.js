@@ -99,7 +99,7 @@ function cancelOne(swap, cancellation, now) {
  *
  * @param {Array<SwapEntry>} swaps
  * @param {Array<CancelEntry>|null} cancellations  - parallel array or null (default policy for all)
- * @param {{ now?: number }} [options]
+ * @param {{ now?: number, swapIds?: string[] }} [options]
  * @returns {BatchCancelResult}
  *
  * @typedef {{ swapId: string, state: string, amount: number }} SwapEntry
@@ -109,6 +109,7 @@ function cancelOne(swap, cancellation, now) {
  * @property {number} batchSize
  * @property {number} cancelledCount
  * @property {number} failedCount
+ * @property {number} skippedCount
  * @property {number} totalRefunded
  * @property {number} totalAmount
  * @property {Array}  results
@@ -121,6 +122,12 @@ function cancelBatchSwaps(swaps, cancellations = null, options = {}) {
     throw new RangeError(`Batch size ${swaps.length} exceeds maximum of ${MAX_BATCH_SIZE}.`);
 
   const now = options.now ?? Date.now();
+   const selectedIds = options.swapIds ?? null;
+   if (selectedIds !== null && (!Array.isArray(selectedIds) || selectedIds.length === 0))
+     throw new TypeError("options.swapIds must be a non-empty array when provided.");
+   if (selectedIds !== null && selectedIds.some((id) => typeof id !== "string" || !id))
+     throw new TypeError("options.swapIds must contain non-empty strings.");
+   const selectedSet = selectedIds === null ? null : new Set(selectedIds);
 
   const cancelArr = cancellations === null
     ? Array(swaps.length).fill(null)
@@ -131,8 +138,13 @@ function cancelBatchSwaps(swaps, cancellations = null, options = {}) {
 
   const results = [];
   const errors  = [];
+  const skipped = [];
 
   for (let i = 0; i < swaps.length; i++) {
+    if (selectedSet !== null && !selectedSet.has(swaps[i]?.swapId)) {
+      skipped.push({ index: i, swapId: swaps[i]?.swapId ?? null });
+      continue;
+    }
     try {
       validateSwap(swaps[i], i);
       validateCancellation(cancelArr[i], swaps[i]);
@@ -149,10 +161,12 @@ function cancelBatchSwaps(swaps, cancellations = null, options = {}) {
     batchSize:       swaps.length,
     cancelledCount:  results.length,
     failedCount:     errors.length,
+    skippedCount:    skipped.length,
     totalRefunded:   +totalRefunded.toFixed(8),
     totalAmount:     +totalAmount.toFixed(8),
     results,
     errors,
+    skipped,
   };
 }
 
