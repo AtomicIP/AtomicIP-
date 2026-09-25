@@ -409,6 +409,24 @@ Individual `SwapInitiatedEvent` events are still emitted per swap inside `batch_
 
 ---
 
+### Batch scheduling, status, cancellation, and cost tracking
+
+The off-chain batch utilities expose the operational controls needed by
+workers and dashboards:
+
+- `BatchScheduler` queues work for a requested execution time and records
+  completion or failure instead of executing immediately.
+- `BatchStatusTracker` reports aggregate progress and per-operation state.
+- `cancelBatchSwaps(..., { swapIds })` cancels only the selected swaps and
+  reports skipped entries.
+- `calculateBatchCosts` returns per-operation resource usage, rates, and
+  aggregate totals for network, compute, and storage.
+
+These utilities are intentionally storage-agnostic. Persist their returned
+status and cost snapshots when monitoring across worker restarts.
+
+---
+
 ## Off-Chain Batch Utilities
 
 The following JavaScript utilities live in `src/batch/` and operate entirely off-chain. They are used to prepare or process batch swap data before submitting to the contract or after reading from it.
