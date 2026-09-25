@@ -5,6 +5,7 @@ use axum::{
     middleware::Next,
     response::Response,
 };
+use http_body_util::BodyExt;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 
@@ -60,23 +61,55 @@ pub async fn compression_middleware(
         "Accept-Encoding".parse().unwrap(),
     );
 
-    // Add Content-Encoding header based on Accept-Encoding
-    if accept_encoding.contains("gzip") {
-        response.headers_mut().insert(
-            "Content-Encoding",
-            "gzip".parse().unwrap(),
-        );
-    } else if accept_encoding.contains("br") {
-        response.headers_mut().insert(
-            "Content-Encoding",
-            "br".parse().unwrap(),
-        );
-    } else if accept_encoding.contains("deflate") {
-        response.headers_mut().insert(
-            "Content-Encoding",
-            "deflate".parse().unwrap(),
-        );
+    if response.headers().contains_key("Content-Encoding")
+        || response.status() == axum::http::StatusCode::NO_CONTENT
+        || response.status() == axum::http::StatusCode::NOT_MODIFIED
+    {
+        return response;
     }
+
+    let config = CompressionConfig::default();
+    let encoding = if config.brotli_enabled && accept_encoding.contains("br") {
+        Some("br")
+    } else if config.gzip_enabled && accept_encoding.contains("gzip") {
+        Some("gzip")
+    } else {
+        None
+    };
+
+    let Some(encoding) = encoding else {
+        return response;
+    };
+
+    let Ok(collected) = response.body_mut().collect().await else {
+        return response;
+    };
+    let body = collected.to_bytes();
+    if body.len() < config.min_size_bytes {
+        *response.body_mut() = Body::from(body);
+        return response;
+    }
+
+    let compressed = match encoding {
+        "br" => compress_brotli(&body),
+        "gzip" => compress_gzip(&body),
+        _ => unreachable!(),
+    };
+    let Ok(compressed) = compressed else {
+        *response.body_mut() = Body::from(body);
+        return response;
+    };
+
+    response.headers_mut().insert(
+        "Content-Encoding",
+        encoding.parse().expect("static encoding is valid"),
+    );
+    response.headers_mut().remove("Content-Length");
+    response.headers_mut().insert(
+        "Content-Length",
+        compressed.len().to_string().parse().expect("length is valid"),
+    );
+    *response.body_mut() = Body::from(compressed);
 
     response
 }
