@@ -225,8 +225,15 @@ function matchOrders(buyOrders, sellOrders, options = {}) {
   };
 }
 
+async function matchOrdersAsync(buyOrders, sellOrders, options = {}) {
+  return new Promise((resolve) => {
+    setImmediate(() => resolve(matchOrders(buyOrders, sellOrders, options)));
+  });
+}
+
 module.exports = {
   matchOrders,
+  matchOrdersAsync,
   MATCHING_ALGORITHMS,
   MAX_BATCH_SIZE,
 };
