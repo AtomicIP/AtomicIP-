@@ -1,7 +1,8 @@
 use axum::{
     extract::{Path, Query, State},
     http::{header, StatusCode},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
+    body::Body,
     Json,
 };
 use once_cell::sync::Lazy;
@@ -232,6 +233,125 @@ pub async fn batch_reveal_commitments(
                 error: format!("commitments must contain between 1 and {} items", MAX_BATCH_SIZE),
             }),
         ));
+    }
+
+    /// Export selected commitment records as JSON, CSV, or XML.
+    #[utoipa::path(
+        get,
+        path = "/v1/ip/export",
+        tag = "IP Registry",
+        params(ExportCommitmentsParams),
+        responses(
+            (status = 200, description = "Commitments exported"),
+            (status = 400, description = "Invalid format or IP IDs", body = ErrorResponse),
+            (status = 404, description = "An IP record was not found", body = ErrorResponse),
+        )
+    )]
+    #[instrument]
+    pub async fn export_commitments(
+        Query(params): Query<ExportCommitmentsParams>,
+    ) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+        let ids: Result<Vec<u64>, _> = params
+            .ip_ids
+            .split(',')
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| value.trim().parse::<u64>())
+            .collect();
+        let ids = ids.map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse { error: "ip_ids must be comma-separated unsigned integers".to_string() }),
+            )
+        })?;
+        if ids.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse { error: "ip_ids must not be empty".to_string() }),
+            ));
+        }
+
+        let mut records = Vec::with_capacity(ids.len());
+        for id in ids {
+            match cache::get::<IpRecord>(&cache::ip_key(id)) {
+                Some(record) => records.push(record),
+                None => {
+                    return Err((
+                        StatusCode::NOT_FOUND,
+                        Json(ErrorResponse { error: format!("IP record {} not found", id) }),
+                    ))
+                }
+            }
+        }
+
+        let format = params.format.to_ascii_lowercase();
+        let (content_type, extension, body) = match format.as_str() {
+            "json" => (
+                "application/json",
+                "json",
+                serde_json::to_string_pretty(&records).map_err(|error| {
+                    (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: error.to_string() }))
+                })?,
+            ),
+            "csv" => ("text/csv; charset=utf-8", "csv", commitment_csv(&records)),
+            "xml" => ("application/xml; charset=utf-8", "xml", commitment_xml(&records)),
+            _ => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse { error: "format must be one of json, csv, or xml".to_string() }),
+                ))
+            }
+        };
+
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, content_type)
+            .header(header::CONTENT_DISPOSITION, format!("attachment; filename=\"commitments.{}\"", extension))
+            .body(Body::from(body))
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: error.to_string() })))
+    }
+
+    fn csv_field(value: &str) -> String {
+        if value.chars().any(|character| matches!(character, ',' | '"' | '\n' | '\r')) {
+            format!("\"{}\"", value.replace('"', "\"\""))
+        } else {
+            value.to_string()
+        }
+    }
+
+    fn commitment_csv(records: &[IpRecord]) -> String {
+        let mut output = "ip_id,owner,commitment_hash,timestamp,revoked\n".to_string();
+        for record in records {
+            output.push_str(&format!(
+                "{},{},{},{},{}\n",
+                record.ip_id,
+                csv_field(&record.owner),
+                csv_field(&record.commitment_hash),
+                record.timestamp,
+                record.revoked
+            ));
+        }
+        output
+    }
+
+    fn xml_field(value: &str) -> String {
+        value
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace('\'', "&apos;")
+    }
+
+    fn commitment_xml(records: &[IpRecord]) -> String {
+        let mut output = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<commitments>\n".to_string();
+        for record in records {
+            output.push_str(&format!(
+                "  <commitment><ip_id>{}</ip_id><owner>{}</owner><commitment_hash>{}</commitment_hash><timestamp>{}</timestamp><revoked>{}</revoked></commitment>\n",
+                record.ip_id, xml_field(&record.owner), xml_field(&record.commitment_hash), record.timestamp, record.revoked
+            ));
+        }
+        output.push_str("</commitments>\n");
+        output
     }
 
     let results = body

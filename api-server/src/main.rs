@@ -89,6 +89,7 @@ mod snapshot_tests;
         handlers::transfer_ip,
         handlers::verify_commitment,
         handlers::batch_reveal_commitments,
+        handlers::export_commitments,
         handlers::list_ip_by_owner,
         handlers::list_ip_by_owner_cursor,
         handlers::initiate_swap,
@@ -121,6 +122,7 @@ mod snapshot_tests;
         schemas::BatchRevealCommitmentsRequest,
         schemas::BatchRevealResult,
         schemas::BatchRevealCommitmentsResponse,
+        schemas::ExportCommitmentsParams,
         schemas::ListIpByOwnerResponse,
         schemas::InitiateSwapRequest,
         schemas::BatchInitiateSwapRequest,
@@ -279,6 +281,7 @@ async fn main() {
         .route("/ip/{ip_id}",                     get(handlers::get_ip))
         .route("/ip/verify",                      post(handlers::verify_commitment))
         .route("/ip/reveal-batch",                post(handlers::batch_reveal_commitments))
+        .route("/ip/export",                     get(handlers::export_commitments))
         .route("/ip/owner/{owner}",               get(handlers::list_ip_by_owner))
         .route("/ip/owner/{owner}/cursor",        get(handlers::list_ip_by_owner_cursor))
         .route("/swap/initiate",                  post(handlers::initiate_swap).layer(signed.clone()))
@@ -398,6 +401,7 @@ fn build_app() -> Router {
         .route("/v1/ip/transfer", post(handlers::transfer_ip).layer(signed.clone()))
         .route("/v1/ip/verify", post(handlers::verify_commitment))
         .route("/v1/ip/reveal-batch", post(handlers::batch_reveal_commitments))
+        .route("/v1/ip/export", get(handlers::export_commitments))
         .route("/v1/ip/owner/{owner}", get(handlers::list_ip_by_owner))
         .route("/v1/ip/owner/{owner}/cursor", get(handlers::list_ip_by_owner_cursor))
         .route("/v1/ip/owner/{owner}/cursor", get(handlers::list_ip_by_owner_cursor))

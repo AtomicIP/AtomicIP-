@@ -67,6 +67,19 @@ pub struct BatchRevealCommitmentsResponse {
     pub results: Vec<BatchRevealResult>,
 }
 
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct ExportCommitmentsParams {
+    /// Export format: json, csv, or xml.
+    #[serde(default = "default_export_format")]
+    pub format: String,
+    /// Comma-separated IP IDs to export.
+    pub ip_ids: String,
+}
+
+fn default_export_format() -> String {
+    "json".to_string()
+}
+
 /// #317: Pagination query parameters shared across list endpoints.
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct PaginationParams {
