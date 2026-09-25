@@ -16,6 +16,9 @@ use types::*;
 
 mod zk_commitment;
 
+/// Issue #973: Commitment metadata storage and search.
+mod metadata;
+
 #[cfg(test)]
 mod test;
 
@@ -5670,6 +5673,68 @@ impl IpRegistry {
                 }
             }
         }
+    }
+
+    /// Issue #973: Store encrypted metadata for a commitment to improve discoverability.
+    ///
+    /// Stores encrypted metadata (title, description, tags) for an IP commitment.
+    /// The metadata is AES-GCM encrypted to preserve privacy while enabling search.
+    ///
+    /// # Arguments
+    /// * `env` - Soroban environment
+    /// * `ip_id` - The IP ID to attach metadata to
+    /// * `encrypted_data` - AES-GCM encrypted metadata blob
+    /// * `nonce` - 12-byte encryption nonce
+    /// * `tag_hashes` - Vec of SHA256 hashes of searchable tags
+    pub fn store_commitment_metadata(
+        env: Env,
+        ip_id: u64,
+        encrypted_data: Bytes,
+        nonce: BytesN<12>,
+        tag_hashes: Vec<BytesN<32>>,
+    ) {
+        // Verify IP exists
+        if env
+            .storage()
+            .persistent()
+            .get::<_, IpRecord>(&DataKey::IpRecord(ip_id))
+            .is_none()
+        {
+            env.panic_with_error(Error::from_contract_error(ContractError::IpNotFound as u32));
+        }
+
+        metadata::store_metadata(&env, ip_id, encrypted_data, nonce, tag_hashes);
+    }
+
+    /// Issue #973: Search for commitments by metadata tag with pagination.
+    ///
+    /// # Arguments
+    /// * `env` - Soroban environment
+    /// * `tag_hash` - SHA256 hash of the tag string to search for
+    /// * `offset` - Starting index in results (pagination)
+    /// * `limit` - Maximum number of results per page
+    ///
+    /// # Returns
+    /// MetadataSearchResult with paginated IP IDs and cursor for next page
+    pub fn search_commitment_metadata(
+        env: Env,
+        tag_hash: BytesN<32>,
+        offset: u32,
+        limit: u32,
+    ) -> types::MetadataSearchResult {
+        metadata::search_by_metadata(&env, tag_hash, offset, limit)
+    }
+
+    /// Issue #973: Retrieve encrypted metadata for a specific commitment.
+    ///
+    /// # Arguments
+    /// * `env` - Soroban environment
+    /// * `ip_id` - The IP ID to retrieve metadata for
+    ///
+    /// # Returns
+    /// Option<IpMetadata> containing the encrypted metadata if it exists
+    pub fn get_commitment_metadata(env: Env, ip_id: u64) -> Option<types::IpMetadata> {
+        metadata::get_metadata(&env, ip_id)
     }
 }
 
