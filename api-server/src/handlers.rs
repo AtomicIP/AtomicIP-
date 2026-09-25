@@ -691,6 +691,80 @@ pub async fn get_swap_escrow(
     ).into_response()
 }
 
+/// Return the immutable on-chain state-transition history for a swap.
+#[utoipa::path(
+    get,
+    path = "/v1/swap/{swap_id}/history",
+    tag = "Atomic Swap",
+    params(("swap_id" = u64, Path, description = "Swap identifier")),
+    responses((status = 200, description = "Swap history", body = [SwapHistoryEntry]))
+)]
+#[instrument]
+pub async fn get_swap_history(
+    State(rpc_client): State<Arc<dyn crate::graphql::SorobanRpcClient>>,
+    Path(swap_id): Path<u64>,
+) -> impl IntoResponse {
+    match rpc_client.get_swap_history(swap_id).await {
+        Ok(entries) => {
+            let entries: Vec<SwapHistoryEntry> = entries
+                .into_iter()
+                .map(|entry| SwapHistoryEntry {
+                    status: match entry.status {
+                        crate::graphql::SwapStatus::Pending => SwapStatus::Pending,
+                        crate::graphql::SwapStatus::Accepted => SwapStatus::Accepted,
+                        crate::graphql::SwapStatus::Completed => SwapStatus::Completed,
+                        crate::graphql::SwapStatus::Disputed => SwapStatus::Disputed,
+                        crate::graphql::SwapStatus::Cancelled => SwapStatus::Cancelled,
+                    },
+                    timestamp: entry.timestamp,
+                })
+                .collect();
+            (StatusCode::OK, Json(serde_json::to_value(entries).unwrap())).into_response()
+        }
+        Err(error) => {
+            tracing::error!(%error, swap_id, "failed to query swap history");
+            (StatusCode::BAD_GATEWAY, Json(serde_json::json!({
+                "error": "failed to query swap history"
+            }))).into_response()
+        }
+    }
+}
+
+/// Return all evidence submissions associated with a swap dispute.
+#[utoipa::path(
+    get,
+    path = "/v1/swap/{swap_id}/disputes",
+    tag = "Atomic Swap",
+    params(("swap_id" = u64, Path, description = "Swap identifier")),
+    responses((status = 200, description = "Dispute evidence history", body = [DisputeEvidenceEntry]))
+)]
+#[instrument]
+pub async fn get_swap_disputes(
+    State(rpc_client): State<Arc<dyn crate::graphql::SorobanRpcClient>>,
+    Path(swap_id): Path<u64>,
+) -> impl IntoResponse {
+    match rpc_client.get_dispute_evidence(swap_id).await {
+        Ok(entries) => {
+            let entries: Vec<DisputeEvidenceEntry> = entries
+                .into_iter()
+                .map(|entry| DisputeEvidenceEntry {
+                    swap_id: entry.swap_id,
+                    submitter: entry.submitter,
+                    evidence_hash: entry.evidence_hash,
+                    timestamp: entry.timestamp,
+                })
+                .collect();
+            (StatusCode::OK, Json(serde_json::to_value(entries).unwrap())).into_response()
+        }
+        Err(error) => {
+            tracing::error!(%error, swap_id, "failed to query dispute evidence");
+            (StatusCode::BAD_GATEWAY, Json(serde_json::json!({
+                "error": "failed to query dispute evidence"
+            }))).into_response()
+        }
+    }
+}
+
 /// List swaps using party/IP selectors and optional status, asset, and price filters.
 #[utoipa::path(
     get,

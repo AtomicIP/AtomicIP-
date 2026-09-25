@@ -216,6 +216,20 @@ pub struct EscrowStatusResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct SwapHistoryEntry {
+    pub status: SwapStatus,
+    pub timestamp: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct DisputeEvidenceEntry {
+    pub swap_id: u64,
+    pub submitter: String,
+    pub evidence_hash: String,
+    pub timestamp: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct InitiateSwapRequest {
     pub ip_registry_id: String,
     pub ip_id: u64,
