@@ -32,6 +32,23 @@ pub struct IpAccessGrant {
     pub access_level: u32, // 1 = view, 2 = verify, 3 = transfer
 }
 
+/// Cached proof path tied to the owner's current Merkle root.
+#[contracttype]
+#[derive(Clone)]
+pub struct MerkleProofCache {
+    pub root: BytesN<32>,
+    pub proof: soroban_sdk::Vec<BytesN<32>>,
+}
+
+/// Hash function used to derive a commitment from secret material.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommitmentAlgorithm {
+    Pedersen,
+    Sha256,
+    Blake3,
+}
+
 // ── Storage Keys ────────────────────────────────────────────────────────────
 
 #[contracttype]
