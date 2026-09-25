@@ -5446,6 +5446,45 @@ impl AtomicSwap {
     /// - `BatchTooLarge`: More than MAX_BATCH_SIZE swaps
     /// - Various swap-specific errors if atomic mode is enabled and any swap fails
     pub fn execute_batch_swaps(env: Env, swap_ids: Vec<u64>, atomic: bool) -> Vec<bool> {
+        Self::execute_batch_swaps_ordered(&env, swap_ids, atomic)
+    }
+
+    /// Execute swaps in descending priority order.
+    pub fn execute_batch_swaps_prioritized(
+        env: Env,
+        swap_ids: Vec<u64>,
+        atomic: bool,
+        priorities: Vec<u32>,
+    ) -> Vec<bool> {
+        if priorities.len() != swap_ids.len() {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::BatchSizeMismatch as u32,
+            ));
+        }
+
+        let mut ordered_ids = swap_ids.clone();
+        let mut ordered_priorities = priorities;
+        for i in 0..ordered_ids.len() {
+            let mut best = i;
+            for j in (i + 1)..ordered_ids.len() {
+                if ordered_priorities.get(j).unwrap() > ordered_priorities.get(best).unwrap() {
+                    best = j;
+                }
+            }
+            if best != i {
+                let id = ordered_ids.get(i).unwrap();
+                let priority = ordered_priorities.get(i).unwrap();
+                ordered_ids.set(i, ordered_ids.get(best).unwrap());
+                ordered_priorities.set(i, ordered_priorities.get(best).unwrap());
+                ordered_ids.set(best, id);
+                ordered_priorities.set(best, priority);
+            }
+        }
+
+        Self::execute_batch_swaps_ordered(&env, ordered_ids, atomic)
+    }
+
+    fn execute_batch_swaps_ordered(env: &Env, swap_ids: Vec<u64>, atomic: bool) -> Vec<bool> {
         let len = swap_ids.len() as usize;
 
         // Validate batch parameters
