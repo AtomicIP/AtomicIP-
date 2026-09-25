@@ -294,18 +294,27 @@ pub async fn list_ip_by_owner_cursor(
     let limit = pagination.limit.min(200);
 
     // Decode cursor if provided
-    let offset = match pagination.cursor {
-        Some(cursor) => {
-            match crate::schemas::cursor::decode(&cursor) {
-                Some(data) => data.offset,
-                None => 0, // Invalid cursor, start from beginning
+    let cursor_data = match pagination.cursor.as_deref() {
+        Some(cursor) => match crate::schemas::cursor::decode(cursor) {
+            Some(data) => Some(data),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    [(header::CACHE_CONTROL, cache::no_cache_header())],
+                    Json(serde_json::json!({ "error": "invalid cursor" })),
+                ).into_response();
             }
-        }
-        None => 0,
+        },
+        None => None,
     };
+    let last_id = cursor_data.as_ref().map(|data| data.last_id);
 
     // #316: Check cache with cursor-based key
-    let cache_key = cache::ip_list_key(&owner, limit, &format!("{}", offset));
+    let cache_key = cache::ip_list_key(
+        &owner,
+        limit,
+        pagination.cursor.as_deref().unwrap_or("first"),
+    );
     if let Some(cached) = cache::get::<PaginatedResponse<u64>>(&cache_key) {
         return (
             StatusCode::OK,
@@ -327,22 +336,25 @@ pub async fn list_ip_by_owner_cursor(
     };
     let total_count = all_ids.len() as u64;
 
-    // Apply cursor-based pagination
-    let page: Vec<u64> = all_ids
+    // IDs are appended monotonically by the contract, so a cursor can seek
+    // directly by the last returned ID instead of skipping an offset.
+    let mut page: Vec<u64> = all_ids
         .into_iter()
-        .skip(offset as usize)
-        .take(limit as usize)
+        .filter(|id| last_id.map_or(true, |last| *id > last))
+        .take(limit as usize + 1)
         .collect();
+    let has_more = page.len() > limit as usize;
+    if has_more {
+        page.truncate(limit as usize);
+    }
 
     // Calculate next cursor
-    let next_cursor = if page.len() == limit as usize && (offset as u64 + limit) < total_count {
+    let next_cursor = if has_more {
         let last_item_id = page.last().copied().unwrap_or(0);
-        Some(crate::schemas::cursor::new(last_item_id, offset as u64 + limit))
+        Some(crate::schemas::cursor::new(last_item_id))
     } else {
         None
     };
-
-    let has_more = offset as u64 + limit < total_count;
 
     let resp = PaginatedResponse {
         items: page,
