@@ -70,6 +70,38 @@ describe("resolveBatchDisputes — resolution types", () => {
     expect(result.results[0].counterpartyAmount).toBeCloseTo(300);
   });
 
+  test("MULTI_PARTY distributes the full amount across named participants", () => {
+    const dispute = { ...openDispute("r-multi", 1000), initiator: "seller", counterparty: "buyer" };
+    const result = resolveBatchDisputes(
+      [dispute],
+      [{
+        type: RESOLUTION_TYPES.MULTI_PARTY,
+        allocations: { seller: 500, buyer: 300, arbitrator: 200 },
+      }]
+    );
+
+    expect(result.resolvedCount).toBe(1);
+    expect(result.results[0].participantAmounts).toEqual({
+      seller: 500,
+      buyer: 300,
+      arbitrator: 200,
+    });
+    expect(result.totalSplit).toBe(1000);
+  });
+
+  test("rejects multi-party allocations that do not balance", () => {
+    const result = resolveBatchDisputes(
+      [openDispute("r-unbalanced", 1000)],
+      [{
+        type: RESOLUTION_TYPES.MULTI_PARTY,
+        allocations: { seller: 600, buyer: 300 },
+      }]
+    );
+
+    expect(result.failedCount).toBe(1);
+    expect(result.errors[0].error).toMatch(/allocations must total 1000/);
+  });
+
   test("ESCALATE moves state to ESCALATED", () => {
     const result = resolveBatchDisputes(
       [openDispute("r5")],
