@@ -2,62 +2,17 @@
  * Swap Reputation Scoring — Issue #474
  * ──────────────────────────────────────
  * Scores buyers and sellers based on their swap history.
- *
- * Score range: 0–1000 (higher = better reputation)
- * Starting score for new participants: 500
- *
- * Scoring factors:
- *  - Completion rate      (swaps completed / initiated)
- *  - Dispute rate         (disputes / completed)
- *  - Average rating       (1–5 stars, weighted by recency)
- *  - Tenure bonus         (account age in days)
- *  - Volume bonus         (total swap count)
- *  - Cancellation penalty (cancelled swaps)
- *
- * Persistence — Issue #878
- * ──────────────────────────────────────
- * `calculateReputationScore` / `batchCalculateReputation` above are pure
- * functions: given a history they return a score, nothing is written down.
- * That's fine for the API/contract layer's own request-scoped caching
- * (`api-server/src/cache.rs`, key prefix `reputation:`, TTL-based), but it
- * means there is no durable record a score ever existed once that cache
- * entry expires or the process restarts.
- *
- * This module fills that gap with a small `ReputationStore` interface —
- * `get(participantId)`, `set(participantId, record)`, `getAll()` — so the
- * scoring logic stays decoupled from *where* scores live:
- *
- *  - `MemoryReputationStore` — process-local Map, not durable. Default
- *    choice for tests and short-lived scripts.
- *  - `FileReputationStore`   — scores serialized to a JSON file on disk.
- *    Durable across process restarts; intended as the default backend for
- *    single-instance deployments/tooling that don't have a real DB handy.
- *
- * A production, multi-instance deployment should back this interface with
- * the API server's shared store instead (e.g. the Redis-backed cache in
- * `api-server/src/cache.rs`, or a proper DB table) by implementing the
- * same three methods — nothing above this layer needs to change.
  */
 
-const fs   = require("fs");
+const fs = require("fs");
 const path = require("path");
 
-const STARTING_SCORE     = 500;
-const MAX_SCORE          = 1000;
-const MIN_SCORE          = 0;
-const RECENCY_HALF_LIFE  = 90;
+const STARTING_SCORE = 500;
+const MAX_SCORE = 1000;
+const MIN_SCORE = 0;
+const RECENCY_HALF_LIFE = 90;
 const MIN_SWAPS_FOR_FULL = 10;
 
-function recencyWeight(eventDateMs, nowMs = Date.now()) {
-/**
- * Compute an exponential recency weight for an event.
- * Events from `RECENCY_HALF_LIFE` days ago receive weight 0.5; older events
- * receive less weight.
- *
- * @param {number} eventDateMs  - Unix timestamp (ms) of the event
- * @param {number} [nowMs]      - reference time (default: Date.now())
- * @returns {number} weight in (0, 1]
- */
 function recencyWeight(eventDateMs, nowMs = Date.now()) {
   const agedays = (nowMs - eventDateMs) / 86_400_000;
   return Math.exp((-Math.LN2 * agedays) / RECENCY_HALF_LIFE);
@@ -73,16 +28,18 @@ function completionScore(history) {
 function disputePenalty(history) {
   const completed = history.filter((h) => h.outcome === "completed").length;
   if (completed === 0) return 0;
-  const disputes  = history.filter((h) => h.disputed === true).length;
-  const rate      = disputes / completed;
-  return -Math.round(Math.min(rate / 0.1, 1) * 150);
+  const disputes = history.filter((h) => h.disputed === true).length;
+  const rate = disputes / completed;
+  const penalty = -Math.round(Math.min(rate / 0.1, 1) * 150);
+  return Object.is(penalty, -0) ? 0 : penalty;
 }
 
 function ratingScore(history, nowMs = Date.now()) {
   const rated = history.filter((h) => h.rating != null && h.rating >= 1 && h.rating <= 5);
   if (rated.length === 0) return 150;
 
-  let weightedSum = 0, totalWeight = 0;
+  let weightedSum = 0;
+  let totalWeight = 0;
   for (const h of rated) {
     const w = recencyWeight(new Date(h.date).getTime(), nowMs);
     weightedSum += h.rating * w;
@@ -113,20 +70,6 @@ function cancellationPenalty(history, nowMs = Date.now()) {
   return -Math.round(Math.min(weightedCancels / 5, 1) * 150);
 }
 
-/**
- * Map a numeric reputation score to a named tier.
- *
- * | Score   | Tier     |
- * |---------|----------|
- * | ≥ 850   | platinum |
- * | ≥ 700   | gold     |
- * | ≥ 550   | silver   |
- * | ≥ 400   | bronze   |
- * | < 400   | new      |
- *
- * @param {number} score  - reputation score (0–1000)
- * @returns {"platinum"|"gold"|"silver"|"bronze"|"new"}
- */
 function scoreTier(score) {
   if (score >= 850) return "platinum";
   if (score >= 700) return "gold";
@@ -135,48 +78,39 @@ function scoreTier(score) {
   return "new";
 }
 
-/**
- * Calculate reputation score for a participant.
- *
- * @param {object} input - { participantId, history, accountCreatedAt? }
- * @returns {{ participantId, score, tier, breakdown, swapCount, dampened }}
- */
 function calculateReputationScore(input, nowMs = Date.now()) {
   const { participantId, history = [], accountCreatedAt } = input;
   if (!participantId) throw new TypeError("participantId is required.");
   if (!Array.isArray(history)) throw new TypeError("history must be an array.");
 
   const breakdown = {
-    completion:   completionScore(history),
-    dispute:      disputePenalty(history),
-    rating:       ratingScore(history, nowMs),
-    tenure:       tenureBonus(accountCreatedAt, nowMs),
-    volume:       volumeBonus(history),
+    completion: completionScore(history),
+    dispute: disputePenalty(history),
+    rating: ratingScore(history, nowMs),
+    tenure: tenureBonus(accountCreatedAt, nowMs),
+    volume: volumeBonus(history),
     cancellation: cancellationPenalty(history, nowMs),
   };
 
-  let raw = Object.values(breakdown).reduce((s, v) => s + v, 0);
+  if (history.length === 0) {
+    return { participantId, score: STARTING_SCORE, tier: "new", breakdown, swapCount: 0, dampened: true };
+  }
 
+  let raw = Object.values(breakdown).reduce((s, v) => s + v, 0);
   const dampened = history.length < MIN_SWAPS_FOR_FULL;
-  if (dampened) {
+  if (!dampened) {
+    raw = STARTING_SCORE + raw;
+  } else {
     const weight = history.length / MIN_SWAPS_FOR_FULL;
     raw = STARTING_SCORE + (raw - STARTING_SCORE) * weight;
   }
 
   const score = Math.round(Math.min(MAX_SCORE, Math.max(MIN_SCORE, raw)));
-  const tier  = scoreTier(score);
+  const tier = scoreTier(score);
 
   return { participantId, score, tier, breakdown, swapCount: history.length, dampened };
 }
 
-/**
- * Calculate reputation scores for multiple participants and return them
- * sorted by score descending.
- *
- * @param {Array<{ participantId: string, history: object[], accountCreatedAt?: string }>} inputs
- * @param {number} [nowMs]  - reference time (default: Date.now())
- * @returns {Array<{ participantId, score, tier, breakdown, swapCount, dampened }>}
- */
 function batchCalculateReputation(inputs, nowMs = Date.now()) {
   if (!Array.isArray(inputs) || inputs.length === 0)
     throw new TypeError("inputs must be a non-empty array.");
@@ -185,11 +119,6 @@ function batchCalculateReputation(inputs, nowMs = Date.now()) {
     .sort((a, b) => b.score - a.score);
 }
 
-/**
- * In-memory reputation store. Not durable — data is lost when the process
- * exits. Useful as the default in tests and short-lived scripts, and as a
- * reference implementation of the `ReputationStore` interface.
- */
 class MemoryReputationStore {
   constructor() {
     this._records = new Map();
@@ -208,12 +137,6 @@ class MemoryReputationStore {
   }
 }
 
-/**
- * File-backed reputation store. Scores are serialized as JSON to disk, so
- * they survive process restarts — the store re-reads from disk on every
- * call rather than caching in memory, which keeps it correct if multiple
- * short-lived processes share the same file.
- */
 class FileReputationStore {
   constructor(filePath) {
     if (!filePath) throw new TypeError("filePath is required.");
@@ -252,14 +175,6 @@ class FileReputationStore {
   }
 }
 
-/**
- * Calculate a participant's reputation score and persist it to `store`.
- *
- * @param {object} input - same shape as `calculateReputationScore`.
- * @param {{get, set, getAll}} store - a `ReputationStore` implementation.
- * @returns {object} the calculated result (same shape as
- *   `calculateReputationScore`), plus `updatedAt`.
- */
 function persistReputationScore(input, store, nowMs = Date.now()) {
   if (!store || typeof store.set !== "function")
     throw new TypeError("store must implement the ReputationStore interface.");
@@ -270,14 +185,6 @@ function persistReputationScore(input, store, nowMs = Date.now()) {
   return record;
 }
 
-/**
- * Look up a previously persisted reputation score.
- *
- * @param {string} participantId
- * @param {{ get: (id: string) => object|null }} store  - a `ReputationStore` implementation
- * @returns {object|null} the stored reputation record, or `null` if the
- *   participant has no persisted record yet.
- */
 function getPersistedReputationScore(participantId, store) {
   if (!store || typeof store.get !== "function")
     throw new TypeError("store must implement the ReputationStore interface.");
