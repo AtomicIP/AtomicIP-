@@ -24,6 +24,8 @@ For each IP commitment, securely store all three values together:
 | `ip_id` | The on-chain ID returned by `commit_ip` |
 
 Losing any one of these makes it impossible to call `verify_commitment` or complete a swap.
+See the [commitment recovery guide](commitment-recovery.md) for the recovery
+process and the limits of what can be reconstructed from chain data.
 
 ### If Your Secret Is Compromised
 
@@ -40,6 +42,19 @@ Immediately revoke the IP record using `revoke_ip` and re-register with a new se
 ## Request Signing (API Authentication)
 
 Every API request must be signed with your Stellar Ed25519 keypair to prove ownership of your address.
+
+## Linking Multiple Stellar Accounts
+
+An authenticated user can link additional Stellar accounts without changing the
+primary account used for JWT authentication:
+
+1. Sign `atomicip:link:{primary_account}:{account_to_link}` with the account being linked.
+2. `POST /v1/accounts/link` with `{"account":"G...","signature":"<hex>"}` and the primary account's bearer token.
+3. Read the resulting account group with `GET /v1/accounts`.
+
+The API verifies the linked account's signature before storing it. Keep the
+primary account secure: it is the identity under which linked accounts are
+grouped.
 
 ### Request Signature Scheme
 

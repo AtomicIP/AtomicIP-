@@ -13,6 +13,39 @@ use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::Mutex;
+use dashmap::DashMap;
+use std::collections::BTreeSet;
+
+static LINKED_ACCOUNTS: Lazy<DashMap<String, BTreeSet<String>>> = Lazy::new(DashMap::new);
+
+pub fn link_stellar_account(primary: &str, account: &str) -> Result<Vec<String>, AuthError> {
+    validate_stellar_account(account)?;
+    if primary == account {
+        return Err(AuthError::AccountAlreadyLinked);
+    }
+
+    let mut accounts = LINKED_ACCOUNTS.entry(primary.to_string()).or_default();
+    accounts.insert(account.to_string());
+    let mut result = Vec::with_capacity(accounts.len() + 1);
+    result.push(primary.to_string());
+    result.extend(accounts.iter().cloned());
+    Ok(result)
+}
+
+pub fn linked_stellar_accounts(primary: &str) -> Vec<String> {
+    let mut result = vec![primary.to_string()];
+    if let Some(accounts) = LINKED_ACCOUNTS.get(primary) {
+        result.extend(accounts.iter().cloned());
+    }
+    result
+}
+
+fn validate_stellar_account(account: &str) -> Result<(), AuthError> {
+    match stellar_strkey::Strkey::from_string(account) {
+        Ok(stellar_strkey::Strkey::PublicKeyEd25519(_)) => Ok(()),
+        _ => Err(AuthError::InvalidPublicKey),
+    }
+}
 
 /// JWT claims.
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -158,6 +191,7 @@ pub enum AuthError {
     InvalidPublicKey,
     InvalidSignature,
     TokenCreation,
+    AccountAlreadyLinked,
 }
 
 impl IntoResponse for AuthError {
@@ -168,6 +202,7 @@ impl IntoResponse for AuthError {
             AuthError::InvalidPublicKey => (StatusCode::BAD_REQUEST, "Invalid public key"),
             AuthError::InvalidSignature => (StatusCode::BAD_REQUEST, "Invalid signature format"),
             AuthError::TokenCreation => (StatusCode::INTERNAL_SERVER_ERROR, "Token creation failed"),
+            AuthError::AccountAlreadyLinked => (StatusCode::CONFLICT, "Account is already the primary account"),
         };
         let body = serde_json::json!({ "error": msg });
         (status, Json(body)).into_response()
