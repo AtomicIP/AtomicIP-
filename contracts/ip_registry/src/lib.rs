@@ -41,6 +41,9 @@ mod invariant_tests;
 #[cfg(test)]
 mod upgrade_tests;
 
+#[cfg(test)]
+mod commitment_property_tests;
+
 // ── Error Codes ────────────────────────────────────────────────────────────
 
 #[contracterror]

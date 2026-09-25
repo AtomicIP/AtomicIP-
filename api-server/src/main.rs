@@ -44,6 +44,7 @@ mod session;
 mod batch;
 mod cache;
 mod circuit_breaker;
+mod connection_pool;
 mod deduplication;
 mod event_topics;
 mod events;
@@ -72,6 +73,8 @@ mod validation;
 mod validation_middleware;
 #[cfg(test)]
 mod validation_fuzz_tests;
+#[cfg(test)]
+mod snapshot_tests;
 
 #[derive(OpenApi)]
 #[openapi(
