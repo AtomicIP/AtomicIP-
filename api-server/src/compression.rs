@@ -5,6 +5,7 @@ use axum::{
     middleware::Next,
     response::Response,
 };
+use http_body_util::BodyExt;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 
@@ -41,6 +42,13 @@ pub fn compress_brotli(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
     Ok(output)
 }
 
+/// Compress data using deflate.
+pub fn compress_deflate(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(data)?;
+    encoder.finish()
+}
+
 /// Middleware to handle Accept-Encoding header and apply compression
 pub async fn compression_middleware(
     headers: HeaderMap,
@@ -52,33 +60,62 @@ pub async fn compression_middleware(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    let mut response = next.run(req).await;
+    let response = next.run(req).await;
 
     // Add Vary header to indicate response varies by Accept-Encoding
-    response.headers_mut().insert(
-        "Vary",
-        "Accept-Encoding".parse().unwrap(),
-    );
+    let (mut parts, body) = response.into_parts();
+    parts.headers.insert("Vary", "Accept-Encoding".parse().unwrap());
 
-    // Add Content-Encoding header based on Accept-Encoding
-    if accept_encoding.contains("gzip") {
-        response.headers_mut().insert(
-            "Content-Encoding",
-            "gzip".parse().unwrap(),
-        );
-    } else if accept_encoding.contains("br") {
-        response.headers_mut().insert(
-            "Content-Encoding",
-            "br".parse().unwrap(),
-        );
+    let encoding = if accept_encoding.contains("br") {
+        Some(("br", compress_brotli as fn(&[u8]) -> Result<Vec<u8>, std::io::Error>))
+    } else if accept_encoding.contains("gzip") {
+        Some(("gzip", compress_gzip as fn(&[u8]) -> Result<Vec<u8>, std::io::Error>))
     } else if accept_encoding.contains("deflate") {
-        response.headers_mut().insert(
-            "Content-Encoding",
-            "deflate".parse().unwrap(),
-        );
+        Some(("deflate", compress_deflate as fn(&[u8]) -> Result<Vec<u8>, std::io::Error>))
+    } else {
+        None
+    };
+
+    let should_compress = encoding.is_some()
+        && !parts.headers.contains_key("Content-Encoding")
+        && parts.status != axum::http::StatusCode::NO_CONTENT
+        && parts.status != axum::http::StatusCode::NOT_MODIFIED;
+
+    if !should_compress {
+        return Response::from_parts(parts, body);
     }
 
-    response
+    let bytes = match body.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(error) => {
+            tracing::error!(%error, "failed to read response body for compression");
+            parts.status = axum::http::StatusCode::INTERNAL_SERVER_ERROR;
+            return Response::from_parts(
+                parts,
+                Body::from("failed to prepare response compression"),
+            );
+        }
+    };
+
+    let Some((name, compress)) = encoding else {
+        return Response::from_parts(parts, Body::from(bytes));
+    };
+    if bytes.len() < CompressionConfig::default().min_size_bytes {
+        return Response::from_parts(parts, Body::from(bytes));
+    }
+
+    match compress(&bytes) {
+        Ok(compressed) => {
+            parts.headers.insert("Content-Encoding", name.parse().unwrap());
+            parts.headers.remove("Content-Length");
+            Response::from_parts(parts, Body::from(compressed))
+        }
+        Err(error) => {
+            tracing::error!(%error, encoding = name, "failed to compress response body");
+            parts.status = axum::http::StatusCode::INTERNAL_SERVER_ERROR;
+            Response::from_parts(parts, Body::from("failed to compress response"))
+        }
+    }
 }
 
 /// Get supported compression methods
@@ -133,5 +170,15 @@ mod tests {
     #[test]
     fn test_is_compression_unsupported() {
         assert!(!is_compression_supported("unknown"));
+    }
+
+    #[test]
+    fn test_deflate_round_trip() {
+        let input = b"repeated batch payload ".repeat(100);
+        let compressed = compress_deflate(&input).unwrap();
+        let mut decoder = flate2::read::ZlibDecoder::new(compressed.as_slice());
+        let mut output = Vec::new();
+        std::io::Read::read_to_end(&mut decoder, &mut output).unwrap();
+        assert_eq!(output, input);
     }
 }
