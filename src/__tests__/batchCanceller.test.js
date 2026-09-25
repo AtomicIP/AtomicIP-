@@ -76,6 +76,37 @@ describe("cancelBatchSwaps — state and counts", () => {
     expect(result.results[0].newState).toBe(CANCELLED_STATE);
   });
 
+  describe("cancelBatchSwaps — atomic rollback", () => {
+    test("restores successful cancellations when any item fails", () => {
+      const result = cancelBatchSwaps(
+        [pendingSwap("ok", 100), { swapId: "bad", state: "COMPLETED", amount: 200 }],
+        null,
+        { atomic: true }
+      );
+
+      expect(result.rolledBack).toBe(true);
+      expect(result.cancelledCount).toBe(0);
+      expect(result.totalRefunded).toBe(0);
+      expect(result.results).toEqual([]);
+      expect(result.rollbackResults).toEqual([
+        { swapId: "ok", restoredState: "PENDING" },
+      ]);
+      expect(result.errors).toHaveLength(1);
+    });
+
+    test("keeps successful results when atomic mode is disabled", () => {
+      const result = cancelBatchSwaps(
+        [pendingSwap("ok"), { swapId: "bad", state: "COMPLETED", amount: 200 }],
+        null,
+        { atomic: false }
+      );
+
+      expect(result.rolledBack).toBe(false);
+      expect(result.cancelledCount).toBe(1);
+      expect(result.rollbackResults).toEqual([]);
+    });
+  });
+
   test("ACTIVE swap is cancellable", () => {
     const result = cancelBatchSwaps([activeSwap("a1")]);
     expect(result.cancelledCount).toBe(1);
