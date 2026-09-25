@@ -122,6 +122,7 @@ pub enum ContractError {
     InvalidPrivacyLevel = 44,
     /// #977: Access denied due to privacy level restrictions.
     AccessDenied = 45,
+    InvalidCommitmentPrefix = 46,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -282,6 +283,7 @@ const CURRENT_FUNCTIONS: &[&str] = &[
     "grant_license", "initialize", "initiate_dispute", "is_delegate",
     "is_ip_owner", "issue_ownership_challenge", "link_commitment", "list_ip_by_category", "list_ip_by_owner",
     "list_ip_by_shard", "list_owner_categories", "merge_duplicate_commitment", "nominate_arbitrator",
+    "search_commitments_by_prefix",
     "notarize_ip_timestamp", "open_arbitration", "register_category_path", "release_batch_escrow",
     "remove_co_owner", "renew_ip", "renew_ip_commitment", "require_threshold_signatures",
     "resolve_dispute", "respond_to_ownership_challenge", "reveal_and_verify_commitments", "reveal_partial",
@@ -376,6 +378,15 @@ pub struct AuditEntry {
     pub action: soroban_sdk::Symbol, // e.g. "committed", "revoked", "transferred"
     pub actor: Address,
     pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CommitmentSearchResult {
+    pub ip_ids: Vec<u64>,
+    pub total_count: u32,
+    pub offset: u32,
+    pub limit: u32,
 }
 
 #[contracttype]
@@ -2095,6 +2106,52 @@ impl IpRegistry {
     /// Panics if the IP record does not exist (IpNotFound error).
     pub fn get_ip(env: Env, ip_id: u64) -> IpRecord {
         require_ip_exists(&env, ip_id)
+    }
+
+    /// Find IP records whose commitment hash starts with `prefix`.
+    pub fn search_commitments_by_prefix(
+        env: Env,
+        prefix: Bytes,
+        offset: u32,
+        limit: u32,
+    ) -> CommitmentSearchResult {
+        if prefix.is_empty() || prefix.len() > 32 {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::InvalidCommitmentPrefix as u32,
+            ));
+        }
+        let limit = if limit == 0 { 100 } else { limit.min(100) };
+        let next_id: u64 = env.storage().persistent().get(&DataKey::NextId).unwrap_or(1);
+        let mut matching = Vec::new(&env);
+        for ip_id in 1..next_id {
+            if let Some(record) = env.storage().persistent().get::<_, IpRecord>(&DataKey::IpRecord(ip_id)) {
+                let hash = record.commitment_hash.to_array();
+                let mut matches = true;
+                for index in 0..prefix.len() {
+                    if hash[index as usize] != prefix.get(index).unwrap() {
+                        matches = false;
+                        break;
+                    }
+                }
+                if matches {
+                    matching.push_back(ip_id);
+                }
+            }
+        }
+
+        let total_count = matching.len() as u32;
+        let start = offset.min(total_count) as usize;
+        let end = (start + limit as usize).min(matching.len());
+        let mut ip_ids = Vec::new(&env);
+        for index in start..end {
+            ip_ids.push_back(matching.get(index as u32).unwrap());
+        }
+        CommitmentSearchResult {
+            ip_ids,
+            total_count,
+            offset,
+            limit,
+        }
     }
 
     // ── Issue #454: Threshold Signatures ───────────────────────────────────
