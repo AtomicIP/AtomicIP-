@@ -149,6 +149,8 @@ mod validation_fuzz_tests;
         (name = "Webhooks", description = "Real-time event notifications"),
         (name = "Batch", description = "Batch API operations"),
         (name = "Events", description = "Server-Sent Events stream"),
+        (name = "Admin", description = "Administrative endpoints for monitoring and audit"),
+        (name = "Auth", description = "Authentication and account recovery"),
     )
 )]
 pub struct ApiDoc;
@@ -260,6 +262,12 @@ async fn main() {
         .route("/ws",              get(ws_handler))
         .route("/events",          get(events_handler))
         .route("/batch",           post(batch::batch_handler))
+        .route("/v1/admin/audit/logs",               get(handlers::get_audit_logs))
+        .route("/v1/admin/audit/suspicious-patterns", get(handlers::get_suspicious_patterns))
+        .route("/v1/auth/recovery/initiate",      post(account_recovery::initiate_recovery))
+        .route("/v1/auth/recovery/verify-token",  post(account_recovery::verify_recovery_token))
+        .route("/v1/auth/recovery/questions",     get(account_recovery::get_security_questions))
+        .route("/v1/auth/recovery/verify-question", post(account_recovery::verify_security_question))
         .route("/ip/{ip_id}",                     get(handlers::get_ip))
         .route("/ip/verify",                      post(handlers::verify_commitment))
         .route("/ip/owner/{owner}",               get(handlers::list_ip_by_owner))
@@ -369,6 +377,12 @@ fn build_app() -> Router {
         .route("/ws", get(ws_handler))
         .route("/events", get(events_handler))
         .route("/batch", post(batch::batch_handler))
+        .route("/v1/admin/audit/logs", get(handlers::get_audit_logs))
+        .route("/v1/admin/audit/suspicious-patterns", get(handlers::get_suspicious_patterns))
+        .route("/v1/auth/recovery/initiate", post(account_recovery::initiate_recovery))
+        .route("/v1/auth/recovery/verify-token", post(account_recovery::verify_recovery_token))
+        .route("/v1/auth/recovery/questions", get(account_recovery::get_security_questions))
+        .route("/v1/auth/recovery/verify-question", post(account_recovery::verify_security_question))
         .route("/v1/graphql", post(graphql_handler))
         .route("/v1/ip/commit", post(handlers::commit_ip).layer(signed.clone()))
         .route("/v1/ip/{ip_id}", get(handlers::get_ip))

@@ -16,6 +16,7 @@ use crate::schemas::*;
 use std::sync::Arc;
 use crate::webhook;
 use crate::websocket;
+use crate::audit::{AuditLogStore, AuditLogQuery, SuspiciousPattern};
 
 // #523/#800: Per-handler idempotency store for batch swap operations. Uses a
 // shared Redis backend when REDIS_URL is configured, so a client's retry is
@@ -45,6 +46,23 @@ const SWAP_EXPIRY_SECONDS: u64 = 604800;
 /// Process-local swap ID counter standing in for the contract's `NextId`
 /// until the handlers are wired to a live Soroban RPC client.
 static NEXT_SWAP_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Audit log store for tracking all API access and sensitive operations
+static AUDIT_LOG_STORE: Lazy<Arc<AuditLogStore>> = Lazy::new(|| {
+    let audit_key = std::env::var("AUDIT_HMAC_KEY")
+        .unwrap_or_else(|_| "default_audit_key_for_testing".to_string());
+    let audit_path = std::env::var("AUDIT_LOG_PATH")
+        .unwrap_or_else(|_| "/tmp/api_audit.log".to_string());
+
+    match AuditLogStore::open(audit_key.into_bytes(), audit_path) {
+        Ok(store) => Arc::new(store),
+        Err(e) => {
+            tracing::warn!("Failed to initialize audit log store: {}", e);
+            Arc::new(AuditLogStore::open("temp_key".into(), "/tmp/api_audit_fallback.log")
+                .unwrap_or_else(|_| panic!("Failed to create fallback audit store")))
+        }
+    }
+});
 
 /// Current Unix timestamp in seconds (substitute for the ledger timestamp).
 fn now_timestamp() -> u64 {
