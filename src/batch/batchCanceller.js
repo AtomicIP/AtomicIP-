@@ -20,6 +20,7 @@ const REFUND_POLICIES = Object.freeze({
   PARTIAL: "PARTIAL", // partial refund (e.g. minus fees already incurred)
   NONE:    "NONE",    // no refund (e.g. penalty cancellation)
 });
+const { createRefundRecord, summarizeRefunds } = require("../refunds/refundTracker");
 
 // ── Validators ────────────────────────────────────────────────────────────────
 
@@ -87,6 +88,12 @@ function cancelOne(swap, cancellation, now) {
     amount:        swap.amount,
     refundAmount:  refund,
     refundPolicy:  policy,
+    refund:        createRefundRecord({
+      swapId: swap.swapId,
+      amount: refund,
+      policy,
+      now,
+    }),
     reason,
     cancelledAt:   new Date(now).toISOString(),
   };
@@ -144,6 +151,7 @@ function cancelBatchSwaps(swaps, cancellations = null, options = {}) {
 
   const totalRefunded = results.reduce((s, r) => s + r.refundAmount, 0);
   const totalAmount   = results.reduce((s, r) => s + r.amount, 0);
+  const refunds       = results.map((result) => result.refund);
 
   return {
     batchSize:       swaps.length,
@@ -151,6 +159,8 @@ function cancelBatchSwaps(swaps, cancellations = null, options = {}) {
     failedCount:     errors.length,
     totalRefunded:   +totalRefunded.toFixed(8),
     totalAmount:     +totalAmount.toFixed(8),
+    refunds,
+    refundSummary: summarizeRefunds(refunds),
     results,
     errors,
   };
