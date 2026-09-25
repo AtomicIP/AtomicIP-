@@ -130,6 +130,7 @@ pub const NUM_SHARDS: u32 = 16;
 /// touches a bounded amount of storage regardless of how many commitments
 /// have ever landed in that shard.
 pub const SUB_SHARD_CAPACITY: u32 = 512;
+const LEGACY_SHARD_CURSOR_FLAG: u32 = 1 << 31;
 
 /// Issue #785: Maximum number of legacy (pre-sub-sharding) entries migrated
 /// into the bounded layout per call. Keeps migration cost bounded per
@@ -149,6 +150,8 @@ pub enum DataKey {
     OwnerIps(Address),
     NextId,
     CommitmentOwner(BytesN<32>), // tracks which owner already holds a commitment hash
+    CommitmentIpId(BytesN<32>), // maps a commitment hash directly to its IP ID
+    VerificationResult(BytesN<32>), // caches a verification result for its full input
     /// Maps commitment hash -> blinded owner identifier for anonymous commits
     AnonymousOwner(BytesN<32>),
     /// #464: Tracks blinded_owner values that have already been used for replay protection
@@ -275,7 +278,7 @@ const CURRENT_FUNCTIONS: &[&str] = &[
 /// contract reads or writes. Used as the compatibility baseline in
 /// `validate_upgrade`.
 const CURRENT_STORAGE_KEYS: &[&str] = &[
-    "IpRecord", "OwnerIps", "NextId", "CommitmentOwner", "AnonymousOwner", "UsedBlindedOwner",
+    "IpRecord", "OwnerIps", "NextId",         "CommitmentOwner", "CommitmentIpId", "VerificationResult", "AnonymousOwner", "UsedBlindedOwner",
     "Admin", "PartialDisclosure", "IpLicenses", "CategoryIps", "PowDifficulty", "IpVersions",
     "SuggestedPrice", "IpCommitmentChecksum", "IpAccessGrants", "NotarySignature", "IpVersionChain",
     "OwnershipChallenge", "NextChallengeId", "EncryptionKeyRotation", "NotaryPublicKey",
@@ -774,6 +777,7 @@ impl IpRegistry {
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::IpRecord(id), LEDGER_BUMP, LEDGER_BUMP);
+        Self::index_commitment(&env, &commitment_hash, id);
 
         // Store pow_difficulty for strength scoring (Issue: entropy/complexity scoring)
         env.storage()
@@ -921,6 +925,7 @@ impl IpRegistry {
             env.storage()
                 .persistent()
                 .extend_ttl(&DataKey::IpRecord(id), LEDGER_BUMP, LEDGER_BUMP);
+            Self::index_commitment(&env, &commitment_hash, id);
 
             // Append to owner index
             let mut owner_ids: Vec<u64> = env
@@ -1080,6 +1085,7 @@ impl IpRegistry {
             env.storage()
                 .persistent()
                 .extend_ttl(&DataKey::IpRecord(id), LEDGER_BUMP, LEDGER_BUMP);
+            Self::index_commitment(&env, &commitment_hash, id);
 
             // Do NOT append to OwnerIps index to preserve anonymity.
 
@@ -1882,6 +1888,21 @@ impl IpRegistry {
             }
         }
 
+        let cache_key = Self::verification_cache_key(
+            &env,
+            ip_id,
+            &record.commitment_hash,
+            &secret,
+            &blinding_factor,
+        );
+        if let Some(result) = env
+            .storage()
+            .persistent()
+            .get(&DataKey::VerificationResult(cache_key.clone()))
+        {
+            return result;
+        }
+
         // Concatenate secret || blinding_factor into Bytes, then SHA256
         let mut preimage = soroban_sdk::Bytes::new(&env);
         preimage.append(&secret.into());
@@ -1889,7 +1910,30 @@ impl IpRegistry {
         let computed_hash: BytesN<32> = env.crypto().sha256(&preimage).into();
 
         // Constant-time comparison to prevent timing side-channel attacks
-        constant_time_bytes_32_eq(&record.commitment_hash, &computed_hash)
+        let valid = constant_time_bytes_32_eq(&record.commitment_hash, &computed_hash);
+        env.storage()
+            .persistent()
+            .set(&DataKey::VerificationResult(cache_key.clone()), &valid);
+        env.storage().persistent().extend_ttl(
+            &DataKey::VerificationResult(cache_key),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+        valid
+    }
+
+    fn verification_cache_key(
+        env: &Env,
+        ip_id: u64,
+        commitment_hash: &BytesN<32>,
+        secret: &BytesN<32>,
+        blinding_factor: &BytesN<32>,
+    ) -> BytesN<32> {
+        let mut input = Bytes::from_array(env, &ip_id.to_be_bytes());
+        input.append(&commitment_hash.clone().into());
+        input.append(&secret.clone().into());
+        input.append(&blinding_factor.clone().into());
+        env.crypto().sha256(&input).into()
     }
 
     /// List all IP IDs owned by an address.
@@ -2468,6 +2512,7 @@ impl IpRegistry {
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::IpRecord(id), LEDGER_BUMP, LEDGER_BUMP);
+        Self::index_commitment(&env, &new_commitment_hash, id);
 
         // Add to owner's IP list
         let mut owner_ids: Vec<u64> = env
@@ -3275,6 +3320,16 @@ impl IpRegistry {
     /// Find an existing IP ID that holds the given commitment hash, if any.
     /// Returns `Some(ip_id)` if a duplicate exists, `None` otherwise.
     pub fn find_duplicate_commitment(env: Env, commitment_hash: BytesN<32>) -> Option<u64> {
+        if let Some(ip_id) = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CommitmentIpId(commitment_hash.clone()))
+        {
+            return Some(ip_id);
+        }
+
+        // Compatibility fallback for commitments written before the direct
+        // index existed. New writes never scan an owner's full history.
         let owner: Option<Address> = env
             .storage()
             .persistent()
@@ -3298,6 +3353,14 @@ impl IpRegistry {
             }
         }
         None
+    }
+
+    fn index_commitment(env: &Env, commitment_hash: &BytesN<32>, ip_id: u64) {
+        let key = DataKey::CommitmentIpId(commitment_hash.clone());
+        env.storage().persistent().set(&key, &ip_id);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, LEDGER_BUMP, LEDGER_BUMP);
     }
 
     /// Merge a duplicate IP commitment into the primary record.
@@ -3427,7 +3490,7 @@ impl IpRegistry {
         let legacy_key = DataKey::ShardIps(shard_id);
         let pos = cursor.unwrap_or_else(|| {
             if env.storage().persistent().has(&legacy_key) {
-                0
+                LEGACY_SHARD_CURSOR_FLAG
             } else {
                 1
             }
@@ -3438,13 +3501,24 @@ impl IpRegistry {
         // only shrinks after the fix ships (migrate_legacy_shard_batch is
         // the only writer to it), so its size is bounded by whatever had
         // already accumulated before deployment, not by ongoing growth.
-        if pos == 0 {
+        if pos & LEGACY_SHARD_CURSOR_FLAG != 0 {
             let legacy: Vec<u64> = env
                 .storage()
                 .persistent()
                 .get(&legacy_key)
                 .unwrap_or(Vec::new(&env));
-            return (legacy, Some(1));
+            let offset = pos & !LEGACY_SHARD_CURSOR_FLAG;
+            let page_end = core::cmp::min(offset + SUB_SHARD_CAPACITY, legacy.len());
+            let mut page = Vec::new(&env);
+            for i in offset..page_end {
+                page.push_back(legacy.get(i).unwrap());
+            }
+            let next_cursor = if page_end < legacy.len() {
+                Some(LEGACY_SHARD_CURSOR_FLAG | page_end)
+            } else {
+                Some(1)
+            };
+            return (page, next_cursor);
         }
 
         let sub_index = pos - 1;
@@ -4813,6 +4887,8 @@ impl IpRegistry {
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::IpRecord(id), LEDGER_BUMP, LEDGER_BUMP);
+
+        Self::index_commitment(&env, &commitment_hash, id);
 
         let mut ids: Vec<u64> = env
             .storage()
