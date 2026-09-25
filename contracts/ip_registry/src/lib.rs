@@ -149,6 +149,7 @@ pub enum DataKey {
     OwnerIps(Address),
     NextId,
     CommitmentOwner(BytesN<32>), // tracks which owner already holds a commitment hash
+    CommitmentIpId(BytesN<32>), // maps a commitment hash directly to its IP ID
     /// Maps commitment hash -> blinded owner identifier for anonymous commits
     AnonymousOwner(BytesN<32>),
     /// #464: Tracks blinded_owner values that have already been used for replay protection
@@ -275,7 +276,7 @@ const CURRENT_FUNCTIONS: &[&str] = &[
 /// contract reads or writes. Used as the compatibility baseline in
 /// `validate_upgrade`.
 const CURRENT_STORAGE_KEYS: &[&str] = &[
-    "IpRecord", "OwnerIps", "NextId", "CommitmentOwner", "AnonymousOwner", "UsedBlindedOwner",
+    "IpRecord", "OwnerIps", "NextId",     "CommitmentOwner", "CommitmentIpId", "AnonymousOwner", "UsedBlindedOwner",
     "Admin", "PartialDisclosure", "IpLicenses", "CategoryIps", "PowDifficulty", "IpVersions",
     "SuggestedPrice", "IpCommitmentChecksum", "IpAccessGrants", "NotarySignature", "IpVersionChain",
     "OwnershipChallenge", "NextChallengeId", "EncryptionKeyRotation", "NotaryPublicKey",
@@ -774,6 +775,7 @@ impl IpRegistry {
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::IpRecord(id), LEDGER_BUMP, LEDGER_BUMP);
+        Self::index_commitment(&env, &commitment_hash, id);
 
         // Store pow_difficulty for strength scoring (Issue: entropy/complexity scoring)
         env.storage()
@@ -921,6 +923,7 @@ impl IpRegistry {
             env.storage()
                 .persistent()
                 .extend_ttl(&DataKey::IpRecord(id), LEDGER_BUMP, LEDGER_BUMP);
+            Self::index_commitment(&env, &commitment_hash, id);
 
             // Append to owner index
             let mut owner_ids: Vec<u64> = env
@@ -1080,6 +1083,7 @@ impl IpRegistry {
             env.storage()
                 .persistent()
                 .extend_ttl(&DataKey::IpRecord(id), LEDGER_BUMP, LEDGER_BUMP);
+            Self::index_commitment(&env, &commitment_hash, id);
 
             // Do NOT append to OwnerIps index to preserve anonymity.
 
@@ -2468,6 +2472,7 @@ impl IpRegistry {
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::IpRecord(id), LEDGER_BUMP, LEDGER_BUMP);
+        Self::index_commitment(&env, &new_commitment_hash, id);
 
         // Add to owner's IP list
         let mut owner_ids: Vec<u64> = env
@@ -3275,6 +3280,16 @@ impl IpRegistry {
     /// Find an existing IP ID that holds the given commitment hash, if any.
     /// Returns `Some(ip_id)` if a duplicate exists, `None` otherwise.
     pub fn find_duplicate_commitment(env: Env, commitment_hash: BytesN<32>) -> Option<u64> {
+        if let Some(ip_id) = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CommitmentIpId(commitment_hash.clone()))
+        {
+            return Some(ip_id);
+        }
+
+        // Compatibility fallback for commitments written before the direct
+        // index existed. New writes never scan an owner's full history.
         let owner: Option<Address> = env
             .storage()
             .persistent()
@@ -3298,6 +3313,14 @@ impl IpRegistry {
             }
         }
         None
+    }
+
+    fn index_commitment(env: &Env, commitment_hash: &BytesN<32>, ip_id: u64) {
+        let key = DataKey::CommitmentIpId(commitment_hash.clone());
+        env.storage().persistent().set(&key, &ip_id);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, LEDGER_BUMP, LEDGER_BUMP);
     }
 
     /// Merge a duplicate IP commitment into the primary record.
@@ -4813,6 +4836,8 @@ impl IpRegistry {
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::IpRecord(id), LEDGER_BUMP, LEDGER_BUMP);
+
+        Self::index_commitment(&env, &commitment_hash, id);
 
         let mut ids: Vec<u64> = env
             .storage()
