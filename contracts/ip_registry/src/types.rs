@@ -76,6 +76,8 @@ pub struct IpRecord {
     pub notary_signature: Option<Bytes>, // Issue #345: notary signature for timestamp notarization
     pub expiry_timestamp: u64,           // 0 = no expiry
     pub grace_period_seconds: u64,       // seconds after expiry before permanent deletion
+    pub unlock_time: u64,                // #975: time-lock release timestamp, 0 = no time-lock
+    pub privacy_level: u32,              // #977: 0=Public, 1=Private, 2=Restricted, 3=Confidential
 }
 
 #[contracttype]

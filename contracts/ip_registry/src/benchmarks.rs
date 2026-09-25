@@ -238,4 +238,114 @@ mod benchmarks {
             ZK_VERIFY_BATCH10_CPU_LIMIT
         );
     }
+
+    // ── #974: Merkle Tree Batch Commitment Benchmarks ───────────────────
+
+    const MERKLE_BATCH_4_CPU_LIMIT: u64 = 500_000;
+    const MERKLE_BATCH_8_CPU_LIMIT: u64 = 1_000_000;
+    const MERKLE_BATCH_16_CPU_LIMIT: u64 = 2_000_000;
+    const MERKLE_PROOF_VERIFY_CPU_LIMIT: u64 = 300_000;
+
+    /// #974: Benchmark Merkle tree construction with 4 commitments.
+    #[test]
+    fn bench_merkle_batch_4_commitments() {
+        let (env, client) = setup();
+        let owner = Address::generate(&env);
+
+        let mut hashes = Vec::new(&env);
+        for i in 1u8..=4 {
+            hashes.push_back(BytesN::from_array(&env, &[i; 32]));
+        }
+
+        env.cost_estimate().budget().reset_default();
+        let root_id = client.batch_commit_merkle(&owner, &hashes);
+        let cpu = env.cost_estimate().budget().cpu_instruction_cost();
+
+        assert!(root_id > 0, "Merkle root should be created");
+        assert!(
+            cpu <= MERKLE_BATCH_4_CPU_LIMIT,
+            "bench_merkle_batch_4_commitments: {} instructions exceeds limit of {}",
+            cpu,
+            MERKLE_BATCH_4_CPU_LIMIT
+        );
+    }
+
+    /// #974: Benchmark Merkle tree construction with 8 commitments.
+    #[test]
+    fn bench_merkle_batch_8_commitments() {
+        let (env, client) = setup();
+        let owner = Address::generate(&env);
+
+        let mut hashes = Vec::new(&env);
+        for i in 1u8..=8 {
+            hashes.push_back(BytesN::from_array(&env, &[i; 32]));
+        }
+
+        env.cost_estimate().budget().reset_default();
+        let root_id = client.batch_commit_merkle(&owner, &hashes);
+        let cpu = env.cost_estimate().budget().cpu_instruction_cost();
+
+        assert!(root_id > 0, "Merkle root should be created");
+        assert!(
+            cpu <= MERKLE_BATCH_8_CPU_LIMIT,
+            "bench_merkle_batch_8_commitments: {} instructions exceeds limit of {}",
+            cpu,
+            MERKLE_BATCH_8_CPU_LIMIT
+        );
+    }
+
+    /// #974: Benchmark Merkle tree construction with 16 commitments.
+    #[test]
+    fn bench_merkle_batch_16_commitments() {
+        let (env, client) = setup();
+        let owner = Address::generate(&env);
+
+        let mut hashes = Vec::new(&env);
+        for i in 1u8..=16 {
+            hashes.push_back(BytesN::from_array(&env, &[i as u8; 32]));
+        }
+
+        env.cost_estimate().budget().reset_default();
+        let root_id = client.batch_commit_merkle(&owner, &hashes);
+        let cpu = env.cost_estimate().budget().cpu_instruction_cost();
+
+        assert!(root_id > 0, "Merkle root should be created");
+        assert!(
+            cpu <= MERKLE_BATCH_16_CPU_LIMIT,
+            "bench_merkle_batch_16_commitments: {} instructions exceeds limit of {}",
+            cpu,
+            MERKLE_BATCH_16_CPU_LIMIT
+        );
+    }
+
+    /// #974: Benchmark Merkle proof verification.
+    #[test]
+    fn bench_merkle_proof_verification() {
+        let (env, client) = setup();
+        let owner = Address::generate(&env);
+
+        let mut hashes = Vec::new(&env);
+        for i in 1u8..=8 {
+            hashes.push_back(BytesN::from_array(&env, &[i; 32]));
+        }
+
+        let root_id = client.batch_commit_merkle(&owner, &hashes);
+        let leaf_hash = BytesN::from_array(&env, &[1u8; 32]);
+        let proof = crate::MerkleProof {
+            leaf_index: 0,
+            proof_path: Vec::new(&env),
+        };
+
+        env.cost_estimate().budget().reset_default();
+        let valid = client.verify_merkle_proof(&root_id, &leaf_hash, &proof);
+        let cpu = env.cost_estimate().budget().cpu_instruction_cost();
+
+        assert!(valid, "Merkle proof should verify");
+        assert!(
+            cpu <= MERKLE_PROOF_VERIFY_CPU_LIMIT,
+            "bench_merkle_proof_verification: {} instructions exceeds limit of {}",
+            cpu,
+            MERKLE_PROOF_VERIFY_CPU_LIMIT
+        );
+    }
 }
