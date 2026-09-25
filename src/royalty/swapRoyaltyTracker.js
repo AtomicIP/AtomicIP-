@@ -14,7 +14,6 @@ const MAX_ROYALTY_RATE_BPS = 3000;
 const BPS_DENOM            = 10_000;
 const MAX_BENEFICIARIES    = 10;
 
-function validateRoyaltyConfig(config) {
 /**
  * Validate a royalty configuration object. Throws if invalid.
  *
@@ -137,10 +136,6 @@ function processPayouts(ledger, beneficiaryId, options = {}) {
 }
 
 /**
- * Query pending royalties owed to a beneficiary.
- */
-function getPendingRoyalties(ledger, beneficiaryId) {
-/**
  * Return all pending (unpaid) royalty ledger entries for a given beneficiary.
  *
  * @param {object[]} ledger        - royalty ledger (array of entries)
@@ -166,12 +161,13 @@ function processBatchRoyalties(transactions, ledger) {
     throw new TypeError("transactions must be a non-empty array.");
 
   const results = [];
-  const errors  = [];
+  const errors = [];
+  const pendingLedger = ledger || [];
 
   for (const tx of transactions) {
     try {
-      const calc    = calculateRoyalty(tx.config, tx.salePrice);
-      const entries = recordRoyaltyEvent(ledger, tx.swapId, calc);
+      const calc = calculateRoyalty(tx.config, tx.salePrice);
+      const entries = recordRoyaltyEvent(pendingLedger, tx.swapId, calc);
       results.push({ swapId: tx.swapId, calculation: calc, entries });
     } catch (err) {
       errors.push({ swapId: tx.swapId, error: err.message });
@@ -179,12 +175,37 @@ function processBatchRoyalties(transactions, ledger) {
   }
 
   return {
-    processed:               results.length,
-    failed:                  errors.length,
+    processed: results.length,
+    failed: errors.length,
     totalRoyaltiesGenerated: results.reduce((s, r) => s + r.calculation.totalRoyalty, 0),
     results,
     errors,
   };
+}
+
+async function processBatchRoyaltiesAsync(transactions, ledger, options = {}) {
+  const batchSize = options.batchSize ?? 25;
+  const work = Array.isArray(transactions) ? [...transactions] : [];
+
+  if (!Array.isArray(work) || work.length === 0) {
+    return Promise.reject(new TypeError("transactions must be a non-empty array."));
+  }
+
+  const ledgerTarget = Array.isArray(ledger) ? ledger : [];
+  const result = { processed: 0, failed: 0, totalRoyaltiesGenerated: 0, results: [], errors: [] };
+
+  for (let i = 0; i < work.length; i += batchSize) {
+    const chunk = work.slice(i, i + batchSize);
+    const chunkResult = processBatchRoyalties(chunk, ledgerTarget);
+    result.processed += chunkResult.processed;
+    result.failed += chunkResult.failed;
+    result.totalRoyaltiesGenerated += chunkResult.totalRoyaltiesGenerated;
+    result.results.push(...chunkResult.results);
+    result.errors.push(...chunkResult.errors);
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+
+  return result;
 }
 
 module.exports = {
@@ -193,6 +214,7 @@ module.exports = {
   processPayouts,
   getPendingRoyalties,
   processBatchRoyalties,
+  processBatchRoyaltiesAsync,
   validateRoyaltyConfig,
   MAX_ROYALTY_RATE_BPS,
   BPS_DENOM,

@@ -36,7 +36,8 @@ function validateSwaps(swaps) {
 function compressBatchSwaps(swaps) {
   validateSwaps(swaps);
   const json = JSON.stringify(swaps);
-  return zlib.deflateSync(Buffer.from(json, "utf8"));
+  const buffer = Buffer.from(json, "utf8");
+  return zlib.deflateSync(buffer, { level: zlib.constants.Z_BEST_COMPRESSION });
 }
 
 /**
@@ -48,11 +49,39 @@ function compressBatchSwaps(swaps) {
 function decompressBatchSwaps(compressed) {
   if (!Buffer.isBuffer(compressed) && !(compressed instanceof Uint8Array))
     throw new TypeError("compressed must be a Buffer.");
-  const json = zlib.inflateSync(compressed).toString("utf8");
+
+  const payload = Buffer.from(compressed);
+  const json = zlib.inflateSync(payload).toString("utf8");
   const swaps = JSON.parse(json);
   if (!Array.isArray(swaps))
     throw new Error("Decompressed data is not an array.");
   return swaps;
 }
 
-module.exports = { compressBatchSwaps, decompressBatchSwaps, MAX_BATCH_SIZE };
+async function compressBatchSwapsAsync(swaps) {
+  return new Promise((resolve, reject) => {
+    try {
+      resolve(compressBatchSwaps(swaps));
+    } catch (error) {
+      reject(error);
+    }
+  });
+}
+
+async function decompressBatchSwapsAsync(compressed) {
+  return new Promise((resolve, reject) => {
+    try {
+      resolve(decompressBatchSwaps(compressed));
+    } catch (error) {
+      reject(error);
+    }
+  });
+}
+
+module.exports = {
+  compressBatchSwaps,
+  compressBatchSwapsAsync,
+  decompressBatchSwaps,
+  decompressBatchSwapsAsync,
+  MAX_BATCH_SIZE,
+};

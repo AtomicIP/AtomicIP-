@@ -162,11 +162,14 @@ function matchOrders(buyOrders, sellOrders, options = {}) {
   validateBatch(buyOrders, sellOrders);
 
   const errors = [];
+  const invalidBuyIndexes = new Set();
+  const invalidSellIndexes = new Set();
 
   buyOrders.forEach((o, i) => {
     try {
       validateOrder(o, i, "buy");
     } catch (err) {
+      invalidBuyIndexes.add(i);
       errors.push({ index: i, orderId: o?.orderId ?? null, side: "buy", error: err.message });
     }
   });
@@ -175,6 +178,7 @@ function matchOrders(buyOrders, sellOrders, options = {}) {
     try {
       validateOrder(o, i, "sell");
     } catch (err) {
+      invalidSellIndexes.add(i);
       errors.push({ index: i, orderId: o?.orderId ?? null, side: "sell", error: err.message });
     }
   });
@@ -184,12 +188,8 @@ function matchOrders(buyOrders, sellOrders, options = {}) {
     throw new TypeError(`Unknown matching algorithm '${algorithm}'.`);
   }
 
-  const validBuys = buyOrders.filter((_, i) => {
-    return !errors.some((e) => e.side === "buy" && e.index === i);
-  });
-  const validSells = sellOrders.filter((_, i) => {
-    return !errors.some((e) => e.side === "sell" && e.index === i);
-  });
+  const validBuys = buyOrders.filter((_, i) => !invalidBuyIndexes.has(i));
+  const validSells = sellOrders.filter((_, i) => !invalidSellIndexes.has(i));
 
   let matches = [];
   let unmatchedBuys = [];
@@ -221,8 +221,15 @@ function matchOrders(buyOrders, sellOrders, options = {}) {
   };
 }
 
+async function matchOrdersAsync(buyOrders, sellOrders, options = {}) {
+  return new Promise((resolve) => {
+    setImmediate(() => resolve(matchOrders(buyOrders, sellOrders, options)));
+  });
+}
+
 module.exports = {
   matchOrders,
+  matchOrdersAsync,
   MATCHING_ALGORITHMS,
   MAX_BATCH_SIZE,
 };
