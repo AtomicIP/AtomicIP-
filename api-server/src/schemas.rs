@@ -7,6 +7,15 @@ pub struct CommitIpRequest {
     pub owner: String,
     /// 32-byte Pedersen commitment hash, hex-encoded
     pub commitment_hash: String,
+    /// Optional labels used to organize the commitment.
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct CommitmentTagsResponse {
+    pub ip_id: u64,
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]

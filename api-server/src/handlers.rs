@@ -88,7 +88,26 @@ pub async fn commit_ip(
             )
         })?;
 
+    crate::commitments::set_tags(ip_id, body.tags).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse { error }),
+        )
+    })?;
     Ok(Json(ip_id))
+}
+
+/// List IP commitment IDs organized under a tag.
+#[utoipa::path(
+    get,
+    path = "/v1/ip/tag/{tag}",
+    tag = "IP Registry",
+    params(("tag" = String, Path, description = "Commitment tag")),
+    responses((status = 200, description = "Commitments with the tag", body = Vec<u64>))
+)]
+#[instrument]
+pub async fn list_commitments_by_tag(Path(tag): Path<String>) -> impl IntoResponse {
+    Json(crate::commitments::list_by_tag(&tag))
 }
 
 /// Retrieve an IP record by ID.
