@@ -4092,4 +4092,274 @@ mod batch_escrow_tests {
         });
         assert!(result.is_err(), "zero/oversized key must be rejected");
     }
+
+    // ── Tests for Issue #974: Merkle Tree Batch Commitments ──────────────
+
+    #[test]
+    fn test_batch_commit_merkle_single_commitment() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let hash1 = BytesN::from_array(&env, &[0xAAu8; 32]);
+        let mut hashes = soroban_sdk::Vec::new(&env);
+        hashes.push_back(hash1.clone());
+
+        let root_id = client.batch_commit_merkle(&owner, &hashes);
+        assert!(root_id > 0, "root_id should be positive");
+    }
+
+    #[test]
+    fn test_batch_commit_merkle_multiple_commitments() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let mut hashes = soroban_sdk::Vec::new(&env);
+        for i in 0..4 {
+            hashes.push_back(BytesN::from_array(&env, &[i as u8; 32]));
+        }
+
+        let root_id = client.batch_commit_merkle(&owner, &hashes);
+        assert!(root_id > 0, "root_id should be positive");
+    }
+
+    #[test]
+    fn test_verify_merkle_proof_valid() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let hash1 = BytesN::from_array(&env, &[0xAAu8; 32]);
+        let hash2 = BytesN::from_array(&env, &[0xBBu8; 32]);
+        let mut hashes = soroban_sdk::Vec::new(&env);
+        hashes.push_back(hash1.clone());
+        hashes.push_back(hash2.clone());
+
+        let root_id = client.batch_commit_merkle(&owner, &hashes);
+
+        let proof = crate::MerkleProof {
+            leaf_index: 0,
+            proof_path: soroban_sdk::Vec::new(&env),
+        };
+
+        let valid = client.verify_merkle_proof(&root_id, &hash1, &proof);
+        assert!(valid, "Merkle proof should be valid");
+    }
+
+    // ── Tests for Issue #975: Time-Lock Commitments ──────────────────────
+
+    #[test]
+    fn test_create_time_locked_commitment() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[0xCCu8; 32]);
+        let current_time = env.ledger().timestamp();
+        let unlock_time = current_time + 3600;
+
+        let ip_id = client.create_time_locked_commitment(&owner, &hash, &unlock_time);
+        assert!(ip_id > 0, "ip_id should be positive");
+
+        let record = client.get_ip(&ip_id);
+        assert_eq!(record.unlock_time, unlock_time, "unlock_time should match");
+    }
+
+    #[test]
+    fn test_time_lock_prevents_early_unlock() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[0xDDu8; 32]);
+        let current_time = env.ledger().timestamp();
+        let unlock_time = current_time + 3600;
+
+        let ip_id = client.create_time_locked_commitment(&owner, &hash, &unlock_time);
+
+        let result = std::panic::catch_unwind(|| {
+            client.unlock_commitment(&ip_id);
+        });
+        assert!(result.is_err(), "unlock should fail before time expires");
+    }
+
+    #[test]
+    fn test_unlock_time_in_past_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[0xEEu8; 32]);
+        let current_time = env.ledger().timestamp();
+        let unlock_time = current_time - 1;
+
+        let result = std::panic::catch_unwind(|| {
+            client.create_time_locked_commitment(&owner, &hash, &unlock_time);
+        });
+        assert!(result.is_err(), "creation with past unlock time should fail");
+    }
+
+    // ── Tests for Issue #976: Commitment Amendment ────────────────────────
+
+    #[test]
+    fn test_amend_commitment_basic() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let old_hash = BytesN::from_array(&env, &[0xFFu8; 32]);
+        let new_hash = BytesN::from_array(&env, &[0x11u8; 32]);
+
+        let ip_id = client.commit_ip(&owner, &old_hash, &0u32);
+        let amended = client.amend_commitment(&ip_id, &new_hash);
+        assert!(amended, "amendment should succeed");
+
+        let record = client.get_ip(&ip_id);
+        assert_eq!(record.commitment_hash, new_hash, "hash should be updated");
+    }
+
+    #[test]
+    fn test_amend_commitment_requires_owner_auth() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let other = Address::generate(&env);
+        let old_hash = BytesN::from_array(&env, &[0x22u8; 32]);
+        let new_hash = BytesN::from_array(&env, &[0x33u8; 32]);
+
+        let ip_id = client.commit_ip(&owner, &old_hash, &0u32);
+
+        env.as_contract(&contract_id, || {
+            let result = std::panic::catch_unwind(|| {
+                other.require_auth();
+                client.amend_commitment(&ip_id, &new_hash);
+            });
+            assert!(result.is_err(), "non-owner amendment should fail");
+        });
+    }
+
+    // ── Tests for Issue #977: Commitment Privacy Levels ──────────────────
+
+    #[test]
+    fn test_set_commitment_privacy_public() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[0x44u8; 32]);
+        let ip_id = client.commit_ip(&owner, &hash, &0u32);
+
+        let allowed = soroban_sdk::Vec::new(&env);
+        let success = client.set_commitment_privacy(&ip_id, &0u32, &allowed);
+        assert!(success, "setting public privacy should succeed");
+
+        let record = client.get_ip(&ip_id);
+        assert_eq!(record.privacy_level, 0, "privacy_level should be 0");
+    }
+
+    #[test]
+    fn test_set_commitment_privacy_restricted() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let allowed_user = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[0x55u8; 32]);
+        let ip_id = client.commit_ip(&owner, &hash, &0u32);
+
+        let mut allowed = soroban_sdk::Vec::new(&env);
+        allowed.push_back(allowed_user.clone());
+        let success = client.set_commitment_privacy(&ip_id, &2u32, &allowed);
+        assert!(success, "setting restricted privacy should succeed");
+
+        let record = client.get_ip(&ip_id);
+        assert_eq!(record.privacy_level, 2, "privacy_level should be 2");
+    }
+
+    #[test]
+    fn test_check_commitment_access_public() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let requester = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[0x66u8; 32]);
+        let ip_id = client.commit_ip(&owner, &hash, &0u32);
+
+        let allowed = soroban_sdk::Vec::new(&env);
+        client.set_commitment_privacy(&ip_id, &0u32, &allowed);
+
+        let access = client.check_commitment_access(&ip_id, &requester);
+        assert!(access, "anyone should access public commitment");
+    }
+
+    #[test]
+    fn test_check_commitment_access_private() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let other = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[0x77u8; 32]);
+        let ip_id = client.commit_ip(&owner, &hash, &0u32);
+
+        let allowed = soroban_sdk::Vec::new(&env);
+        client.set_commitment_privacy(&ip_id, &1u32, &allowed);
+
+        let access = client.check_commitment_access(&ip_id, &other);
+        assert!(!access, "non-owner should not access private commitment");
+
+        let owner_access = client.check_commitment_access(&ip_id, &owner);
+        assert!(owner_access, "owner should always access their commitment");
+    }
+
+    #[test]
+    fn test_check_commitment_access_restricted() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let allowed_user = Address::generate(&env);
+        let denied_user = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[0x88u8; 32]);
+        let ip_id = client.commit_ip(&owner, &hash, &0u32);
+
+        let mut allowed = soroban_sdk::Vec::new(&env);
+        allowed.push_back(allowed_user.clone());
+        client.set_commitment_privacy(&ip_id, &2u32, &allowed);
+
+        let allowed_access = client.check_commitment_access(&ip_id, &allowed_user);
+        assert!(allowed_access, "allowed user should have access");
+
+        let denied_access = client.check_commitment_access(&ip_id, &denied_user);
+        assert!(!denied_access, "non-allowed user should not have access");
+    }
 }
