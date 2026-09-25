@@ -240,7 +240,7 @@ pub async fn list_ip_by_owner(
     Query(pagination): Query<PaginationParams>,
     axum::extract::State(client): axum::extract::State<Arc<SorobanQueryClient>>,
 ) -> impl IntoResponse {
-    let limit = pagination.limit.clamp(1, 200);
+    let limit = pagination.limit.clamp(1, MAX_PAGE_SIZE);
     let offset = pagination.offset;
 
     // #316: Check cache
@@ -302,7 +302,7 @@ pub async fn list_ip_by_owner_cursor(
     Query(pagination): Query<CursorPaginationParams>,
     axum::extract::State(client): axum::extract::State<Arc<SorobanQueryClient>>,
 ) -> impl IntoResponse {
-    let limit = pagination.limit.clamp(1, 200);
+    let limit = pagination.limit.clamp(1, MAX_PAGE_SIZE);
 
     // Decode cursor if provided
     let offset = match pagination.cursor {

@@ -55,6 +55,8 @@ pub struct LinkedStellarAccountsResponse {
 }
 
 /// #317: Pagination query parameters shared across list endpoints.
+pub const MAX_PAGE_SIZE: u64 = 200;
+
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct PaginationParams {
     /// Maximum number of items to return (default: 50, max: 200).
