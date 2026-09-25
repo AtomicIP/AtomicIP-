@@ -188,12 +188,8 @@ function matchOrders(buyOrders, sellOrders, options = {}) {
     throw new TypeError(`Unknown matching algorithm '${algorithm}'.`);
   }
 
-  const validBuys = buyOrders.filter((_, i) => {
-    return !errors.some((e) => e.side === "buy" && e.index === i);
-  });
-  const validSells = sellOrders.filter((_, i) => {
-    return !errors.some((e) => e.side === "sell" && e.index === i);
-  });
+  const validBuys = buyOrders.filter((_, i) => !invalidBuyIndexes.has(i));
+  const validSells = sellOrders.filter((_, i) => !invalidSellIndexes.has(i));
 
   let matches = [];
   let unmatchedBuys = [];
