@@ -24,6 +24,8 @@ For each IP commitment, securely store all three values together:
 | `ip_id` | The on-chain ID returned by `commit_ip` |
 
 Losing any one of these makes it impossible to call `verify_commitment` or complete a swap.
+See the [commitment recovery guide](commitment-recovery.md) for the recovery
+process and the limits of what can be reconstructed from chain data.
 
 ### If Your Secret Is Compromised
 
