@@ -681,8 +681,22 @@ pub async fn register_webhook(Json(body): Json<RegisterWebhookRequest>) -> Resul
             }),
         ));
     }
+    let url = reqwest::Url::parse(&body.url).map_err(|_| (
+        StatusCode::BAD_REQUEST,
+        Json(ErrorResponse {
+            error: "Webhook URL must be a valid HTTP(S) URL".to_string(),
+        }),
+    ))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Webhook URL must use HTTP or HTTPS".to_string(),
+            }),
+        ));
+    }
 
-    let config = webhook::register(body.url, body.events);
+    let config = webhook::register(url.to_string(), body.events);
 
     Ok(Json(WebhookResponse {
         id: config.id.to_string(),
