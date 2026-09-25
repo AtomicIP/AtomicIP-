@@ -162,11 +162,14 @@ function matchOrders(buyOrders, sellOrders, options = {}) {
   validateBatch(buyOrders, sellOrders);
 
   const errors = [];
+  const invalidBuyIndexes = new Set();
+  const invalidSellIndexes = new Set();
 
   buyOrders.forEach((o, i) => {
     try {
       validateOrder(o, i, "buy");
     } catch (err) {
+      invalidBuyIndexes.add(i);
       errors.push({ index: i, orderId: o?.orderId ?? null, side: "buy", error: err.message });
     }
   });
@@ -175,6 +178,7 @@ function matchOrders(buyOrders, sellOrders, options = {}) {
     try {
       validateOrder(o, i, "sell");
     } catch (err) {
+      invalidSellIndexes.add(i);
       errors.push({ index: i, orderId: o?.orderId ?? null, side: "sell", error: err.message });
     }
   });
