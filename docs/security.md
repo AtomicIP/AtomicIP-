@@ -41,6 +41,17 @@ Immediately revoke the IP record using `revoke_ip` and re-register with a new se
 
 Every API request must be signed with your Stellar Ed25519 keypair to prove ownership of your address.
 
+### JWT Secret Configuration
+
+The API server reads `JWT_SECRET` from the deployment secret manager. It must
+contain at least 32 bytes; the server refuses to issue or validate tokens when
+it is missing or too short. Configure this value through the runtime's secret
+injection mechanism (for example, an orchestrator secret or CI environment
+secret), not in source control or a checked-in `.env` file. Use the same
+managed value for every API instance so tokens remain valid during rolling
+deployments, and rotate it through the deployment system when invalidating all
+active tokens.
+
 ### Request Signature Scheme
 
 The API server enforces request signing using Ed25519 (Stellar's standard). Signatures bind four pieces of data:
