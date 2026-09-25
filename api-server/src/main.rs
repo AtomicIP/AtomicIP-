@@ -17,6 +17,7 @@ struct AppState {
     ws_broadcaster:   Arc<websocket::EventBroadcaster>,
     sse_broadcaster:  Arc<events::EventBroadcaster>,
     health_checker:   Arc<health::HealthChecker>,
+    rate_limiter:     Arc<rate_limit::RateLimitMiddleware>,
 }
 
 impl FromRef<AppState> for Arc<health::HealthChecker> {
@@ -31,13 +32,23 @@ impl FromRef<AppState> for Arc<dyn graphql::SorobanRpcClient> {
     }
 }
 
+impl FromRef<AppState> for Arc<rate_limit::RateLimitMiddleware> {
+    fn from_ref(state: &AppState) -> Self {
+        state.rate_limiter.clone()
+    }
+}
+
 mod auth;
+mod auth_2fa;
+mod session;
 mod batch;
 mod cache;
 mod commitments;
 mod analytics;
 mod circuit_breaker;
+mod connection_pool;
 mod deduplication;
+mod event_topics;
 mod events;
 mod graphql;
 mod handlers;
@@ -54,6 +65,7 @@ mod invariants;
 mod health;
 mod compression;
 mod fallback;
+mod sdk;
 mod distributed_tracing;
 mod error_recovery;
 mod otel;
@@ -63,6 +75,8 @@ mod validation;
 mod validation_middleware;
 #[cfg(test)]
 mod validation_fuzz_tests;
+#[cfg(test)]
+mod snapshot_tests;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -95,6 +109,12 @@ mod validation_fuzz_tests;
         handlers::unregister_webhook,
         handlers::bulk_commit_ip,
         handlers::bulk_initiate_swap,
+        handlers::execute_batch_swaps,
+        handlers::enable_2fa,
+        handlers::verify_2fa,
+        handlers::use_backup_code,
+        handlers::check_session,
+        handlers::extend_session,
         batch::batch_handler,
         events::events_handler,
     ),
@@ -124,6 +144,17 @@ mod validation_fuzz_tests;
         schemas::BulkInitiateSwapRequest,
         schemas::BulkInitiateSwapResponse,
         schemas::BulkOperationResult<schemas::IpRecord>,
+        schemas::ExecuteBatchSwapsRequest,
+        schemas::ExecuteBatchSwapsResponse,
+        schemas::Enable2faRequest,
+        schemas::Enable2faResponse,
+        schemas::Verify2faRequest,
+        schemas::Verify2faResponse,
+        schemas::UseBackupCodeRequest,
+        schemas::CheckSessionRequest,
+        schemas::CheckSessionResponse,
+        schemas::ExtendSessionRequest,
+        schemas::ExtendSessionResponse,
     )),
     tags(
         (name = "IP Registry", description = "Commit and query intellectual property records"),
@@ -131,6 +162,8 @@ mod validation_fuzz_tests;
         (name = "Webhooks", description = "Real-time event notifications"),
         (name = "Batch", description = "Batch API operations"),
         (name = "Events", description = "Server-Sent Events stream"),
+        (name = "Admin", description = "Administrative endpoints for monitoring and audit"),
+        (name = "Auth", description = "Authentication and account recovery"),
     )
 )]
 pub struct ApiDoc;
@@ -204,6 +237,8 @@ async fn main() {
         subscription_broadcaster.clone(),
     );
 
+    let rate_limiter = Arc::new(rate_limit::RateLimitMiddleware::new(rate_limit::RateLimitConfig::default()));
+
     let state = AppState {
         schema,
         query_client,
@@ -211,9 +246,8 @@ async fn main() {
         ws_broadcaster:  Arc::new(websocket::EventBroadcaster::new()),
         sse_broadcaster: Arc::new(events::create_event_broadcaster().0),
         health_checker:  Arc::new(health::HealthChecker::new()),
+        rate_limiter: rate_limiter.clone(),
     };
-
-    let rate_limiter = rate_limit::RateLimitMiddleware::new(rate_limit::RateLimitConfig::default());
     let request_queue = Arc::new(request_queue::RequestQueue::new(
         request_queue::QueueConfig::default(),
     ));
@@ -241,6 +275,12 @@ async fn main() {
         .route("/ws",              get(ws_handler))
         .route("/events",          get(events_handler))
         .route("/batch",           post(batch::batch_handler))
+        .route("/v1/admin/audit/logs",               get(handlers::get_audit_logs))
+        .route("/v1/admin/audit/suspicious-patterns", get(handlers::get_suspicious_patterns))
+        .route("/v1/auth/recovery/initiate",      post(account_recovery::initiate_recovery))
+        .route("/v1/auth/recovery/verify-token",  post(account_recovery::verify_recovery_token))
+        .route("/v1/auth/recovery/questions",     get(account_recovery::get_security_questions))
+        .route("/v1/auth/recovery/verify-question", post(account_recovery::verify_security_question))
         .route("/ip/{ip_id}",                     get(handlers::get_ip))
         .route("/ip/verify",                      post(handlers::verify_commitment))
         .route("/ip/owner/{owner}",               get(handlers::list_ip_by_owner))
@@ -348,6 +388,12 @@ fn build_app() -> Router {
         .route("/ws", get(ws_handler))
         .route("/events", get(events_handler))
         .route("/batch", post(batch::batch_handler))
+        .route("/v1/admin/audit/logs", get(handlers::get_audit_logs))
+        .route("/v1/admin/audit/suspicious-patterns", get(handlers::get_suspicious_patterns))
+        .route("/v1/auth/recovery/initiate", post(account_recovery::initiate_recovery))
+        .route("/v1/auth/recovery/verify-token", post(account_recovery::verify_recovery_token))
+        .route("/v1/auth/recovery/questions", get(account_recovery::get_security_questions))
+        .route("/v1/auth/recovery/verify-question", post(account_recovery::verify_security_question))
         .route("/v1/graphql", post(graphql_handler))
         .route("/v1/ip/commit", post(handlers::commit_ip).layer(signed.clone()))
         .route("/v1/ip/{ip_id}", get(handlers::get_ip))
@@ -373,6 +419,12 @@ fn build_app() -> Router {
         .route("/v1/swap/{swap_id}", get(handlers::get_swap))
         .route("/v1/bulk/commit-ip", post(handlers::bulk_commit_ip))
         .route("/v1/bulk/initiate-swap", post(handlers::bulk_initiate_swap))
+        .route("/v1/swaps/execute-batch", post(handlers::execute_batch_swaps))
+        .route("/auth/2fa/enable", post(handlers::enable_2fa))
+        .route("/auth/2fa/verify", post(handlers::verify_2fa))
+        .route("/auth/2fa/backup-code", post(handlers::use_backup_code))
+        .route("/auth/session/status", post(handlers::check_session))
+        .route("/auth/extend-session", post(handlers::extend_session))
         .route("/openapi.json", get(openapi_handler))
         .with_state(state)
         .layer(middleware::from_fn_with_state(rate_limiter, rate_limit::rate_limit_middleware))

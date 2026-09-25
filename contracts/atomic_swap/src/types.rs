@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, BytesN, Vec};
+use soroban_sdk::{contracttype, Address, Bytes, BytesN, String, Vec};
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
 
@@ -595,4 +595,82 @@ pub struct BatchEscrowArbitrationEvent {
 pub struct BatchTimeoutAutoResolvedEvent {
     pub swap_ids: Vec<u64>,
     pub count: u32,
+}
+
+// ── #980: Escrow Arbitrator Decision ───────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum ArbitratorDecision {
+    /// Release funds to buyer (IP ownership transfer fails or is disputed)
+    RefundToBuyer,
+    /// Release funds to seller (IP ownership transfer is valid)
+    ConfirmToSeller,
+    /// Partial refund: both parties get a split amount
+    PartialRefund(i128), // i128 is the amount refunded to buyer, rest to seller
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct EscrowSwapResolvedEvent {
+    pub swap_id: u64,
+    pub arbiter: Address,
+    pub decision: ArbitratorDecision,
+    pub timestamp: u64,
+}
+
+// ── #981: Swap Metadata and Deal Terms ─────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SwapMetadata {
+    /// Versioned structured deal terms for compliance and transparency
+    pub terms: Bytes,
+    /// Version number for tracking deal term updates
+    pub version: u32,
+    /// Metadata blob containing deal context and conditions
+    pub metadata: Bytes,
+    /// Unix timestamp when metadata was set
+    pub created_at: u64,
+    /// Optional: reference URI for the full deal document
+    pub terms_uri: Option<String>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SwapMetadataUpdatedEvent {
+    pub swap_id: u64,
+    pub version: u32,
+    pub terms_hash: BytesN<32>,
+    pub timestamp: u64,
+}
+
+// ── #982: Batch Execution ─────────────────────────────────────────────────────
+
+/// Execution mode for batch swaps - determines atomicity semantics.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum BatchExecutionMode {
+    /// Atomic: all-or-nothing. Fails if any swap fails.
+    Atomic,
+    /// Partial: best-effort. Executes all possible swaps, skips failures.
+    Partial,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct BatchSwapExecutedEvent {
+    pub batch_id: BytesN<32>,
+    pub swap_ids: Vec<u64>,
+    pub successful: u32,
+    pub failed: u32,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct BatchExecutionFailedEvent {
+    pub batch_id: BytesN<32>,
+    pub failed_swap_ids: Vec<u64>,
+    pub reason: String,
 }
