@@ -651,76 +651,6 @@ pub async fn get_swap(
         ).into_response();
     }
 
-    async fn marketplace_response(
-        result: Result<crate::graphql::SwapConnection, String>,
-    ) -> axum::response::Response {
-        match result {
-            Ok(connection) => (
-                StatusCode::OK,
-                Json(MarketplaceResponse {
-                    swap_ids: connection.swap_ids,
-                    next_cursor: connection.cursor,
-                    has_more: connection.has_next_page,
-                }),
-            ).into_response(),
-            Err(error) => {
-                tracing::error!(%error, "failed to query marketplace swaps");
-                (
-                    StatusCode::BAD_GATEWAY,
-                    Json(ErrorResponse { error: "failed to query swap marketplace".to_string() }),
-                ).into_response()
-            }
-        }
-    }
-
-    /// Discover swaps listed by a seller.
-    #[utoipa::path(
-        get,
-        path = "/v1/swap/marketplace/seller/{seller}",
-        tag = "Marketplace",
-        params(("seller" = String, Path), CursorPaginationParams),
-        responses((status = 200, description = "Seller marketplace listings", body = MarketplaceResponse))
-    )]
-    pub async fn marketplace_by_seller(
-        State(rpc_client): State<Arc<dyn crate::graphql::SorobanRpcClient>>,
-        Path(seller): Path<String>,
-        Query(pagination): Query<CursorPaginationParams>,
-    ) -> impl IntoResponse {
-        marketplace_response(rpc_client.get_swaps_by_seller(&seller, pagination.limit.min(200), pagination.cursor).await).await
-    }
-
-    /// Discover swaps available to a buyer.
-    #[utoipa::path(
-        get,
-        path = "/v1/swap/marketplace/buyer/{buyer}",
-        tag = "Marketplace",
-        params(("buyer" = String, Path), CursorPaginationParams),
-        responses((status = 200, description = "Buyer marketplace listings", body = MarketplaceResponse))
-    )]
-    pub async fn marketplace_by_buyer(
-        State(rpc_client): State<Arc<dyn crate::graphql::SorobanRpcClient>>,
-        Path(buyer): Path<String>,
-        Query(pagination): Query<CursorPaginationParams>,
-    ) -> impl IntoResponse {
-        marketplace_response(rpc_client.get_swaps_by_buyer(&buyer, pagination.limit.min(200), pagination.cursor).await).await
-    }
-
-    /// Discover swaps for an IP record.
-    #[utoipa::path(
-        get,
-        path = "/v1/swap/marketplace/ip/{ip_id}",
-        tag = "Marketplace",
-        params(("ip_id" = u64, Path), CursorPaginationParams),
-        responses((status = 200, description = "IP marketplace listings", body = MarketplaceResponse))
-    )]
-    pub async fn marketplace_by_ip(
-        State(rpc_client): State<Arc<dyn crate::graphql::SorobanRpcClient>>,
-        Path(ip_id): Path<u64>,
-        Query(pagination): Query<CursorPaginationParams>,
-    ) -> impl IntoResponse {
-        marketplace_response(rpc_client.get_swaps_by_ip(ip_id, pagination.limit.min(200), pagination.cursor).await).await
-    }
-
     // #316: On cache miss, read through to the Soroban RPC layer and backfill
     // the cache so subsequent lookups hit the fast path.
     match rpc_client.get_swap_record(swap_id).await {
@@ -764,6 +694,76 @@ impl From<crate::graphql::SwapRecord> for SwapRecord {
             expiry: record.expiry,
         }
     }
+}
+
+async fn marketplace_response(
+    result: Result<crate::graphql::SwapConnection, String>,
+) -> axum::response::Response {
+    match result {
+        Ok(connection) => (
+            StatusCode::OK,
+            Json(MarketplaceResponse {
+                swap_ids: connection.swap_ids,
+                next_cursor: connection.cursor,
+                has_more: connection.has_next_page,
+            }),
+        ).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to query marketplace swaps");
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorResponse { error: "failed to query swap marketplace".to_string() }),
+            ).into_response()
+        }
+    }
+}
+
+/// Discover swaps listed by a seller.
+#[utoipa::path(
+    get,
+    path = "/v1/swap/marketplace/seller/{seller}",
+    tag = "Marketplace",
+    params(("seller" = String, Path), CursorPaginationParams),
+    responses((status = 200, description = "Seller marketplace listings", body = MarketplaceResponse))
+)]
+pub async fn marketplace_by_seller(
+    State(rpc_client): State<Arc<dyn crate::graphql::SorobanRpcClient>>,
+    Path(seller): Path<String>,
+    Query(pagination): Query<CursorPaginationParams>,
+) -> impl IntoResponse {
+    marketplace_response(rpc_client.get_swaps_by_seller(&seller, pagination.limit.min(200), pagination.cursor).await).await
+}
+
+/// Discover swaps available to a buyer.
+#[utoipa::path(
+    get,
+    path = "/v1/swap/marketplace/buyer/{buyer}",
+    tag = "Marketplace",
+    params(("buyer" = String, Path), CursorPaginationParams),
+    responses((status = 200, description = "Buyer marketplace listings", body = MarketplaceResponse))
+)]
+pub async fn marketplace_by_buyer(
+    State(rpc_client): State<Arc<dyn crate::graphql::SorobanRpcClient>>,
+    Path(buyer): Path<String>,
+    Query(pagination): Query<CursorPaginationParams>,
+) -> impl IntoResponse {
+    marketplace_response(rpc_client.get_swaps_by_buyer(&buyer, pagination.limit.min(200), pagination.cursor).await).await
+}
+
+/// Discover swaps for an IP record.
+#[utoipa::path(
+    get,
+    path = "/v1/swap/marketplace/ip/{ip_id}",
+    tag = "Marketplace",
+    params(("ip_id" = u64, Path), CursorPaginationParams),
+    responses((status = 200, description = "IP marketplace listings", body = MarketplaceResponse))
+)]
+pub async fn marketplace_by_ip(
+    State(rpc_client): State<Arc<dyn crate::graphql::SorobanRpcClient>>,
+    Path(ip_id): Path<u64>,
+    Query(pagination): Query<CursorPaginationParams>,
+) -> impl IntoResponse {
+    marketplace_response(rpc_client.get_swaps_by_ip(ip_id, pagination.limit.min(200), pagination.cursor).await).await
 }
 
 // ── Webhooks ──────────────────────────────────────────────────────────────────
