@@ -72,4 +72,6 @@ pub enum ContractError {
     InsufficientInsuranceReserve          = 67,
     // #906: Treasury address validation
     InvalidTreasuryAddress                = 68,
+    HashlockNotMet                       = 69,
+    TimelockExpired                     = 70,
 }

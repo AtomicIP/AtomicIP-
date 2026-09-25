@@ -938,3 +938,18 @@ the rotation).
 
 `encryptionKeyRotationCompatibility.test.js` verifies this end-to-end and runs as part
 of the standard `npm test` suite.
+# Conditional hash-time-locked swaps
+
+Conditional acceptance supports `Hashlock(hash)` and `Timelock(timestamp)` in
+addition to the existing conditions. The seller must reveal a secret whose
+SHA-256 digest matches the hashlock before the swap can complete. If the
+timelock passes first, the buyer can call `refund_htlc` to reclaim the
+escrowed payment. A hashlock and timelock can be supplied together to model a
+standard HTLC.
+
+## Partial execution
+
+`accept_swap_partial` accepts a requested quantity between one and the
+available quantity and charges the proportional price. Approval requirements
+and non-key conditions are enforced for partial acceptance just as they are
+for a full acceptance.

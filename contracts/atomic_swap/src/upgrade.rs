@@ -262,6 +262,7 @@ pub fn build_v1_schema(env: &Env) -> ContractSchema {
     f!("cancel_swap",              "cancel_swap(swap_id:u64,canceller:Address)->()");
     f!("cancel_pending_swap",      "cancel_pending_swap(swap_id:u64,caller:Address)->()");
     f!("cancel_expired_swap",      "cancel_expired_swap(swap_id:u64,caller:Address)->()");
+    f!("refund_htlc",              "refund_htlc(swap_id:u64,caller:Address)->()");
     f!("raise_dispute",            "raise_dispute(swap_id:u64)->()");
     f!("resolve_dispute",          "resolve_dispute(swap_id:u64,caller:Address,refunded:bool)->()");
     f!("auto_resolve_dispute",     "auto_resolve_dispute(swap_id:u64)->()");
@@ -327,6 +328,8 @@ pub fn build_v1_schema(env: &Env) -> ContractSchema {
     e!("ConditionNotMet",                       58);
     e!("InsuranceNotEnabled",                   59);
     e!("InsuranceNotClaimable",                 60);
+    e!("HashlockNotMet",                        69);
+    e!("TimelockExpired",                       70);
 
     let mut storage_keys: Vec<String> = Vec::new(env);
 
