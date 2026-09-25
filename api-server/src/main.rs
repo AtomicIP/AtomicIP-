@@ -89,6 +89,7 @@ mod validation_fuzz_tests;
         handlers::cancel_expired_swap,
         handlers::get_swap,
         handlers::register_webhook,
+        handlers::list_webhooks,
         handlers::unregister_webhook,
         handlers::bulk_commit_ip,
         handlers::bulk_initiate_swap,
@@ -244,6 +245,8 @@ async fn main() {
         .route("/ip/owner/{owner}/cursor",        get(handlers::list_ip_by_owner_cursor))
         .route("/ip/tag/{tag}",                   get(handlers::list_commitments_by_tag))
         .route("/analytics/commitments",          get(handlers::commitment_analytics))
+        .route("/webhooks",                       post(handlers::register_webhook).get(handlers::list_webhooks))
+        .route("/webhooks/{id}",                  axum::routing::delete(handlers::unregister_webhook))
         .route("/swap/initiate",                  post(handlers::initiate_swap).layer(signed.clone()))
         .route("/swap/batch-initiate",            post(handlers::batch_initiate_swap))
         .route("/swap/{swap_id}/accept",          post(handlers::accept_swap).layer(signed.clone()))
@@ -358,6 +361,8 @@ fn build_app() -> Router {
         .route("/v1/ip/owner/{owner}/cursor", get(handlers::list_ip_by_owner_cursor))
         .route("/v1/ip/tag/{tag}", get(handlers::list_commitments_by_tag))
         .route("/v1/analytics/commitments", get(handlers::commitment_analytics))
+        .route("/v1/webhooks", post(handlers::register_webhook).get(handlers::list_webhooks))
+        .route("/v1/webhooks/{id}", axum::routing::delete(handlers::unregister_webhook))
         .route("/v1/ip/owner/{owner}/cursor", get(handlers::list_ip_by_owner_cursor))
         .route("/v1/swap/initiate", post(handlers::initiate_swap))
         .route("/v1/swap/batch-initiate", post(handlers::batch_initiate_swap))
@@ -367,8 +372,6 @@ fn build_app() -> Router {
         .route("/v1/swap/{swap_id}/cancel", post(handlers::cancel_swap).layer(signed.clone()))
         .route("/v1/swap/{swap_id}/cancel-expired", post(handlers::cancel_expired_swap))
         .route("/v1/swap/{swap_id}", get(handlers::get_swap))
-        .route("/v1/webhooks", post(handlers::register_webhook))
-        .route("/v1/webhooks/{id}", axum::routing::delete(handlers::unregister_webhook))
         .route("/v1/bulk/commit-ip", post(handlers::bulk_commit_ip))
         .route("/v1/bulk/initiate-swap", post(handlers::bulk_initiate_swap))
         .route("/openapi.json", get(openapi_handler))

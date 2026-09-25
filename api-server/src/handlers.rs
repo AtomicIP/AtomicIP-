@@ -710,11 +710,14 @@ impl From<crate::graphql::SwapRecord> for SwapRecord {
     )
 )]
 pub async fn register_webhook(Json(body): Json<RegisterWebhookRequest>) -> Result<Json<WebhookResponse>, (StatusCode, Json<ErrorResponse>)> {
-    if body.url.is_empty() || body.events.is_empty() {
+    let parsed_url = reqwest::Url::parse(&body.url);
+    if parsed_url.as_ref().map(|url| !matches!(url.scheme(), "http" | "https")).unwrap_or(true)
+        || body.events.is_empty()
+        || body.events.iter().any(|event| event != "*" && event != "swap.status_changed") {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
-                error: "URL and events are required".to_string(),
+                error: "url must be an HTTP(S) URL and events must contain swap.status_changed or *".to_string(),
             }),
         ));
     }
@@ -727,6 +730,23 @@ pub async fn register_webhook(Json(body): Json<RegisterWebhookRequest>) -> Resul
         events: config.events,
         created_at: config.created_at,
     }))
+}
+
+/// List registered webhook subscriptions.
+#[utoipa::path(
+    get,
+    path = "/v1/webhooks",
+    tag = "Webhooks",
+    responses((status = 200, description = "Registered webhooks", body = Vec<WebhookResponse>))
+)]
+pub async fn list_webhooks() -> impl IntoResponse {
+    let webhooks = webhook::list_all().into_iter().map(|config| WebhookResponse {
+        id: config.id.to_string(),
+        url: config.url,
+        events: config.events,
+        created_at: config.created_at,
+    }).collect::<Vec<_>>();
+    Json(webhooks)
 }
 
 /// Unregister a webhook by ID.
