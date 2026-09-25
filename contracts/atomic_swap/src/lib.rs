@@ -855,6 +855,18 @@ impl AtomicSwap {
             }
         }
 
+        for i in 0..swap.conditions.len() {
+            if let Some(SwapCondition::Hashlock(expected)) = swap.conditions.get(i) {
+                let secret_bytes: Bytes = secret.clone().into();
+                let hash: BytesN<32> = env.crypto().sha256(&secret_bytes).into();
+                if hash != expected {
+                    env.panic_with_error(Error::from_contract_error(
+                        ContractError::HashlockNotMet as u32,
+                    ));
+                }
+            }
+        }
+
         let valid = registry::verify_commitment(&env, swap.ip_id, &secret, &blinding_factor);
         if !valid {
             // #354: If insurance is enabled, mark swap as claimable before panicking.
@@ -869,16 +881,6 @@ impl AtomicSwap {
                 );
             }
 
-            for i in 0..swap.conditions.len() {
-                if let Some(SwapCondition::Hashlock(expected)) = swap.conditions.get(i) {
-                    let hash: BytesN<32> = env.crypto().sha256(&secret.clone().into()).into();
-                    if hash != expected {
-                        env.panic_with_error(Error::from_contract_error(
-                            ContractError::HashlockNotMet as u32,
-                        ));
-                    }
-                }
-            }
             env.panic_with_error(Error::from_contract_error(ContractError::InvalidKey as u32));
         }
 
