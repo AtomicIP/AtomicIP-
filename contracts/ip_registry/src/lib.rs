@@ -151,6 +151,7 @@ pub enum DataKey {
     NextId,
     CommitmentOwner(BytesN<32>), // tracks which owner already holds a commitment hash
     CommitmentIpId(BytesN<32>), // maps a commitment hash directly to its IP ID
+    VerificationResult(BytesN<32>), // caches a verification result for its full input
     /// Maps commitment hash -> blinded owner identifier for anonymous commits
     AnonymousOwner(BytesN<32>),
     /// #464: Tracks blinded_owner values that have already been used for replay protection
@@ -277,7 +278,7 @@ const CURRENT_FUNCTIONS: &[&str] = &[
 /// contract reads or writes. Used as the compatibility baseline in
 /// `validate_upgrade`.
 const CURRENT_STORAGE_KEYS: &[&str] = &[
-    "IpRecord", "OwnerIps", "NextId",     "CommitmentOwner", "CommitmentIpId", "AnonymousOwner", "UsedBlindedOwner",
+    "IpRecord", "OwnerIps", "NextId",         "CommitmentOwner", "CommitmentIpId", "VerificationResult", "AnonymousOwner", "UsedBlindedOwner",
     "Admin", "PartialDisclosure", "IpLicenses", "CategoryIps", "PowDifficulty", "IpVersions",
     "SuggestedPrice", "IpCommitmentChecksum", "IpAccessGrants", "NotarySignature", "IpVersionChain",
     "OwnershipChallenge", "NextChallengeId", "EncryptionKeyRotation", "NotaryPublicKey",
@@ -1887,6 +1888,21 @@ impl IpRegistry {
             }
         }
 
+        let cache_key = Self::verification_cache_key(
+            &env,
+            ip_id,
+            &record.commitment_hash,
+            &secret,
+            &blinding_factor,
+        );
+        if let Some(result) = env
+            .storage()
+            .persistent()
+            .get(&DataKey::VerificationResult(cache_key.clone()))
+        {
+            return result;
+        }
+
         // Concatenate secret || blinding_factor into Bytes, then SHA256
         let mut preimage = soroban_sdk::Bytes::new(&env);
         preimage.append(&secret.into());
@@ -1894,7 +1910,30 @@ impl IpRegistry {
         let computed_hash: BytesN<32> = env.crypto().sha256(&preimage).into();
 
         // Constant-time comparison to prevent timing side-channel attacks
-        constant_time_bytes_32_eq(&record.commitment_hash, &computed_hash)
+        let valid = constant_time_bytes_32_eq(&record.commitment_hash, &computed_hash);
+        env.storage()
+            .persistent()
+            .set(&DataKey::VerificationResult(cache_key.clone()), &valid);
+        env.storage().persistent().extend_ttl(
+            &DataKey::VerificationResult(cache_key),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+        valid
+    }
+
+    fn verification_cache_key(
+        env: &Env,
+        ip_id: u64,
+        commitment_hash: &BytesN<32>,
+        secret: &BytesN<32>,
+        blinding_factor: &BytesN<32>,
+    ) -> BytesN<32> {
+        let mut input = Bytes::from_array(env, &ip_id.to_be_bytes());
+        input.append(&commitment_hash.clone().into());
+        input.append(&secret.clone().into());
+        input.append(&blinding_factor.clone().into());
+        env.crypto().sha256(&input).into()
     }
 
     /// List all IP IDs owned by an address.
