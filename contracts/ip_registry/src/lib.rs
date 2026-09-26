@@ -191,6 +191,32 @@ const SHARD_MIGRATION_BATCH: u32 = 64;
 /// Supports paths like "Software/Cryptography/ZK-Proofs/DLV/AXIOM" (depth 5).
 pub const MAX_CATEGORY_DEPTH: u32 = 10;
 
+fn commitment_hash(
+    env: &Env,
+    secret: &BytesN<32>,
+    blinding_factor: &BytesN<32>,
+    algorithm: CommitmentAlgorithm,
+) -> BytesN<32> {
+    let mut preimage = Bytes::new(env);
+    preimage.append(&secret.clone().into());
+    preimage.append(&blinding_factor.clone().into());
+
+    match algorithm {
+        // Preserve the historical Pedersen-compatible wire format used by
+        // existing records while allowing new records to select another hash.
+        CommitmentAlgorithm::Pedersen | CommitmentAlgorithm::Sha256 => {
+            env.crypto().sha256(&preimage).into()
+        }
+        CommitmentAlgorithm::Blake3 => {
+            let mut input = [0u8; 64];
+            for i in 0..preimage.len() {
+                input[i as usize] = preimage.get(i).unwrap();
+            }
+            BytesN::from_array(env, blake3::hash(&input).as_bytes())
+        }
+    }
+}
+
 // ── Storage Keys ────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -262,6 +288,9 @@ pub enum DataKey {
     MerkleRoot(Address),
     // Issue #812: Flag indicating the cached Merkle root for an owner is stale
     MerkleRootStale(Address),
+    /// Issue #812: cached proof path tied to the root used to generate it.
+    MerkleProof(u64),
+    CommitmentAlgorithm(u64),
     // Issue #979: Commitment linking for related IPs
     CommitmentLinks(u64), // maps ip_id -> Vec<CommitmentLink> of linked commitments
     LinkedCommitments(u64), // maps linked_ip_id -> Vec<u64> of ip_ids linking to it (reverse index)
@@ -317,7 +346,7 @@ const CURRENT_FUNCTIONS: &[&str] = &[
     "batch_commit_ip_anonymous", "batch_delegate_commitment", "batch_escrow_commitments", "batch_renew_ip",
     "batch_stake_commitments", "batch_update_reputation", "batch_verify_commitments", "cancel_batch_escrow",
     "check_expiration_warning", "check_ip_access", "cleanup_expired_ips", "commit_ip",
-    "commit_ip_delegated", "commit_ip_version", "compute_ip_merkle_root", "create_ip_version",
+    "commit_ip_delegated", "commit_ip_version", "commit_ip_with_algorithm", "compute_ip_merkle_root", "create_ip_version",
     "delegate_commitment_authority", "encrypt_commitment", "finalize_arbitration", "find_duplicate_commitment",
     "generate_merkle_proof", "get_anonymous_owner", "get_arbitration", "get_batch_escrow",
     "get_batch_metadata", "get_blinded_owner_batch", "get_commitment_compression", "get_commitment_shard",
@@ -357,7 +386,7 @@ const CURRENT_STORAGE_KEYS: &[&str] = &[
     "OwnerReputation", "ArbitrationCase", "NextArbitrationId", "ArbitratorPool",
     "CompressedCommitment", "BatchVerifyResult", "CompressionSelection", "HierarchyNode",
     "OwnerCategories", "CategoryDepth", "ThresholdConfig", "ThresholdSignatures", "BatchMetadata",
-    "EncryptedCommitment", "BatchEscrow", "CommitmentLinks", "LinkedCommitments",
+    "EncryptedCommitment", "BatchEscrow", "MerkleProof", "CommitmentAlgorithm", "CommitmentLinks", "LinkedCommitments",
 ];
 
 /// (error name, error code) pairs defined by the currently deployed contract.
@@ -987,6 +1016,23 @@ impl IpRegistry {
         commitment_hash: BytesN<32>,
         pow_difficulty: u32,
     ) -> u64 {
+        Self::commit_ip_with_algorithm(
+            env,
+            owner,
+            commitment_hash,
+            pow_difficulty,
+            CommitmentAlgorithm::Pedersen,
+        )
+    }
+
+    /// Commit an IP using an explicitly selected commitment hash algorithm.
+    pub fn commit_ip_with_algorithm(
+        env: Env,
+        owner: Address,
+        commitment_hash: BytesN<32>,
+        pow_difficulty: u32,
+        algorithm: CommitmentAlgorithm,
+    ) -> u64 {
         // Enforced by the Soroban host: panics if the transaction does not carry
         // a valid authorization for `owner`. This is the correct auth pattern.
         owner.require_auth();
@@ -1038,6 +1084,14 @@ impl IpRegistry {
             .set(&DataKey::IpPowDifficulty(id), &pow_difficulty);
         env.storage().persistent().extend_ttl(
             &DataKey::IpPowDifficulty(id),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::CommitmentAlgorithm(id), &algorithm);
+        env.storage().persistent().extend_ttl(
+            &DataKey::CommitmentAlgorithm(id),
             LEDGER_BUMP,
             LEDGER_BUMP,
         );
@@ -2608,11 +2662,12 @@ impl IpRegistry {
             }
         }
 
-        // Concatenate secret || blinding_factor into Bytes, then SHA256
-        let mut preimage = soroban_sdk::Bytes::new(&env);
-        preimage.append(&secret.into());
-        preimage.append(&blinding_factor.into());
-        let computed_hash: BytesN<32> = env.crypto().sha256(&preimage).into();
+        let algorithm: CommitmentAlgorithm = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CommitmentAlgorithm(ip_id))
+            .unwrap_or(CommitmentAlgorithm::Pedersen);
+        let computed_hash = commitment_hash(&env, &secret, &blinding_factor, algorithm);
 
         // Constant-time comparison to prevent timing side-channel attacks
         constant_time_bytes_32_eq(&record.commitment_hash, &computed_hash)
@@ -3551,6 +3606,16 @@ impl IpRegistry {
     /// Panics if the IP does not exist.
     pub fn generate_merkle_proof(env: Env, ip_id: u64) -> Vec<BytesN<32>> {
         let record = require_ip_exists(&env, ip_id);
+        let root = Self::get_merkle_root(env.clone(), record.owner.clone());
+        if let Some(cached) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, MerkleProofCache>(&DataKey::MerkleProof(ip_id))
+        {
+            if cached.root == root {
+                return cached.proof;
+            }
+        }
 
         let ip_ids: Vec<u64> = env
             .storage()
@@ -3576,7 +3641,18 @@ impl IpRegistry {
             }
         }
 
-        Self::build_merkle_proof(&env, &leaves, found_index)
+        let proof = Self::build_merkle_proof(&env, &leaves, found_index);
+        let cached = MerkleProofCache {
+            root,
+            proof: proof.clone(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::MerkleProof(ip_id), &cached);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::MerkleProof(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+        proof
     }
 
     /// Build a Merkle proof for the leaf at `index` in `leaves`.

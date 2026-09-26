@@ -189,7 +189,6 @@ pub mod cursor {
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct CursorData {
         pub last_id: u64,
-        pub offset: u64,
     }
 
     /// Encode a cursor from cursor data.
@@ -205,14 +204,14 @@ pub mod cursor {
         serde_json::from_str(&json).ok()
     }
 
-    /// Create a cursor from the last item ID and offset.
-    pub fn new(last_id: u64, offset: u64) -> String {
-        encode(&CursorData { last_id, offset })
+    /// Create a cursor from the last item ID.
+    pub fn new(last_id: u64) -> String {
+        encode(&CursorData { last_id })
     }
 
     /// Get the next cursor for the following page.
-    pub fn next_cursor(last_id: u64, current_offset: u64, items_per_page: u64) -> String {
-        new(last_id, current_offset + items_per_page)
+    pub fn next_cursor(last_id: u64) -> String {
+        new(last_id)
     }
 }
 
@@ -223,17 +222,16 @@ mod cursor_tests {
 
     #[test]
     fn test_cursor_encode_decode_roundtrip() {
-        let data = cursor::CursorData { last_id: 100, offset: 50 };
+        let data = cursor::CursorData { last_id: 100 };
         let encoded = cursor::encode(&data);
         let decoded = cursor::decode(&encoded).unwrap();
         assert_eq!(decoded.last_id, 100);
-        assert_eq!(decoded.offset, 50);
     }
 
     #[test]
     fn test_cursor_new_and_next() {
-        let cursor = cursor::new(50, 0);
-        let next = cursor::next_cursor(50, 0, 20);
+        let cursor = cursor::new(50);
+        let next = cursor::next_cursor(50);
         assert_ne!(cursor, next);
     }
 
