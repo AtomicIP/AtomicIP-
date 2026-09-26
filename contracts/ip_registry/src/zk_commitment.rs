@@ -25,6 +25,8 @@
 //! this module only verifies. As with any Schnorr-style proof, a nonce must
 //! never be reused across two different messages/commitments or the secret
 //! can be recovered.
+//!
+//! Design rationale: docs/adr/0002-pedersen-commitments-for-privacy.md
 
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
 use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};

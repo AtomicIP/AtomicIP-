@@ -124,6 +124,9 @@ pub async fn commit_ip(
         ));
     }
 
+    // #1064: track the new commitment entering the Active lifecycle state.
+    crate::commitment_monitoring::COMMITMENT_MONITOR.record_commit(1);
+
     Ok(Json(ip_id))
 }
 

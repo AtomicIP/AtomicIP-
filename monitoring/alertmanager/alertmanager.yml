@@ -1,0 +1,75 @@
+# #1065: Alertmanager configuration implementing alert-fatigue reduction.
+# Mirrors the in-process pipeline in api-server/src/alerting.rs:
+#   deduplication -> group_by / group_interval / repeat_interval
+#   correlation   -> inhibit_rules
+#   silencing     -> `amtool silence add` (see docs/alerting-best-practices.md)
+#   escalation    -> severity-based routes with increasing urgency
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: slack-default
+  # Deduplication: identical alerts collapse into one group notification.
+  group_by: ["alertname", "network", "service"]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    - matchers: ['severity="critical"']
+      receiver: pagerduty-oncall
+      group_wait: 10s
+      repeat_interval: 30m
+      continue: true
+    - matchers: ['severity="critical"']
+      receiver: slack-incidents
+    - matchers: ['severity="warning"']
+      receiver: slack-default
+      repeat_interval: 4h
+    - matchers: ['severity="info"']
+      receiver: slack-digest
+      group_by: ["team"]
+      group_wait: 10m
+      group_interval: 6h
+      repeat_interval: 24h
+
+# Correlation: suppress symptom alerts while their root cause is firing.
+inhibit_rules:
+  - source_matchers: ['alertname="SorobanRpcUnavailable"']
+    target_matchers:
+      - alertname=~"HighErrorRate|HighLatency|CommitmentRateDrop|SwapCompletionStalled"
+    equal: ["network"]
+  - source_matchers: ['alertname="RedisUnavailable"']
+    target_matchers:
+      - alertname=~"HighLatency|RateLimiterDegraded"
+  - source_matchers: ['alertname="CommitmentSpike"']
+    target_matchers:
+      - alertname=~"CommitmentRateLimitHits|HighErrorRate"
+  # A critical alert suppresses the warning-level variant of the same alert.
+  - source_matchers: ['severity="critical"']
+    target_matchers: ['severity="warning"']
+    equal: ["alertname", "network"]
+  - source_matchers: ['alertname="ApiServerDown"']
+    target_matchers: ['service="api-server"']
+
+receivers:
+  - name: slack-default
+    slack_configs:
+      - api_url_file: /etc/alertmanager/secrets/slack-webhook
+        channel: "#atomicip-alerts"
+        send_resolved: true
+        title: '[{{ .Status | toUpper }}] {{ .CommonLabels.alertname }} ({{ .Alerts | len }})'
+        text: '{{ range .Alerts }}{{ .Annotations.summary }} {{ if .Annotations.runbook }}— runbook: {{ .Annotations.runbook }}{{ end }}{{ "\n" }}{{ end }}'
+  - name: slack-incidents
+    slack_configs:
+      - api_url_file: /etc/alertmanager/secrets/slack-webhook
+        channel: "#atomicip-incidents"
+        send_resolved: true
+  - name: slack-digest
+    slack_configs:
+      - api_url_file: /etc/alertmanager/secrets/slack-webhook
+        channel: "#atomicip-digest"
+        send_resolved: false
+  - name: pagerduty-oncall
+    pagerduty_configs:
+      - routing_key_file: /etc/alertmanager/secrets/pagerduty-key
+        severity: critical

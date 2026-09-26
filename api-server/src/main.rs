@@ -38,12 +38,14 @@ impl FromRef<AppState> for Arc<rate_limit::RateLimitMiddleware> {
     }
 }
 
+mod alerting;
 mod auth;
 mod auth_2fa;
 mod session;
 mod batch;
 mod cache;
 mod circuit_breaker;
+mod commitment_monitoring;
 mod connection_pool;
 mod deduplication;
 mod event_topics;
@@ -218,6 +220,8 @@ async fn main() {
     let tracer_provider = otel::init_tracer();
 
     metrics::init();
+    // #1064/#1065: periodic lifecycle anomaly detection + alert escalation.
+    commitment_monitoring::spawn_background_evaluator();
 
     let subscription_broadcaster = init_subscription_broadcaster().await;
     let rpc_client: Arc<dyn graphql::SorobanRpcClient> = Arc::new(graphql::MockSorobanRpcClient::default());
@@ -267,6 +271,8 @@ async fn main() {
         .route("/batch",           post(batch::batch_handler))
         .route("/v1/admin/audit/logs",               get(handlers::get_audit_logs))
         .route("/v1/admin/audit/suspicious-patterns", get(handlers::get_suspicious_patterns))
+        .route("/v1/admin/commitments/lifecycle", get(commitment_monitoring::lifecycle_handler))
+        .route("/v1/admin/alerts", get(commitment_monitoring::open_alerts_handler))
         .route("/v1/auth/recovery/initiate",      post(account_recovery::initiate_recovery))
         .route("/v1/auth/recovery/verify-token",  post(account_recovery::verify_recovery_token))
         .route("/v1/auth/recovery/questions",     get(account_recovery::get_security_questions))
@@ -382,6 +388,8 @@ fn build_app() -> Router {
         .route("/batch", post(batch::batch_handler))
         .route("/v1/admin/audit/logs", get(handlers::get_audit_logs))
         .route("/v1/admin/audit/suspicious-patterns", get(handlers::get_suspicious_patterns))
+        .route("/v1/admin/commitments/lifecycle", get(commitment_monitoring::lifecycle_handler))
+        .route("/v1/admin/alerts", get(commitment_monitoring::open_alerts_handler))
         .route("/v1/auth/recovery/initiate", post(account_recovery::initiate_recovery))
         .route("/v1/auth/recovery/verify-token", post(account_recovery::verify_recovery_token))
         .route("/v1/auth/recovery/questions", get(account_recovery::get_security_questions))
