@@ -1,0 +1,100 @@
+name: Canary Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: Container image and tag to deploy
+        required: true
+        type: string
+      namespace:
+        description: Kubernetes namespace
+        required: true
+        default: production
+        type: string
+      service:
+        description: Service shared by stable and canary deployments
+        required: true
+        default: atomicip
+        type: string
+      metrics_url:
+        description: Endpoint returning {"error_rate": number}
+        required: true
+        type: string
+      max_error_rate:
+        description: Maximum allowed error rate percentage
+        required: true
+        default: "1"
+        type: string
+
+concurrency:
+  group: canary-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      NAMESPACE: ${{ inputs.namespace }}
+      SERVICE: ${{ inputs.service }}
+      IMAGE: ${{ inputs.image }}
+      METRICS_URL: ${{ inputs.metrics_url }}
+      MAX_ERROR_RATE: ${{ inputs.max_error_rate }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure kubectl
+        uses: azure/k8s-set-context@v4
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.KUBE_CONFIG }}
+
+      - name: Start five percent canary
+        id: rollout
+        shell: bash
+        run: |
+          set -euo pipefail
+          stable="${SERVICE}-stable"
+          canary="${SERVICE}-canary"
+          stable_replicas=$(kubectl -n "$NAMESPACE" get deployment "$stable" \
+            -o jsonpath='{.spec.replicas}')
+          kubectl -n "$NAMESPACE" set image "deployment/${canary}" "${SERVICE}=${IMAGE}"
+          kubectl -n "$NAMESPACE" scale deployment "$canary" --replicas=1
+          kubectl -n "$NAMESPACE" rollout status "deployment/${canary}" --timeout=10m
+          echo "stable_replicas=$stable_replicas" >> "$GITHUB_OUTPUT"
+          echo "canary=$canary" >> "$GITHUB_OUTPUT"
+
+      - name: Check canary metrics
+        shell: bash
+        run: |
+          set -euo pipefail
+          payload=$(curl --fail --silent "$METRICS_URL")
+          error_rate=$(jq -er '.error_rate | tonumber' <<< "$payload")
+          awk -v actual="$error_rate" -v maximum="$MAX_ERROR_RATE" \
+            'BEGIN { if (actual > maximum) exit 1 }'
+
+      - name: Increase canary traffic
+        shell: bash
+        run: |
+          set -euo pipefail
+          stable="${SERVICE}-stable"
+          canary="${SERVICE}-canary"
+          for canary_replicas in 5 10 20; do
+            stable_replicas=$((20 - canary_replicas))
+            kubectl -n "$NAMESPACE" scale deployment "$canary" --replicas="$canary_replicas"
+            kubectl -n "$NAMESPACE" scale deployment "$stable" --replicas="$stable_replicas"
+            kubectl -n "$NAMESPACE" rollout status "deployment/${canary}" --timeout=10m
+            sleep 30
+            payload=$(curl --fail --silent "$METRICS_URL")
+            error_rate=$(jq -er '.error_rate | tonumber' <<< "$payload")
+            awk -v actual="$error_rate" -v maximum="$MAX_ERROR_RATE" \
+              'BEGIN { if (actual > maximum) exit 1 }'
+          done
+
+      - name: Roll back canary
+        if: failure() && steps.rollout.outputs.stable_replicas != ''
+        run: |
+          kubectl -n "$NAMESPACE" scale deployment "${SERVICE}-canary" --replicas=0
+          kubectl -n "$NAMESPACE" scale deployment "${SERVICE}-stable" \
+            --replicas="${{ steps.rollout.outputs.stable_replicas }}"
