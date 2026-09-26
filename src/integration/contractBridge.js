@@ -19,156 +19,107 @@ class ContractBridge {
     this.contractId = contractId;
   }
 
-  /**
-   * Send a batch cancellation decision to the contract.
-   * Converts JS batch result to contract state mutations.
-   *
-   * @param {Object} batchResult - Result from cancelBatchSwaps()
-   * @returns {Promise<Object>} Transaction result from contract
-   */
-  async submitBatchCancellations(batchResult) {
+  submitBatchCancellations(batchResult) {
     if (!batchResult || typeof batchResult !== "object") {
       throw new TypeError("batchResult must be an object");
     }
 
     if (batchResult.cancelledCount === 0) {
-      return {
+      return Promise.resolve({
         success: false,
         message: "No swaps were successfully cancelled",
         error: "NOTHING_TO_SUBMIT",
-      };
-    }
-
-    const cancellations = batchResult.results.map((result) => ({
-      swap_id: result.swapId,
-      new_state: result.newState,
-      refund_amount: result.refundAmount,
-      refund_policy: result.refundPolicy,
-      reason: result.reason || "",
-      timestamp: result.cancelledAt,
-    }));
-
-    try {
-      const txResponse = await this._invokeContract("cancel_batch_swaps", {
-        cancellations,
       });
-
-      return {
-        success: true,
-        message: `${batchResult.cancelledCount} swaps cancelled`,
-        transactionHash: txResponse.hash,
-        ledger: txResponse.ledger,
-        results: batchResult.results,
-        failedCount: batchResult.failedCount,
-      };
-    } catch (error) {
-      return {
-        success: false,
-        message: "Contract invocation failed",
-        error: error.message,
-        results: batchResult.results,
-        failedCount: batchResult.failedCount,
-      };
     }
+
+    return Promise.resolve().then(() => {
+      const cancellations = batchResult.results.map((result) => ({
+        swap_id: result.swapId,
+        new_state: result.newState,
+        refund_amount: result.refundAmount,
+        refund_policy: result.refundPolicy,
+        reason: result.reason || "",
+        timestamp: result.cancelledAt,
+      }));
+
+      return this._invokeContract("cancel_batch_swaps", { cancellations });
+    }).then((txResponse) => ({
+      success: true,
+      message: `${batchResult.cancelledCount} swaps cancelled`,
+      transactionHash: txResponse.hash,
+      ledger: txResponse.ledger,
+      results: batchResult.results,
+      failedCount: batchResult.failedCount,
+    })).catch((error) => ({
+      success: false,
+      message: "Contract invocation failed",
+      error: error.message,
+      results: batchResult.results,
+      failedCount: batchResult.failedCount,
+    }));
   }
 
-  /**
-   * Send a batch dispute resolution to the contract.
-   * Converts JS batch result to contract state mutations.
-   *
-   * @param {Object} batchResult - Result from resolveBatchDisputes()
-   * @returns {Promise<Object>} Transaction result from contract
-   */
-  async submitBatchDisputeResolutions(batchResult) {
+  submitBatchDisputeResolutions(batchResult) {
     if (!batchResult || typeof batchResult !== "object") {
       throw new TypeError("batchResult must be an object");
     }
 
     const successCount = batchResult.resolvedCount + batchResult.escalatedCount;
     if (successCount === 0) {
-      return {
+      return Promise.resolve({
         success: false,
         message: "No disputes were successfully resolved",
         error: "NOTHING_TO_SUBMIT",
-      };
-    }
-
-    const resolutions = batchResult.results.map((result) => ({
-      swap_id: result.swapId,
-      new_state: result.newState,
-      resolution_type: result.resolutionType,
-      initiator_amount: result.initiatorAmount,
-      counterparty_amount: result.counterpartyAmount,
-      split_ratio: result.splitRatio || null,
-      reason: result.reason || "",
-      timestamp: result.resolvedAt,
-    }));
-
-    try {
-      const txResponse = await this._invokeContract("resolve_batch_disputes", {
-        resolutions,
       });
-
-      return {
-        success: true,
-        message: `${batchResult.resolvedCount} disputes resolved, ${batchResult.escalatedCount} escalated`,
-        transactionHash: txResponse.hash,
-        ledger: txResponse.ledger,
-        results: batchResult.results,
-        failedCount: batchResult.failedCount,
-      };
-    } catch (error) {
-      return {
-        success: false,
-        message: "Contract invocation failed",
-        error: error.message,
-        results: batchResult.results,
-        failedCount: batchResult.failedCount,
-      };
     }
+
+    return Promise.resolve().then(() => {
+      const resolutions = batchResult.results.map((result) => ({
+        swap_id: result.swapId,
+        new_state: result.newState,
+        resolution_type: result.resolutionType,
+        initiator_amount: result.initiatorAmount,
+        counterparty_amount: result.counterpartyAmount,
+        split_ratio: result.splitRatio || null,
+        reason: result.reason || "",
+        timestamp: result.resolvedAt,
+      }));
+
+      return this._invokeContract("resolve_batch_disputes", { resolutions });
+    }).then((txResponse) => ({
+      success: true,
+      message: `${batchResult.resolvedCount} disputes resolved, ${batchResult.escalatedCount} escalated`,
+      transactionHash: txResponse.hash,
+      ledger: txResponse.ledger,
+      results: batchResult.results,
+      failedCount: batchResult.failedCount,
+    })).catch((error) => ({
+      success: false,
+      message: "Contract invocation failed",
+      error: error.message,
+      results: batchResult.results,
+      failedCount: batchResult.failedCount,
+    }));
   }
 
-  /**
-   * Query contract state for a swap.
-   *
-   * @param {string} swapId
-   * @returns {Promise<Object>} Swap state from contract
-   */
-  async getSwapState(swapId) {
+  getSwapState(swapId) {
     if (!swapId) {
       throw new TypeError("swapId is required");
     }
 
-    try {
-      const result = await this._invokeContract("get_swap", { swap_id: swapId });
-      return {
+    return Promise.resolve()
+      .then(() => this._invokeContract("get_swap", { swap_id: swapId }))
+      .then((result) => ({
         success: true,
         data: result,
-      };
-    } catch (error) {
-      return {
+      }))
+      .catch((error) => ({
         success: false,
         error: error.message,
-      };
-    }
+      }));
   }
 
-  /**
-   * Internal: Invoke a contract method via Soroban RPC.
-   * This is a placeholder implementation.
-   *
-   * @private
-   * @param {string} method - Contract method name
-   * @param {Object} params - Method parameters
-   * @returns {Promise<Object>} RPC response
-   */
   async _invokeContract(method, params) {
-    // This is a reference implementation. In production:
-    // 1. Use stellar-sdk to build transactions
-    // 2. Sign with user wallet
-    // 3. Submit to Soroban RPC endpoint
-    // 4. Poll for transaction confirmation
-
     const payload = {
       method: "sorobanRpc_simulateTransaction",
       params: {
@@ -183,9 +134,7 @@ class ContractBridge {
     });
 
     if (!response.ok) {
-      throw new Error(
-        `RPC error: ${response.status} ${response.statusText}`
-      );
+      throw new Error(`RPC error: ${response.status} ${response.statusText}`);
     }
 
     const result = await response.json();
@@ -200,18 +149,7 @@ class ContractBridge {
     };
   }
 
-  /**
-   * Internal: Build a contract invocation transaction.
-   *
-   * @private
-   * @param {string} method - Contract method name
-   * @param {Object} params - Method parameters
-   * @returns {string} Serialized transaction (XDR format)
-   */
   _buildContractInvocation(method, params) {
-    // This is where a real implementation would use stellar-sdk
-    // to construct a proper InvokeHostFunction transaction.
-    // For now, return a placeholder.
     return `contract_invocation_${method}_${JSON.stringify(params).length}`;
   }
 }
