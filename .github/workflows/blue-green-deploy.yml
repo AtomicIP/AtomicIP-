@@ -1,0 +1,105 @@
+name: Blue-Green Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: Container image and tag to deploy
+        required: true
+        type: string
+      namespace:
+        description: Kubernetes namespace
+        required: true
+        default: production
+        type: string
+      service:
+        description: Service selecting the active color
+        required: true
+        default: atomicip
+        type: string
+      health_url:
+        description: URL that must return HTTP 200 before switching traffic
+        required: true
+        type: string
+
+concurrency:
+  group: blue-green-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      NAMESPACE: ${{ inputs.namespace }}
+      SERVICE: ${{ inputs.service }}
+      IMAGE: ${{ inputs.image }}
+      HEALTH_URL: ${{ inputs.health_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure kubectl
+        uses: azure/k8s-set-context@v4
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.KUBE_CONFIG }}
+
+      - name: Deploy inactive color
+        id: deploy
+        shell: bash
+        run: |
+          set -euo pipefail
+          active=$(kubectl -n "$NAMESPACE" get service "$SERVICE" -o jsonpath='{.spec.selector.color}')
+          case "$active" in
+            blue) inactive=green ;;
+            green) inactive=blue ;;
+            *) echo "Service selector must contain color=blue or color=green" >&2; exit 1 ;;
+          esac
+          deployment="${SERVICE}-${inactive}"
+          kubectl -n "$NAMESPACE" set image "deployment/${deployment}" \
+            "${SERVICE}=${IMAGE}"
+          kubectl -n "$NAMESPACE" rollout status "deployment/${deployment}" --timeout=10m
+          echo "inactive=$inactive" >> "$GITHUB_OUTPUT"
+          echo "previous=$active" >> "$GITHUB_OUTPUT"
+
+      - name: Verify inactive color
+        run: |
+          set -euo pipefail
+          for attempt in {1..30}; do
+            status=$(curl --silent --output /dev/null --write-out '%{http_code}' "$HEALTH_URL")
+            if [ "$status" = "200" ]; then exit 0; fi
+            sleep 10
+          done
+          echo "Inactive deployment did not become healthy" >&2
+          exit 1
+
+      - name: Switch traffic
+        run: |
+          kubectl -n "$NAMESPACE" patch service "$SERVICE" --type merge \
+            -p "{\"spec\":{\"selector\":{\"app\":\"${SERVICE}\",\"color\":\"${{ steps.deploy.outputs.inactive }}\"}}}"
+
+      - name: Verify active color
+        run: |
+          set -euo pipefail
+          for attempt in {1..12}; do
+            status=$(curl --silent --output /dev/null --write-out '%{http_code}' "$HEALTH_URL")
+            if [ "$status" = "200" ]; then exit 0; fi
+            sleep 5
+          done
+          exit 1
+
+      - name: Roll back traffic on failure
+        if: failure() && steps.deploy.outputs.previous != ''
+        run: |
+          kubectl -n "$NAMESPACE" patch service "$SERVICE" --type merge \
+            -p "{\"spec\":{\"selector\":{\"app\":\"${SERVICE}\",\"color\":\"${{ steps.deploy.outputs.previous }}\"}}}"
+
+      - name: Monitor deployment
+        if: success()
+        run: |
+          set -euo pipefail
+          for attempt in {1..6}; do
+            status=$(curl --silent --output /dev/null --write-out '%{http_code}' "$HEALTH_URL")
+            [ "$status" = "200" ] || exit 1
+            sleep 10
+          done

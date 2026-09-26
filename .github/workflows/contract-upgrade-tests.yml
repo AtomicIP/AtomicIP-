@@ -1,0 +1,35 @@
+name: Contract Upgrade Tests
+
+on:
+  pull_request:
+    paths:
+      - "contracts/**"
+      - "docs/contract-upgrades.md"
+      - ".github/workflows/contract-upgrade-tests.yml"
+  workflow_dispatch:
+
+jobs:
+  upgrade-tests:
+    name: Validate contract upgrade compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-upgrade-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-upgrade-
+
+      - name: Run IP Registry upgrade tests
+        run: cargo test -p ip_registry upgrade_tests
+
+      - name: Run Atomic Swap upgrade tests
+        run: cargo test -p atomic_swap upgrade

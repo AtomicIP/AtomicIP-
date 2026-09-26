@@ -146,6 +146,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md#dependency-updates) for contributor detail
 - [Commitment Scheme](docs/commitment-scheme.md)
 - [Atomic Swap Flow](docs/atomic-swap.md)
 - [Threat Model & Security](docs/threat-model.md)
+- [Compliance and Legal Guidance](docs/compliance.md)
 - [Integration Guide for Wallet Providers](docs/integration-guide.md)
 
 ### Additional Resources
