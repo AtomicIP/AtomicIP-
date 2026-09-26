@@ -1,14 +1,18 @@
 use axum::{
     extract::{Path, Query, State},
     http::{header, StatusCode},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
+    body::Body,
     Json,
 };
 use once_cell::sync::Lazy;
 use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::time::{Duration, Instant};
 use tracing::instrument;
+use sha2::{Digest, Sha256};
 use crate::cache;
 use crate::deduplication::{create_store, DeduplicationStore};
 use crate::graphql::SorobanQueryClient;
@@ -17,6 +21,7 @@ use std::sync::Arc;
 use crate::webhook;
 use crate::websocket;
 use crate::audit::{AuditLogStore, AuditLogQuery, SuspiciousPattern};
+use dashmap::DashMap;
 
 // #523/#800: Per-handler idempotency store for batch swap operations. Uses a
 // shared Redis backend when REDIS_URL is configured, so a client's retry is
@@ -46,6 +51,9 @@ const SWAP_EXPIRY_SECONDS: u64 = 604800;
 /// Process-local swap ID counter standing in for the contract's `NextId`
 /// until the handlers are wired to a live Soroban RPC client.
 static NEXT_SWAP_ID: AtomicU64 = AtomicU64::new(0);
+static WATCHLISTS: Lazy<Mutex<HashMap<String, BTreeSet<u64>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+static COMMITMENT_INDEX: Lazy<DashMap<u64, IpRecord>> = Lazy::new(DashMap::new);
 
 /// Audit log store for tracking all API access and sensitive operations
 static AUDIT_LOG_STORE: Lazy<Arc<AuditLogStore>> = Lazy::new(|| {
@@ -210,6 +218,331 @@ pub async fn verify_commitment(Json(body): Json<VerifyCommitmentRequest>) -> Res
             error: format!("IP record {} not found", body.ip_id),
         }),
     ))
+}
+
+/// Reveal and verify multiple IP commitments in one request.
+#[utoipa::path(
+    post,
+    path = "/v1/ip/reveal-batch",
+    tag = "IP Registry",
+    request_body = BatchRevealCommitmentsRequest,
+    responses(
+        (status = 200, description = "Commitments verified with per-item results", body = BatchRevealCommitmentsResponse),
+        (status = 400, description = "Invalid or oversized batch", body = ErrorResponse),
+    )
+)]
+#[instrument(skip(body))]
+pub async fn batch_reveal_commitments(
+    Json(body): Json<BatchRevealCommitmentsRequest>,
+) -> Result<Json<BatchRevealCommitmentsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if body.commitments.is_empty() || body.commitments.len() > MAX_BATCH_SIZE {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("commitments must contain between 1 and {} items", MAX_BATCH_SIZE),
+            }),
+        ));
+    }
+
+    /// Export selected commitment records as JSON, CSV, or XML.
+    #[utoipa::path(
+        get,
+        path = "/v1/ip/export",
+        tag = "IP Registry",
+        params(ExportCommitmentsParams),
+        responses(
+            (status = 200, description = "Commitments exported"),
+            (status = 400, description = "Invalid format or IP IDs", body = ErrorResponse),
+            (status = 404, description = "An IP record was not found", body = ErrorResponse),
+        )
+    )]
+    #[instrument]
+    pub async fn export_commitments(
+        Query(params): Query<ExportCommitmentsParams>,
+    ) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+        let ids: Result<Vec<u64>, _> = params
+            .ip_ids
+            .split(',')
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| value.trim().parse::<u64>())
+            .collect();
+        let ids = ids.map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse { error: "ip_ids must be comma-separated unsigned integers".to_string() }),
+            )
+        })?;
+        if ids.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse { error: "ip_ids must not be empty".to_string() }),
+            ));
+        }
+
+        /// Add a commitment to a user's watchlist.
+        #[utoipa::path(
+            post,
+            path = "/v1/watchlist",
+            tag = "IP Registry",
+            request_body = WatchlistRequest,
+            responses(
+                (status = 200, description = "Commitment added to watchlist", body = WatchlistResponse),
+                (status = 400, description = "Invalid user ID", body = ErrorResponse),
+            )
+        )]
+        #[instrument(skip(body))]
+        pub async fn add_to_watchlist(
+            Json(body): Json<WatchlistRequest>,
+        ) -> Result<Json<WatchlistResponse>, (StatusCode, Json<ErrorResponse>)> {
+            if body.user_id.trim().is_empty() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse { error: "user_id must not be empty".to_string() }),
+                ));
+            }
+            let mut watchlists = WATCHLISTS.lock().map_err(|_| {
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "watchlist unavailable".to_string() }))
+            })?;
+            let ids = watchlists.entry(body.user_id.clone()).or_default();
+            ids.insert(body.ip_id);
+            Ok(Json(WatchlistResponse {
+                user_id: body.user_id,
+                ip_ids: ids.iter().copied().collect(),
+            }))
+        }
+
+        /// List all commitments on a user's watchlist.
+        #[utoipa::path(
+            get,
+            path = "/v1/watchlist",
+            tag = "IP Registry",
+            params(WatchlistQuery),
+            responses((status = 200, description = "User watchlist", body = WatchlistResponse))
+        )]
+        #[instrument]
+        pub async fn get_watchlist(
+            Query(query): Query<WatchlistQuery>,
+        ) -> Result<Json<WatchlistResponse>, (StatusCode, Json<ErrorResponse>)> {
+            if query.user_id.trim().is_empty() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse { error: "user_id must not be empty".to_string() }),
+                ));
+            }
+            let watchlists = WATCHLISTS.lock().map_err(|_| {
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "watchlist unavailable".to_string() }))
+            })?;
+            Ok(Json(WatchlistResponse {
+                user_id: query.user_id.clone(),
+                ip_ids: watchlists
+                    .get(&query.user_id)
+                    .map(|ids| ids.iter().copied().collect())
+                    .unwrap_or_default(),
+            }))
+        }
+
+        /// Remove a commitment from a user's watchlist.
+        #[utoipa::path(
+            delete,
+            path = "/v1/watchlist/{user_id}/{ip_id}",
+            tag = "IP Registry",
+            params(
+                ("user_id" = String, Path, description = "User identifier"),
+                ("ip_id" = u64, Path, description = "IP commitment identifier")
+            ),
+            responses((status = 200, description = "Commitment removed", body = WatchlistResponse))
+        )]
+        #[instrument]
+        pub async fn remove_from_watchlist(
+            Path((user_id, ip_id)): Path<(String, u64)>,
+        ) -> Result<Json<WatchlistResponse>, (StatusCode, Json<ErrorResponse>)> {
+            if user_id.trim().is_empty() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse { error: "user_id must not be empty".to_string() }),
+                ));
+            }
+            let mut watchlists = WATCHLISTS.lock().map_err(|_| {
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "watchlist unavailable".to_string() }))
+            })?;
+            let ids = watchlists.entry(user_id.clone()).or_default();
+            ids.remove(&ip_id);
+            Ok(Json(WatchlistResponse {
+                user_id,
+                ip_ids: ids.iter().copied().collect(),
+            }))
+        }
+
+        let mut records = Vec::with_capacity(ids.len());
+        for id in ids {
+            match cache::get::<IpRecord>(&cache::ip_key(id)) {
+                Some(record) => records.push(record),
+                None => {
+                    return Err((
+                        StatusCode::NOT_FOUND,
+                        Json(ErrorResponse { error: format!("IP record {} not found", id) }),
+                    ))
+                }
+            }
+        }
+
+        let format = params.format.to_ascii_lowercase();
+        let (content_type, extension, body) = match format.as_str() {
+            "json" => (
+                "application/json",
+                "json",
+                serde_json::to_string_pretty(&records).map_err(|error| {
+                    (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: error.to_string() }))
+                })?,
+            ),
+            "csv" => ("text/csv; charset=utf-8", "csv", commitment_csv(&records)),
+            "xml" => ("application/xml; charset=utf-8", "xml", commitment_xml(&records)),
+            _ => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse { error: "format must be one of json, csv, or xml".to_string() }),
+                ))
+            }
+        };
+
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, content_type)
+            .header(header::CONTENT_DISPOSITION, format!("attachment; filename=\"commitments.{}\"", extension))
+            .body(Body::from(body))
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: error.to_string() })))
+    }
+
+    fn csv_field(value: &str) -> String {
+        if value.chars().any(|character| matches!(character, ',' | '"' | '\n' | '\r')) {
+            format!("\"{}\"", value.replace('"', "\"\""))
+        } else {
+            value.to_string()
+        }
+    }
+
+    fn commitment_csv(records: &[IpRecord]) -> String {
+        let mut output = "ip_id,owner,commitment_hash,timestamp,revoked\n".to_string();
+        for record in records {
+            output.push_str(&format!(
+                "{},{},{},{},{}\n",
+                record.ip_id,
+                csv_field(&record.owner),
+                csv_field(&record.commitment_hash),
+                record.timestamp,
+                record.revoked
+            ));
+        }
+        output
+    }
+
+    fn xml_field(value: &str) -> String {
+        value
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace('\'', "&apos;")
+    }
+
+    fn commitment_xml(records: &[IpRecord]) -> String {
+        let mut output = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<commitments>\n".to_string();
+        for record in records {
+            output.push_str(&format!(
+                "  <commitment><ip_id>{}</ip_id><owner>{}</owner><commitment_hash>{}</commitment_hash><timestamp>{}</timestamp><revoked>{}</revoked></commitment>\n",
+                record.ip_id, xml_field(&record.owner), xml_field(&record.commitment_hash), record.timestamp, record.revoked
+            ));
+        }
+        output.push_str("</commitments>\n");
+        output
+    }
+
+    let results = body
+        .commitments
+        .into_iter()
+        .map(|item| {
+            let ip_id = item.ip_id;
+            let (valid, error) = match (
+                hex::decode(&item.secret),
+                hex::decode(&item.blinding_factor),
+            ) {
+                (Ok(secret), Ok(blinding_factor)) if secret.len() == 32 && blinding_factor.len() == 32 => {
+                    match cache::get::<IpRecord>(&cache::ip_key(ip_id)) {
+                        Some(record) => {
+                            COMMITMENT_INDEX.insert(ip_id, record.clone());
+                            let mut hasher = Sha256::new();
+                            hasher.update(&secret);
+                            hasher.update(&blinding_factor);
+                            let computed = hex::encode(hasher.finalize());
+                            (
+                                computed.eq_ignore_ascii_case(&record.commitment_hash),
+                                None,
+                            )
+                        }
+                        None => (false, Some(format!("IP record {} not found", ip_id))),
+                    }
+                }
+                _ => (
+                    false,
+                    Some("secret and blinding_factor must be 32-byte hex values".to_string()),
+                ),
+            };
+            BatchRevealResult { ip_id, valid, error }
+        })
+        .collect();
+
+    Ok(Json(BatchRevealCommitmentsResponse { results }))
+}
+
+/// Find indexed commitments by Hamming distance from a supplied hash.
+#[utoipa::path(
+    get,
+    path = "/v1/ip/similar",
+    tag = "IP Registry",
+    params(SimilarCommitmentsParams),
+    responses(
+        (status = 200, description = "Similar commitments ordered by distance", body = SimilarCommitmentsResponse),
+        (status = 400, description = "Invalid commitment hash", body = ErrorResponse),
+    )
+)]
+#[instrument]
+pub async fn find_similar_commitments(
+    Query(params): Query<SimilarCommitmentsParams>,
+) -> Result<Json<SimilarCommitmentsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let query_hash = hex::decode(&params.commitment_hash).map_err(|_| {
+        (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: "commitment_hash must be hex".to_string() }))
+    })?;
+    if query_hash.len() != 32 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse { error: "commitment_hash must be exactly 32 bytes".to_string() }),
+        ));
+    }
+    let max_distance = params.max_distance.min(256);
+    let limit = params.limit.clamp(1, 100) as usize;
+    let mut results: Vec<SimilarCommitment> = COMMITMENT_INDEX
+        .iter()
+        .filter_map(|entry| {
+            let record = entry.value();
+            let candidate = hex::decode(&record.commitment_hash).ok()?;
+            if candidate.len() != query_hash.len() {
+                return None;
+            }
+            let distance = query_hash
+                .iter()
+                .zip(candidate.iter())
+                .map(|(left, right)| (left ^ right).count_ones() as u16)
+                .sum::<u16>();
+            (distance <= max_distance).then(|| SimilarCommitment {
+                ip_id: record.ip_id,
+                commitment_hash: record.commitment_hash.clone(),
+                distance,
+            })
+        })
+        .collect();
+    results.sort_by_key(|result| (result.distance, result.ip_id));
+    results.truncate(limit);
+    Ok(Json(SimilarCommitmentsResponse { results }))
 }
 
 /// List all IP IDs owned by a Stellar address.

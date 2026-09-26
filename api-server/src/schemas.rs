@@ -9,7 +9,7 @@ pub struct CommitIpRequest {
     pub commitment_hash: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct IpRecord {
     pub ip_id: u64,
     pub owner: String,
@@ -38,6 +38,95 @@ pub struct VerifyCommitmentRequest {
 pub struct VerifyCommitmentResponse {
     /// true if sha256(secret || blinding_factor) matches the stored commitment hash
     pub valid: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct BatchRevealCommitment {
+    pub ip_id: u64,
+    /// 32-byte secret, hex-encoded.
+    pub secret: String,
+    /// 32-byte blinding factor, hex-encoded.
+    pub blinding_factor: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct BatchRevealCommitmentsRequest {
+    pub commitments: Vec<BatchRevealCommitment>,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct BatchRevealResult {
+    pub ip_id: u64,
+    pub valid: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct BatchRevealCommitmentsResponse {
+    pub results: Vec<BatchRevealResult>,
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct ExportCommitmentsParams {
+    /// Export format: json, csv, or xml.
+    #[serde(default = "default_export_format")]
+    pub format: String,
+    /// Comma-separated IP IDs to export.
+    pub ip_ids: String,
+}
+
+fn default_export_format() -> String {
+    "json".to_string()
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct WatchlistRequest {
+    pub user_id: String,
+    pub ip_id: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, IntoParams)]
+pub struct WatchlistQuery {
+    pub user_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct WatchlistResponse {
+    pub user_id: String,
+    pub ip_ids: Vec<u64>,
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct SimilarCommitmentsParams {
+    /// 32-byte commitment hash, hex-encoded.
+    pub commitment_hash: String,
+    /// Maximum Hamming distance from the query hash (default: 32).
+    #[serde(default = "default_similarity_distance")]
+    pub max_distance: u16,
+    /// Maximum number of results (default: 20, max: 100).
+    #[serde(default = "default_similarity_limit")]
+    pub limit: u16,
+}
+
+fn default_similarity_distance() -> u16 {
+    32
+}
+
+fn default_similarity_limit() -> u16 {
+    20
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct SimilarCommitment {
+    pub ip_id: u64,
+    pub commitment_hash: String,
+    pub distance: u16,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct SimilarCommitmentsResponse {
+    pub results: Vec<SimilarCommitment>,
 }
 
 /// #317: Pagination query parameters shared across list endpoints.
