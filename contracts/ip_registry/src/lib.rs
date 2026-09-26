@@ -1,3 +1,5 @@
+// Design rationale: docs/adr/0002-pedersen-commitments-for-privacy.md (commitments),
+// docs/adr/0003-stellar-soroban-for-settlement.md (settlement chain).
 #![no_std]
 #![allow(deprecated)]
 #[cfg(test)]

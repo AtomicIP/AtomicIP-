@@ -148,6 +148,10 @@ See [CONTRIBUTING.md](CONTRIBUTING.md#dependency-updates) for contributor detail
 - [Threat Model & Security](docs/threat-model.md)
 - [Compliance and Legal Guidance](docs/compliance.md)
 - [Integration Guide for Wallet Providers](docs/integration-guide.md)
+- [Architecture Decision Records](docs/adr/README.md)
+- [Disaster Recovery Procedures](docs/disaster-recovery.md)
+- [Commitment Lifecycle Monitoring](docs/commitment-monitoring.md)
+- [Alerting Best Practices](docs/alerting-best-practices.md)
 
 ### Additional Resources
 - [API Reference](docs/api-reference.md)

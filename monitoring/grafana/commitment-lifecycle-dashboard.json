@@ -1,0 +1,486 @@
+{
+  "title": "AtomicIP \u2013 Commitment Lifecycle",
+  "uid": "atomicip-commitment-lifecycle",
+  "schemaVersion": 39,
+  "tags": [
+    "atomicip",
+    "commitments"
+  ],
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "refresh": "1m",
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Overview",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 1
+      }
+    },
+    {
+      "id": 2,
+      "title": "Active commitments",
+      "type": "stat",
+      "gridPos": {
+        "x": 0,
+        "y": 1,
+        "w": 8,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(commitments_by_state{state=\"active\"})",
+          "legendFormat": "active"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Revealed commitments",
+      "type": "stat",
+      "gridPos": {
+        "x": 8,
+        "y": 1,
+        "w": 8,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(commitments_by_state{state=\"revealed\"})",
+          "legendFormat": "revealed"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Archived commitments",
+      "type": "stat",
+      "gridPos": {
+        "x": 16,
+        "y": 1,
+        "w": 8,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(commitments_by_state{state=\"archived\"})",
+          "legendFormat": "archived"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "row",
+      "title": "State: active",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 5,
+        "w": 24,
+        "h": 1
+      }
+    },
+    {
+      "id": 6,
+      "title": "Active \u2013 count over time",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 6,
+        "w": 8,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(commitments_by_state{state=\"active\"})",
+          "legendFormat": "active"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Transitions into active (per min)",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 8,
+        "y": 6,
+        "w": 8,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (from) (rate(commitment_transitions_total{to=\"active\"}[5m])) * 60",
+          "legendFormat": "{{from}} -> active"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Transitions out of active (per min)",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 16,
+        "y": 6,
+        "w": 8,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (to) (rate(commitment_transitions_total{from=\"active\"}[5m])) * 60",
+          "legendFormat": "active -> {{to}}"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "row",
+      "title": "State: revealed",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 14,
+        "w": 24,
+        "h": 1
+      }
+    },
+    {
+      "id": 10,
+      "title": "Revealed \u2013 count over time",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 15,
+        "w": 8,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(commitments_by_state{state=\"revealed\"})",
+          "legendFormat": "revealed"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "title": "Transitions into revealed (per min)",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 8,
+        "y": 15,
+        "w": 8,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (from) (rate(commitment_transitions_total{to=\"revealed\"}[5m])) * 60",
+          "legendFormat": "{{from}} -> revealed"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "title": "Transitions out of revealed (per min)",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 16,
+        "y": 15,
+        "w": 8,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (to) (rate(commitment_transitions_total{from=\"revealed\"}[5m])) * 60",
+          "legendFormat": "revealed -> {{to}}"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "type": "row",
+      "title": "State: archived",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 23,
+        "w": 24,
+        "h": 1
+      }
+    },
+    {
+      "id": 14,
+      "title": "Archived \u2013 count over time",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 24,
+        "w": 8,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(commitments_by_state{state=\"archived\"})",
+          "legendFormat": "archived"
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "title": "Transitions into archived (per min)",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 8,
+        "y": 24,
+        "w": 8,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (from) (rate(commitment_transitions_total{to=\"archived\"}[5m])) * 60",
+          "legendFormat": "{{from}} -> archived"
+        }
+      ]
+    },
+    {
+      "id": 16,
+      "title": "Transitions out of archived (per min)",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 16,
+        "y": 24,
+        "w": 8,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (to) (rate(commitment_transitions_total{from=\"archived\"}[5m])) * 60",
+          "legendFormat": "archived -> {{to}}"
+        }
+      ]
+    },
+    {
+      "id": 17,
+      "type": "row",
+      "title": "Trends & anomalies",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 32,
+        "w": 24,
+        "h": 1
+      }
+    },
+    {
+      "id": 18,
+      "title": "Trend slope (per bucket)",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 33,
+        "w": 8,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "commitment_transition_trend",
+          "legendFormat": "{{from}} -> {{to}}"
+        }
+      ]
+    },
+    {
+      "id": 19,
+      "title": "Week-over-week ratio",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 8,
+        "y": 33,
+        "w": 8,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "atomicip:commitment_transitions:wow_ratio",
+          "legendFormat": "{{from}} -> {{to}}"
+        }
+      ]
+    },
+    {
+      "id": 20,
+      "title": "Invalid transitions (10m)",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 16,
+        "y": 33,
+        "w": 8,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (from,to) (increase(commitment_invalid_transitions_total[10m]))",
+          "legendFormat": "{{from}} -> {{to}}"
+        }
+      ]
+    },
+    {
+      "id": 21,
+      "type": "row",
+      "title": "Alert pipeline (#1065)",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 41,
+        "w": 24,
+        "h": 1
+      }
+    },
+    {
+      "id": 22,
+      "title": "Notified vs suppressed",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 42,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(alerts_notified_total[15m]))*900",
+          "legendFormat": "notified"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(alerts_deduplicated_total[15m]))*900",
+          "legendFormat": "deduplicated"
+        },
+        {
+          "refId": "C",
+          "expr": "sum(rate(alerts_correlated_total[15m]))*900",
+          "legendFormat": "correlated"
+        },
+        {
+          "refId": "D",
+          "expr": "sum(rate(alerts_silenced_total[15m]))*900",
+          "legendFormat": "silenced"
+        }
+      ]
+    },
+    {
+      "id": 23,
+      "title": "Escalations by channel",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 12,
+        "y": 42,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (channel) (increase(alerts_escalated_total[1h]))",
+          "legendFormat": "{{channel}}"
+        }
+      ]
+    }
+  ]
+}

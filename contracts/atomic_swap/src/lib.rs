@@ -1,3 +1,4 @@
+// Design rationale: docs/adr/0003-stellar-soroban-for-settlement.md
 #![no_std]
 #![allow(deprecated)]
 mod registry;

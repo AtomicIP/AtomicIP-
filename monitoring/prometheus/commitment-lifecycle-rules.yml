@@ -1,0 +1,86 @@
+# #1064: Commitment lifecycle recording + alert rules.
+# Metrics are exported by api-server/src/commitment_monitoring.rs.
+groups:
+  - name: commitment-lifecycle-recording
+    interval: 1m
+    rules:
+      - record: atomicip:commitment_transitions:rate5m
+        expr: sum by (from, to) (rate(commitment_transitions_total[5m]))
+      - record: atomicip:commitment_transitions:rate1h
+        expr: sum by (from, to) (rate(commitment_transitions_total[1h]))
+      - record: atomicip:commitments_by_state:sum
+        expr: sum by (state) (commitments_by_state)
+      # Week-over-week ratio for trend analysis.
+      - record: atomicip:commitment_transitions:wow_ratio
+        expr: |
+          sum by (from, to) (rate(commitment_transitions_total[1h]))
+            /
+          sum by (from, to) (rate(commitment_transitions_total[1h] offset 1w))
+
+  - name: commitment-lifecycle-alerts
+    rules:
+      - alert: CommitmentSpike
+        expr: |
+          atomicip:commitment_transitions:rate5m{from="new",to="active"}
+            > 3 * atomicip:commitment_transitions:rate1h{from="new",to="active"}
+          and atomicip:commitment_transitions:rate5m{from="new",to="active"} * 60 > 10
+        for: 5m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "Commitment creation rate is >3x the hourly baseline"
+          runbook: "docs/disaster-recovery.md#playbook-abnormal-commitment-activity"
+
+      - alert: CommitmentRateDrop
+        expr: |
+          atomicip:commitment_transitions:rate5m{from="new",to="active"}
+            < 0.2 * atomicip:commitment_transitions:rate1h{from="new",to="active"}
+          and atomicip:commitment_transitions:rate1h{from="new",to="active"} * 60 > 5
+        for: 15m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "Commitment creation rate dropped below 20% of the hourly baseline"
+          runbook: "docs/disaster-recovery.md#playbook-soroban-rpc-outage"
+
+      - alert: CommitmentArchivalSurge
+        expr: |
+          atomicip:commitment_transitions:rate5m{to="archived"}
+            > 5 * atomicip:commitment_transitions:rate1h{to="archived"}
+          and atomicip:commitment_transitions:rate5m{to="archived"} * 60 > 5
+        for: 10m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "Unusual volume of commitments being archived/revoked ({{ $labels.from }} -> archived)"
+          runbook: "docs/disaster-recovery.md#playbook-key-compromise"
+
+      - alert: CommitmentInvalidTransition
+        expr: increase(commitment_invalid_transitions_total[10m]) > 0
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "Illegal commitment lifecycle transition {{ $labels.from }} -> {{ $labels.to }} observed"
+
+      - alert: CommitmentStateDrift
+        expr: min(commitments_by_state) < 0
+        for: 5m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: "A commitment state gauge is negative; indexer missed lifecycle events"
+          runbook: "docs/disaster-recovery.md#playbook-indexer-data-loss"
+
+      - alert: CommitmentTrendDecline
+        expr: atomicip:commitment_transitions:wow_ratio{from="new",to="active"} < 0.5
+        for: 6h
+        labels:
+          severity: info
+          team: product
+        annotations:
+          summary: "Commitment creation down >50% week-over-week"
