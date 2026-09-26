@@ -7,6 +7,7 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
     Bytes, BytesN, Env, Error, Symbol, Vec,
 };
+use soroban_sdk::xdr::{FromXdr, ToXdr};
 
 mod validation;
 use validation::*;
@@ -122,6 +123,34 @@ pub enum ContractError {
     InvalidPrivacyLevel = 44,
     /// #977: Access denied due to privacy level restrictions.
     AccessDenied = 45,
+    /// #1070 / #1072: Invalid notary key (all-zero bytes).
+    InvalidNotaryKey = 46,
+    /// #1070: Notary not registered in the notary registry.
+    NotaryNotFound = 47,
+    /// #1070: Notary reputation is too low to notarize high-value IPs.
+    NotaryReputationTooLow = 48,
+    /// #1070: Multi-notary threshold not met.
+    NotaryThresholdNotMet = 49,
+    /// #1073: Insurance policy not found.
+    InsurancePolicyNotFound = 50,
+    /// #1073: Insurance claim not found.
+    InsuranceClaimNotFound = 51,
+    /// #1073: Insurance policy is not active.
+    InsurancePolicyNotActive = 52,
+    /// #1073: Insurance claim already filed for this policy.
+    InsuranceClaimAlreadyFiled = 53,
+    /// #1073: Insurance claim is not in a claimable state.
+    InsuranceClaimNotClaimable = 54,
+    /// #1071: Non-existence proof is invalid.
+    InvalidNonExistenceProof = 55,
+    /// #1072: Access delegation depth exceeded.
+    AccessDelegationDepthExceeded = 56,
+    /// #1072: Delegate not found.
+    AccessDelegateNotFound = 57,
+    /// #1073: Referenced dispute does not belong to the insured commitment.
+    InsuranceDisputeMismatch = 58,
+    /// #1073: Dispute must be resolved before the claim can be verified.
+    InsuranceDisputeUnresolved = 59,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -234,6 +263,24 @@ pub enum DataKey {
     // Issue #979: Commitment linking for related IPs
     CommitmentLinks(u64), // maps ip_id -> Vec<CommitmentLink> of linked commitments
     LinkedCommitments(u64), // maps linked_ip_id -> Vec<u64> of ip_ids linking to it (reverse index)
+    // Issue #1070: Notary registry and multi-notary
+    NotaryRecord(Address),        // maps notary_address -> NotaryRecord
+    NotaryList,                   // stores Vec<Address> of all registered notaries
+    NotaryFeeConfig(Address),     // maps notary_address -> fee amount (u64)
+    MultiNotaryRecord(u64),       // maps ip_id -> MultiNotaryRecord (multi-notary state)
+    // Issue #1071: Non-existence proof accumulator snapshots
+    MerkleSnapshot(u64),          // maps snapshot_id -> MerkleSnapshotRecord (timestamp + root)
+    NextSnapshotId,               // monotonic snapshot counter
+    // Issue #1072: Hierarchical access control delegation
+    AccessDelegation(u64, Address), // maps (ip_id, delegate) -> AccessDelegation record
+    AccessDelegationList(u64),    // maps ip_id -> Vec<Address> of all delegates
+    // Issue #1073: Commitment insurance
+    InsurancePolicy(u64),         // maps policy_id -> InsurancePolicyRecord
+    InsuranceClaim(u64),          // maps claim_id -> InsuranceClaimRecord
+    NextPolicyId,                 // monotonic policy ID counter
+    NextClaimId,                  // monotonic claim ID counter
+    IpInsurancePolicy(u64),       // maps ip_id -> policy_id (one policy per IP)
+    PolicyClaim(u64),             // maps policy_id -> claim_id (one claim per policy)
 }
 
 // ── Upgrade Compatibility Manifest (#791) ───────────────────────────────────
@@ -597,6 +644,188 @@ pub struct BatchVerifyResultStorage {
     pub aggregate_proof: BytesN<32>,
     pub total_count: u32,
     pub valid_count: u32,
+}
+
+// ── Issue #1070: Verifiable Commitment Timestamps with Notary ─────────────────
+
+/// Reputation and registration record for a notary.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct NotaryRecord {
+    pub notary: Address,
+    /// Cumulative reputation score. Starts at 0, incremented on each valid notarization.
+    pub reputation: u64,
+    /// Total number of notarizations performed.
+    pub total_notarizations: u64,
+    /// Unix timestamp when this notary was registered.
+    pub registered_at: u64,
+    /// Whether this notary is currently active.
+    pub active: bool,
+    /// Total fees (in stroops) accrued by this notary across all notarizations.
+    pub fees_earned: u64,
+}
+
+/// Multi-notary state for a high-value IP commitment.
+/// Tracks how many independent notaries have signed a given IP's timestamp.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct MultiNotaryRecord {
+    pub ip_id: u64,
+    /// Required number of notary signatures.
+    pub threshold: u32,
+    /// Notary addresses that have already signed.
+    pub signers: soroban_sdk::Vec<Address>,
+    /// Whether the multi-notary threshold has been met.
+    pub finalized: bool,
+}
+
+// ── Issue #1071: Commitment Proof of Non-Existence ────────────────────────────
+
+/// An accumulated Merkle tree snapshot at a specific ledger timestamp.
+/// Used to prove that a data_hash was NOT present in the commitment set at that time.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct MerkleSnapshotRecord {
+    pub snapshot_id: u64,
+    /// Merkle root over every commitment hash registered up to `max_ip_id` (zeros if empty).
+    pub merkle_root: BytesN<32>,
+    /// Ledger timestamp when this snapshot was taken.
+    pub timestamp: u64,
+    /// Number of commitments included in the accumulator.
+    pub commitment_count: u32,
+    /// Highest IP ID covered by this snapshot (IDs are monotonic).
+    pub max_ip_id: u64,
+}
+
+/// A proof that `data_hash` was not committed before `claimed_before`.
+///
+/// Privacy guarantees:
+/// - Only the SHA-256 `data_hash` is ever handled; the underlying data is never
+///   revealed or required on-chain.
+/// - The proof discloses nothing about other commitments beyond the public
+///   snapshot root and count that are already on-chain.
+/// - Proofs are bound to a specific snapshot via `proof_bytes`, so they cannot
+///   be replayed against a different snapshot or timestamp.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct NonExistenceProof {
+    /// The data hash being proved absent.
+    pub data_hash: BytesN<32>,
+    /// The timestamp the absence claim refers to ("did not exist before").
+    pub claimed_before: u64,
+    /// The snapshot ID used to anchor the non-existence claim.
+    pub snapshot_id: u64,
+    /// The accumulated root of the snapshot.
+    pub snapshot_root: BytesN<32>,
+    /// The ledger timestamp of the snapshot (always ≥ `claimed_before`).
+    pub snapshot_timestamp: u64,
+    /// sha256(data_hash || snapshot_root || snapshot_id_be || claimed_before_be).
+    pub proof_bytes: BytesN<32>,
+}
+
+// ── Issue #1072: Commitment Hierarchical Access Control ───────────────────────
+
+/// Hierarchical access level constants.
+/// Tiers are cumulative: Revoke (4) ⊃ Transfer (3) ⊃ Reveal (2) ⊃ View (1).
+pub const ACCESS_LEVEL_VIEW: u32 = 1;
+pub const ACCESS_LEVEL_REVEAL: u32 = 2;
+pub const ACCESS_LEVEL_TRANSFER: u32 = 3;
+pub const ACCESS_LEVEL_REVOKE: u32 = 4;
+
+/// A single hierarchical access delegation record for an IP commitment.
+/// Supports role-based delegation with retroactive revocation.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct AccessDelegationRecord {
+    pub ip_id: u64,
+    pub delegate: Address,
+    /// The address that granted this delegation (the owner at depth 0).
+    pub granted_by: Address,
+    /// Access level: 1 = view, 2 = reveal, 3 = transfer, 4 = revoke.
+    pub level: u32,
+    /// Unix timestamp when this delegation was granted.
+    pub granted_at: u64,
+    /// Delegation depth (0 = granted by owner directly, 1 = re-delegated, etc.)
+    /// Max depth is capped at MAX_ACCESS_DELEGATION_DEPTH.
+    pub depth: u32,
+    /// Whether this delegation has been revoked.
+    pub revoked: bool,
+    /// Unix timestamp of revocation (0 if not revoked).
+    pub revoked_at: u64,
+}
+
+/// Maximum depth for re-delegation chains to prevent unbounded chains.
+pub const MAX_ACCESS_DELEGATION_DEPTH: u32 = 3;
+
+// ── Issue #1073: Commitment Insurance Proof System ────────────────────────────
+
+/// Status of an insurance policy.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+#[repr(u32)]
+pub enum InsurancePolicyStatus {
+    /// Policy is active and claims can be filed.
+    Active = 0,
+    /// Policy has expired (no more claims).
+    Expired = 1,
+    /// Policy was cancelled by the owner.
+    Cancelled = 2,
+}
+
+/// An insurance policy for an IP commitment.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct InsurancePolicyRecord {
+    pub policy_id: u64,
+    pub ip_id: u64,
+    /// The IP owner who purchased the insurance.
+    pub owner: Address,
+    /// The insurance provider address.
+    pub provider: Address,
+    /// Coverage amount in stroops (smallest XLM unit).
+    pub amount: u64,
+    /// Unix timestamp when the policy was registered.
+    pub created_at: u64,
+    /// Unix timestamp when the policy expires (0 = no expiry).
+    pub expires_at: u64,
+    /// Current policy status.
+    pub status: InsurancePolicyStatus,
+}
+
+/// Status of an insurance claim.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+#[repr(u32)]
+pub enum InsuranceClaimStatus {
+    /// Claim filed, awaiting verification.
+    Pending = 0,
+    /// Claim verified and approved for payout.
+    Approved = 1,
+    /// Claim rejected.
+    Rejected = 2,
+    /// Payout completed.
+    Paid = 3,
+}
+
+/// An insurance claim against an IP insurance policy.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct InsuranceClaimRecord {
+    pub claim_id: u64,
+    pub policy_id: u64,
+    pub ip_id: u64,
+    /// The claimant (must be the IP owner).
+    pub claimant: Address,
+    /// The dispute (see `initiate_dispute`) this claim is insuring against.
+    pub dispute_id: u64,
+    /// SHA-256 hash of supporting evidence (documents, legal costs, etc.).
+    pub evidence_hash: BytesN<32>,
+    /// Unix timestamp when the claim was filed.
+    pub filed_at: u64,
+    /// Current claim status.
+    pub status: InsuranceClaimStatus,
+    /// Payout amount actually disbursed (0 until approved).
+    pub payout_amount: u64,
 }
 
 // ── Issue #459: Hierarchical Storage ─────────────────────────────────────────
@@ -6231,6 +6460,1326 @@ impl IpRegistry {
     /// Option<IpMetadata> containing the encrypted metadata if it exists
     pub fn get_commitment_metadata(env: Env, ip_id: u64) -> Option<types::IpMetadata> {
         metadata::get_metadata(&env, ip_id)
+    }
+
+    // ── Issue #1070: Verifiable Commitment Timestamps with Notary ─────────────
+
+    /// Register a notary in the on-chain notary registry.
+    ///
+    /// Any address can self-register as a notary. The notary starts with a
+    /// reputation score of 0 and gains reputation with each valid notarization.
+    ///
+    /// # Arguments
+    /// * `env` - Soroban environment
+    /// * `notary` - The address to register as a notary. Must authorize the call.
+    ///
+    /// # Panics
+    ///
+    /// Panics with `CommitmentAlreadyRegistered` if the notary is already registered.
+    pub fn register_notary(env: Env, notary: Address) {
+        notary.require_auth();
+
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::NotaryRecord(notary.clone()))
+        {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::CommitmentAlreadyRegistered as u32,
+            ));
+        }
+
+        let record = NotaryRecord {
+            notary: notary.clone(),
+            reputation: 0,
+            total_notarizations: 0,
+            registered_at: env.ledger().timestamp(),
+            active: true,
+            fees_earned: 0,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::NotaryRecord(notary.clone()), &record);
+        env.storage().persistent().extend_ttl(
+            &DataKey::NotaryRecord(notary.clone()),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        // Append to the global notary list
+        let mut notaries: soroban_sdk::Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NotaryList)
+            .unwrap_or(soroban_sdk::Vec::new(&env));
+        notaries.push_back(notary.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::NotaryList, &notaries);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::NotaryList, LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish(
+            (symbol_short!("ntr_reg"), notary.clone()),
+            env.ledger().timestamp(),
+        );
+    }
+
+    /// Notarize an IP commitment timestamp with an independent notary signature.
+    ///
+    /// The notary signs `ip_id_be_bytes (8) || timestamp_be_bytes (8)` with the
+    /// Ed25519 key stored in `NotaryPublicKey` (set via `set_notary_public_key`).
+    /// Each successful notarization increments the notary's reputation score by 1.
+    ///
+    /// For high-value IPs (determined by the caller passing `required_notaries > 1`),
+    /// multiple independent notaries must sign before the IP is considered fully
+    /// notarized. The multi-notary state is tracked in `MultiNotaryRecord`.
+    ///
+    /// # Arguments
+    ///
+    /// * `commitment_id` - The IP ID to notarize.
+    /// * `notary` - The notary address. Must be registered and active. Must authorize.
+    /// * `signature` - 64-byte Ed25519 signature over `ip_id || timestamp`.
+    /// * `required_notaries` - Minimum number of notaries required (1 = single notary).
+    ///
+    /// # Returns
+    ///
+    /// A notarization event ID (ledger timestamp of the notarization).
+    ///
+    /// # Panics
+    ///
+    /// Panics with `NotaryNotFound` if the notary is not registered or not active.
+    /// Panics with `IpNotFound` if the IP does not exist.
+    /// Panics with `Unauthorized` if the Ed25519 signature verification fails.
+    pub fn notarize_commitment(
+        env: Env,
+        commitment_id: u64,
+        notary: Address,
+        signature: Bytes,
+    ) -> u64 {
+        notary.require_auth();
+
+        // Verify IP exists
+        let mut record = require_ip_exists(&env, commitment_id);
+
+        // Verify notary is registered and active
+        let mut notary_rec: NotaryRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NotaryRecord(notary.clone()))
+            .unwrap_or_else(|| {
+                panic_with_error!(env, ContractError::NotaryNotFound);
+            });
+
+        if !notary_rec.active {
+            panic_with_error!(env, ContractError::NotaryNotFound);
+        }
+
+        // Require notary public key to be configured
+        let public_key: BytesN<32> =
+            match env.storage().persistent().get(&DataKey::NotaryPublicKey) {
+                Some(k) => k,
+                None => {
+                    panic_with_error!(env, ContractError::Unauthorized);
+                }
+            };
+
+        // Signature must be exactly 64 bytes for Ed25519
+        if signature.len() != 64 {
+            panic_with_error!(env, ContractError::Unauthorized);
+        }
+        let sig: BytesN<64> = match signature.clone().try_into() {
+            Ok(s) => s,
+            Err(_) => {
+                panic_with_error!(env, ContractError::Unauthorized);
+            }
+        };
+
+        // Message: ip_id (8 bytes BE) || timestamp (8 bytes BE)
+        let mut message = Bytes::new(&env);
+        message.append(&Bytes::from_array(&env, &commitment_id.to_be_bytes()));
+        message.append(&Bytes::from_array(&env, &record.timestamp.to_be_bytes()));
+
+        // Verify Ed25519 signature — panics if invalid
+        env.crypto().ed25519_verify(&public_key, &message, &sig);
+
+        // Store signature on IpRecord
+        record.notary_signature = Some(signature.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::IpRecord(commitment_id), &record);
+        env.storage().persistent().extend_ttl(
+            &DataKey::IpRecord(commitment_id),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        // Increment notary reputation and accrue the notary's configured fee
+        let fee = Self::_credit_notary(&env, &mut notary_rec);
+
+        let notarized_at = env.ledger().timestamp();
+
+        env.events().publish(
+            (symbol_short!("ntr_sign"), notary.clone()),
+            (commitment_id, notarized_at, fee),
+        );
+
+        notarized_at
+    }
+
+    /// Require multiple independent notaries to co-sign a high-value IP timestamp.
+    ///
+    /// Each call by a distinct notary adds their signature to the multi-notary
+    /// record. Once `threshold` notaries have signed, `finalized` is set to `true`.
+    ///
+    /// # Arguments
+    ///
+    /// * `commitment_id` - The IP ID requiring multi-notary certification.
+    /// * `notary` - The signing notary. Must be registered and active. Must authorize.
+    /// * `signature` - 64-byte Ed25519 signature.
+    /// * `threshold` - Required number of notaries (must be ≥ 2 for multi-notary).
+    /// * `min_reputation` - Minimum notary reputation required to participate.
+    ///
+    /// # Panics
+    ///
+    /// Panics with `NotaryNotFound` if the notary is not registered or not active.
+    /// Panics with `NotaryReputationTooLow` if the notary's reputation is below `min_reputation`.
+    /// Panics with `AlreadySigned` if this notary has already signed for this IP.
+    pub fn require_multi_notary(
+        env: Env,
+        commitment_id: u64,
+        notary: Address,
+        signature: Bytes,
+        threshold: u32,
+        min_reputation: u64,
+    ) -> bool {
+        notary.require_auth();
+
+        // Verify IP exists
+        require_ip_exists(&env, commitment_id);
+
+        // Verify notary is registered and active
+        let mut notary_rec: NotaryRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NotaryRecord(notary.clone()))
+            .unwrap_or_else(|| {
+                panic_with_error!(env, ContractError::NotaryNotFound);
+            });
+
+        if !notary_rec.active {
+            panic_with_error!(env, ContractError::NotaryNotFound);
+        }
+
+        // Check reputation threshold for high-value IPs
+        if notary_rec.reputation < min_reputation {
+            panic_with_error!(env, ContractError::NotaryReputationTooLow);
+        }
+
+        // Load or initialize multi-notary record
+        let mut multi: MultiNotaryRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MultiNotaryRecord(commitment_id))
+            .unwrap_or(MultiNotaryRecord {
+                ip_id: commitment_id,
+                threshold,
+                signers: soroban_sdk::Vec::new(&env),
+                finalized: false,
+            });
+
+        // The threshold is fixed by the first signer; multi-notary requires ≥ 2 signers
+        if multi.threshold < 2 {
+            panic_with_error!(env, ContractError::NotaryThresholdNotMet);
+        }
+
+        // Reject duplicate signer
+        for s in multi.signers.iter() {
+            if s == notary {
+                panic_with_error!(env, ContractError::AlreadySigned);
+            }
+        }
+
+        // Validate signature (re-use single-notary logic)
+        let public_key: BytesN<32> =
+            match env.storage().persistent().get(&DataKey::NotaryPublicKey) {
+                Some(k) => k,
+                None => {
+                    panic_with_error!(env, ContractError::Unauthorized);
+                }
+            };
+
+        if signature.len() != 64 {
+            panic_with_error!(env, ContractError::Unauthorized);
+        }
+        let sig: BytesN<64> = match signature.clone().try_into() {
+            Ok(s) => s,
+            Err(_) => {
+                panic_with_error!(env, ContractError::Unauthorized);
+            }
+        };
+
+        let ip_rec = require_ip_exists(&env, commitment_id);
+        let mut message = Bytes::new(&env);
+        message.append(&Bytes::from_array(&env, &commitment_id.to_be_bytes()));
+        message.append(&Bytes::from_array(&env, &ip_rec.timestamp.to_be_bytes()));
+        env.crypto().ed25519_verify(&public_key, &message, &sig);
+
+        multi.signers.push_back(notary.clone());
+        Self::_credit_notary(&env, &mut notary_rec);
+
+        let finalized = multi.signers.len() >= multi.threshold;
+        multi.finalized = finalized;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::MultiNotaryRecord(commitment_id), &multi);
+        env.storage().persistent().extend_ttl(
+            &DataKey::MultiNotaryRecord(commitment_id),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        env.events().publish(
+            (symbol_short!("ntr_multi"), commitment_id),
+            (notary, multi.signers.len(), multi.threshold, finalized),
+        );
+
+        finalized
+    }
+
+    /// Set a notary fee for a given notary address. Only the notary themselves may set their fee.
+    ///
+    /// # Arguments
+    /// * `notary` - The notary address. Must authorize.
+    /// * `fee` - Fee amount in stroops.
+    pub fn set_notary_fee(env: Env, notary: Address, fee: u64) {
+        notary.require_auth();
+
+        // Notary must be registered
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::NotaryRecord(notary.clone()))
+        {
+            panic_with_error!(env, ContractError::NotaryNotFound);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::NotaryFeeConfig(notary.clone()), &fee);
+        env.storage().persistent().extend_ttl(
+            &DataKey::NotaryFeeConfig(notary.clone()),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        env.events()
+            .publish((symbol_short!("ntr_fee"), notary), fee);
+    }
+
+    /// Retrieve the fee (in stroops) a notary charges per notarization. Defaults to 0.
+    pub fn get_notary_fee(env: Env, notary: Address) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::NotaryFeeConfig(notary))
+            .unwrap_or(0)
+    }
+
+    /// Check whether a commitment has met its multi-notary threshold.
+    pub fn is_multi_notarized(env: Env, commitment_id: u64) -> bool {
+        env.storage()
+            .persistent()
+            .get::<_, MultiNotaryRecord>(&DataKey::MultiNotaryRecord(commitment_id))
+            .map(|m| m.finalized)
+            .unwrap_or(false)
+    }
+
+    /// Internal helper: bump a notary's reputation, accrue their configured fee,
+    /// and persist the updated record. Returns the fee accrued.
+    fn _credit_notary(env: &Env, notary_rec: &mut NotaryRecord) -> u64 {
+        let fee: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NotaryFeeConfig(notary_rec.notary.clone()))
+            .unwrap_or(0);
+
+        notary_rec.reputation = notary_rec.reputation.saturating_add(1);
+        notary_rec.total_notarizations = notary_rec.total_notarizations.saturating_add(1);
+        notary_rec.fees_earned = notary_rec.fees_earned.saturating_add(fee);
+
+        let key = DataKey::NotaryRecord(notary_rec.notary.clone());
+        env.storage().persistent().set(&key, notary_rec);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, LEDGER_BUMP, LEDGER_BUMP);
+
+        fee
+    }
+
+    /// Retrieve a notary's registration record, including reputation.
+    pub fn get_notary_record(env: Env, notary: Address) -> Option<NotaryRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::NotaryRecord(notary))
+    }
+
+    /// Retrieve the multi-notary state for a given IP.
+    pub fn get_multi_notary_record(env: Env, commitment_id: u64) -> Option<MultiNotaryRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MultiNotaryRecord(commitment_id))
+    }
+
+    /// List all registered notaries.
+    pub fn list_notaries(env: Env) -> soroban_sdk::Vec<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::NotaryList)
+            .unwrap_or(soroban_sdk::Vec::new(&env))
+    }
+
+    // ── Issue #1071: Commitment Proof of Non-Existence ────────────────────────
+
+    /// Take an accumulated Merkle snapshot of every commitment hash registered so far.
+    ///
+    /// Anyone can call this to anchor the current state of the commitment set.
+    /// Non-existence proofs reference a snapshot to claim "this data_hash was not
+    /// in the commitment set at snapshot time".
+    ///
+    /// # Returns
+    ///
+    /// The snapshot ID assigned to this snapshot.
+    pub fn take_commitment_snapshot(env: Env) -> u64 {
+        let snapshot_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NextSnapshotId)
+            .unwrap_or(1);
+
+        let next_ip_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NextId)
+            .unwrap_or(1);
+        let max_ip_id = next_ip_id.saturating_sub(1);
+
+        // Accumulate every registered commitment hash (in ID order) into a binary Merkle tree
+        let mut hashes: Vec<BytesN<32>> = Vec::new(&env);
+        for ip_id in 1..=max_ip_id {
+            if let Some(rec) = env
+                .storage()
+                .persistent()
+                .get::<_, IpRecord>(&DataKey::IpRecord(ip_id))
+            {
+                hashes.push_back(rec.commitment_hash);
+            }
+        }
+        let commitment_count = hashes.len();
+        let merkle_root = if hashes.is_empty() {
+            BytesN::from_array(&env, &[0u8; 32])
+        } else {
+            Self::compute_merkle_root(&env, &hashes)
+        };
+        let timestamp = env.ledger().timestamp();
+
+        let snapshot = MerkleSnapshotRecord {
+            snapshot_id,
+            merkle_root: merkle_root.clone(),
+            timestamp,
+            commitment_count,
+            max_ip_id,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::MerkleSnapshot(snapshot_id), &snapshot);
+        env.storage().persistent().extend_ttl(
+            &DataKey::MerkleSnapshot(snapshot_id),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::NextSnapshotId, &(snapshot_id + 1));
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::NextSnapshotId, LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish(
+            (symbol_short!("snap_new"), snapshot_id),
+            (merkle_root, timestamp, commitment_count),
+        );
+
+        snapshot_id
+    }
+
+    /// Generate a proof that `data_hash` was not committed before `timestamp`.
+    ///
+    /// The earliest snapshot taken at or after `timestamp` is used as the anchor:
+    /// if the hash is absent from that snapshot, it cannot have existed before
+    /// `timestamp`. The proof is returned XDR-encoded so it can be shared
+    /// off-chain and later passed to `verify_non_existence`.
+    ///
+    /// # Panics
+    ///
+    /// Panics with `InvalidNonExistenceProof` if no snapshot covers `timestamp`
+    /// or if `data_hash` was committed within the anchoring snapshot.
+    pub fn generate_non_existence_proof(
+        env: Env,
+        data_hash: BytesN<32>,
+        timestamp: u64,
+    ) -> Bytes {
+        let snapshot = Self::_find_covering_snapshot(&env, timestamp).unwrap_or_else(|| {
+            panic_with_error!(env, ContractError::InvalidNonExistenceProof);
+        });
+
+        if Self::_hash_in_snapshot(&env, &data_hash, &snapshot) {
+            panic_with_error!(env, ContractError::InvalidNonExistenceProof);
+        }
+
+        let proof_bytes = Self::_non_existence_digest(
+            &env,
+            &data_hash,
+            &snapshot.merkle_root,
+            snapshot.snapshot_id,
+            timestamp,
+        );
+
+        let proof = NonExistenceProof {
+            data_hash,
+            claimed_before: timestamp,
+            snapshot_id: snapshot.snapshot_id,
+            snapshot_root: snapshot.merkle_root,
+            snapshot_timestamp: snapshot.timestamp,
+            proof_bytes,
+        };
+
+        env.events().publish(
+            (symbol_short!("nex_gen"), proof.snapshot_id),
+            (proof.data_hash.clone(), timestamp),
+        );
+
+        proof.to_xdr(&env)
+    }
+
+    /// Verify an XDR-encoded non-existence proof produced by
+    /// `generate_non_existence_proof`.
+    ///
+    /// Returns `false` if the proof cannot be decoded, the referenced snapshot
+    /// is missing or does not match, the digest is wrong, the snapshot does not
+    /// cover the claimed timestamp, or the hash is in fact present in the snapshot.
+    pub fn verify_non_existence(env: Env, proof: Bytes) -> bool {
+        let proof = match NonExistenceProof::from_xdr(&env, &proof) {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+
+        let snapshot: MerkleSnapshotRecord = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::MerkleSnapshot(proof.snapshot_id))
+        {
+            Some(s) => s,
+            None => return false,
+        };
+
+        if snapshot.merkle_root != proof.snapshot_root
+            || snapshot.timestamp != proof.snapshot_timestamp
+            || snapshot.timestamp < proof.claimed_before
+        {
+            return false;
+        }
+
+        let expected = Self::_non_existence_digest(
+            &env,
+            &proof.data_hash,
+            &proof.snapshot_root,
+            proof.snapshot_id,
+            proof.claimed_before,
+        );
+        if expected != proof.proof_bytes {
+            return false;
+        }
+
+        !Self::_hash_in_snapshot(&env, &proof.data_hash, &snapshot)
+    }
+
+    /// Retrieve a stored Merkle snapshot by ID.
+    pub fn get_commitment_snapshot(env: Env, snapshot_id: u64) -> Option<MerkleSnapshotRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MerkleSnapshot(snapshot_id))
+    }
+
+    /// Internal helper: earliest snapshot whose timestamp is ≥ `timestamp`.
+    fn _find_covering_snapshot(env: &Env, timestamp: u64) -> Option<MerkleSnapshotRecord> {
+        let next_snapshot_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NextSnapshotId)
+            .unwrap_or(1);
+        for snapshot_id in 1..next_snapshot_id {
+            if let Some(snap) = env
+                .storage()
+                .persistent()
+                .get::<_, MerkleSnapshotRecord>(&DataKey::MerkleSnapshot(snapshot_id))
+            {
+                if snap.timestamp >= timestamp {
+                    return Some(snap);
+                }
+            }
+        }
+        None
+    }
+
+    /// Internal helper: whether `data_hash` was committed by an IP covered by `snapshot`.
+    fn _hash_in_snapshot(
+        env: &Env,
+        data_hash: &BytesN<32>,
+        snapshot: &MerkleSnapshotRecord,
+    ) -> bool {
+        for ip_id in 1..=snapshot.max_ip_id {
+            if let Some(rec) = env
+                .storage()
+                .persistent()
+                .get::<_, IpRecord>(&DataKey::IpRecord(ip_id))
+            {
+                if rec.commitment_hash == *data_hash && rec.timestamp <= snapshot.timestamp {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Internal helper: sha256(data_hash || root || snapshot_id_be || claimed_before_be).
+    fn _non_existence_digest(
+        env: &Env,
+        data_hash: &BytesN<32>,
+        root: &BytesN<32>,
+        snapshot_id: u64,
+        claimed_before: u64,
+    ) -> BytesN<32> {
+        let mut input = Bytes::new(env);
+        input.append(&data_hash.clone().into());
+        input.append(&root.clone().into());
+        input.append(&Bytes::from_array(env, &snapshot_id.to_be_bytes()));
+        input.append(&Bytes::from_array(env, &claimed_before.to_be_bytes()));
+        env.crypto().sha256(&input).into()
+    }
+
+    // ── Issue #1072: Commitment Hierarchical Access Control ───────────────────
+
+    /// Grant hierarchical access to a commitment with an explicit access level.
+    ///
+    /// Access levels are hierarchical and cumulative:
+    /// - `1` (View): read IP metadata
+    /// - `2` (Reveal): verify the commitment opening (implies View)
+    /// - `3` (Transfer): initiate IP transfer (implies View + Reveal)
+    /// - `4` (Revoke): revoke other parties' delegations (implies all of the above)
+    ///
+    /// Only the IP owner may call this; grants made here are at depth 0.
+    /// Delegates may further re-delegate via `delegate_access`.
+    ///
+    /// # Panics
+    ///
+    /// Panics with `Unauthorized` if the caller is not the IP owner or `level` is invalid.
+    pub fn grant_access(env: Env, commitment_id: u64, party: Address, level: u32) {
+        let record = require_ip_exists(&env, commitment_id);
+        record.owner.require_auth();
+
+        if !(ACCESS_LEVEL_VIEW..=ACCESS_LEVEL_REVOKE).contains(&level) || party == record.owner {
+            panic_with_error!(env, ContractError::Unauthorized);
+        }
+
+        Self::_store_access_delegation(&env, commitment_id, party.clone(), record.owner, level, 0);
+
+        env.events().publish(
+            (symbol_short!("ac_grant"), commitment_id),
+            (party, level, 0u32),
+        );
+    }
+
+    /// Role-based delegation: an active delegate re-delegates up to their own level.
+    /// Delegation depth is limited to `MAX_ACCESS_DELEGATION_DEPTH`.
+    ///
+    /// # Panics
+    ///
+    /// Panics with `AccessDelegateNotFound` if the delegator has no effective access.
+    /// Panics with `Unauthorized` if the delegator tries to grant a higher level than they hold.
+    /// Panics with `AccessDelegationDepthExceeded` if the chain is too deep.
+    pub fn delegate_access(
+        env: Env,
+        commitment_id: u64,
+        delegator: Address,
+        new_delegate: Address,
+        level: u32,
+    ) {
+        delegator.require_auth();
+        let record = require_ip_exists(&env, commitment_id);
+
+        let delegator_rec: AccessDelegationRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AccessDelegation(commitment_id, delegator.clone()))
+            .unwrap_or_else(|| {
+                panic_with_error!(env, ContractError::AccessDelegateNotFound);
+            });
+
+        // The delegator's whole chain must still be valid (retroactive revocation)
+        if Self::_effective_access_level(&env, commitment_id, &record.owner, &delegator) == 0 {
+            panic_with_error!(env, ContractError::AccessDelegateNotFound);
+        }
+
+        if level == 0 || level > delegator_rec.level || new_delegate == record.owner {
+            panic_with_error!(env, ContractError::Unauthorized);
+        }
+
+        let new_depth = delegator_rec.depth + 1;
+        if new_depth > MAX_ACCESS_DELEGATION_DEPTH {
+            panic_with_error!(env, ContractError::AccessDelegationDepthExceeded);
+        }
+
+        Self::_store_access_delegation(
+            &env,
+            commitment_id,
+            new_delegate.clone(),
+            delegator.clone(),
+            level,
+            new_depth,
+        );
+
+        env.events().publish(
+            (symbol_short!("ac_redelg"), commitment_id),
+            (delegator, new_delegate, level, new_depth),
+        );
+    }
+
+    /// Revoke a delegation with retroactive effect.
+    ///
+    /// Marks the delegation as revoked. Because access checks walk the full
+    /// delegation chain, every downstream re-delegation made by `party` loses
+    /// access at the same moment, without needing to be revoked individually.
+    ///
+    /// `revoker` must be the IP owner, or a delegate with effective `Revoke`
+    /// access who is not revoking themselves.
+    ///
+    /// # Panics
+    ///
+    /// Panics with `Unauthorized` if `revoker` lacks revoke rights.
+    /// Panics with `AccessDelegateNotFound` if no delegation exists for `party`.
+    pub fn revoke_access_delegation(
+        env: Env,
+        commitment_id: u64,
+        revoker: Address,
+        party: Address,
+    ) {
+        revoker.require_auth();
+        let record = require_ip_exists(&env, commitment_id);
+
+        if revoker != record.owner
+            && (revoker == party
+                || Self::_effective_access_level(&env, commitment_id, &record.owner, &revoker)
+                    < ACCESS_LEVEL_REVOKE)
+        {
+            panic_with_error!(env, ContractError::Unauthorized);
+        }
+
+        let key = DataKey::AccessDelegation(commitment_id, party.clone());
+        let mut del_rec: AccessDelegationRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| {
+                panic_with_error!(env, ContractError::AccessDelegateNotFound);
+            });
+
+        del_rec.revoked = true;
+        del_rec.revoked_at = env.ledger().timestamp();
+
+        env.storage().persistent().set(&key, &del_rec);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish(
+            (symbol_short!("ac_rev"), commitment_id),
+            (revoker, party, del_rec.revoked_at),
+        );
+    }
+
+    /// Check whether `party` has at least `required_level` hierarchical access.
+    ///
+    /// The IP owner always has full access. Delegates must hold a sufficient
+    /// level, and every link in their delegation chain back to the owner must
+    /// be unrevoked.
+    pub fn check_hierarchical_access(
+        env: Env,
+        commitment_id: u64,
+        party: Address,
+        required_level: u32,
+    ) -> bool {
+        let record = require_ip_exists(&env, commitment_id);
+        Self::_effective_access_level(&env, commitment_id, &record.owner, &party)
+            >= required_level
+    }
+
+    /// Return the effective access level `party` holds (0 = none, 4 = owner/revoke).
+    pub fn get_access_level(env: Env, commitment_id: u64, party: Address) -> u32 {
+        let record = require_ip_exists(&env, commitment_id);
+        Self::_effective_access_level(&env, commitment_id, &record.owner, &party)
+    }
+
+    /// List all delegation records (including revoked ones) for a commitment.
+    pub fn list_access_delegations(
+        env: Env,
+        commitment_id: u64,
+    ) -> Vec<AccessDelegationRecord> {
+        require_ip_exists(&env, commitment_id);
+        let delegates: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AccessDelegationList(commitment_id))
+            .unwrap_or(Vec::new(&env));
+
+        let mut result = Vec::new(&env);
+        for addr in delegates.iter() {
+            if let Some(rec) = env
+                .storage()
+                .persistent()
+                .get::<_, AccessDelegationRecord>(&DataKey::AccessDelegation(commitment_id, addr))
+            {
+                result.push_back(rec);
+            }
+        }
+        result
+    }
+
+    /// Internal helper: resolve `party`'s effective level by walking the
+    /// delegation chain back to the owner. Any revoked or missing link yields 0.
+    fn _effective_access_level(
+        env: &Env,
+        commitment_id: u64,
+        owner: &Address,
+        party: &Address,
+    ) -> u32 {
+        if party == owner {
+            return ACCESS_LEVEL_REVOKE;
+        }
+
+        let mut current = party.clone();
+        let mut level = u32::MAX;
+        // Chain length is bounded by MAX_ACCESS_DELEGATION_DEPTH + 1 links
+        for _ in 0..=MAX_ACCESS_DELEGATION_DEPTH {
+            let rec: AccessDelegationRecord = match env
+                .storage()
+                .persistent()
+                .get(&DataKey::AccessDelegation(commitment_id, current.clone()))
+            {
+                Some(r) => r,
+                None => return 0,
+            };
+            if rec.revoked {
+                return 0;
+            }
+            level = level.min(rec.level);
+            if rec.granted_by == *owner {
+                return level;
+            }
+            current = rec.granted_by;
+        }
+        0
+    }
+
+    /// Internal helper to write an `AccessDelegationRecord` and update the list index.
+    fn _store_access_delegation(
+        env: &Env,
+        commitment_id: u64,
+        party: Address,
+        granted_by: Address,
+        level: u32,
+        depth: u32,
+    ) {
+        let del_rec = AccessDelegationRecord {
+            ip_id: commitment_id,
+            delegate: party.clone(),
+            granted_by,
+            level,
+            granted_at: env.ledger().timestamp(),
+            depth,
+            revoked: false,
+            revoked_at: 0,
+        };
+
+        let key = DataKey::AccessDelegation(commitment_id, party.clone());
+        env.storage().persistent().set(&key, &del_rec);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, LEDGER_BUMP, LEDGER_BUMP);
+
+        let list_key = DataKey::AccessDelegationList(commitment_id);
+        let mut list: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&list_key)
+            .unwrap_or(Vec::new(env));
+        if !list.contains(&party) {
+            list.push_back(party);
+            env.storage().persistent().set(&list_key, &list);
+            env.storage()
+                .persistent()
+                .extend_ttl(&list_key, LEDGER_BUMP, LEDGER_BUMP);
+        }
+    }
+
+    // ── Issue #1073: Commitment Insurance Proof System ────────────────────────
+
+    /// Register an insurance policy for an IP commitment.
+    ///
+    /// Each IP may have at most one active insurance policy at a time. The policy
+    /// records the provider, coverage amount, and expiry. It integrates with the
+    /// dispute resolution system: if a dispute exists for the IP when a claim is
+    /// filed, the claim is automatically eligible for payout verification.
+    ///
+    /// # Arguments
+    ///
+    /// * `commitment_id` - The IP ID to insure.
+    /// * `amount` - Coverage amount in stroops.
+    /// * `provider` - The insurance provider address.
+    /// * `expires_at` - Unix timestamp when the policy expires (0 = no expiry).
+    ///
+    /// # Returns
+    ///
+    /// The policy ID assigned to this insurance policy.
+    ///
+    /// # Panics
+    ///
+    /// Panics with `IpNotFound` if the IP does not exist.
+    /// Panics with `Unauthorized` if the caller is not the IP owner.
+    /// Panics with `CommitmentAlreadyRegistered` if the IP already has an active policy.
+    pub fn register_insurance(
+        env: Env,
+        commitment_id: u64,
+        amount: u64,
+        provider: Address,
+        expires_at: u64,
+    ) -> u64 {
+        let record = require_ip_exists(&env, commitment_id);
+        record.owner.require_auth();
+
+        if amount == 0 || provider == record.owner {
+            panic_with_error!(env, ContractError::Unauthorized);
+        }
+        if expires_at != 0 && expires_at <= env.ledger().timestamp() {
+            panic_with_error!(env, ContractError::InsurancePolicyNotActive);
+        }
+
+        // Only one active policy per IP
+        if let Some(existing_policy_id) = env
+            .storage()
+            .persistent()
+            .get::<_, u64>(&DataKey::IpInsurancePolicy(commitment_id))
+        {
+            let existing: Option<InsurancePolicyRecord> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::InsurancePolicy(existing_policy_id));
+            if let Some(pol) = existing {
+                if pol.status == InsurancePolicyStatus::Active {
+                    panic_with_error!(env, ContractError::CommitmentAlreadyRegistered);
+                }
+            }
+        }
+
+        let policy_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NextPolicyId)
+            .unwrap_or(1);
+
+        let policy = InsurancePolicyRecord {
+            policy_id,
+            ip_id: commitment_id,
+            owner: record.owner.clone(),
+            provider: provider.clone(),
+            amount,
+            created_at: env.ledger().timestamp(),
+            expires_at,
+            status: InsurancePolicyStatus::Active,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::InsurancePolicy(policy_id), &policy);
+        env.storage().persistent().extend_ttl(
+            &DataKey::InsurancePolicy(policy_id),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        // Map ip_id -> policy_id for quick lookup
+        env.storage()
+            .persistent()
+            .set(&DataKey::IpInsurancePolicy(commitment_id), &policy_id);
+        env.storage().persistent().extend_ttl(
+            &DataKey::IpInsurancePolicy(commitment_id),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::NextPolicyId, &(policy_id + 1));
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::NextPolicyId, LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish(
+            (symbol_short!("ins_reg"), record.owner.clone()),
+            (policy_id, commitment_id, amount),
+        );
+
+        policy_id
+    }
+
+    /// Initiate an insurance claim against an active policy.
+    ///
+    /// The claimant must be the policy owner, and the claim must reference an
+    /// existing dispute on the insured commitment. A claim can only be filed
+    /// once per policy; subsequent calls panic.
+    ///
+    /// # Arguments
+    ///
+    /// * `policy_id` - The insurance policy to claim against.
+    /// * `dispute_id` - The dispute on the insured IP that triggered the claim.
+    /// * `evidence_hash` - SHA-256 hash of supporting evidence.
+    ///
+    /// # Returns
+    ///
+    /// The claim ID assigned to this claim.
+    ///
+    /// # Panics
+    ///
+    /// Panics with `InsurancePolicyNotFound` if the policy does not exist.
+    /// Panics with `InsurancePolicyNotActive` if the policy is not active or is expired.
+    /// Panics with `InsuranceClaimAlreadyFiled` if a claim already exists for this policy.
+    /// Panics with `DisputeNotFound` if the dispute does not exist.
+    /// Panics with `InsuranceDisputeMismatch` if the dispute is for a different IP.
+    /// Panics with `Unauthorized` if the caller is not the policy owner.
+    pub fn initiate_insurance_claim(
+        env: Env,
+        policy_id: u64,
+        dispute_id: u64,
+        evidence_hash: BytesN<32>,
+    ) -> u64 {
+        let policy: InsurancePolicyRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::InsurancePolicy(policy_id))
+            .unwrap_or_else(|| {
+                panic_with_error!(env, ContractError::InsurancePolicyNotFound);
+            });
+
+        policy.owner.require_auth();
+
+        // Policy must be active
+        if policy.status != InsurancePolicyStatus::Active {
+            panic_with_error!(env, ContractError::InsurancePolicyNotActive);
+        }
+
+        // Check expiry
+        let now = env.ledger().timestamp();
+        if policy.expires_at != 0 && now > policy.expires_at {
+            panic_with_error!(env, ContractError::InsurancePolicyNotActive);
+        }
+
+        // One claim per policy
+        let policy_claim_key = DataKey::PolicyClaim(policy_id);
+        if env.storage().persistent().has(&policy_claim_key) {
+            panic_with_error!(env, ContractError::InsuranceClaimAlreadyFiled);
+        }
+
+        // Dispute resolution integration: the claim must reference a dispute on this IP
+        let dispute: DisputeRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IpDisputes(dispute_id))
+            .unwrap_or_else(|| {
+                panic_with_error!(env, ContractError::DisputeNotFound);
+            });
+        if dispute.ip_id != policy.ip_id {
+            panic_with_error!(env, ContractError::InsuranceDisputeMismatch);
+        }
+
+        let claim_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NextClaimId)
+            .unwrap_or(1);
+
+        let claim = InsuranceClaimRecord {
+            claim_id,
+            policy_id,
+            ip_id: policy.ip_id,
+            claimant: policy.owner.clone(),
+            dispute_id,
+            evidence_hash,
+            filed_at: now,
+            status: InsuranceClaimStatus::Pending,
+            payout_amount: 0,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::InsuranceClaim(claim_id), &claim);
+        env.storage().persistent().extend_ttl(
+            &DataKey::InsuranceClaim(claim_id),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        env.storage()
+            .persistent()
+            .set(&policy_claim_key, &claim_id);
+        env.storage()
+            .persistent()
+            .extend_ttl(&policy_claim_key, LEDGER_BUMP, LEDGER_BUMP);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::NextClaimId, &(claim_id + 1));
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::NextClaimId, LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish(
+            (symbol_short!("ins_clm"), policy.owner.clone()),
+            (claim_id, policy_id, dispute_id),
+        );
+
+        claim_id
+    }
+
+    /// Verify an insurance claim once its linked dispute has been resolved.
+    ///
+    /// Only the insurance provider may call this. Payout conditions:
+    /// - the linked dispute must be resolved;
+    /// - approval is only possible when the policy owner lost the dispute
+    ///   (the winner is someone other than the owner). If the owner won,
+    ///   there is no insured loss and the claim can only be rejected.
+    ///
+    /// On approval the payout amount is set to `policy.amount`.
+    ///
+    /// # Arguments
+    ///
+    /// * `claim_id` - The claim to verify.
+    /// * `approved` - Whether to approve (`true`) or reject (`false`) the claim.
+    ///
+    /// # Panics
+    ///
+    /// Panics with `InsuranceClaimNotFound` if the claim does not exist.
+    /// Panics with `InsuranceClaimNotClaimable` if the claim is not in `Pending` status,
+    /// or if approval is requested but the owner won the dispute.
+    /// Panics with `InsuranceDisputeUnresolved` if the linked dispute is still open.
+    /// Panics with `Unauthorized` if the caller is not the insurance provider.
+    pub fn verify_insurance_claim(env: Env, claim_id: u64, approved: bool) {
+        let mut claim: InsuranceClaimRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::InsuranceClaim(claim_id))
+            .unwrap_or_else(|| {
+                panic_with_error!(env, ContractError::InsuranceClaimNotFound);
+            });
+
+        // Only pending claims can be verified
+        if claim.status != InsuranceClaimStatus::Pending {
+            panic_with_error!(env, ContractError::InsuranceClaimNotClaimable);
+        }
+
+        // Load policy to get provider and amount
+        let policy: InsurancePolicyRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::InsurancePolicy(claim.policy_id))
+            .unwrap_or_else(|| {
+                panic_with_error!(env, ContractError::InsurancePolicyNotFound);
+            });
+
+        policy.provider.require_auth();
+
+        let dispute: DisputeRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IpDisputes(claim.dispute_id))
+            .unwrap_or_else(|| {
+                panic_with_error!(env, ContractError::DisputeNotFound);
+            });
+        if !dispute.resolved {
+            panic_with_error!(env, ContractError::InsuranceDisputeUnresolved);
+        }
+        let owner_lost = dispute.winner != Some(policy.owner.clone());
+
+        if approved && !owner_lost {
+            panic_with_error!(env, ContractError::InsuranceClaimNotClaimable);
+        }
+
+        if approved {
+            claim.status = InsuranceClaimStatus::Approved;
+            claim.payout_amount = policy.amount;
+        } else {
+            claim.status = InsuranceClaimStatus::Rejected;
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::InsuranceClaim(claim_id), &claim);
+        env.storage().persistent().extend_ttl(
+            &DataKey::InsuranceClaim(claim_id),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        env.events().publish(
+            (symbol_short!("ins_vfy"), policy.provider.clone()),
+            (claim_id, approved, claim.payout_amount),
+        );
+    }
+
+    /// Record a completed payout for an approved insurance claim.
+    ///
+    /// Transitions the claim from `Approved` to `Paid`. Only the insurance
+    /// provider may trigger this. In production the actual token transfer
+    /// is coordinated off-chain or via a separate token contract call.
+    ///
+    /// # Panics
+    ///
+    /// Panics with `InsuranceClaimNotFound` if the claim does not exist.
+    /// Panics with `InsuranceClaimNotClaimable` if the claim is not in `Approved` status.
+    /// Panics with `Unauthorized` if the caller is not the insurance provider.
+    pub fn complete_insurance_payout(env: Env, claim_id: u64) {
+        let mut claim: InsuranceClaimRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::InsuranceClaim(claim_id))
+            .unwrap_or_else(|| {
+                panic_with_error!(env, ContractError::InsuranceClaimNotFound);
+            });
+
+        if claim.status != InsuranceClaimStatus::Approved {
+            panic_with_error!(env, ContractError::InsuranceClaimNotClaimable);
+        }
+
+        let policy: InsurancePolicyRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::InsurancePolicy(claim.policy_id))
+            .unwrap_or_else(|| {
+                panic_with_error!(env, ContractError::InsurancePolicyNotFound);
+            });
+
+        policy.provider.require_auth();
+
+        claim.status = InsuranceClaimStatus::Paid;
+
+        // A paid-out policy is consumed; the owner may register a new one.
+        let mut policy = policy;
+        policy.status = InsurancePolicyStatus::Expired;
+        env.storage()
+            .persistent()
+            .set(&DataKey::InsurancePolicy(policy.policy_id), &policy);
+        env.storage().persistent().extend_ttl(
+            &DataKey::InsurancePolicy(policy.policy_id),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::InsuranceClaim(claim_id), &claim);
+        env.storage().persistent().extend_ttl(
+            &DataKey::InsuranceClaim(claim_id),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        env.events().publish(
+            (symbol_short!("ins_pay"), policy.provider.clone()),
+            (claim_id, claim.payout_amount),
+        );
+    }
+
+    /// Cancel an active insurance policy. Only the policy owner may cancel, and
+    /// only while no claim is pending against it.
+    ///
+    /// # Panics
+    ///
+    /// Panics with `InsurancePolicyNotFound` if the policy does not exist.
+    /// Panics with `InsurancePolicyNotActive` if the policy is not active.
+    /// Panics with `InsuranceClaimAlreadyFiled` if a claim has been filed.
+    pub fn cancel_insurance(env: Env, policy_id: u64) {
+        let mut policy: InsurancePolicyRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::InsurancePolicy(policy_id))
+            .unwrap_or_else(|| {
+                panic_with_error!(env, ContractError::InsurancePolicyNotFound);
+            });
+
+        policy.owner.require_auth();
+
+        if policy.status != InsurancePolicyStatus::Active {
+            panic_with_error!(env, ContractError::InsurancePolicyNotActive);
+        }
+        if env.storage().persistent().has(&DataKey::PolicyClaim(policy_id)) {
+            panic_with_error!(env, ContractError::InsuranceClaimAlreadyFiled);
+        }
+
+        policy.status = InsurancePolicyStatus::Cancelled;
+        env.storage()
+            .persistent()
+            .set(&DataKey::InsurancePolicy(policy_id), &policy);
+        env.storage().persistent().extend_ttl(
+            &DataKey::InsurancePolicy(policy_id),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        env.events().publish(
+            (symbol_short!("ins_cxl"), policy.owner.clone()),
+            policy_id,
+        );
+    }
+
+    /// Retrieve an insurance policy by ID.
+    pub fn get_insurance_policy(env: Env, policy_id: u64) -> Option<InsurancePolicyRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::InsurancePolicy(policy_id))
+    }
+
+    /// Retrieve an insurance claim by ID.
+    pub fn get_insurance_claim(env: Env, claim_id: u64) -> Option<InsuranceClaimRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::InsuranceClaim(claim_id))
+    }
+
+    /// Retrieve the claim ID filed against a policy, if any.
+    pub fn get_policy_claim_id(env: Env, policy_id: u64) -> Option<u64> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PolicyClaim(policy_id))
+    }
+
+    /// Retrieve the active policy ID for a given IP commitment, if any.
+    pub fn get_ip_insurance_policy_id(env: Env, commitment_id: u64) -> Option<u64> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::IpInsurancePolicy(commitment_id))
     }
 }
 
