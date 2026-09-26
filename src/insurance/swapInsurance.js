@@ -75,6 +75,32 @@ function assessRiskFactor(swapMeta) {
   if (swapMeta.sellerSwapCount != null && swapMeta.sellerSwapCount < 5)
     factor += 0.4;
 
+  if (swapMeta.previousClaimsCount != null) {
+    if (swapMeta.previousClaimsCount >= 5) factor += 0.8;
+    else if (swapMeta.previousClaimsCount >= 2) factor += 0.4;
+    else if (swapMeta.previousClaimsCount === 0) factor -= 0.1;
+  }
+
+  if (swapMeta.completionRate != null) {
+    const completionRate = Math.max(0, Math.min(1, swapMeta.completionRate));
+    if (completionRate < 0.8) factor += (0.8 - completionRate) * 1.5;
+    else if (completionRate > 0.98) factor -= 0.15;
+  }
+
+  if (swapMeta.disputeRate != null) {
+    const disputeRate = Math.max(0, Math.min(1, swapMeta.disputeRate));
+    factor += disputeRate * 1.2;
+  }
+
+  if (swapMeta.priceVolatilityPct != null) {
+    factor += Math.min(0.6, Math.max(0, swapMeta.priceVolatilityPct) / 100);
+  }
+
+  if (swapMeta.assetLiquidityScore != null) {
+    const liquidity = Math.max(0, Math.min(100, swapMeta.assetLiquidityScore));
+    factor += (50 - liquidity) / 100;
+  }
+
   return Math.max(0.5, Math.min(3.0, +factor.toFixed(2)));
 }
 
