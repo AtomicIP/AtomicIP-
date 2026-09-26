@@ -2,6 +2,9 @@ use axum::{extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use tokio::time::sleep;
+
+use crate::error_recovery::{calculate_backoff, is_retryable_error, RetryConfig};
 
 /// Configuration for batch request handling
 pub struct BatchConfig {
@@ -111,14 +114,42 @@ pub async fn batch_handler(
     }
 
     let mut responses = Vec::new();
+    let retry_config = RetryConfig::default();
     
-    // Process requests sequentially for now (could be parallel for read-only operations)
+    // Process requests sequentially so retries preserve request ordering.
     for request in batch_request.requests {
-        let response = process_single_request(request).await;
+        let response = process_single_request_with_retry(request, &retry_config).await;
         responses.push(response);
     }
 
     Ok(Json(BatchResponse { responses }))
+}
+
+async fn process_single_request_with_retry(
+    request: SingleRequest,
+    config: &RetryConfig,
+) -> SingleResponse {
+    let mut response = process_single_request(request.clone()).await;
+
+    for attempt in 0..config.max_retries {
+        if !is_retryable_error(StatusCode::from_u16(response.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)) {
+            break;
+        }
+
+        let delay = calculate_backoff(attempt, config);
+        tracing::warn!(
+            request_id = %request.id,
+            attempt = attempt + 1,
+            max_retries = config.max_retries,
+            ?delay,
+            status = response.status,
+            "retrying failed batch request"
+        );
+        sleep(delay).await;
+        response = process_single_request(request.clone()).await;
+    }
+
+    response
 }
 
 async fn process_single_request(request: SingleRequest) -> SingleResponse {
