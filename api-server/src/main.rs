@@ -97,6 +97,10 @@ mod snapshot_tests;
         handlers::cancel_swap,
         handlers::cancel_expired_swap,
         handlers::get_swap,
+        handlers::get_swap_escrow,
+        handlers::get_swap_history,
+        handlers::get_swap_disputes,
+        handlers::list_swaps,
         handlers::register_webhook,
         handlers::unregister_webhook,
         handlers::bulk_commit_ip,
@@ -125,6 +129,10 @@ mod snapshot_tests;
         schemas::CancelSwapRequest,
         schemas::CancelExpiredSwapRequest,
         schemas::SwapRecord,
+        schemas::SwapListResponse,
+        schemas::EscrowStatusResponse,
+        schemas::SwapHistoryEntry,
+        schemas::DisputeEvidenceEntry,
         schemas::SwapStatus,
         schemas::ErrorResponse,
         schemas::RegisterWebhookRequest,
@@ -402,6 +410,10 @@ fn build_app() -> Router {
         .route("/v1/swap/{swap_id}/cancel", post(handlers::cancel_swap).layer(signed.clone()))
         .route("/v1/swap/{swap_id}/cancel-expired", post(handlers::cancel_expired_swap))
         .route("/v1/swap/{swap_id}", get(handlers::get_swap))
+        .route("/v1/swap/{swap_id}/escrow", get(handlers::get_swap_escrow))
+        .route("/v1/swap/{swap_id}/history", get(handlers::get_swap_history))
+        .route("/v1/swap/{swap_id}/disputes", get(handlers::get_swap_disputes))
+        .route("/v1/swaps", get(handlers::list_swaps))
         .route("/v1/webhooks", post(handlers::register_webhook))
         .route("/v1/webhooks/{id}", axum::routing::delete(handlers::unregister_webhook))
         .route("/v1/bulk/commit-ip", post(handlers::bulk_commit_ip))
