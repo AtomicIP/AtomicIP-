@@ -17,6 +17,14 @@ mod oracle_tests;
 mod treasury_validation_tests;
 #[cfg(test)]
 mod swap_fuzz_tests;
+#[cfg(test)]
+mod sla_enforcement_tests;
+#[cfg(test)]
+mod refund_distribution_tests;
+#[cfg(test)]
+mod reputation_pricing_tests;
+#[cfg(test)]
+mod dispute_escalation_tests;
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Bytes,
