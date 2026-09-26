@@ -122,6 +122,24 @@ pub enum ContractError {
     InvalidPrivacyLevel = 44,
     /// #977: Access denied due to privacy level restrictions.
     AccessDenied = 45,
+    /// #1074: Extension request not found.
+    ExtensionRequestNotFound = 46,
+    /// #1074: Extension has already been approved or rejected.
+    ExtensionAlreadyProcessed = 47,
+    /// #1074: Caller is not the issuer (admin) required to approve an extension.
+    NotIssuer = 48,
+    /// #1075: Immutability proof not found for the given commitment.
+    ImmutabilityProofNotFound = 49,
+    /// #1076: Commitment already split into fractions.
+    AlreadySplit = 50,
+    /// #1076: Invalid fraction count (must be >= 2).
+    InvalidFractionCount = 51,
+    /// #1076: Commitments cannot be merged (not all fractions present, or chain mismatch).
+    MergeNotAllowed = 52,
+    /// #1077: Unsupported target chain identifier.
+    UnsupportedChain = 53,
+    /// #1077: Commitment has already been bridged to the target chain.
+    AlreadyBridged = 54,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -234,6 +252,16 @@ pub enum DataKey {
     // Issue #979: Commitment linking for related IPs
     CommitmentLinks(u64), // maps ip_id -> Vec<CommitmentLink> of linked commitments
     LinkedCommitments(u64), // maps linked_ip_id -> Vec<u64> of ip_ids linking to it (reverse index)
+    // Issue #1074: Grace period extension requests
+    ExtensionRequests(u64), // maps ip_id -> Vec<ExtensionRequest>
+    // Issue #1075: Immutability proofs
+    ImmutabilityProof(u64), // maps ip_id -> ImmutabilityProof
+    // Issue #1076: Fractional ownership
+    FractionalOwnership(u64), // maps ip_id -> FractionalOwnership record
+    FractionParent(u64),      // maps fraction ip_id -> parent ip_id
+    // Issue #1077: Cross-chain bridge records
+    BridgeRecord(u64, BytesN<32>), // maps (ip_id, chain_id_hash) -> BridgeRecord
+    BridgedChains(u64),            // maps ip_id -> Vec<BytesN<32>> of chain id hashes bridged to
 }
 
 // ── Upgrade Compatibility Manifest (#791) ───────────────────────────────────
@@ -293,6 +321,14 @@ const CURRENT_FUNCTIONS: &[&str] = &[
     "validate_upgrade", "verify_batch_proof", "verify_commitment", "verify_commitment_integrity",
     "verify_commitment_pow", "verify_ip_merkle_proof", "verify_ownership_challenge", "verify_threshold_signatures",
     "vote_on_dispute",
+    // #1074
+    "request_extension", "approve_extension", "reject_extension", "get_extension_requests",
+    // #1075
+    "generate_immutability_proof", "verify_immutability", "get_immutability_proof",
+    // #1076
+    "split_commitment", "merge_commitments", "get_fractional_ownership",
+    // #1077
+    "bridge_commitment", "get_bridge_record", "get_bridged_chains",
 ];
 
 /// Names of every `DataKey` storage-key variant the currently deployed
@@ -309,6 +345,14 @@ const CURRENT_STORAGE_KEYS: &[&str] = &[
     "CompressedCommitment", "BatchVerifyResult", "CompressionSelection", "HierarchyNode",
     "OwnerCategories", "CategoryDepth", "ThresholdConfig", "ThresholdSignatures", "BatchMetadata",
     "EncryptedCommitment", "BatchEscrow", "CommitmentLinks", "LinkedCommitments",
+    // #1074
+    "ExtensionRequests",
+    // #1075
+    "ImmutabilityProof",
+    // #1076
+    "FractionalOwnership", "FractionParent",
+    // #1077
+    "BridgeRecord", "BridgedChains",
 ];
 
 /// (error name, error code) pairs defined by the currently deployed contract.
@@ -352,6 +396,19 @@ const CURRENT_ERROR_CODES: &[(&str, u32)] = &[
     ("NotInitialized", 36),
     ("AlreadyInitialized", 37),
     ("IncompatibleUpgrade", 38),
+    // #1074
+    ("ExtensionRequestNotFound", 46),
+    ("ExtensionAlreadyProcessed", 47),
+    ("NotIssuer", 48),
+    // #1075
+    ("ImmutabilityProofNotFound", 49),
+    // #1076
+    ("AlreadySplit", 50),
+    ("InvalidFractionCount", 51),
+    ("MergeNotAllowed", 52),
+    // #1077
+    ("UnsupportedChain", 53),
+    ("AlreadyBridged", 54),
 ];
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -617,6 +674,140 @@ pub struct HierarchyNode {
 pub struct CategoryInfo {
     pub path: soroban_sdk::Bytes, // full category path e.g. "Software/Cryptography/ZK-Proofs"
     pub depth: u32,               // number of segments (3 for the example above)
+}
+
+// ── Issue #1074: Grace Period Extension Requests ─────────────────────────────
+
+/// Status of a grace period extension request.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum ExtensionStatus {
+    Pending = 0,
+    Approved = 1,
+    Rejected = 2,
+}
+
+/// A single extension request for a commitment's grace period.
+///
+/// The owner requests additional time before the commitment expires and loses
+/// protection. An issuer (admin) must approve or reject the request.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ExtensionRequest {
+    /// Monotonically increasing index within this IP's request list.
+    pub request_index: u32,
+    /// Address that submitted the request (must be the IP owner).
+    pub requester: Address,
+    /// Number of seconds of additional time requested.
+    pub additional_time: u64,
+    /// Wall-clock timestamp when the request was submitted.
+    pub submitted_at: u64,
+    /// Current status of this request.
+    pub status: ExtensionStatus,
+    /// If approved, the new expiry timestamp that was applied.
+    pub applied_expiry: Option<u64>,
+}
+
+// ── Issue #1075: Commitment Immutability Proof ────────────────────────────────
+
+/// An immutability proof anchors a commitment to a Merkle root and timestamp,
+/// enabling blockchain-agnostic verification that the commitment has not been
+/// tampered with since the proof was generated.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ImmutabilityProof {
+    pub ip_id: u64,
+    /// SHA-256 Merkle root over all commitment hashes registered at proof
+    /// generation time, used as the tamper-evident anchor.
+    pub merkle_root: BytesN<32>,
+    /// SHA-256 of `(commitment_hash || merkle_root || timestamp_bytes)`,
+    /// forming the portable proof digest.
+    pub proof_digest: BytesN<32>,
+    /// Ledger timestamp at which the proof was generated.
+    pub generated_at: u64,
+    /// Human-readable note on how long this proof is expected to remain valid
+    /// (informational; proofs have no on-chain expiry).
+    pub validity_note: Bytes,
+}
+
+// ── Issue #1076: Fractional Ownership ────────────────────────────────────────
+
+/// A single fractional share in a split commitment.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct FractionalShare {
+    /// On-chain IP ID of the fraction (a new IpRecord pointing to the same
+    /// commitment hash as the parent, but with this owner).
+    pub fraction_ip_id: u64,
+    /// Address that owns this fraction.
+    pub owner: Address,
+    /// Numerator of the ownership fraction: `owner_fraction / total_fractions`.
+    pub owner_fraction: u32,
+}
+
+/// Fractional ownership record stored for the original (parent) commitment
+/// after `split_commitment` is called.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct FractionalOwnershipRecord {
+    /// The original IP ID that was split.
+    pub parent_ip_id: u64,
+    /// Total number of equal fractions the commitment was split into.
+    pub total_fractions: u32,
+    /// Ordered list of all fractional shares.
+    pub shares: soroban_sdk::Vec<FractionalShare>,
+    /// True once all fractions have been merged back via `merge_commitments`.
+    pub merged: bool,
+}
+
+// ── Issue #1077: Cross-Chain Commitment Bridge ───────────────────────────────
+
+/// Supported target chains for the cross-chain bridge.
+///
+/// Each variant maps to the canonical chain identifier bytes used in the
+/// chain-agnostic commitment format.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum TargetChain {
+    Ethereum = 1,
+    Polygon = 2,
+}
+
+/// Chain-agnostic commitment payload.
+///
+/// This is the canonical representation of an IP commitment that can be
+/// interpreted by any target chain's bridge contract without Soroban-specific
+/// encoding.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ChainAgnosticCommitment {
+    /// The 32-byte commitment hash (Pedersen hash of secret || blinding_factor).
+    pub commitment_hash: BytesN<32>,
+    /// The Stellar ledger timestamp when the commitment was originally created.
+    pub original_timestamp: u64,
+    /// Chain identifier of the target chain (EIP-155 chain ID for EVM chains).
+    pub target_chain_id: u32,
+    /// Canonical textual identifier for the source chain (e.g. "stellar").
+    pub source_chain: Bytes,
+    /// Additional chain-specific metadata encoded as raw bytes.
+    /// For EVM chains: ABI-encoded `(address owner, uint256 timestamp)`.
+    pub chain_payload: Bytes,
+}
+
+/// A bridge record created by `bridge_commitment`.  Stored on-chain so the
+/// contract can prevent double-bridging and provide audit trails.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct BridgeRecord {
+    pub ip_id: u64,
+    /// SHA-256 of the target chain identifier bytes, used as the map key.
+    pub chain_id_hash: BytesN<32>,
+    /// The chain-agnostic payload that was produced and emitted.
+    pub payload: ChainAgnosticCommitment,
+    /// Ledger timestamp when the bridge was initiated.
+    pub bridged_at: u64,
+    /// Validation digest: SHA-256(`commitment_hash || chain_payload || bridged_at_bytes`).
+    pub validation_hash: BytesN<32>,
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -6231,6 +6422,993 @@ impl IpRegistry {
     /// Option<IpMetadata> containing the encrypted metadata if it exists
     pub fn get_commitment_metadata(env: Env, ip_id: u64) -> Option<types::IpMetadata> {
         metadata::get_metadata(&env, ip_id)
+    }
+
+    // ── Issue #1074: Commitment Expiration with Grace Period Extension ────────
+
+    /// Request an extension to an IP commitment's expiry (and thus its grace
+    /// period).  Only the IP owner may submit a request.
+    ///
+    /// Extensions are not applied automatically; an issuer (admin) must call
+    /// `approve_extension` to confirm the additional time.  This two-step
+    /// process prevents owners from unilaterally extending protection without
+    /// oversight.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment.
+    /// * `commitment_id` - The IP ID to request the extension for.
+    /// * `additional_time` - Extra seconds to add to the current
+    ///   `expiry_timestamp`.  Must be greater than zero.
+    ///
+    /// # Returns
+    ///
+    /// `true` if the request was recorded successfully.
+    ///
+    /// # Panics
+    ///
+    /// * `IpNotFound` – the IP ID does not exist.
+    /// * `InvalidExpiry` – `additional_time` is zero.
+    /// * `Unauthorized` – caller is not the IP owner.
+    pub fn request_extension(env: Env, commitment_id: u64, additional_time: u64) -> bool {
+        let record = require_ip_exists(&env, commitment_id);
+        record.owner.require_auth();
+
+        if additional_time == 0 {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::InvalidExpiry as u32,
+            ));
+        }
+
+        let mut requests: Vec<ExtensionRequest> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ExtensionRequests(commitment_id))
+            .unwrap_or(Vec::new(&env));
+
+        let request_index = requests.len();
+        requests.push_back(ExtensionRequest {
+            request_index,
+            requester: record.owner.clone(),
+            additional_time,
+            submitted_at: env.ledger().timestamp(),
+            status: ExtensionStatus::Pending,
+            applied_expiry: None,
+        });
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ExtensionRequests(commitment_id), &requests);
+        env.storage().persistent().extend_ttl(
+            &DataKey::ExtensionRequests(commitment_id),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        env.events().publish(
+            (symbol_short!("ext_req"), record.owner),
+            (commitment_id, additional_time, request_index),
+        );
+
+        true
+    }
+
+    /// Approve a pending extension request.  Only the contract admin (issuer)
+    /// may approve.
+    ///
+    /// On approval the IP record's `expiry_timestamp` is incremented by
+    /// `additional_time`, and an `ExpiryNotified` flag is cleared so the new
+    /// deadline triggers a fresh notification.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment.
+    /// * `commitment_id` - The IP ID whose extension is being approved.
+    /// * `request_index` - The zero-based index of the request within the IP's
+    ///   extension request list.
+    ///
+    /// # Returns
+    ///
+    /// The new `expiry_timestamp` that was applied.
+    ///
+    /// # Panics
+    ///
+    /// * `NotInitialized` / `NotIssuer` – caller is not the admin.
+    /// * `IpNotFound` – the IP ID does not exist.
+    /// * `ExtensionRequestNotFound` – `request_index` is out of bounds.
+    /// * `ExtensionAlreadyProcessed` – request is not `Pending`.
+    pub fn approve_extension(env: Env, commitment_id: u64, request_index: u32) -> u64 {
+        let admin = Self::require_admin(&env);
+        admin.require_auth();
+
+        let mut record = require_ip_exists(&env, commitment_id);
+
+        let mut requests: Vec<ExtensionRequest> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ExtensionRequests(commitment_id))
+            .unwrap_or(Vec::new(&env));
+
+        if request_index >= requests.len() {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::ExtensionRequestNotFound as u32,
+            ));
+        }
+
+        let mut req = requests.get(request_index).unwrap();
+
+        if req.status != ExtensionStatus::Pending {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::ExtensionAlreadyProcessed as u32,
+            ));
+        }
+
+        // Apply the extension: bump expiry by the requested additional_time.
+        let new_expiry = record.expiry_timestamp.saturating_add(req.additional_time);
+        record.expiry_timestamp = new_expiry;
+
+        // Update the request record.
+        req.status = ExtensionStatus::Approved;
+        req.applied_expiry = Some(new_expiry);
+        requests.set(request_index, req);
+
+        // Persist the updated IP record and request list.
+        env.storage()
+            .persistent()
+            .set(&DataKey::IpRecord(commitment_id), &record);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::IpRecord(commitment_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ExtensionRequests(commitment_id), &requests);
+        env.storage().persistent().extend_ttl(
+            &DataKey::ExtensionRequests(commitment_id),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        // Clear the expiry-notified flag so the new deadline can emit a fresh event.
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::ExpiryNotified(commitment_id))
+        {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::ExpiryNotified(commitment_id));
+        }
+
+        env.events().publish(
+            (symbol_short!("ext_app"), admin),
+            (commitment_id, new_expiry, request_index),
+        );
+
+        new_expiry
+    }
+
+    /// Reject a pending extension request.  Only the contract admin (issuer)
+    /// may reject.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment.
+    /// * `commitment_id` - The IP ID whose extension is being rejected.
+    /// * `request_index` - The zero-based index of the request within the IP's
+    ///   extension request list.
+    ///
+    /// # Panics
+    ///
+    /// * `NotInitialized` / `NotIssuer` – caller is not the admin.
+    /// * `IpNotFound` – the IP ID does not exist.
+    /// * `ExtensionRequestNotFound` – `request_index` is out of bounds.
+    /// * `ExtensionAlreadyProcessed` – request is not `Pending`.
+    pub fn reject_extension(env: Env, commitment_id: u64, request_index: u32) {
+        let admin = Self::require_admin(&env);
+        admin.require_auth();
+
+        // Ensure the IP exists before touching the request list.
+        require_ip_exists(&env, commitment_id);
+
+        let mut requests: Vec<ExtensionRequest> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ExtensionRequests(commitment_id))
+            .unwrap_or(Vec::new(&env));
+
+        if request_index >= requests.len() {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::ExtensionRequestNotFound as u32,
+            ));
+        }
+
+        let mut req = requests.get(request_index).unwrap();
+
+        if req.status != ExtensionStatus::Pending {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::ExtensionAlreadyProcessed as u32,
+            ));
+        }
+
+        req.status = ExtensionStatus::Rejected;
+        requests.set(request_index, req);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ExtensionRequests(commitment_id), &requests);
+        env.storage().persistent().extend_ttl(
+            &DataKey::ExtensionRequests(commitment_id),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        env.events().publish(
+            (symbol_short!("ext_rej"), admin),
+            (commitment_id, request_index),
+        );
+    }
+
+    /// Retrieve all extension requests for a given IP commitment.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment.
+    /// * `commitment_id` - The IP ID to query.
+    ///
+    /// # Returns
+    ///
+    /// `Vec<ExtensionRequest>` — may be empty if no requests have been submitted.
+    pub fn get_extension_requests(env: Env, commitment_id: u64) -> Vec<ExtensionRequest> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ExtensionRequests(commitment_id))
+            .unwrap_or(Vec::new(&env))
+    }
+
+    // ── Issue #1075: Commitment Immutability Proof ────────────────────────────
+
+    /// Generate an immutability proof for an IP commitment.
+    ///
+    /// The proof anchors the commitment hash to the current Merkle root of all
+    /// commitments registered by the owner, producing a portable digest that
+    /// can be verified both on- and off-chain without Stellar-specific tooling.
+    ///
+    /// Proof construction:
+    /// 1. Compute `merkle_root` = SHA-256 Merkle root over all commitment hashes
+    ///    currently registered on-chain (using `compute_ip_merkle_root`).
+    /// 2. Compute `proof_digest` = SHA-256(`commitment_hash || merkle_root || timestamp_u64_le`).
+    /// 3. Store the proof under `DataKey::ImmutabilityProof(ip_id)`.
+    ///
+    /// # Proof validity duration
+    ///
+    /// Proofs carry no on-chain expiry. A proof remains valid for as long as:
+    /// * the `IpRecord` exists (it is subject to persistent-storage TTL and is
+    ///   bumped by `LEDGER_BUMP` on each write), and
+    /// * its `commitment_hash` is unchanged since `generated_at`.
+    ///
+    /// The stored `merkle_root` is a snapshot of the commitment set at
+    /// `generated_at`; later registrations do not invalidate the proof.
+    /// Calling this function again replaces the stored proof, invalidating the
+    /// previously issued digest.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment.
+    /// * `commitment_id` - The IP ID to generate the proof for.
+    ///
+    /// # Returns
+    ///
+    /// The raw proof bytes (32-byte `proof_digest` as `Bytes`).
+    ///
+    /// # Panics
+    ///
+    /// * `IpNotFound` – the IP ID does not exist.
+    pub fn generate_immutability_proof(env: Env, commitment_id: u64) -> Bytes {
+        let record = require_ip_exists(&env, commitment_id);
+
+        // Step 1: Compute Merkle root over all known commitment hashes.
+        let all_hashes: Vec<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CommitmentHashes)
+            .unwrap_or(Vec::new(&env));
+
+        let merkle_root = aggregate_batch_proof(&env, &all_hashes);
+
+        // Step 2: Build the proof digest: SHA-256(commitment_hash || merkle_root || timestamp).
+        let now = env.ledger().timestamp();
+        let ts_bytes = now.to_le_bytes();
+
+        let mut preimage = Bytes::new(&env);
+        preimage.append(&record.commitment_hash.into());
+        preimage.append(&merkle_root.clone().into());
+        preimage.append(&Bytes::from_slice(&env, &ts_bytes));
+
+        let proof_digest: BytesN<32> = env.crypto().sha256(&preimage).into();
+
+        // Step 3: Build and store the proof.
+        let validity_note = Bytes::from_slice(
+            &env,
+            b"Valid as long as commitment_hash exists on Stellar and Merkle root is reproducible",
+        );
+
+        let proof = ImmutabilityProof {
+            ip_id: commitment_id,
+            merkle_root,
+            proof_digest: proof_digest.clone(),
+            generated_at: now,
+            validity_note,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ImmutabilityProof(commitment_id), &proof);
+        env.storage().persistent().extend_ttl(
+            &DataKey::ImmutabilityProof(commitment_id),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        env.events().publish(
+            (symbol_short!("imm_prf"), record.owner),
+            (commitment_id, proof_digest.clone()),
+        );
+
+        proof_digest.into()
+    }
+
+    /// Verify a previously generated immutability proof against the current
+    /// on-chain state.
+    ///
+    /// Re-derives the proof digest from the stored commitment hash and the
+    /// current commitment set, then compares it to the stored proof using
+    /// constant-time equality.  Returns `true` only if the digest matches,
+    /// confirming the commitment has not been tampered with.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment.
+    /// * `commitment_id` - The IP ID whose proof is being verified.
+    /// * `proof` - The 32-byte `proof_digest` bytes originally returned by
+    ///   `generate_immutability_proof`.
+    ///
+    /// # Returns
+    ///
+    /// `true` if the supplied proof matches the on-chain commitment; `false`
+    /// otherwise.
+    ///
+    /// # Panics
+    ///
+    /// * `IpNotFound` – the IP ID does not exist.
+    /// * `ImmutabilityProofNotFound` – no proof has been generated for this IP.
+    pub fn verify_immutability(env: Env, commitment_id: u64, proof: Bytes) -> bool {
+        let record = require_ip_exists(&env, commitment_id);
+
+        let stored_proof: ImmutabilityProof = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ImmutabilityProof(commitment_id))
+            .unwrap_or_else(|| {
+                panic_with_error!(env, ContractError::ImmutabilityProofNotFound)
+            });
+
+        // Re-derive proof_digest from the original merkle_root and stored
+        // generated_at timestamp to produce the expected value.
+        let ts_bytes = stored_proof.generated_at.to_le_bytes();
+        let mut preimage = Bytes::new(&env);
+        preimage.append(&record.commitment_hash.into());
+        preimage.append(&stored_proof.merkle_root.into());
+        preimage.append(&Bytes::from_slice(&env, &ts_bytes));
+
+        let expected_digest: BytesN<32> = env.crypto().sha256(&preimage).into();
+
+        // Convert the caller-supplied proof bytes into a BytesN<32> for comparison.
+        if proof.len() != 32 {
+            return false;
+        }
+        let mut proof_arr = [0u8; 32];
+        for i in 0..32 {
+            proof_arr[i] = proof.get(i).unwrap_or(0);
+        }
+        let supplied: BytesN<32> = BytesN::from_array(&env, &proof_arr);
+
+        constant_time_bytes_32_eq(&expected_digest, &supplied)
+    }
+
+    /// Retrieve the stored immutability proof for an IP commitment.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment.
+    /// * `commitment_id` - The IP ID to look up.
+    ///
+    /// # Returns
+    ///
+    /// `Option<ImmutabilityProof>` — `Some` if a proof exists, `None` otherwise.
+    pub fn get_immutability_proof(env: Env, commitment_id: u64) -> Option<ImmutabilityProof> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ImmutabilityProof(commitment_id))
+    }
+
+    // ── Issue #1076: Commitment Fractional Ownership ──────────────────────────
+
+    /// Split a commitment into `fractions` equal ownership shares.
+    ///
+    /// Creates `fractions` new IpRecords (each pointing to the same commitment
+    /// hash as the parent, owned by the caller), marks the original record as
+    /// split, and stores a `FractionalOwnershipRecord` that tracks all shares.
+    ///
+    /// Each fraction is assigned `1/fractions` of the total, represented as
+    /// `owner_fraction = 1` out of `total_fractions`.  Individual fractions can
+    /// later be transferred via `transfer_ip` to different addresses.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment.
+    /// * `commitment_id` - The IP ID to split.
+    /// * `fractions` - Number of equal shares to create (must be ≥ 2).
+    ///
+    /// # Returns
+    ///
+    /// `Vec<u64>` — the IP IDs of the newly created fraction records, in order.
+    ///
+    /// # Panics
+    ///
+    /// * `IpNotFound` – the IP ID does not exist.
+    /// * `Unauthorized` – caller is not the IP owner.
+    /// * `InvalidFractionCount` – `fractions` < 2.
+    /// * `AlreadySplit` – this commitment has already been fractionalised.
+    pub fn split_commitment(env: Env, commitment_id: u64, fractions: u32) -> Vec<u64> {
+        let record = require_ip_exists(&env, commitment_id);
+        record.owner.require_auth();
+
+        if fractions < 2 {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::InvalidFractionCount as u32,
+            ));
+        }
+
+        // A fraction cannot itself be split, and a revoked record cannot be split.
+        if record.revoked
+            || env
+                .storage()
+                .persistent()
+                .has(&DataKey::FractionParent(commitment_id))
+        {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::AlreadySplit as u32,
+            ));
+        }
+
+        // Guard against double-splitting (a merged record may be split again).
+        let existing: Option<FractionalOwnershipRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::FractionalOwnership(commitment_id));
+        if let Some(existing) = existing {
+            if !existing.merged {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::AlreadySplit as u32,
+                ));
+            }
+        }
+
+        let mut fraction_ids = Vec::new(&env);
+        let mut shares = Vec::new(&env);
+        let timestamp = env.ledger().timestamp();
+
+        for i in 0..fractions {
+            let fraction_id: u64 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::NextId)
+                .unwrap_or(1);
+
+            let fraction_record = IpRecord {
+                ip_id: fraction_id,
+                owner: record.owner.clone(),
+                commitment_hash: record.commitment_hash.clone(),
+                timestamp,
+                revoked: false,
+                co_owners: Vec::new(&env),
+                parent_ip_id: Some(commitment_id),
+                notary_signature: None,
+                expiry_timestamp: record.expiry_timestamp,
+                grace_period_seconds: record.grace_period_seconds,
+                unlock_time: record.unlock_time,
+                privacy_level: record.privacy_level,
+            };
+
+            env.storage()
+                .persistent()
+                .set(&DataKey::IpRecord(fraction_id), &fraction_record);
+            env.storage().persistent().extend_ttl(
+                &DataKey::IpRecord(fraction_id),
+                LEDGER_BUMP,
+                LEDGER_BUMP,
+            );
+
+            // Record which parent this fraction belongs to.
+            env.storage()
+                .persistent()
+                .set(&DataKey::FractionParent(fraction_id), &commitment_id);
+            env.storage().persistent().extend_ttl(
+                &DataKey::FractionParent(fraction_id),
+                LEDGER_BUMP,
+                LEDGER_BUMP,
+            );
+
+            // Append to owner's IP list.
+            let mut owner_ids: Vec<u64> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::OwnerIps(record.owner.clone()))
+                .unwrap_or(Vec::new(&env));
+            owner_ids.push_back(fraction_id);
+            env.storage()
+                .persistent()
+                .set(&DataKey::OwnerIps(record.owner.clone()), &owner_ids);
+            env.storage().persistent().extend_ttl(
+                &DataKey::OwnerIps(record.owner.clone()),
+                LEDGER_BUMP,
+                LEDGER_BUMP,
+            );
+
+            env.storage()
+                .persistent()
+                .set(&DataKey::NextId, &(fraction_id + 1));
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::NextId, LEDGER_BUMP, LEDGER_BUMP);
+
+            shares.push_back(FractionalShare {
+                fraction_ip_id: fraction_id,
+                owner: record.owner.clone(),
+                owner_fraction: 1,
+            });
+
+            fraction_ids.push_back(fraction_id);
+
+            env.events().publish(
+                (symbol_short!("frac_new"), record.owner.clone()),
+                (commitment_id, fraction_id, i, fractions),
+            );
+        }
+
+        // The parent is inactive while its fractions are outstanding; it is
+        // restored by `merge_commitments`.
+        let mut parent_record = record.clone();
+        parent_record.revoked = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::IpRecord(commitment_id), &parent_record);
+        env.storage().persistent().extend_ttl(
+            &DataKey::IpRecord(commitment_id),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        // Persist the fractional ownership record.
+        let fo_record = FractionalOwnershipRecord {
+            parent_ip_id: commitment_id,
+            total_fractions: fractions,
+            shares,
+            merged: false,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::FractionalOwnership(commitment_id), &fo_record);
+        env.storage().persistent().extend_ttl(
+            &DataKey::FractionalOwnership(commitment_id),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        // Issue #436: Audit entry.
+        Self::append_audit_entry(
+            &env,
+            commitment_id,
+            symbol_short!("split"),
+            record.owner,
+        );
+
+        fraction_ids
+    }
+
+    /// Merge all fractional shares of a split commitment back into a single IP.
+    ///
+    /// All supplied `commitment_ids` must be fraction IDs that share the same
+    /// parent, and the caller must be the current owner of every fraction.  On
+    /// success the original parent record is restored as the sole active record
+    /// and all fraction records are marked revoked.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment.
+    /// * `commitment_ids` - Vec of fraction IP IDs to merge (must be all
+    ///   fractions of a single parent commitment).
+    ///
+    /// # Returns
+    ///
+    /// The parent IP ID that was restored.
+    ///
+    /// # Panics
+    ///
+    /// * `MergeNotAllowed` – IDs do not all share the same parent, the parent
+    ///   has not been split, or not all fractions are present.
+    /// * `IpNotFound` – any fraction IP ID does not exist.
+    /// * `Unauthorized` – caller does not own all fractions.
+    pub fn merge_commitments(env: Env, commitment_ids: Vec<u64>) -> u64 {
+        if commitment_ids.is_empty() {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::MergeNotAllowed as u32,
+            ));
+        }
+
+        // Resolve the parent IP ID from the first fraction.
+        let first_id = commitment_ids.get(0).unwrap();
+        let parent_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::FractionParent(first_id))
+            .unwrap_or_else(|| panic_with_error!(env, ContractError::MergeNotAllowed));
+
+        // Load the fractional ownership record.
+        let mut fo_record: FractionalOwnershipRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::FractionalOwnership(parent_id))
+            .unwrap_or_else(|| panic_with_error!(env, ContractError::MergeNotAllowed));
+
+        // Verify the record is still split and we were given exactly all fractions.
+        if fo_record.merged || commitment_ids.len() != fo_record.total_fractions {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::MergeNotAllowed as u32,
+            ));
+        }
+
+        // Verify every supplied ID is a known fraction of this parent and that
+        // the caller owns it; also collect the merging owner (must be consistent).
+        let mut merge_owner: Option<Address> = None;
+        for frac_id in commitment_ids.iter() {
+            let stored_parent: u64 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::FractionParent(frac_id))
+                .unwrap_or_else(|| panic_with_error!(env, ContractError::MergeNotAllowed));
+
+            if stored_parent != parent_id {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::MergeNotAllowed as u32,
+                ));
+            }
+
+            // Reject duplicate IDs so every fraction is accounted for exactly once.
+            let mut occurrences = 0u32;
+            for other in commitment_ids.iter() {
+                if other == frac_id {
+                    occurrences += 1;
+                }
+            }
+            if occurrences != 1 {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::MergeNotAllowed as u32,
+                ));
+            }
+
+            let frac_record = require_ip_exists(&env, frac_id);
+            if frac_record.revoked {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::MergeNotAllowed as u32,
+                ));
+            }
+            frac_record.owner.require_auth();
+
+            match &merge_owner {
+                None => merge_owner = Some(frac_record.owner),
+                Some(o) => {
+                    if *o != frac_record.owner {
+                        // All fractions must be owned by the same caller for a
+                        // single-step merge; multi-owner merges require
+                        // governance (tracked separately).
+                        env.panic_with_error(Error::from_contract_error(
+                            ContractError::Unauthorized as u32,
+                        ));
+                    }
+                }
+            }
+        }
+
+        let merge_owner = merge_owner.unwrap();
+
+        // Mark all fraction records revoked.
+        for frac_id in commitment_ids.iter() {
+            let mut frac_rec = require_ip_exists(&env, frac_id);
+            frac_rec.revoked = true;
+            env.storage()
+                .persistent()
+                .set(&DataKey::IpRecord(frac_id), &frac_rec);
+            env.storage().persistent().extend_ttl(
+                &DataKey::IpRecord(frac_id),
+                LEDGER_BUMP,
+                LEDGER_BUMP,
+            );
+        }
+
+        // Restore the parent record: un-revoke it and update ownership.
+        let mut parent_record = require_ip_exists(&env, parent_id);
+        parent_record.revoked = false;
+        parent_record.owner = merge_owner.clone();
+        env.storage()
+            .persistent()
+            .set(&DataKey::IpRecord(parent_id), &parent_record);
+        env.storage().persistent().extend_ttl(
+            &DataKey::IpRecord(parent_id),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        // Mark the fractional record as merged.
+        fo_record.merged = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::FractionalOwnership(parent_id), &fo_record);
+        env.storage().persistent().extend_ttl(
+            &DataKey::FractionalOwnership(parent_id),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        // Issue #436: Audit entry.
+        Self::append_audit_entry(&env, parent_id, symbol_short!("merged"), merge_owner.clone());
+
+        env.events().publish(
+            (symbol_short!("frac_mrg"), merge_owner),
+            (parent_id, commitment_ids.len()),
+        );
+
+        parent_id
+    }
+
+    /// Retrieve the fractional ownership record for a split commitment.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment.
+    /// * `commitment_id` - The parent IP ID.
+    ///
+    /// # Returns
+    ///
+    /// `Option<FractionalOwnershipRecord>` — `None` if the commitment has not
+    /// been split.
+    pub fn get_fractional_ownership(
+        env: Env,
+        commitment_id: u64,
+    ) -> Option<FractionalOwnershipRecord> {
+        let mut fo_record: FractionalOwnershipRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::FractionalOwnership(commitment_id))?;
+
+        // Fractions are ordinary IP records and may be transferred, so refresh
+        // each share's owner from its live record to report current percentages.
+        let mut shares = Vec::new(&env);
+        for mut share in fo_record.shares.iter() {
+            if let Some(rec) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, IpRecord>(&DataKey::IpRecord(share.fraction_ip_id))
+            {
+                share.owner = rec.owner;
+            }
+            shares.push_back(share);
+        }
+        fo_record.shares = shares;
+        Some(fo_record)
+    }
+
+    // ── Issue #1077: Cross-Chain Commitment Bridge ────────────────────────────
+
+    /// Bridge an IP commitment to a target chain, producing a chain-agnostic
+    /// payload that can be relayed to and verified by the target chain's bridge
+    /// contract.
+    ///
+    /// Bridge flow:
+    /// 1. Validate the target chain identifier.
+    /// 2. Guard against double-bridging to the same chain.
+    /// 3. Build a `ChainAgnosticCommitment` that encodes the commitment hash,
+    ///    original timestamp, and owner address in a chain-neutral format.
+    /// 4. Compute a validation digest: SHA-256(`commitment_hash || chain_payload || bridged_at`).
+    /// 5. Persist a `BridgeRecord` and emit a `"bridge"` event containing the
+    ///    full payload for off-chain relayers to pick up and relay.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment.
+    /// * `commitment_id` - The IP ID to bridge.
+    /// * `target_chain` - Raw bytes identifying the target chain
+    ///   (e.g. `b"ethereum"`, `b"polygon"`).
+    ///
+    /// # Returns
+    ///
+    /// The 32-byte validation digest as `Bytes`, which the target chain bridge
+    /// contract uses to confirm the payload's integrity.
+    ///
+    /// # Panics
+    ///
+    /// * `IpNotFound` – the IP ID does not exist.
+    /// * `Unauthorized` – caller is not the IP owner.
+    /// * `IpAlreadyRevoked` – revoked commitments cannot be bridged.
+    /// * `UnsupportedChain` – `target_chain` is not `b"ethereum"` or
+    ///   `b"polygon"`.
+    /// * `AlreadyBridged` – the commitment has already been bridged to this chain.
+    pub fn bridge_commitment(env: Env, commitment_id: u64, target_chain: Bytes) -> Bytes {
+        let record = require_ip_exists(&env, commitment_id);
+        record.owner.require_auth();
+
+        // Security: revoked commitments must never be propagated to other chains.
+        if record.revoked {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::IpAlreadyRevoked as u32,
+            ));
+        }
+
+        // Validate target chain.
+        let ethereum_bytes = Bytes::from_slice(&env, b"ethereum");
+        let polygon_bytes = Bytes::from_slice(&env, b"polygon");
+        let is_ethereum = target_chain == ethereum_bytes;
+        let is_polygon = target_chain == polygon_bytes;
+
+        if !is_ethereum && !is_polygon {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::UnsupportedChain as u32,
+            ));
+        }
+
+        let chain_id: u32 = if is_ethereum { 1 } else { 137 };
+
+        // Build a deterministic chain_id_hash for storage keying.
+        let chain_id_hash: BytesN<32> = env.crypto().sha256(&target_chain).into();
+
+        // Guard against double-bridging.
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::BridgeRecord(commitment_id, chain_id_hash.clone()))
+        {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::AlreadyBridged as u32,
+            ));
+        }
+
+        // Build the chain-agnostic commitment.
+        // chain_payload: `owner_digest (32 bytes) || timestamp_u64_le (8 bytes)`
+        // where owner_digest = SHA-256(XDR(owner)), a fixed-width, chain-neutral
+        // owner fingerprint that works for both account and contract addresses.
+        let owner_bytes: BytesN<32> = env
+            .crypto()
+            .sha256(&soroban_sdk::xdr::ToXdr::to_xdr(record.owner.clone(), &env))
+            .into();
+        let ts_bytes = record.timestamp.to_le_bytes();
+
+        let mut chain_payload = Bytes::new(&env);
+        chain_payload.append(&owner_bytes.into());
+        chain_payload.append(&Bytes::from_slice(&env, &ts_bytes));
+
+        let source_chain = Bytes::from_slice(&env, b"stellar");
+
+        let agnostic = ChainAgnosticCommitment {
+            commitment_hash: record.commitment_hash.clone(),
+            original_timestamp: record.timestamp,
+            target_chain_id: chain_id,
+            source_chain,
+            chain_payload: chain_payload.clone(),
+        };
+
+        // Compute the validation digest.
+        let bridged_at = env.ledger().timestamp();
+        let bridged_at_bytes = bridged_at.to_le_bytes();
+
+        let mut digest_input = Bytes::new(&env);
+        digest_input.append(&record.commitment_hash.into());
+        digest_input.append(&chain_payload);
+        digest_input.append(&Bytes::from_slice(&env, &bridged_at_bytes));
+
+        let validation_hash: BytesN<32> = env.crypto().sha256(&digest_input).into();
+
+        // Persist the bridge record.
+        let bridge_rec = BridgeRecord {
+            ip_id: commitment_id,
+            chain_id_hash: chain_id_hash.clone(),
+            payload: agnostic,
+            bridged_at,
+            validation_hash: validation_hash.clone(),
+        };
+
+        env.storage().persistent().set(
+            &DataKey::BridgeRecord(commitment_id, chain_id_hash.clone()),
+            &bridge_rec,
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey::BridgeRecord(commitment_id, chain_id_hash.clone()),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        // Track which chains this IP has been bridged to.
+        let mut bridged_chains: Vec<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BridgedChains(commitment_id))
+            .unwrap_or(Vec::new(&env));
+        bridged_chains.push_back(chain_id_hash.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::BridgedChains(commitment_id), &bridged_chains);
+        env.storage().persistent().extend_ttl(
+            &DataKey::BridgedChains(commitment_id),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        // Issue #436: Audit entry.
+        Self::append_audit_entry(
+            &env,
+            commitment_id,
+            symbol_short!("bridged"),
+            record.owner.clone(),
+        );
+
+        env.events().publish(
+            (symbol_short!("bridge"), record.owner),
+            (commitment_id, chain_id_hash, validation_hash.clone()),
+        );
+
+        validation_hash.into()
+    }
+
+    /// Retrieve the bridge record for a commitment on a specific target chain.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment.
+    /// * `commitment_id` - The IP ID to query.
+    /// * `chain_id_hash` - SHA-256 of the target chain identifier bytes (as
+    ///   returned by the `bridge_commitment` event).
+    ///
+    /// # Returns
+    ///
+    /// `Option<BridgeRecord>` — `None` if the commitment has not been bridged
+    /// to this chain.
+    pub fn get_bridge_record(
+        env: Env,
+        commitment_id: u64,
+        chain_id_hash: BytesN<32>,
+    ) -> Option<BridgeRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::BridgeRecord(commitment_id, chain_id_hash))
+    }
+
+    /// Retrieve the list of chain identifier hashes that a commitment has been
+    /// bridged to.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment.
+    /// * `commitment_id` - The IP ID to query.
+    ///
+    /// # Returns
+    ///
+    /// `Vec<BytesN<32>>` — may be empty if the commitment has not been bridged.
+    pub fn get_bridged_chains(env: Env, commitment_id: u64) -> Vec<BytesN<32>> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::BridgedChains(commitment_id))
+            .unwrap_or(Vec::new(&env))
     }
 }
 
