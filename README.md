@@ -144,6 +144,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md#dependency-updates) for contributor detail
 ### Core Documentation
 - [Architecture Overview](docs/architecture.md)
 - [Commitment Scheme](docs/commitment-scheme.md)
+- [Commitment Recovery](docs/commitment-recovery.md)
 - [Atomic Swap Flow](docs/atomic-swap.md)
 - [Threat Model & Security](docs/threat-model.md)
 - [Compliance and Legal Guidance](docs/compliance.md)

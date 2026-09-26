@@ -1,5 +1,15 @@
 # IP Registry API Reference
 
+## Pagination
+
+Collection endpoints return bounded pages instead of unbounded result sets.
+`GET /v1/ip/owner/{owner}` accepts `limit` (default 50, maximum 200) and
+`offset` (default 0), and returns `ip_ids`, `total_count`, and `has_more`.
+`GET /v1/ip/owner/{owner}/cursor` accepts the same `limit` and an opaque
+`cursor` returned as `next_cursor`; use the cursor endpoint when walking a
+large collection to avoid repeatedly skipping earlier rows. A zero limit is
+treated as one item, and malformed cursors return `400 Bad Request`.
+
 Complete API documentation for the IP Registry smart contract.
 
 ---
@@ -1363,4 +1373,3 @@ Soroban smart contract RPC operations (read calls, simulation, ledger entry quer
 - **Queue Capacity (`max_queue_size`, default: 1000):** Maximum total depth of queued plus active requests. When this threshold is exceeded, additional incoming requests are immediately rejected with **HTTP 503 Service Unavailable**.
 - **Request Timeout (`request_timeout`, default: 30s):** Maximum time a request is permitted to wait in the queue for a concurrency slot. If the timeout expires before a slot becomes available, the server returns **HTTP 408 Request Timeout**.
 - **Client Backoff & Retry Strategy:** Clients receiving `503 Service Unavailable` or `408 Request Timeout` should apply exponential backoff with randomized jitter before retrying.
-
