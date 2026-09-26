@@ -138,6 +138,31 @@ pub async fn commit_ip(
     Ok(Json(ip_id))
 }
 
+/// Return aggregate commitment and swap usage statistics.
+#[utoipa::path(
+    get,
+    path = "/v1/analytics/commitments",
+    tag = "Analytics",
+    responses((status = 200, description = "Commitment and swap analytics"))
+)]
+#[instrument]
+pub async fn commitment_analytics() -> impl IntoResponse {
+    Json(crate::analytics::snapshot())
+}
+
+/// List IP commitment IDs organized under a tag.
+#[utoipa::path(
+    get,
+    path = "/v1/ip/tag/{tag}",
+    tag = "IP Registry",
+    params(("tag" = String, Path, description = "Commitment tag")),
+    responses((status = 200, description = "Commitments with the tag", body = Vec<u64>))
+)]
+#[instrument]
+pub async fn list_commitments_by_tag(Path(tag): Path<String>) -> impl IntoResponse {
+    Json(crate::commitments::list_by_tag(&tag))
+}
+
 /// Retrieve an IP record by ID.
 #[utoipa::path(
     get,
@@ -834,6 +859,7 @@ pub async fn batch_initiate_swap(Json(body): Json<BatchInitiateSwapRequest>) -> 
             expiry,
         };
         cache::set_with_ttl(&cache::swap_key(swap_id), &record, SWAP_EXPIRY_SECONDS);
+        crate::analytics::record_swap_initiated();
         swap_ids.push(swap_id);
     }
 
@@ -873,6 +899,7 @@ pub async fn accept_swap(Path(swap_id): Path<u64>, Json(body): Json<AcceptSwapRe
     // swap record and both list prefixes are invalidated.
     cache::invalidate_swap(swap_id);
     webhook::trigger_swap_status_changed(swap_id, Some("Pending".to_string()), "Accepted".to_string());
+    crate::analytics::record_swap_status("Accepted");
     websocket::trigger_swap_status_changed(swap_id, Some("Pending".to_string()), "Accepted".to_string());
     Err((
         StatusCode::NOT_FOUND,
@@ -905,6 +932,7 @@ pub async fn reveal_key(Path(swap_id): Path<u64>, Json(body): Json<RevealKeyRequ
     cache::invalidate_swap(swap_id);
     cache::invalidate_prefix("reputation:");
     webhook::trigger_swap_status_changed(swap_id, Some("Accepted".to_string()), "Completed".to_string());
+    crate::analytics::record_swap_status("Completed");
     websocket::trigger_swap_status_changed(swap_id, Some("Accepted".to_string()), "Completed".to_string());
     Err((
         StatusCode::NOT_FOUND,
@@ -934,6 +962,7 @@ pub async fn cancel_swap(Path(swap_id): Path<u64>, Json(body): Json<CancelSwapRe
     // swap record and both seller/buyer list prefixes.
     cache::invalidate_swap(swap_id);
     webhook::trigger_swap_status_changed(swap_id, Some("Pending".to_string()), "Cancelled".to_string());
+    crate::analytics::record_swap_status("Cancelled");
     websocket::trigger_swap_status_changed(swap_id, Some("Pending".to_string()), "Cancelled".to_string());
     Err((
         StatusCode::NOT_FOUND,
@@ -963,6 +992,7 @@ pub async fn cancel_expired_swap(Path(swap_id): Path<u64>, Json(body): Json<Canc
     // swap record and both seller/buyer list prefixes.
     cache::invalidate_swap(swap_id);
     webhook::trigger_swap_status_changed(swap_id, Some("Accepted".to_string()), "Cancelled".to_string());
+    crate::analytics::record_swap_status("Cancelled");
     websocket::trigger_swap_status_changed(swap_id, Some("Accepted".to_string()), "Cancelled".to_string());
     Err((
         StatusCode::NOT_FOUND,
@@ -1240,6 +1270,76 @@ impl From<crate::graphql::SwapRecord> for SwapRecord {
     }
 }
 
+async fn marketplace_response(
+    result: Result<crate::graphql::SwapConnection, String>,
+) -> axum::response::Response {
+    match result {
+        Ok(connection) => (
+            StatusCode::OK,
+            Json(MarketplaceResponse {
+                swap_ids: connection.swap_ids,
+                next_cursor: connection.cursor,
+                has_more: connection.has_next_page,
+            }),
+        ).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to query marketplace swaps");
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorResponse { error: "failed to query swap marketplace".to_string() }),
+            ).into_response()
+        }
+    }
+}
+
+/// Discover swaps listed by a seller.
+#[utoipa::path(
+    get,
+    path = "/v1/swap/marketplace/seller/{seller}",
+    tag = "Marketplace",
+    params(("seller" = String, Path), CursorPaginationParams),
+    responses((status = 200, description = "Seller marketplace listings", body = MarketplaceResponse))
+)]
+pub async fn marketplace_by_seller(
+    State(rpc_client): State<Arc<dyn crate::graphql::SorobanRpcClient>>,
+    Path(seller): Path<String>,
+    Query(pagination): Query<CursorPaginationParams>,
+) -> impl IntoResponse {
+    marketplace_response(rpc_client.get_swaps_by_seller(&seller, pagination.limit.min(200), pagination.cursor).await).await
+}
+
+/// Discover swaps available to a buyer.
+#[utoipa::path(
+    get,
+    path = "/v1/swap/marketplace/buyer/{buyer}",
+    tag = "Marketplace",
+    params(("buyer" = String, Path), CursorPaginationParams),
+    responses((status = 200, description = "Buyer marketplace listings", body = MarketplaceResponse))
+)]
+pub async fn marketplace_by_buyer(
+    State(rpc_client): State<Arc<dyn crate::graphql::SorobanRpcClient>>,
+    Path(buyer): Path<String>,
+    Query(pagination): Query<CursorPaginationParams>,
+) -> impl IntoResponse {
+    marketplace_response(rpc_client.get_swaps_by_buyer(&buyer, pagination.limit.min(200), pagination.cursor).await).await
+}
+
+/// Discover swaps for an IP record.
+#[utoipa::path(
+    get,
+    path = "/v1/swap/marketplace/ip/{ip_id}",
+    tag = "Marketplace",
+    params(("ip_id" = u64, Path), CursorPaginationParams),
+    responses((status = 200, description = "IP marketplace listings", body = MarketplaceResponse))
+)]
+pub async fn marketplace_by_ip(
+    State(rpc_client): State<Arc<dyn crate::graphql::SorobanRpcClient>>,
+    Path(ip_id): Path<u64>,
+    Query(pagination): Query<CursorPaginationParams>,
+) -> impl IntoResponse {
+    marketplace_response(rpc_client.get_swaps_by_ip(ip_id, pagination.limit.min(200), pagination.cursor).await).await
+}
+
 // ── Webhooks ──────────────────────────────────────────────────────────────────
 
 /// Register a webhook URL to receive swap event notifications.
@@ -1254,11 +1354,14 @@ impl From<crate::graphql::SwapRecord> for SwapRecord {
     )
 )]
 pub async fn register_webhook(Json(body): Json<RegisterWebhookRequest>) -> Result<Json<WebhookResponse>, (StatusCode, Json<ErrorResponse>)> {
-    if body.url.is_empty() || body.events.is_empty() {
+    let parsed_url = reqwest::Url::parse(&body.url);
+    if parsed_url.as_ref().map(|url| !matches!(url.scheme(), "http" | "https")).unwrap_or(true)
+        || body.events.is_empty()
+        || body.events.iter().any(|event| event != "*" && event != "swap.status_changed") {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
-                error: "URL and events are required".to_string(),
+                error: "url must be an HTTP(S) URL and events must contain swap.status_changed or *".to_string(),
             }),
         ));
     }
@@ -1285,6 +1388,23 @@ pub async fn register_webhook(Json(body): Json<RegisterWebhookRequest>) -> Resul
         events: config.events,
         created_at: config.created_at,
     }))
+}
+
+/// List registered webhook subscriptions.
+#[utoipa::path(
+    get,
+    path = "/v1/webhooks",
+    tag = "Webhooks",
+    responses((status = 200, description = "Registered webhooks", body = Vec<WebhookResponse>))
+)]
+pub async fn list_webhooks() -> impl IntoResponse {
+    let webhooks = webhook::list_all().into_iter().map(|config| WebhookResponse {
+        id: config.id.to_string(),
+        url: config.url,
+        events: config.events,
+        created_at: config.created_at,
+    }).collect::<Vec<_>>();
+    Json(webhooks)
 }
 
 /// Unregister a webhook by ID.

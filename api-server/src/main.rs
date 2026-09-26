@@ -44,6 +44,8 @@ mod auth_2fa;
 mod session;
 mod batch;
 mod cache;
+mod commitments;
+mod analytics;
 mod circuit_breaker;
 mod commitment_monitoring;
 mod connection_pool;
@@ -98,6 +100,11 @@ mod snapshot_tests;
         handlers::find_similar_commitments,
         handlers::list_ip_by_owner,
         handlers::list_ip_by_owner_cursor,
+        handlers::list_commitments_by_tag,
+        handlers::commitment_analytics,
+        handlers::marketplace_by_seller,
+        handlers::marketplace_by_buyer,
+        handlers::marketplace_by_ip,
         handlers::initiate_swap,
         handlers::batch_initiate_swap,
         handlers::accept_swap,
@@ -110,6 +117,7 @@ mod snapshot_tests;
         handlers::get_swap_disputes,
         handlers::list_swaps,
         handlers::register_webhook,
+        handlers::list_webhooks,
         handlers::unregister_webhook,
         handlers::bulk_commit_ip,
         handlers::bulk_initiate_swap,
@@ -124,6 +132,8 @@ mod snapshot_tests;
     ),
     components(schemas(
         schemas::CommitIpRequest,
+        schemas::CommitmentTagsResponse,
+        schemas::MarketplaceResponse,
         schemas::IpRecord,
         schemas::TransferIpRequest,
         schemas::VerifyCommitmentRequest,
@@ -311,6 +321,13 @@ async fn main() {
         .route("/ip/similar",                  get(handlers::find_similar_commitments))
         .route("/ip/owner/{owner}",               get(handlers::list_ip_by_owner))
         .route("/ip/owner/{owner}/cursor",        get(handlers::list_ip_by_owner_cursor))
+        .route("/ip/tag/{tag}",                   get(handlers::list_commitments_by_tag))
+        .route("/analytics/commitments",          get(handlers::commitment_analytics))
+        .route("/webhooks",                       post(handlers::register_webhook).get(handlers::list_webhooks))
+        .route("/webhooks/{id}",                  axum::routing::delete(handlers::unregister_webhook))
+        .route("/swap/marketplace/seller/{seller}", get(handlers::marketplace_by_seller))
+        .route("/swap/marketplace/buyer/{buyer}",  get(handlers::marketplace_by_buyer))
+        .route("/swap/marketplace/ip/{ip_id}",     get(handlers::marketplace_by_ip))
         .route("/swap/initiate",                  post(handlers::initiate_swap).layer(signed.clone()))
         .route("/swap/batch-initiate",            post(handlers::batch_initiate_swap))
         .route("/swap/{swap_id}/accept",          post(handlers::accept_swap).layer(signed.clone()))
@@ -384,15 +401,6 @@ fn build_app() -> Router {
     let query_client = Arc::new(graphql::SorobanQueryClient::new(rpc_client.clone()));
     let schema = graphql::build_schema_with_context(rpc_client.clone());
     let health_checker = Arc::new(health::HealthChecker::new());
-    let state = AppState {
-        schema,
-        query_client: query_client.clone(),
-        ws_broadcaster: Arc::new(websocket::EventBroadcaster::new()),
-        sse_broadcaster: Arc::new(events::create_event_broadcaster().0),
-        health_checker,
-        rpc_client: rpc_client.clone(),
-    };
-
     let rate_limiter = rate_limit::RateLimitMiddleware::new(rate_limit::RateLimitConfig::default());
     let state = AppState {
         schema,
@@ -436,6 +444,13 @@ fn build_app() -> Router {
         .route("/v1/ip/similar", get(handlers::find_similar_commitments))
         .route("/v1/ip/owner/{owner}", get(handlers::list_ip_by_owner))
         .route("/v1/ip/owner/{owner}/cursor", get(handlers::list_ip_by_owner_cursor))
+        .route("/v1/ip/tag/{tag}", get(handlers::list_commitments_by_tag))
+        .route("/v1/analytics/commitments", get(handlers::commitment_analytics))
+        .route("/v1/webhooks", post(handlers::register_webhook).get(handlers::list_webhooks))
+        .route("/v1/webhooks/{id}", axum::routing::delete(handlers::unregister_webhook))
+        .route("/v1/swap/marketplace/seller/{seller}", get(handlers::marketplace_by_seller))
+        .route("/v1/swap/marketplace/buyer/{buyer}",  get(handlers::marketplace_by_buyer))
+        .route("/v1/swap/marketplace/ip/{ip_id}",     get(handlers::marketplace_by_ip))
         .route("/v1/ip/owner/{owner}/cursor", get(handlers::list_ip_by_owner_cursor))
         .route("/v1/swap/initiate", post(handlers::initiate_swap))
         .route("/v1/swap/batch-initiate", post(handlers::batch_initiate_swap))
