@@ -117,6 +117,7 @@ pub enum ContractError {
     InsufficientInsuranceReserve = 67,
     /// #906: Treasury address validation - rejects zero or placeholder addresses
     InvalidTreasuryAddress = 68,
+    BatchDependencyNotMet = 69,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -258,6 +259,8 @@ pub enum DataKey {
     BatchSwapResults(BytesN<32>),
     /// #982: Maps batch_id → BatchExecutionMode (Atomic or Partial).
     BatchExecutionMode(BytesN<32>),
+    /// Maps swap_id to swap IDs that must complete first.
+    BatchDependencies(u64),
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -5447,6 +5450,112 @@ impl AtomicSwap {
     /// - `BatchTooLarge`: More than MAX_BATCH_SIZE swaps
     /// - Various swap-specific errors if atomic mode is enabled and any swap fails
     pub fn execute_batch_swaps(env: Env, swap_ids: Vec<u64>, atomic: bool) -> Vec<bool> {
+        Self::execute_batch_swaps_ordered(&env, swap_ids, atomic)
+    }
+
+    /// Execute swaps in descending priority order.
+    pub fn execute_batch_swaps_prioritized(
+        env: Env,
+        swap_ids: Vec<u64>,
+        atomic: bool,
+        priorities: Vec<u32>,
+    ) -> Vec<bool> {
+        if priorities.len() != swap_ids.len() {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::BatchSizeMismatch as u32,
+            ));
+        }
+
+        let mut ordered_ids = swap_ids.clone();
+        let mut ordered_priorities = priorities;
+        for i in 0..ordered_ids.len() {
+            let mut best = i;
+            for j in (i + 1)..ordered_ids.len() {
+                if ordered_priorities.get(j).unwrap() > ordered_priorities.get(best).unwrap() {
+                    best = j;
+                }
+            }
+            if best != i {
+                let id = ordered_ids.get(i).unwrap();
+                let priority = ordered_priorities.get(i).unwrap();
+                ordered_ids.set(i, ordered_ids.get(best).unwrap());
+                ordered_priorities.set(i, ordered_priorities.get(best).unwrap());
+                ordered_ids.set(best, id);
+                ordered_priorities.set(best, priority);
+            }
+        }
+
+        Self::execute_batch_swaps_ordered(&env, ordered_ids, atomic)
+    }
+
+    /// Execute a batch while enforcing per-swap prerequisites. Dependencies
+    /// included in the batch are ordered first; external dependencies must
+    /// already be completed.
+    pub fn execute_batch_swaps_with_dependencies(
+        env: Env,
+        swap_ids: Vec<u64>,
+        atomic: bool,
+        dependencies: Vec<Vec<u64>>,
+    ) -> Vec<bool> {
+        if dependencies.len() != swap_ids.len() {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::BatchSizeMismatch as u32,
+            ));
+        }
+
+        let mut remaining = swap_ids.clone();
+        let mut ordered = Vec::new(&env);
+        while !remaining.is_empty() {
+            let mut selected = None;
+            for i in 0..remaining.len() {
+                let candidate = remaining.get(i).unwrap();
+                let original_index = swap_ids.iter().position(|id| id == candidate).unwrap();
+                let mut ready = true;
+                for dependency in dependencies.get(original_index).unwrap().iter() {
+                    if remaining.iter().any(|id| id == dependency) {
+                        ready = false;
+                        break;
+                    }
+                    let record = require_swap_exists(&env, dependency);
+                    if record.status != SwapStatus::Completed {
+                        ready = false;
+                        break;
+                    }
+                }
+                if ready {
+                    selected = Some(i);
+                    break;
+                }
+            }
+
+            if let Some(index) = selected {
+                let swap_id = remaining.get(index).unwrap();
+                ordered.push_back(swap_id);
+                remaining.remove(index);
+            } else {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::BatchDependencyNotMet as u32,
+                ));
+            }
+        }
+
+        for i in 0..swap_ids.len() {
+            let swap_id = swap_ids.get(i).unwrap();
+            let deps = dependencies.get(i).unwrap();
+            env.storage()
+                .persistent()
+                .set(&DataKey::BatchDependencies(swap_id), &deps);
+            env.storage().persistent().extend_ttl(
+                &DataKey::BatchDependencies(swap_id),
+                LEDGER_BUMP,
+                LEDGER_BUMP,
+            );
+        }
+
+        Self::execute_batch_swaps_ordered(&env, ordered, atomic)
+    }
+
+    fn execute_batch_swaps_ordered(env: &Env, swap_ids: Vec<u64>, atomic: bool) -> Vec<bool> {
         let len = swap_ids.len() as usize;
 
         // Validate batch parameters
