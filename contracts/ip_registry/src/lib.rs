@@ -2642,6 +2642,14 @@ impl IpRegistry {
         blinding_factor: BytesN<32>,
     ) -> bool {
         let record = require_ip_exists(&env, ip_id);
+        if env
+            .storage()
+            .persistent()
+            .get(&DataKey::Archived(ip_id))
+            .unwrap_or(false)
+        {
+            return false;
+        }
 
         // Emit EXPIRY_TOPIC exactly once per expiry transition so off-chain
         // indexers can cheaply detect an IP crossing into its grace period.
@@ -2839,7 +2847,50 @@ impl IpRegistry {
         blinding_factor: BytesN<32>,
     ) -> bool {
         let record = require_ip_exists(&env, ip_id);
+        if env
+            .storage()
+            .persistent()
+            .get(&DataKey::Archived(ip_id))
+            .unwrap_or(false)
+        {
+            panic_with_error!(&env, ContractError::CommitmentArchived);
+        }
+
         record.owner.require_auth();
+        Self::reveal_partial_authorized(&env, &record, ip_id, partial_hash, blinding_factor)
+    }
+
+    /// Reveal a commitment through an authority delegated by its owner.
+    pub fn reveal_partial_by_delegate(
+        env: Env,
+        ip_id: u64,
+        delegate: Address,
+        partial_hash: BytesN<32>,
+        blinding_factor: BytesN<32>,
+    ) -> bool {
+        let record = require_ip_exists(&env, ip_id);
+        if !Self::is_delegate_in_chain(&env, &record.owner, &delegate, 0) {
+            panic_with_error!(&env, ContractError::Unauthorized);
+        }
+        delegate.require_auth();
+        Self::reveal_partial_authorized(&env, &record, ip_id, partial_hash, blinding_factor)
+    }
+
+    fn reveal_partial_authorized(
+        env: &Env,
+        record: &IpRecord,
+        ip_id: u64,
+        partial_hash: BytesN<32>,
+        blinding_factor: BytesN<32>,
+    ) -> bool {
+        if env
+            .storage()
+            .persistent()
+            .get(&DataKey::Archived(ip_id))
+            .unwrap_or(false)
+        {
+            panic_with_error!(env, ContractError::CommitmentArchived);
+        }
 
         // Recompute commitment: sha256(partial_hash || blinding_factor)
         let mut preimage = Bytes::new(&env);
@@ -2867,6 +2918,41 @@ impl IpRegistry {
         );
 
         true
+    }
+
+    /// Archive a commitment that is no longer actively used. Archiving keeps
+    /// the stable IP ID and ownership indexes, while excluding the commitment
+    /// from verification and reveal operations.
+    pub fn archive_commitment(env: Env, ip_id: u64) {
+        let record = require_ip_exists(&env, ip_id);
+        record.owner.require_auth();
+
+        if env
+            .storage()
+            .persistent()
+            .get(&DataKey::Archived(ip_id))
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Archived(ip_id), &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Archived(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+        env.events()
+            .publish((symbol_short!("archived"),), (ip_id, record.owner));
+    }
+
+    /// Returns whether a commitment has been archived.
+    pub fn is_commitment_archived(env: Env, ip_id: u64) -> bool {
+        require_ip_exists(&env, ip_id);
+        env.storage()
+            .persistent()
+            .get(&DataKey::Archived(ip_id))
+            .unwrap_or(false)
     }
 
     /// Retrieve the publicly disclosed partial hash for an IP, if any.
@@ -5742,6 +5828,10 @@ impl IpRegistry {
 
         for req in requests.iter() {
             let record = require_ip_exists(&env, req.ip_id);
+            // Revealing plaintext openings is an authenticated operation.
+            // Delegated callers use `reveal_partial_by_delegate`, which
+            // verifies the delegation chain before accepting the reveal.
+            record.owner.require_auth();
 
             let mut preimage = Bytes::new(&env);
             preimage.append(&req.secret.into());

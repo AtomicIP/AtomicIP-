@@ -58,6 +58,8 @@ pub enum DataKey {
     OwnerIps(Address),
     NextId,
     CommitmentOwner(BytesN<32>), // tracks which owner already holds a commitment hash
+    /// Marks an old commitment as archived without deleting its immutable ID.
+    Archived(u64),
     Admin,
     CategoryIps(BytesN<32>),    // maps category hash -> Vec<u64> of IP IDs
     IpLineage(u64),             // stores parent_ip_id for versioning
