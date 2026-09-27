@@ -1,0 +1,104 @@
+name: GitOps Promote
+
+# #1069: Pull-request based deployments.
+#  - push to main          -> build image, commit new tag to the staging overlay
+#                             (Argo CD auto-syncs staging)
+#  - workflow_dispatch     -> open a PR bumping the production overlay to a
+#                             given tag; merging that PR deploys production.
+# Rollback is `git revert` of the promotion commit (scripts/gitops-rollback.sh).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "api-server/**"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Image tag (git SHA) already running in staging to promote to production
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  packages: write
+  pull-requests: write
+
+concurrency:
+  group: gitops-promote
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/atomicip/api-server
+
+jobs:
+  build-and-stage:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: api-server
+          push: true
+          tags: ${{ env.IMAGE }}:${{ github.sha }}
+
+      - name: Install kustomize
+        run: |
+          curl -sSL "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.4.3/kustomize_v5.4.3_linux_amd64.tar.gz" \
+            | tar -xz -C /usr/local/bin kustomize
+
+      - name: Bump staging overlay
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd deploy/k8s/overlays/staging
+          kustomize edit set image "${IMAGE}=${IMAGE}:${GITHUB_SHA}"
+          cd -
+          git config user.name "atomicip-gitops-bot"
+          git config user.email "gitops-bot@users.noreply.github.com"
+          git add deploy/k8s/overlays/staging/kustomization.yaml
+          git commit -m "deploy(staging): api-server ${GITHUB_SHA::12}"
+          git push origin HEAD:main
+
+  promote-production:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify image exists
+        run: docker manifest inspect "${IMAGE}:${{ inputs.tag }}" > /dev/null
+
+      - name: Install kustomize
+        run: |
+          curl -sSL "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.4.3/kustomize_v5.4.3_linux_amd64.tar.gz" \
+            | tar -xz -C /usr/local/bin kustomize
+
+      - name: Bump production overlay
+        working-directory: deploy/k8s/overlays/production
+        run: kustomize edit set image "${IMAGE}=${IMAGE}:${{ inputs.tag }}"
+
+      - name: Open promotion pull request
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: gitops/promote-production-${{ inputs.tag }}
+          commit-message: "deploy(production): api-server ${{ inputs.tag }}"
+          title: "deploy(production): api-server ${{ inputs.tag }}"
+          labels: deployment, production
+          body: |
+            Promotes `${{ env.IMAGE }}:${{ inputs.tag }}` from staging to production.
+
+            Merging this PR deploys it: Argo CD syncs `deploy/k8s/overlays/production`
+            automatically. To roll back, revert the merge commit
+            (`scripts/gitops-rollback.sh production`).
+
+            - [ ] Tag verified healthy in staging
+            - [ ] No open SEV-1/SEV-2 incidents

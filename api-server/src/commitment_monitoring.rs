@@ -371,6 +371,8 @@ pub fn spawn_background_evaluator() {
             COMMITMENT_MONITOR.evaluate(now);
             alerting::ALERT_MANAGER.tick(now);
             for n in alerting::ALERT_MANAGER.drain_notifications() {
+                // #1068: critical notifications open (or re-trigger) an incident.
+                crate::incidents::INCIDENTS.open_from_notification(&n, now);
                 tracing::warn!(
                     alert = %n.alert_name,
                     severity = ?n.severity,

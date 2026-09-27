@@ -1,0 +1,24 @@
+# #1069: Base Kubernetes manifests for the AtomicIP api-server.
+# Environments are Kustomize overlays under ../overlays and are synced to the
+# cluster by Argo CD (see ../../argocd and docs/gitops.md). Never `kubectl
+# apply` these by hand in production: Git is the source of truth.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+labels:
+  - pairs:
+      app.kubernetes.io/name: atomicip-api
+      app.kubernetes.io/part-of: atomicip
+      app.kubernetes.io/managed-by: argocd
+    includeSelectors: false
+
+resources:
+  - deployment.yaml
+  - service.yaml
+  - hpa.yaml
+  - pdb.yaml
+  - ../jobs
+
+images:
+  - name: ghcr.io/atomicip/api-server
+    newTag: latest

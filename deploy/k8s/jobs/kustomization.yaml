@@ -1,0 +1,17 @@
+# Scheduled operational jobs (#1066 backup verification, #1067 cost optimization).
+# The scripts are shipped as a ConfigMap so the jobs always run the version in Git.
+# Referencing ../../../scripts requires `--load-restrictor LoadRestrictionsNone`
+# (set in deploy/argocd/argocd-cm.yaml and in gitops-validate.yml).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - rbac-storage.yaml
+  - backup-verification-cronjob.yaml
+  - cost-optimization-cronjob.yaml
+
+configMapGenerator:
+  - name: atomicip-ops-scripts
+    files:
+      - backup-verify.sh=../../../scripts/ops/backup-verify.sh
+      - cost-optimize.sh=../../../scripts/ops/cost-optimize.sh

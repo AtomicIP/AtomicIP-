@@ -1,0 +1,15 @@
+# #1069: Argo CD settings required by the AtomicIP manifests.
+# Merged into the argocd-cm ConfigMap installed by Argo CD.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-cm
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: argocd-cm
+    app.kubernetes.io/part-of: argocd
+data:
+  # deploy/k8s/jobs packages scripts/ops/*.sh from outside its directory.
+  kustomize.buildOptions: --load-restrictor LoadRestrictionsNone
+  # Poll Git every 3 minutes (webhook from GitHub makes this near-instant).
+  timeout.reconciliation: 180s

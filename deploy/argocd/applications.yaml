@@ -1,0 +1,70 @@
+# #1069: Argo CD Applications. Bootstrap once with
+#   kubectl apply -n argocd -f deploy/argocd/
+# after which Argo CD continuously reconciles the cluster to Git.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: atomicip-staging
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: atomicip
+  source:
+    repoURL: https://github.com/AtomicIP/AtomicIP-.git
+    targetRevision: main
+    path: deploy/k8s/overlays/staging
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: atomicip-staging
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ApplyOutOfSyncOnly=true
+    retry:
+      limit: 5
+      backoff: { duration: 10s, factor: 2, maxDuration: 3m }
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: atomicip-production
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+  annotations:
+    # Sync outcomes are forwarded to the incident pipeline (#1068).
+    notifications.argoproj.io/subscribe.on-sync-failed.pagerduty: atomicip-production
+    notifications.argoproj.io/subscribe.on-health-degraded.pagerduty: atomicip-production
+    notifications.argoproj.io/subscribe.on-deployed.slack: atomicip-deploys
+spec:
+  project: atomicip
+  source:
+    repoURL: https://github.com/AtomicIP/AtomicIP-.git
+    targetRevision: main
+    path: deploy/k8s/overlays/production
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: atomicip-production
+  # Automated sync from Git: whatever is merged to main in the production
+  # overlay is what runs. selfHeal reverts manual drift in the cluster.
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ApplyOutOfSyncOnly=true
+      - PruneLast=true
+    retry:
+      limit: 3
+      backoff: { duration: 30s, factor: 2, maxDuration: 5m }
+  # The HPA owns replica counts (#1067).
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      jsonPointers:
+        - /spec/replicas

@@ -1,0 +1,45 @@
+# #1067: Nightly orphaned-data cleanup + compression; weekly report.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cost-optimization
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  schedule: "0 3 * * *"
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        spec:
+          restartPolicy: Never
+          serviceAccountName: atomicip-cost-optimizer
+          containers:
+            - name: optimize
+              image: ghcr.io/atomicip/ops-toolbox:latest # aws-cli, psql, jq, zstd
+              command: ["bash", "/scripts/cost-optimize.sh", "all"]
+              env:
+                - { name: RETENTION_DAYS, value: "30" }
+                - { name: COMPRESS_AFTER_DAYS, value: "7" }
+                - { name: COLD_TIER_AFTER_DAYS, value: "90" }
+                - { name: COST_LEDGER, value: "/ledger/cost-ledger.jsonl" }
+                - { name: REPORT_OUT, value: "/ledger/cost-report-latest.md" }
+                - { name: PUSHGATEWAY_URL, value: "http://prometheus-pushgateway.monitoring:9091" }
+                - name: DATABASE_URL
+                  valueFrom: { secretKeyRef: { name: atomicip-api-secrets, key: DATABASE_URL } }
+                - name: ARCHIVE_BUCKET
+                  valueFrom: { secretKeyRef: { name: atomicip-backup, key: archive_bucket } }
+              resources:
+                requests: { cpu: 100m, memory: 128Mi }
+              volumeMounts:
+                - { name: scripts, mountPath: /scripts }
+                - { name: ledger, mountPath: /ledger }
+                - { name: audit, mountPath: /var/log/atomicip/audit }
+          volumes:
+            - name: scripts
+              configMap: { name: atomicip-ops-scripts, defaultMode: 0555 }
+            - name: ledger
+              persistentVolumeClaim: { claimName: atomicip-cost-ledger }
+            - name: audit
+              persistentVolumeClaim: { claimName: atomicip-audit-logs }

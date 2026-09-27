@@ -1,0 +1,54 @@
+name: Backup Verification
+
+# #1066: Weekly off-cluster restore test (the in-cluster CronJob runs daily).
+# Running it from a second environment proves backups are restorable even if
+# the production cluster is gone.
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    environment: backup-verification
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.BACKUP_VERIFY_ROLE_ARN }}
+          aws-region: ${{ vars.BACKUP_REGION }}
+
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y zstd jq
+
+      - name: Restore and verify latest backup
+        env:
+          BACKUP_BUCKET: ${{ secrets.BACKUP_BUCKET }}
+          PUSHGATEWAY_URL: ${{ secrets.PUSHGATEWAY_URL }}
+          ALERTMANAGER_URL: ${{ secrets.ALERTMANAGER_URL }}
+        run: scripts/ops/backup-verify.sh
+
+      - name: Upload verification report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backup-verification-${{ github.run_id }}
+          path: backup-verification.json
+          retention-days: 90
+
+      - name: Open issue on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create --title "Backup verification failed ($(date -u +%F))" \
+            --label incident,backups \
+            --body "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}. See docs/backup-strategy.md §5."

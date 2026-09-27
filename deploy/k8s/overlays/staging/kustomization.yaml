@@ -1,0 +1,33 @@
+# #1069: Staging environment. Auto-synced by Argo CD on every merge to main.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: atomicip-staging
+
+resources:
+  - ../../base
+
+configMapGenerator:
+  - name: atomicip-api-config
+    literals:
+      - RUST_LOG=info
+      - STELLAR_NETWORK=testnet
+      - PORT=8080
+      - INCIDENT_PROVIDER=none
+
+patches:
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: atomicip-api
+    patch: |
+      - op: replace
+        path: /spec/minReplicas
+        value: 1
+      - op: replace
+        path: /spec/maxReplicas
+        value: 3
+
+# Updated by .github/workflows/gitops-promote.yml — do not edit by hand.
+images:
+  - name: ghcr.io/atomicip/api-server
+    newTag: latest

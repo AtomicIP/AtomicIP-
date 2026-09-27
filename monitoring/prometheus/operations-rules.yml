@@ -1,0 +1,91 @@
+# #1066 backup verification, #1067 cost optimization, #1069 GitOps sync alerts.
+# Backup / cost metrics are pushed by scripts/ops/*.sh via the Pushgateway.
+groups:
+  - name: backup-verification
+    rules:
+      - alert: BackupVerificationFailed
+        expr: atomicip_backup_verify_success == 0
+        labels:
+          severity: critical
+          team: platform
+          service: backups
+        annotations:
+          summary: Latest backup restore test failed
+          runbook: docs/backup-strategy.md#5-when-verification-fails
+      - alert: BackupVerificationStale
+        expr: time() - atomicip_backup_verify_last_success_timestamp_seconds > 2 * 86400
+        labels:
+          severity: critical
+          team: platform
+          service: backups
+        annotations:
+          summary: No successful backup restore test in over 48h
+          runbook: docs/backup-strategy.md#5-when-verification-fails
+      - alert: BackupTooOld
+        expr: atomicip_backup_age_seconds{kind="postgres_base"} > 26 * 3600
+          or atomicip_backup_age_seconds{kind="postgres_wal"} > 900
+          or atomicip_backup_age_seconds{kind="audit_log"} > 1800
+        labels:
+          severity: warning
+          team: platform
+          service: backups
+        annotations:
+          summary: '{{ $labels.kind }} backup older than its RPO'
+          runbook: docs/backup-strategy.md#5-when-verification-fails
+      - alert: BackupRestoreSlowerThanRTO
+        expr: atomicip_backup_restore_seconds > 7200
+        labels:
+          severity: warning
+          team: platform
+          service: backups
+        annotations:
+          summary: 'Database restore took {{ $value | humanizeDuration }} (RTO 2h)'
+          runbook: docs/backup-strategy.md#4-recovery-time
+
+  - name: cost-optimization
+    rules:
+      - record: atomicip:cost_monthly_usd_saved:sum
+        expr: sum(atomicip_cost_monthly_usd_saved)
+      - record: atomicip:api_replicas:avg1d
+        expr: avg_over_time(kube_horizontalpodautoscaler_status_current_replicas{horizontalpodautoscaler="atomicip-api"}[1d])
+      - alert: CostOptimizationJobStale
+        expr: time() - max(atomicip_cost_last_run_timestamp_seconds) > 3 * 86400
+        labels:
+          severity: info
+          team: platform
+        annotations:
+          summary: Cost optimization job has not run for 3 days
+          runbook: docs/cost-optimization.md
+      - alert: ApiServerAtMaxReplicas
+        expr: |
+          kube_horizontalpodautoscaler_status_current_replicas{horizontalpodautoscaler="atomicip-api"}
+            >= kube_horizontalpodautoscaler_spec_max_replicas{horizontalpodautoscaler="atomicip-api"}
+        for: 30m
+        labels:
+          severity: warning
+          team: platform
+          service: api-server
+        annotations:
+          summary: api-server HPA pinned at maxReplicas for 30m; raise the cap or investigate load
+          runbook: docs/cost-optimization.md#1-auto-scaling
+
+  - name: gitops
+    rules:
+      - alert: ArgoAppOutOfSync
+        expr: argocd_app_info{project="atomicip", sync_status!="Synced"} == 1
+        for: 30m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: 'Argo CD application {{ $labels.name }} has been {{ $labels.sync_status }} for 30m'
+          runbook: docs/gitops.md#troubleshooting
+      - alert: ArgoAppDegraded
+        expr: argocd_app_info{project="atomicip", health_status="Degraded"} == 1
+        for: 10m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: 'Argo CD application {{ $labels.name }} is Degraded'
+          runbook: docs/gitops.md#rollback

@@ -1,0 +1,80 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: atomicip-api
+  annotations:
+    # Argo CD syncs this resource in wave 0, after config (-1) and before jobs (1).
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  # replicas is owned by the HorizontalPodAutoscaler (#1067); leaving it unset
+  # prevents Argo CD from fighting the autoscaler on every sync.
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app: atomicip-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: atomicip-api
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: /metrics
+    spec:
+      serviceAccountName: atomicip-api
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: api-server
+          image: ghcr.io/atomicip/api-server
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: atomicip-api-config
+            - secretRef:
+                name: atomicip-api-secrets
+                optional: true
+          # Right-sized requests are the main cost lever (#1067): requests
+          # drive scheduling/bin-packing, limits only cap bursts.
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: atomicip-api

@@ -1,0 +1,65 @@
+name: GitOps Manifest Validation
+
+# #1069: Every pull request touching deployment manifests is rendered and
+# schema-validated, and the rendered diff against main is posted for review.
+# Merging the PR *is* the deployment: Argo CD syncs main to the cluster.
+
+on:
+  pull_request:
+    paths:
+      - "deploy/**"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        overlay: [staging, production]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install kustomize and kubeconform
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sSL "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.4.3/kustomize_v5.4.3_linux_amd64.tar.gz" \
+            | tar -xz -C /usr/local/bin kustomize
+          curl -sSL "https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz" \
+            | tar -xz -C /usr/local/bin kubeconform
+
+      - name: Render overlay
+        run: kustomize build --load-restrictor LoadRestrictionsNone "deploy/k8s/overlays/${{ matrix.overlay }}" > rendered.yaml
+
+      - name: Validate schemas
+        run: kubeconform -strict -summary -ignore-missing-schemas rendered.yaml
+
+      - name: Diff against main
+        id: diff
+        shell: bash
+        run: |
+          set -euo pipefail
+          git worktree add /tmp/base origin/${{ github.base_ref }}
+          if [ -d "/tmp/base/deploy/k8s/overlays/${{ matrix.overlay }}" ]; then
+            kustomize build --load-restrictor LoadRestrictionsNone "/tmp/base/deploy/k8s/overlays/${{ matrix.overlay }}" > base.yaml
+          else
+            : > base.yaml
+          fi
+          diff -u base.yaml rendered.yaml > manifest.diff || true
+          {
+            echo "### Rendered diff: \`${{ matrix.overlay }}\`"
+            echo '```diff'
+            head -c 60000 manifest.diff
+            echo '```'
+          } > comment.md
+
+      - name: Comment diff on PR
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: gitops-diff-${{ matrix.overlay }}
+          path: comment.md

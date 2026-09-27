@@ -1,0 +1,10 @@
+# Keeps at least one pod serving while the HPA or cluster autoscaler drains nodes.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: atomicip-api
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: atomicip-api

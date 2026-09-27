@@ -1,0 +1,58 @@
+name: Cost Report
+
+# #1067: Weekly cost report generated from the savings ledger written by
+# scripts/ops/cost-optimize.sh, published as a workflow summary + artifact.
+
+on:
+  schedule:
+    - cron: "0 7 * * 1"
+  workflow_dispatch:
+    inputs:
+      days:
+        description: Reporting window in days
+        default: "30"
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.COST_REPORT_ROLE_ARN }}
+          aws-region: ${{ vars.BACKUP_REGION }}
+
+      - name: Fetch savings ledger
+        run: aws s3 cp "${{ secrets.COST_LEDGER_URI }}" cost-ledger.jsonl
+
+      - name: Build report
+        env:
+          COST_LEDGER: cost-ledger.jsonl
+          REPORT_DAYS: ${{ inputs.days || '30' }}
+          REPORT_OUT: cost-report.md
+        run: scripts/ops/cost-optimize.sh report
+
+      - name: Append cloud spend (AWS Cost Explorer)
+        run: |
+          start=$(date -u -d "-${{ inputs.days || '30' }} days" +%F); end=$(date -u +%F)
+          aws ce get-cost-and-usage --time-period "Start=$start,End=$end" \
+            --granularity MONTHLY --metrics UnblendedCost \
+            --filter '{"Tags":{"Key":"project","Values":["atomicip"]}}' \
+            --group-by Type=DIMENSION,Key=SERVICE \
+            | jq -r '"\n## Cloud spend by service\n\n| Service | USD |\n|---|---:|",
+                     (.ResultsByTime[].Groups[] | "| \(.Keys[0]) | \(.Metrics.UnblendedCost.Amount | tonumber * 100 | round / 100) |")' \
+            >> cost-report.md
+
+      - name: Publish summary
+        run: cat cost-report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cost-report-${{ github.run_id }}
+          path: cost-report.md
+          retention-days: 365

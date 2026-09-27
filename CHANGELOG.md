@@ -71,6 +71,12 @@ Each entry below references an issue number from our GitHub repository. When rev
 - **#781** — Arbitrator committee mechanism with M-of-N signatures and time-locked ruling enforcement
 - **#906** — Treasury address validation: guard against hardcoded placeholder addresses
 
+### Operations & Reliability
+- **#1066** — Automated backup verification: daily/weekly restore tests, integrity checks, RTO measurement, failure alerts (`scripts/ops/backup-verify.sh`, `docs/backup-strategy.md`)
+- **#1067** — Cost optimization automation: api-server HPA, orphaned data cleanup, compression/tiering, savings ledger and reports (`scripts/ops/cost-optimize.sh`, `docs/cost-optimization.md`)
+- **#1068** — Incident management: PagerDuty/Opsgenie integration, incidents from alerts, acknowledgment, postmortems (`api-server/src/incidents.rs`, `docs/incident-response.md`)
+- **#1069** — GitOps deployment pipeline: Argo CD + Kustomize, PR-based promotion, rollback via `git revert` (`deploy/`, `docs/gitops.md`)
+
 ## Contributing
 
 When adding new features or fixes, update this file with:
