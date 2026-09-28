@@ -1,5 +1,43 @@
 use soroban_sdk::{contracttype, Address, Bytes, BytesN, String, Vec};
 
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum SwapContingency {
+    MarketPrice(MarketPriceContingency),
+    OracleEvent(OracleEventContingency),
+    TimeWindow(TimeWindowContingency),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct MarketPriceContingency {
+    pub token: Address,
+    pub min_price: i128,
+    pub max_price: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct OracleEventContingency {
+    pub token: Address,
+    pub price: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct TimeWindowContingency {
+    pub start: u64,
+    pub end: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SwapContingencyRecord {
+    pub id: u64,
+    pub previous_id: Option<u64>,
+    pub condition: SwapContingency,
+}
+
 // ── TTL ───────────────────────────────────────────────────────────────────────
 
 /// Minimum ledger TTL bump applied to every persistent storage write.
