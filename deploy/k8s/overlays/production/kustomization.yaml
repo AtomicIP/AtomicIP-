@@ -1,0 +1,34 @@
+# #1069: Production environment. Changes land ONLY via a reviewed pull request
+# (see docs/gitops.md). Rollback = `git revert` of the promotion commit.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: atomicip-production
+
+resources:
+  - ../../base
+
+configMapGenerator:
+  - name: atomicip-api-config
+    literals:
+      - RUST_LOG=warn
+      - STELLAR_NETWORK=mainnet
+      - PORT=8080
+      - INCIDENT_PROVIDER=pagerduty
+
+patches:
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: atomicip-api
+    patch: |
+      - op: replace
+        path: /spec/minReplicas
+        value: 3
+      - op: replace
+        path: /spec/maxReplicas
+        value: 20
+
+# Updated by .github/workflows/gitops-promote.yml via pull request — do not edit by hand.
+images:
+  - name: ghcr.io/atomicip/api-server
+    newTag: latest

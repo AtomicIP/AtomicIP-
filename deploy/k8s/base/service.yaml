@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: atomicip-api
+spec:
+  selector:
+    app: atomicip-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

@@ -1,0 +1,33 @@
+# #1069: Argo CD project scoping what the AtomicIP applications may deploy.
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: atomicip
+  namespace: argocd
+spec:
+  description: AtomicIP api-server and operational jobs
+  sourceRepos:
+    - https://github.com/AtomicIP/AtomicIP-.git
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: atomicip-staging
+    - server: https://kubernetes.default.svc
+      namespace: atomicip-production
+  clusterResourceWhitelist: []
+  namespaceResourceWhitelist:
+    - { group: "", kind: ConfigMap }
+    - { group: "", kind: Service }
+    - { group: "", kind: ServiceAccount }
+    - { group: "", kind: PersistentVolumeClaim }
+    - { group: apps, kind: Deployment }
+    - { group: autoscaling, kind: HorizontalPodAutoscaler }
+    - { group: policy, kind: PodDisruptionBudget }
+    - { group: batch, kind: CronJob }
+  # Production syncs are blocked outside business hours unless overridden
+  # manually by an on-call engineer in the Argo CD UI.
+  syncWindows:
+    - kind: allow
+      schedule: "0 8 * * 1-5"
+      duration: 10h
+      applications: ["atomicip-production"]
+      manualSync: true

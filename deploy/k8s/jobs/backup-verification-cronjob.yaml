@@ -1,0 +1,52 @@
+# #1066: Daily restore test of the latest backup. Needs a Docker-capable runner
+# (dind sidecar) because the restore happens in a throwaway Postgres container.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: backup-verification
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  schedule: "30 4 * * *" # after the 02:00 UTC base backup
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 10800
+      template:
+        spec:
+          restartPolicy: Never
+          serviceAccountName: atomicip-backup-verifier
+          containers:
+            - name: verify
+              image: ghcr.io/atomicip/ops-toolbox:latest # aws-cli, jq, zstd, docker-cli
+              command: ["bash", "/scripts/backup-verify.sh"]
+              env:
+                - { name: DOCKER_HOST, value: "tcp://localhost:2375" }
+                - { name: RTO_TARGET_SECONDS, value: "7200" }
+                - { name: PUSHGATEWAY_URL, value: "http://prometheus-pushgateway.monitoring:9091" }
+                - { name: ALERTMANAGER_URL, value: "http://alertmanager.monitoring:9093" }
+                - { name: REPORT_OUT, value: "/tmp/backup-verification.json" }
+                - name: BACKUP_BUCKET
+                  valueFrom: { secretKeyRef: { name: atomicip-backup, key: bucket } }
+              resources:
+                requests: { cpu: 250m, memory: 256Mi }
+              volumeMounts:
+                - { name: scripts, mountPath: /scripts }
+                - { name: work, mountPath: /tmp }
+            - name: dind
+              image: docker:27-dind
+              args: ["--tls=false"]
+              env:
+                - { name: DOCKER_TLS_CERTDIR, value: "" }
+              securityContext:
+                privileged: true
+              volumeMounts:
+                - { name: work, mountPath: /tmp }
+          volumes:
+            - name: scripts
+              configMap: { name: atomicip-ops-scripts, defaultMode: 0555 }
+            - name: work
+              emptyDir: { sizeLimit: 50Gi }

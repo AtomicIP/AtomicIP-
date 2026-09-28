@@ -15,6 +15,13 @@ route:
   group_interval: 5m
   repeat_interval: 4h
   routes:
+    # #1068: every critical alert opens/updates a tracked incident in the
+    # api-server (timeline, acknowledgment, postmortems). `continue` keeps the
+    # direct paging routes below as a backstop.
+    - matchers: ['severity="critical"']
+      receiver: incident-tracker
+      group_wait: 0s
+      continue: true
     - matchers: ['severity="critical"']
       receiver: pagerduty-oncall
       group_wait: 10s
@@ -73,3 +80,21 @@ receivers:
     pagerduty_configs:
       - routing_key_file: /etc/alertmanager/secrets/pagerduty-key
         severity: critical
+        details:
+          firing: '{{ .Alerts.Firing | len }}'
+          runbook: '{{ .CommonAnnotations.runbook }}'
+  # #1068: Opsgenie alternative. Swap `receiver: pagerduty-oncall` above for
+  # `opsgenie-oncall` when INCIDENT_PROVIDER=opsgenie.
+  - name: opsgenie-oncall
+    opsgenie_configs:
+      - api_key_file: /etc/alertmanager/secrets/opsgenie-key
+        api_url: https://api.opsgenie.com/
+        priority: '{{ if eq .CommonLabels.severity "critical" }}P1{{ else }}P3{{ end }}'
+        message: '{{ .CommonLabels.alertname }}: {{ .CommonAnnotations.summary }}'
+        tags: atomicip,{{ .CommonLabels.service }}
+        send_resolved: true
+  - name: incident-tracker
+    webhook_configs:
+      - url: http://atomicip-api.atomicip-production.svc/v1/admin/incidents/alertmanager
+        send_resolved: true
+        max_alerts: 50

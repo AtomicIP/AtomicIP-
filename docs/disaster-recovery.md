@@ -61,6 +61,9 @@ write endpoints (these depend on RPC).
 Every backup job emits `backup_last_success_timestamp_seconds{asset=...}`.
 Alert if this is older than 2× the backup interval.
 
+Backups are restore-tested daily and weekly off-cluster; see
+[backup-strategy.md](backup-strategy.md) (#1066).
+
 ### 3.2 Restore: Postgres (point-in-time)
 
 1. Declare an incident and freeze writes: scale the API server to read-only
@@ -97,6 +100,9 @@ region or cluster, with the same environment (`SOROBAN_RPC_URL`,
 `GET /health/detailed` and run `scripts/smoke-test.sh` against the new
 endpoint before moving DNS or load-balancer traffic.
 
+With GitOps (#1069) this means pointing Argo CD at the new cluster, or
+reverting the bad promotion commit; see [gitops.md](gitops.md#rollback).
+
 ### 3.5 Restore: Audit log
 
 Restore the log from the versioned bucket to `AUDIT_LOG_PATH`. Verify the HMAC chain
@@ -125,6 +131,9 @@ path is `validate_upgrade` + `upgrade` with a new WASM hash. See §5.3.
 | R10 | Full region loss | Multiple T1 alerts in one region | Run R1 + R3 + R4 in the secondary region, then move DNS |
 
 ## 5. Incident response playbooks
+
+Incident tracking, paging integration (PagerDuty/Opsgenie) and postmortems:
+[incident-response.md](incident-response.md) (#1068).
 
 ### Roles and severity
 

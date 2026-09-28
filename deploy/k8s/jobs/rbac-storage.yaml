@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: atomicip-backup-verifier
+  # Bind to a read-only role on the backup bucket (IRSA / Workload Identity).
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: atomicip-cost-optimizer
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: atomicip-cost-ledger
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
