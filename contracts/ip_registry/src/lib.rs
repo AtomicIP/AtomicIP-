@@ -47,6 +47,12 @@ mod upgrade_tests;
 #[cfg(test)]
 mod commitment_property_tests;
 
+#[cfg(test)]
+mod commitment_sybil_resistance_tests;
+
+#[cfg(test)]
+mod validator_network_tests;
+
 // ── Error Codes ────────────────────────────────────────────────────────────
 
 #[contracterror]
