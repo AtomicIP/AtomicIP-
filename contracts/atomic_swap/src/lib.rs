@@ -21,7 +21,10 @@ mod swap_fuzz_tests;
 mod swap_multisig_requirement_tests;
 #[cfg(test)]
 mod swap_collateral_tests;
+#[cfg(test)]
+mod contingency_tests;
 
+use soroban_sdk::xdr::{FromXdr, ToXdr};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Bytes,
     BytesN, Env, Error, IntoVal, String, Val, Vec,
@@ -265,6 +268,8 @@ pub enum DataKey {
     BatchExecutionMode(BytesN<32>),
     /// Maps swap_id to swap IDs that must complete first.
     BatchDependencies(u64),
+    /// #1086: Ordered contingency clauses attached to a swap.
+    SwapContingencies(u64),
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -645,6 +650,107 @@ impl AtomicSwap {
         }
     }
 
+    fn validate_contingencies(env: &Env, swap_id: u64) {
+        let contingencies: Vec<SwapContingencyRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SwapContingencies(swap_id))
+            .unwrap_or(Vec::new(env));
+
+        for (index, contingency) in contingencies.iter().enumerate() {
+            let expected_id = index as u64;
+            let expected_previous = if index == 0 {
+                None
+            } else {
+                Some(expected_id - 1)
+            };
+            if contingency.id != expected_id || contingency.previous_id != expected_previous {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::ConditionNotMet as u32,
+                ));
+            }
+
+            let passed = match contingency.condition {
+                SwapContingency::MarketPrice(condition) => {
+                    let price = fetch_oracle_price_with_staleness_check(env, &condition.token);
+                    price >= condition.min_price && price <= condition.max_price
+                }
+                SwapContingency::OracleEvent(condition) => {
+                    fetch_oracle_price_with_staleness_check(env, &condition.token) == condition.price
+                }
+                SwapContingency::TimeWindow(condition) => {
+                    let now = env.ledger().timestamp();
+                    now >= condition.start && now <= condition.end
+                }
+            };
+
+            if !passed {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::ConditionNotMet as u32,
+                ));
+            }
+        }
+    }
+
+    /// Append an XDR-encoded contingency to the buyer's ordered swap clause chain.
+    /// Returns its zero-based ID; every clause in the chain must pass.
+    pub fn add_contingency(env: Env, swap_id: u64, condition: Bytes) -> u64 {
+        let swap = require_swap_exists(&env, swap_id);
+        require_swap_status(&env, &swap, SwapStatus::Pending, ContractError::NotPending);
+        swap.buyer.require_auth();
+
+        let decoded = SwapContingency::from_xdr(&env, &condition).unwrap_or_else(|_| {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::ConditionNotMet as u32,
+            ))
+        });
+        let structurally_valid = match decoded.clone() {
+            SwapContingency::MarketPrice(condition) => {
+                condition.min_price > 0 && condition.max_price >= condition.min_price
+            }
+            SwapContingency::OracleEvent(condition) => condition.price > 0,
+            SwapContingency::TimeWindow(condition) => condition.end >= condition.start,
+        };
+        if !structurally_valid {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::ConditionNotMet as u32,
+            ));
+        }
+
+        let key = DataKey::SwapContingencies(swap_id);
+        let mut contingencies: Vec<SwapContingencyRecord> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(Vec::new(&env));
+        if contingencies.len() >= MAX_BATCH_SIZE {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::BatchTooLarge as u32,
+            ));
+        }
+        let id = contingencies.len() as u64;
+        let previous_id = if id == 0 { None } else { Some(id - 1) };
+        contingencies.push_back(SwapContingencyRecord {
+            id,
+            previous_id,
+            condition: decoded,
+        });
+        env.storage().persistent().set(&key, &contingencies);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, LEDGER_BUMP, LEDGER_BUMP);
+
+        id
+    }
+
+    /// Return the ordered contingency chain for a swap.
+    pub fn get_contingencies(env: Env, swap_id: u64) -> Vec<SwapContingencyRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SwapContingencies(swap_id))
+            .unwrap_or(Vec::new(&env))
+    }
+
     /// #468: Buyer accepts the swap with conditions. Conditions are stored on the swap
     /// record and evaluated immediately (except KeyValid, which is deferred to reveal_key).
     /// If all non-deferred conditions pass, the swap proceeds to Accepted.
@@ -654,6 +760,7 @@ impl AtomicSwap {
         let mut swap = require_swap_exists(&env, swap_id);
         swap.buyer.require_auth();
         require_swap_status(&env, &swap, SwapStatus::Pending, ContractError::NotPending);
+        Self::validate_contingencies(&env, swap_id);
 
         // #254: Ensure all required approvals have been collected.
         if swap.required_approvals > 0 {
@@ -706,6 +813,7 @@ impl AtomicSwap {
 
         swap.buyer.require_auth();
         require_swap_status(&env, &swap, SwapStatus::Pending, ContractError::NotPending);
+        Self::validate_contingencies(&env, swap_id);
 
         // #254: Ensure all required approvals have been collected.
         if swap.required_approvals > 0 {
@@ -848,6 +956,7 @@ impl AtomicSwap {
             SwapStatus::Accepted,
             ContractError::NotAccepted,
         );
+        Self::validate_contingencies(&env, swap_id);
 
         // Verify commitment via IP registry
         // Guard: if this swap has required signers, all must have signed before reveal.
@@ -1849,12 +1958,12 @@ impl AtomicSwap {
         let bond_key = DataKey::DisputeBond(swap_id);
         let mut bonds: DisputeBonds = env
             .storage()
-            .persistent()
-            .get(&bond_key)
-            .unwrap_or(DisputeBonds {
-                buyer_bond: 0,
-                seller_bond: 0,
-            });
+                .persistent()
+                .get(&bond_key)
+                .unwrap_or(DisputeBonds {
+                    buyer_bond: 0,
+                    seller_bond: 0,
+                });
 
         let is_buyer = *submitter == swap.buyer;
         let already_charged = if is_buyer {
@@ -1918,6 +2027,7 @@ impl AtomicSwap {
         let mut swap = require_swap_exists(&env, swap_id);
         swap.buyer.require_auth();
         require_swap_status(&env, &swap, SwapStatus::Pending, ContractError::NotPending);
+        Self::validate_contingencies(&env, swap_id);
 
         if quantity == 0 || quantity > swap.quantity {
             env.panic_with_error(Error::from_contract_error(ContractError::InvalidKey as u32));
@@ -3369,7 +3479,6 @@ impl AtomicSwap {
         if env.ledger().timestamp() < payment.due_timestamp {
             env.panic_with_error(Error::from_contract_error(ContractError::NotExpired as u32));
         }
-
         // Transfer payment
         token::Client::new(&env, &swap.token).transfer(
             &swap.buyer,
@@ -3399,6 +3508,7 @@ impl AtomicSwap {
 
         // If all payments made, transition to Accepted
         if all_paid {
+            Self::validate_contingencies(&env, swap_id);
             swap.status = SwapStatus::Accepted;
             swap.accept_timestamp = env.ledger().timestamp();
             swap::save_swap(&env, swap_id, &swap);
@@ -3588,6 +3698,7 @@ impl AtomicSwap {
 
         // If fully paid, transition to Accepted so seller can reveal key
         if swap.paid_amount >= swap.price {
+            Self::validate_contingencies(&env, swap_id);
             swap.status = SwapStatus::Accepted;
             swap.accept_timestamp = env.ledger().timestamp();
             Self::append_history(&env, swap_id, SwapStatus::Accepted);
@@ -3893,6 +4004,7 @@ impl AtomicSwap {
             SwapStatus::Accepted,
             ContractError::NotAccepted,
         );
+        Self::validate_contingencies(&env, swap_id);
 
         // Verify commitment
         let valid = registry::verify_commitment(&env, swap.ip_id, &secret, &blinding_factor);
@@ -4051,6 +4163,7 @@ impl AtomicSwap {
                     ));
                 }
             }
+            Self::validate_contingencies(&env, swap_id);
         }
 
         // Execution pass — all validations passed, safe to mutate
@@ -4152,6 +4265,7 @@ impl AtomicSwap {
                 SwapStatus::Accepted,
                 ContractError::NotAccepted,
             );
+            Self::validate_contingencies(&env, swap_id);
             let valid = registry::verify_commitment(
                 &env,
                 swap.ip_id,
@@ -4725,6 +4839,7 @@ impl AtomicSwap {
             }
 
             require_swap_status(&env, &swap, SwapStatus::Pending, ContractError::NotPending);
+            Self::validate_contingencies(&env, swap_id);
 
             token::Client::new(&env, &swap.token).transfer(
                 &swap.buyer,
@@ -4777,6 +4892,7 @@ impl AtomicSwap {
         }
 
         require_swap_status(&env, &swap, SwapStatus::Pending, ContractError::NotPending);
+        Self::validate_contingencies(&env, swap_id);
 
         // Transfer payment from buyer into contract escrow
         token::Client::new(&env, &swap.token).transfer(
@@ -5600,6 +5716,8 @@ impl AtomicSwap {
                     }
                     false
                 } else {
+                    Self::validate_contingencies(env, swap_id);
+
                     // Execute the swap state transition
                     // Mark swap as Completed
                     let mut updated_swap = swap;
@@ -5608,18 +5726,22 @@ impl AtomicSwap {
                     env.storage()
                         .persistent()
                         .set(&DataKey::Swap(swap_id), &updated_swap);
-                    env.storage()
-                        .persistent()
-                        .extend_ttl(&DataKey::Swap(swap_id), LEDGER_BUMP, LEDGER_BUMP);
+                    env.storage().persistent().extend_ttl(
+                        &DataKey::Swap(swap_id),
+                        LEDGER_BUMP,
+                        LEDGER_BUMP,
+                    );
 
                     // Record completion timestamp
                     let now = env.ledger().timestamp();
                     env.storage()
                         .persistent()
                         .set(&DataKey::CompletionTimestamp(swap_id), &now);
-                    env.storage()
-                        .persistent()
-                        .extend_ttl(&DataKey::CompletionTimestamp(swap_id), LEDGER_BUMP, LEDGER_BUMP);
+                    env.storage().persistent().extend_ttl(
+                        &DataKey::CompletionTimestamp(swap_id),
+                        LEDGER_BUMP,
+                        LEDGER_BUMP,
+                    );
 
                     // Emit individual completion event
                     env.events().publish(
@@ -5632,7 +5754,9 @@ impl AtomicSwap {
                 }
             } else {
                 if atomic {
-                    env.panic_with_error(Error::from_contract_error(ContractError::SwapNotFound as u32));
+                    env.panic_with_error(Error::from_contract_error(
+                        ContractError::SwapNotFound as u32,
+                    ));
                 }
                 false
             };
@@ -5647,12 +5771,7 @@ impl AtomicSwap {
         // Emit batch completion event
         env.events().publish(
             (soroban_sdk::symbol_short!("btch_ex"),),
-            (
-                swap_ids.clone(),
-                successful_count,
-                len as u32,
-                atomic,
-            ),
+            (swap_ids.clone(), successful_count, len as u32, atomic),
         );
 
         results
@@ -6336,7 +6455,6 @@ mod batch_enhancement_tests {
     }
 }
 
-
 #[cfg(test)]
 mod insurance_reserve_tests {
     use ip_registry::{IpRegistry, IpRegistryClient};
@@ -6438,9 +6556,7 @@ mod insurance_reserve_tests {
 
         // Top the pool up to the full outstanding coverage.
         client.fund_insurance_pool(&pool.funder, &pool.token, &status.shortfall);
-        assert!(client
-            .get_insurance_pool_status(&pool.token)
-            .collateralized);
+        assert!(client.get_insurance_pool_status(&pool.token).collateralized);
 
         mark_claimable(&env, &pool.contract_id, pool.swap_a);
         mark_claimable(&env, &pool.contract_id, pool.swap_b);

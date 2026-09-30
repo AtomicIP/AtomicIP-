@@ -253,6 +253,8 @@ pub fn build_v1_schema(env: &Env) -> ContractSchema {
     f!("initiate_swap",            "initiate_swap(token:Address,ip_id:u64,seller:Address,price:i128,buyer:Address,required_approvals:u32,referrer:Option<Address>)->u64");
     f!("batch_initiate_swap",      "batch_initiate_swap(token:Address,ip_ids:Vec<u64>,seller:Address,prices:Vec<i128>,buyer:Address,required_approvals:u32,referrer:Option<Address>)->Vec<u64>");
     f!("accept_swap",              "accept_swap(swap_id:u64)->()");
+    f!("add_contingency",           "add_contingency(swap_id:u64,condition:Bytes)->u64");
+    f!("get_contingencies",         "get_contingencies(swap_id:u64)->Vec<SwapContingencyRecord>");
     f!("accept_swap_partial",      "accept_swap_partial(swap_id:u64,quantity:u32)->()");
     f!("renegotiate_swap",         "renegotiate_swap(swap_id:u64,new_price:i128)->()");
     f!("accept_renegotiation",     "accept_renegotiation(swap_id:u64)->()");
@@ -360,6 +362,7 @@ pub fn build_v1_schema(env: &Env) -> ContractSchema {
     k!("InsurancePool");
     k!("InsuranceReserved");
     k!("InsuranceReservedTotal");
+    k!("SwapContingencies");
 
     ContractSchema {
         version: 1,
