@@ -48,6 +48,7 @@ mod cache;
 mod commitments;
 mod due_diligence;
 mod marketplace_analytics;
+mod recommendations;
 mod analytics;
 mod circuit_breaker;
 mod commitment_monitoring;
@@ -337,6 +338,7 @@ async fn main() {
         .route("/analytics/commitments",          get(handlers::commitment_analytics))
         .route("/analytics/marketplace",          get(marketplace_analytics::marketplace_analytics_handler))
         .route("/ip/{ip_id}/due-diligence",       get(due_diligence::get_due_diligence))
+        .route("/recommendations",                get(recommendations::get_recommendations))
         .route("/webhooks",                       post(handlers::register_webhook).get(handlers::list_webhooks))
         .route("/webhooks/{id}",                  axum::routing::delete(handlers::unregister_webhook))
         .route("/swap/marketplace/seller/{seller}", get(handlers::marketplace_by_seller))

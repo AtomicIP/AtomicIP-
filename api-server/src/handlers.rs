@@ -65,6 +65,14 @@ pub(crate) fn indexed_records() -> Vec<IpRecord> {
     COMMITMENT_INDEX.iter().map(|entry| entry.value().clone()).collect()
 }
 
+/// Copy of every user's watchlist, for the recommendation engine (#1097).
+pub(crate) fn watchlist_snapshot() -> HashMap<String, BTreeSet<u64>> {
+    WATCHLISTS
+        .lock()
+        .map(|watchlists| watchlists.clone())
+        .unwrap_or_default()
+}
+
 /// Audit log store for tracking all API access and sensitive operations
 static AUDIT_LOG_STORE: Lazy<Arc<AuditLogStore>> = Lazy::new(|| {
     let audit_key = std::env::var("AUDIT_HMAC_KEY")
