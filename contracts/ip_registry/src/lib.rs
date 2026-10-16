@@ -166,6 +166,8 @@ pub enum ContractError {
     AlreadyNotarized = 60,
     /// #1150: Access level is outside the accepted range `1..=3`.
     InvalidAccessLevel = 61,
+    /// #1151: The owner cannot grant access to their own address.
+    SelfGrantNotAllowed = 62,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -3903,6 +3905,29 @@ impl IpRegistry {
     /// Panics with `InvalidAccessLevel` if `access_level` is 0 or > 3 (#1150),
     /// or with `Unauthorized` if caller is not the owner.
     pub fn grant_ip_access(env: Env, ip_id: u64, grantee: Address, access_level: u32) {
+        Self::grant_ip_access_with_expiry(env, ip_id, grantee, access_level, None);
+    }
+
+    /// Grant access like `grant_ip_access`, with an optional expiry (#1151).
+    ///
+    /// `expires_at` is a ledger timestamp. Once `ledger.timestamp() >= expires_at`
+    /// the grant no longer passes `check_ip_access`. `None` means no expiry.
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// * The IP does not exist (IpNotFound error)
+    /// * The caller is not the owner (Unauthorized error)
+    /// * `access_level` is 0 or > 3 (InvalidAccessLevel error)
+    /// * `grantee` is the owner (SelfGrantNotAllowed error)
+    /// * `expires_at` is not in the future (InvalidExpiry error)
+    pub fn grant_ip_access_with_expiry(
+        env: Env,
+        ip_id: u64,
+        grantee: Address,
+        access_level: u32,
+        expires_at: Option<u64>,
+    ) {
         let record = require_ip_exists(&env, ip_id);
         record.owner.require_auth();
 
@@ -3910,6 +3935,21 @@ impl IpRegistry {
             env.panic_with_error(Error::from_contract_error(
                 ContractError::InvalidAccessLevel as u32,
             ));
+        }
+
+        // #1151: owner already has full access; a self-grant only adds noise.
+        if grantee == record.owner {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::SelfGrantNotAllowed as u32,
+            ));
+        }
+
+        if let Some(expiry) = expires_at {
+            if expiry <= env.ledger().timestamp() {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::InvalidExpiry as u32,
+                ));
+            }
         }
 
         let mut grants: Vec<IpAccessGrant> = env
@@ -3926,6 +3966,7 @@ impl IpRegistry {
                     IpAccessGrant {
                         grantee: grantee.clone(),
                         access_level,
+                        expires_at,
                     },
                 );
                 found = true;
@@ -3936,6 +3977,7 @@ impl IpRegistry {
             grants.push_back(IpAccessGrant {
                 grantee: grantee.clone(),
                 access_level,
+                expires_at,
             });
         }
 
@@ -3995,6 +4037,7 @@ impl IpRegistry {
     /// a grantee with level 3 satisfies a check for level 1 or 2.
     ///
     /// Returns `true` if access is granted, `false` otherwise.
+    /// Expired grants (#1151) are treated as absent.
     pub fn check_ip_access(env: Env, ip_id: u64, grantee: Address, required_level: u32) -> bool {
         let record = require_ip_exists(&env, ip_id);
         // Owner always has full access
@@ -4006,8 +4049,14 @@ impl IpRegistry {
             .persistent()
             .get(&DataKey::IpAccessGrants(ip_id))
             .unwrap_or(Vec::new(&env));
+        let now = env.ledger().timestamp();
         for grant in grants.iter() {
             if grant.grantee == grantee {
+                if let Some(expiry) = grant.expires_at {
+                    if now >= expiry {
+                        return false;
+                    }
+                }
                 return grant.access_level >= required_level;
             }
         }

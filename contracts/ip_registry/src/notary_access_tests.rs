@@ -159,4 +159,77 @@ mod notary_access_tests {
             assert!(client.check_ip_access(&ip_id, &grantee, &level));
         }
     }
+
+    // ── #1151: grant expiry and self-grant guard ─────────────────────────────
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #62)")]
+    fn owner_cannot_grant_to_self() {
+        let env = Env::default();
+        let (contract_id, owner) = setup(&env);
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[15u8; 32]), &0u32);
+        client.grant_ip_access(&ip_id, &owner, &1u32);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #11)")]
+    fn expiry_in_the_past_is_rejected() {
+        let env = Env::default();
+        let (contract_id, owner) = setup(&env);
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[16u8; 32]), &0u32);
+        env.ledger().set_timestamp(1_000);
+        client.grant_ip_access_with_expiry(
+            &ip_id,
+            &Address::generate(&env),
+            &1u32,
+            &Some(500u64),
+        );
+    }
+
+    #[test]
+    fn expired_grant_is_not_honoured() {
+        let env = Env::default();
+        let (contract_id, owner) = setup(&env);
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[17u8; 32]), &0u32);
+        let grantee = Address::generate(&env);
+
+        env.ledger().set_timestamp(1_000);
+        client.grant_ip_access_with_expiry(&ip_id, &grantee, &3u32, &Some(2_000u64));
+        assert!(client.check_ip_access(&ip_id, &grantee, &3u32));
+
+        // Boundary: at exactly `expires_at` the grant is already expired.
+        env.ledger().set_timestamp(2_000);
+        assert!(!client.check_ip_access(&ip_id, &grantee, &1u32));
+    }
+
+    #[test]
+    fn grant_without_expiry_never_lapses() {
+        let env = Env::default();
+        let (contract_id, owner) = setup(&env);
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[18u8; 32]), &0u32);
+        let grantee = Address::generate(&env);
+
+        client.grant_ip_access(&ip_id, &grantee, &2u32);
+        env.ledger().set_timestamp(u32::MAX as u64 * 10);
+        assert!(client.check_ip_access(&ip_id, &grantee, &2u32));
+    }
+
+    #[test]
+    fn stored_grant_records_its_expiry() {
+        let env = Env::default();
+        let (contract_id, owner) = setup(&env);
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[19u8; 32]), &0u32);
+        let grantee = Address::generate(&env);
+
+        env.ledger().set_timestamp(1_000);
+        client.grant_ip_access_with_expiry(&ip_id, &grantee, &1u32, &Some(5_000u64));
+        let grants = client.get_ip_access_grants(&ip_id);
+        assert_eq!(grants.get(0).unwrap().expires_at, Some(5_000u64));
+    }
 }
+
