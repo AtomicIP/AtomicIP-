@@ -2690,23 +2690,16 @@ impl IpRegistry {
             return false;
         }
 
-        // Emit EXPIRY_TOPIC exactly once per expiry transition so off-chain
-        // indexers can cheaply detect an IP crossing into its grace period.
-        if record.expiry_timestamp != 0 && env.ledger().timestamp() >= record.expiry_timestamp {
-            let already_notified: bool = env
-                .storage()
-                .persistent()
-                .get(&DataKey::ExpiryNotified(ip_id))
-                .unwrap_or(false);
-            if !already_notified {
-                env.events().publish(
-                    (EXPIRY_TOPIC, ip_id),
-                    (record.owner.clone(), record.expiry_timestamp),
-                );
-                env.storage()
-                    .persistent()
-                    .set(&DataKey::ExpiryNotified(ip_id), &true);
-            }
+        // Expired past the grace period: the commitment is no longer verifiable.
+        // Inside the grace period (expiry..expiry+grace) verification still succeeds.
+        // Read-only: expiry transition events are emitted by `notify_ip_expiry`.
+        if record.expiry_timestamp != 0
+            && env.ledger().timestamp()
+                >= record
+                    .expiry_timestamp
+                    .saturating_add(record.grace_period_seconds)
+        {
+            return false;
         }
 
         let algorithm: CommitmentAlgorithm = env
@@ -6549,6 +6542,40 @@ impl IpRegistry {
         env.storage()
             .persistent()
             .remove(&DataKey::ExpiryNotified(ip_id));
+    }
+
+    /// Emit `EXPIRY_TOPIC` once for an IP's expiry transition. Anyone can call.
+    ///
+    /// Expiry notifications used to be emitted from `verify_commitment`, which made a
+    /// read path write state and emit events. This state-changing entry point owns
+    /// that transition instead. Indexers should call it, or watch for the event.
+    ///
+    /// Returns `true` only when this call emitted the event. It returns `false` if
+    /// the IP has no expiry, has not reached it yet, or was already notified for the
+    /// current expiry. `set_ip_expiry` and `renew_ip_commitment` reset the flag.
+    pub fn notify_ip_expiry(env: Env, ip_id: u64) -> bool {
+        let record = require_ip_exists(&env, ip_id);
+        if record.expiry_timestamp == 0 || env.ledger().timestamp() < record.expiry_timestamp {
+            return false;
+        }
+
+        let already_notified: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ExpiryNotified(ip_id))
+            .unwrap_or(false);
+        if already_notified {
+            return false;
+        }
+
+        env.events().publish(
+            (EXPIRY_TOPIC, ip_id),
+            (record.owner.clone(), record.expiry_timestamp),
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::ExpiryNotified(ip_id), &true);
+        true
     }
 
     /// Renew an IP commitment's expiry. Owner-only.

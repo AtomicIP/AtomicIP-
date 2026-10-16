@@ -180,6 +180,14 @@ The on-chain `verify_commitment` is stricter than the hash comparison above. It 
   even when the secret and blinding factor are correct. Revocation is terminal, so downstream
   swap logic cannot accept a revoked commitment.
 - **Archived commitments.** If the commitment has been archived, verification returns `false`.
+- **Expired commitments (#1145).** If the IP has an `expiry_timestamp` and the ledger time is at
+  or past `expiry_timestamp + grace_period_seconds`, verification returns `false`. Between expiry
+  and the end of the grace period, verification still succeeds.
+
+`verify_commitment` is read-only. It does not emit events or write state. To record an expiry
+transition, call `notify_ip_expiry(ip_id)`. Anyone can call it. It emits `ip_expiry` once per
+expiry, and returns `true` only on the call that emitted it. `set_ip_expiry` and
+`renew_ip_commitment` reset the notification so the next transition can emit again.
 
 ## Commitment Strength Scoring
 

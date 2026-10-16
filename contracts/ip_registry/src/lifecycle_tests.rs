@@ -5,7 +5,7 @@
 extern crate std;
 
 use crate::{IpRegistry, IpRegistryClient};
-use soroban_sdk::testutils::Address as _;
+use soroban_sdk::testutils::{Address as _, Ledger};
 use soroban_sdk::{Address, Bytes, BytesN, Env};
 
 struct Fixture {
@@ -60,4 +60,91 @@ fn verify_commitment_rejects_revoked_ip_with_correct_secret() {
     // The secret and blinding factor are still correct, but the IP has been
     // revoked, so downstream swap logic must not accept the commitment.
     assert!(!f.client.verify_commitment(&f.ip_id, &f.secret, &f.blinding));
+}
+
+// ── #1145: expiry is enforced by verify_commitment; events leave the read path ──
+
+#[test]
+fn verify_commitment_valid_before_expiry() {
+    let f = setup();
+    let now = f.env.ledger().timestamp();
+    f.client.set_ip_expiry(&f.ip_id, &(now + 1000), &0);
+
+    assert!(f.client.verify_commitment(&f.ip_id, &f.secret, &f.blinding));
+}
+
+#[test]
+fn verify_commitment_valid_during_grace_period() {
+    let f = setup();
+    let now = f.env.ledger().timestamp();
+    f.client.set_ip_expiry(&f.ip_id, &(now + 100), &500);
+
+    // Past expiry but before expiry + grace: still verifies.
+    f.env.ledger().with_mut(|l| l.timestamp = now + 150);
+    assert!(f.client.verify_commitment(&f.ip_id, &f.secret, &f.blinding));
+}
+
+#[test]
+fn verify_commitment_rejects_after_grace_period() {
+    let f = setup();
+    let now = f.env.ledger().timestamp();
+    f.client.set_ip_expiry(&f.ip_id, &(now + 100), &500);
+
+    // At exactly expiry + grace the commitment is no longer verifiable.
+    f.env.ledger().with_mut(|l| l.timestamp = now + 600);
+    assert!(!f.client.verify_commitment(&f.ip_id, &f.secret, &f.blinding));
+}
+
+#[test]
+fn verify_commitment_rejects_at_expiry_when_no_grace() {
+    let f = setup();
+    let now = f.env.ledger().timestamp();
+    f.client.set_ip_expiry(&f.ip_id, &(now + 100), &0);
+
+    f.env.ledger().with_mut(|l| l.timestamp = now + 100);
+    assert!(!f.client.verify_commitment(&f.ip_id, &f.secret, &f.blinding));
+}
+
+#[test]
+fn verify_commitment_does_not_emit_expiry_event() {
+    use soroban_sdk::testutils::Events;
+
+    let f = setup();
+    let now = f.env.ledger().timestamp();
+    f.client.set_ip_expiry(&f.ip_id, &(now + 100), &500);
+    f.env.ledger().with_mut(|l| l.timestamp = now + 600);
+
+    let before = f.env.events().all().events().len();
+    f.client.verify_commitment(&f.ip_id, &f.secret, &f.blinding);
+    f.client.verify_commitment(&f.ip_id, &f.secret, &f.blinding);
+    assert_eq!(
+        f.env.events().all().events().len(),
+        before,
+        "verify_commitment is a read path and must not emit events"
+    );
+}
+
+#[test]
+fn notify_ip_expiry_is_noop_before_expiry() {
+    let f = setup();
+    let now = f.env.ledger().timestamp();
+    f.client.set_ip_expiry(&f.ip_id, &(now + 1000), &0);
+
+    assert!(!f.client.notify_ip_expiry(&f.ip_id));
+}
+
+#[test]
+fn notify_ip_expiry_fires_once_per_transition() {
+    let f = setup();
+    let now = f.env.ledger().timestamp();
+    f.client.set_ip_expiry(&f.ip_id, &(now + 100), &500);
+    f.env.ledger().with_mut(|l| l.timestamp = now + 150);
+
+    assert!(f.client.notify_ip_expiry(&f.ip_id));
+    assert!(!f.client.notify_ip_expiry(&f.ip_id));
+
+    // Renewing starts a new expiry transition, so it can notify again.
+    f.client.renew_ip_commitment(&f.ip_id, &(now + 1000));
+    f.env.ledger().with_mut(|l| l.timestamp = now + 1100);
+    assert!(f.client.notify_ip_expiry(&f.ip_id));
 }
