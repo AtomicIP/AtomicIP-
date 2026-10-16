@@ -159,6 +159,14 @@ pub enum ContractError {
     InsuranceDisputeMismatch = 58,
     /// #1073: Dispute must be resolved before the claim can be verified.
     InsuranceDisputeUnresolved = 59,
+    /// Ownership percentages in a cap table do not sum to 100.
+    InvalidShareTotal = 60,
+    /// The commitment has been archived and can no longer be revealed.
+    CommitmentArchived = 61,
+    /// #811: Ownership challenge TTL has elapsed.
+    ChallengeExpired = 62,
+    /// #811: Ownership challenge already has a response.
+    ChallengeAlreadyAnswered = 63,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -297,6 +305,20 @@ pub enum DataKey {
     /// Issue #812: cached proof path tied to the root used to generate it.
     MerkleProof(u64),
     CommitmentAlgorithm(u64),
+    /// Marks an old commitment as archived without deleting its immutable ID.
+    Archived(u64),
+    /// Tracks whether an expiry notification was already emitted for an IP.
+    ExpiryNotified(u64),
+    /// Cap table (owner + co-owner percentages) for an IP.
+    OwnershipShares(u64),
+    /// #974: Merkle root metadata for batch commitments
+    MerkleRootRecord(u64),
+    /// #975: Time-lock metadata for time-locked commitments
+    TimeLockRecord(u64),
+    /// #976: Amendment history for commitment amendments
+    AmendmentHistory(u64),
+    /// #977: Privacy level for each commitment
+    CommitmentPrivacy(u64),
     // Issue #979: Commitment linking for related IPs
     CommitmentLinks(u64), // maps ip_id -> Vec<CommitmentLink> of linked commitments
     LinkedCommitments(u64), // maps linked_ip_id -> Vec<u64> of ip_ids linking to it (reverse index)
@@ -1509,10 +1531,9 @@ impl IpRegistry {
     ) -> u64 {
         owner.require_auth();
 
-        require!(
-            commitment_hashes.len() > 0,
-            ContractError::BatchSizeMismatch
-        );
+        if commitment_hashes.len() == 0 {
+            panic_with_error!(&env, ContractError::BatchSizeMismatch);
+        }
 
         let root_hash = Self::compute_merkle_root(&env, &commitment_hashes);
         let timestamp = env.ledger().timestamp();
@@ -1539,7 +1560,7 @@ impl IpRegistry {
             .extend_ttl(&DataKey::MerkleRootRecord(root_id), LEDGER_BUMP, LEDGER_BUMP);
 
         env.events()
-            .publish((symbol_short!("merkle_root"),), (root_id, timestamp, root_hash));
+            .publish((symbol_short!("mrkl_root"),), (root_id, timestamp, root_hash));
 
         root_id
     }
@@ -1641,7 +1662,9 @@ impl IpRegistry {
         owner.require_auth();
 
         let current_time = env.ledger().timestamp();
-        require!(unlock_time > current_time, ContractError::InvalidTimeLock);
+        if unlock_time <= current_time {
+            panic_with_error!(&env, ContractError::InvalidTimeLock);
+        }
         require_non_zero_commitment(&env, &commitment_hash);
         require_unique_commitment(&env, &commitment_hash);
 
@@ -1697,7 +1720,7 @@ impl IpRegistry {
             .extend_ttl(&DataKey::NextId, LEDGER_BUMP, LEDGER_BUMP);
 
         env.events().publish(
-            (symbol_short!("timelock_crt"),),
+            (symbol_short!("tl_create"),),
             (id, unlock_time, current_time),
         );
 
@@ -1739,7 +1762,7 @@ impl IpRegistry {
             .set(&DataKey::TimeLockRecord(commitment_id), &lock);
 
         env.events()
-            .publish((symbol_short!("timelock_unlock"),), (commitment_id, current_time));
+            .publish((symbol_short!("tl_unlock"),), (commitment_id, current_time));
 
         true
     }
@@ -1849,10 +1872,9 @@ impl IpRegistry {
         privacy_level: u32,
         allowed_addresses: Vec<Address>,
     ) -> bool {
-        require!(
-            privacy_level <= 3,
-            ContractError::InvalidPrivacyLevel
-        );
+        if privacy_level > 3 {
+            panic_with_error!(&env, ContractError::InvalidPrivacyLevel);
+        }
 
         let mut record: Option<IpRecord> = env
             .storage()
@@ -1892,7 +1914,7 @@ impl IpRegistry {
             );
 
         env.events()
-            .publish((symbol_short!("privacy_set"),), (commitment_id, privacy_level));
+            .publish((symbol_short!("priv_set"),), (commitment_id, privacy_level));
 
         true
     }
@@ -2919,7 +2941,7 @@ impl IpRegistry {
         );
 
         env.events().publish(
-            (symbol_short!("partial"), record.owner),
+            (symbol_short!("partial"), record.owner.clone()),
             (ip_id, partial_hash),
         );
 
@@ -3674,7 +3696,7 @@ impl IpRegistry {
             }
         }
 
-        Self::verify_merkle_proof(&env, &record.commitment_hash, &proof, &hashes)
+        Self::verify_merkle_inclusion(&env, &record.commitment_hash, &proof, &hashes)
     }
 
     // ── Issue #435: Generate Merkle Proof ─────────────────────────────────────
@@ -3825,7 +3847,7 @@ impl IpRegistry {
         current_level.get(0).unwrap()
     }
 
-    fn verify_merkle_proof(
+    fn verify_merkle_inclusion(
         env: &Env,
         leaf: &BytesN<32>,
         proof: &Vec<BytesN<32>>,
