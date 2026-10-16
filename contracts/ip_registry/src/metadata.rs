@@ -5,7 +5,7 @@
 /// for efficient searching.
 
 use crate::types::{IpMetadata, MetadataSearchResult};
-use crate::DataKey;
+use crate::{DataKey, LEDGER_BUMP};
 use soroban_sdk::{Bytes, BytesN, Env, Vec};
 
 /// Maximum number of results per search page
@@ -44,7 +44,7 @@ pub fn store_metadata(
     env.storage().persistent().set(&key, &metadata);
     env.storage()
         .persistent()
-        .extend_ttl(&key, 6_307_200, 6_307_200);
+        .extend_ttl(&key, LEDGER_BUMP, LEDGER_BUMP);
 
     // Index by each tag for search
     for i in 0..tag_hashes.len() {
@@ -71,7 +71,7 @@ fn index_metadata_by_tag(env: &Env, tag_hash: &BytesN<32>, ip_id: u64) {
     env.storage().persistent().set(&key, &ip_ids);
     env.storage()
         .persistent()
-        .extend_ttl(&key, 6_307_200, 6_307_200);
+        .extend_ttl(&key, LEDGER_BUMP, LEDGER_BUMP);
 }
 
 /// Search for commitments by tag with pagination.

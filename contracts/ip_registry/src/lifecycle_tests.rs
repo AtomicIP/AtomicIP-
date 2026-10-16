@@ -234,3 +234,99 @@ fn new_owner_can_grant_access_after_transfer() {
 
     assert!(f.client.check_ip_access(&f.ip_id, &grantee, &1u32));
 }
+
+// ── #1147: TTL policy — extend_ttl must use LEDGER_BUMP, never a literal ─────
+
+fn is_numeric_literal(arg: &str) -> bool {
+    !arg.is_empty() && arg.chars().all(|c| c.is_ascii_digit() || c == '_')
+}
+
+/// Returns `(line, call)` for every `extend_ttl(...)` call in `src` whose last
+/// two arguments (the threshold and extend-to TTLs) are numeric literals.
+fn literal_ttl_calls(src: &str) -> std::vec::Vec<(usize, std::string::String)> {
+    const CALL: &str = "extend_ttl(";
+    let mut found = std::vec::Vec::new();
+
+    for (start, _) in src.match_indices(CALL) {
+        let args_start = start + CALL.len();
+
+        // Find the matching closing parenthesis.
+        let mut depth = 1usize;
+        let mut end = args_start;
+        for (k, c) in src[args_start..].char_indices() {
+            match c {
+                '(' | '[' => depth += 1,
+                ')' | ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = args_start + k;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Split the argument list on top-level commas only.
+        let mut args = std::vec::Vec::new();
+        let mut nest = 0usize;
+        let mut last = args_start;
+        for (k, c) in src[args_start..end].char_indices() {
+            match c {
+                '(' | '[' => nest += 1,
+                ')' | ']' => nest -= 1,
+                ',' if nest == 0 => {
+                    args.push(src[last..args_start + k].trim());
+                    last = args_start + k + 1;
+                }
+                _ => {}
+            }
+        }
+        args.push(src[last..end].trim());
+        let args: std::vec::Vec<&str> = args.into_iter().filter(|a| !a.is_empty()).collect();
+
+        if args.len() >= 3 && args[args.len() - 2..].iter().all(|a| is_numeric_literal(a)) {
+            let line = src[..start].matches('\n').count() + 1;
+            found.push((line, std::format!("extend_ttl({})", args.join(", "))));
+        }
+    }
+
+    found
+}
+
+#[test]
+fn literal_ttl_scanner_detects_literal_values() {
+    let bad = "env.storage().persistent().extend_ttl(&key, 50000, 50000);";
+    let good = "env.storage().persistent().extend_ttl(&key, LEDGER_BUMP, LEDGER_BUMP);";
+    let multiline = "extend_ttl(\n    &DataKey::OwnerIps(owner.clone()),\n    6_307_200,\n    6_307_200,\n);";
+    assert_eq!(literal_ttl_calls(bad).len(), 1);
+    assert_eq!(literal_ttl_calls(multiline).len(), 1);
+    assert!(literal_ttl_calls(good).is_empty());
+}
+
+#[test]
+fn extend_ttl_uses_ledger_bump_policy() {
+    let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut violations = std::vec::Vec::new();
+
+    for entry in std::fs::read_dir(&src_dir).expect("read src directory") {
+        let path = entry.expect("directory entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        // This file contains the scanner's own sample strings.
+        if path.file_name().and_then(|n| n.to_str()) == Some("lifecycle_tests.rs") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).expect("read source file");
+        for (line, call) in literal_ttl_calls(&text) {
+            violations.push(std::format!("{}:{}: {}", path.display(), line, call));
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "extend_ttl must use LEDGER_BUMP instead of literal TTLs:\n{}",
+        violations.join("\n")
+    );
+}

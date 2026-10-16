@@ -43,6 +43,19 @@ This document details the Soroban ledger resource limits relevant to AtomicIP's 
 - Ed25519 signature: 64 bytes + overhead
 - Full batch of 50 IPs with signatures: ~15-20 KB
 
+## Persistent Storage TTL Policy (#1147)
+
+Every persistent write extends its entry's TTL through `extend_ttl(key, threshold, extend_to)`.
+The contract uses one policy for all of them:
+
+- Both arguments are the `LEDGER_BUMP` constant (`contracts/ip_registry/src/lib.rs`), which is
+  `6_307_200` ledgers, about one year at 5 seconds per ledger.
+- Numeric literals are not allowed. `transfer_ip`, `revoke_ip` and `grant_ip_access` used to pass
+  `50000`, which made the lifetime of a record depend on which function last touched it.
+- The `ip_registry` test `extend_ttl_uses_ledger_bump_policy` enforces this. It scans every file in
+  `contracts/ip_registry/src` and fails on any `extend_ttl` call whose last two arguments are
+  numeric literals.
+
 ## Project Batch Size Constants
 
 ### API Server (`api-server/src/handlers.rs`)

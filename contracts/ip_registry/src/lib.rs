@@ -1154,8 +1154,8 @@ impl IpRegistry {
             .set(&DataKey::CommitmentOwner(commitment_hash.clone()), &owner);
         env.storage().persistent().extend_ttl(
             &DataKey::CommitmentOwner(commitment_hash.clone()),
-            50000,
-            50000,
+            LEDGER_BUMP,
+            LEDGER_BUMP,
         );
 
         env.storage().persistent().set(&DataKey::NextId, &(id + 1));
@@ -1293,8 +1293,8 @@ impl IpRegistry {
                 .set(&DataKey::CommitmentOwner(commitment_hash.clone()), &owner);
             env.storage().persistent().extend_ttl(
                 &DataKey::CommitmentOwner(commitment_hash.clone()),
-                50000,
-                50000,
+                LEDGER_BUMP,
+                LEDGER_BUMP,
             );
 
             env.events()
@@ -1441,8 +1441,8 @@ impl IpRegistry {
             );
             env.storage().persistent().extend_ttl(
                 &DataKey::CommitmentOwner(commitment_hash.clone()),
-                50000,
-                50000,
+                LEDGER_BUMP,
+                LEDGER_BUMP,
             );
 
             // Record blinded owner mapping for later on-chain/off-chain proof if needed.
@@ -2183,7 +2183,7 @@ impl IpRegistry {
             .set(&DataKey::OwnerIps(old_owner.clone()), &old_ids);
         env.storage()
             .persistent()
-            .extend_ttl(&DataKey::OwnerIps(old_owner.clone()), 50000, 50000);
+            .extend_ttl(&DataKey::OwnerIps(old_owner.clone()), LEDGER_BUMP, LEDGER_BUMP);
 
         // Add to new owner's index
         let mut new_ids: Vec<u64> = env
@@ -2197,7 +2197,7 @@ impl IpRegistry {
             .set(&DataKey::OwnerIps(new_owner.clone()), &new_ids);
         env.storage()
             .persistent()
-            .extend_ttl(&DataKey::OwnerIps(new_owner.clone()), 50000, 50000);
+            .extend_ttl(&DataKey::OwnerIps(new_owner.clone()), LEDGER_BUMP, LEDGER_BUMP);
 
         // Update commitment index
         env.storage().persistent().set(
@@ -2269,7 +2269,7 @@ impl IpRegistry {
             .set(&DataKey::IpRecord(ip_id), &record);
         env.storage()
             .persistent()
-            .extend_ttl(&DataKey::IpRecord(ip_id), 50000, 50000);
+            .extend_ttl(&DataKey::IpRecord(ip_id), LEDGER_BUMP, LEDGER_BUMP);
 
         env.events().publish(
             (REVOKE_TOPIC, record.owner.clone()),
