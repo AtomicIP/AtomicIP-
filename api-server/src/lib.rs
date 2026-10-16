@@ -50,6 +50,7 @@ pub mod batch;
 pub mod cache;
 pub mod commitments;
 pub mod portfolio;
+pub mod transfers;
 pub mod valuation;
 pub mod analytics;
 pub mod circuit_breaker;
