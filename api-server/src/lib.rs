@@ -44,6 +44,7 @@ pub mod commitments;
 pub mod due_diligence;
 pub mod marketplace_analytics;
 pub mod recommendations;
+pub mod collections;
 pub mod analytics;
 pub mod circuit_breaker;
 pub mod compression;

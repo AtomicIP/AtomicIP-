@@ -49,6 +49,7 @@ mod commitments;
 mod due_diligence;
 mod marketplace_analytics;
 mod recommendations;
+mod collections;
 mod analytics;
 mod circuit_breaker;
 mod commitment_monitoring;
@@ -296,6 +297,15 @@ async fn main() {
         .route("/swap/{swap_id}/reveal",          post(handlers::reveal_key))
         .route("/swap/{swap_id}/cancel",          post(handlers::cancel_swap))
         .route("/swap/{swap_id}/cancel-expired",  post(handlers::cancel_expired_swap))
+        // #1098: collections identify the caller by the verified X-Public-Key header,
+        // so every collection route, reads included, must be signed.
+        .route("/collections",                          post(collections::create_collection).get(collections::list_collections))
+        .route("/collections/{id}",                     get(collections::get_collection).delete(collections::delete_collection))
+        .route("/collections/{id}/ips",                 post(collections::add_collection_ips))
+        .route("/collections/{id}/ips/{ip_id}",         axum::routing::delete(collections::remove_collection_ip))
+        .route("/collections/{id}/shares",              post(collections::share_collection))
+        .route("/collections/{id}/shares/{user}",       axum::routing::delete(collections::unshare_collection))
+        .route("/collections/{id}/summary",             get(collections::collection_summary))
         .route_layer(middleware::from_fn(request_signing::verify_request_signature));
 
     let app = Router::new()
