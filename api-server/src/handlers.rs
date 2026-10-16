@@ -55,6 +55,24 @@ static WATCHLISTS: Lazy<Mutex<HashMap<String, BTreeSet<u64>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 static COMMITMENT_INDEX: Lazy<DashMap<u64, IpRecord>> = Lazy::new(DashMap::new);
 
+/// Look up one indexed commitment by ID, for read-side features (#1095).
+pub(crate) fn indexed_record(ip_id: u64) -> Option<IpRecord> {
+    COMMITMENT_INDEX.get(&ip_id).map(|entry| entry.value().clone())
+}
+
+/// Snapshot of every indexed commitment, for read-side features (#1095, #1097).
+pub(crate) fn indexed_records() -> Vec<IpRecord> {
+    COMMITMENT_INDEX.iter().map(|entry| entry.value().clone()).collect()
+}
+
+/// Copy of every user's watchlist, for the recommendation engine (#1097).
+pub(crate) fn watchlist_snapshot() -> HashMap<String, BTreeSet<u64>> {
+    WATCHLISTS
+        .lock()
+        .map(|watchlists| watchlists.clone())
+        .unwrap_or_default()
+}
+
 /// Audit log store for tracking all API access and sensitive operations
 static AUDIT_LOG_STORE: Lazy<Arc<AuditLogStore>> = Lazy::new(|| {
     let audit_key = std::env::var("AUDIT_HMAC_KEY")
@@ -860,6 +878,13 @@ pub async fn batch_initiate_swap(Json(body): Json<BatchInitiateSwapRequest>) -> 
         };
         cache::set_with_ttl(&cache::swap_key(swap_id), &record, SWAP_EXPIRY_SECONDS);
         crate::analytics::record_swap_initiated();
+        crate::marketplace_analytics::record_initiated(
+            swap_id,
+            &crate::commitments::get_tags(ip_id),
+            &body.seller,
+            &body.buyer,
+            price,
+        );
         swap_ids.push(swap_id);
     }
 
