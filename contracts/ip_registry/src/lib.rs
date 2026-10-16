@@ -2543,7 +2543,9 @@ impl IpRegistry {
     }
 
     pub fn set_commitment_compression(env: Env, ip_id: u64, algorithm: CompressionAlgo) {
-        require_ip_exists(&env, ip_id);
+        // Only the IP owner may change how its commitment is stored and read back.
+        let record = require_ip_exists(&env, ip_id);
+        record.owner.require_auth();
         let selection = CompressionSelection { ip_id, algorithm };
         env.storage()
             .persistent()
@@ -8633,6 +8635,77 @@ mod tests {
 
         client.set_commitment_compression(&ip_id, &CompressionAlgo::None);
         assert_eq!(client.get_compressed_bytes(&ip_id).len(), 32);
+    }
+
+    /// #1157: a non-owner must not be able to change an IP's compression algorithm.
+    #[test]
+    fn test_set_compression_rejects_non_owner() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+        let attacker = Address::generate(&env);
+
+        let hash = BytesN::from_array(&env, &[0x27u8; 32]);
+        let ip_id = client.commit_ip(&owner, &hash, &0u32);
+
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &attacker,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "set_commitment_compression",
+                args: (ip_id, CompressionAlgo::None).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        assert!(client
+            .try_set_commitment_compression(&ip_id, &CompressionAlgo::None)
+            .is_err());
+
+        // The default algorithm is untouched.
+        env.mock_auths(&[]);
+        assert_eq!(
+            client.get_commitment_compression(&ip_id),
+            CompressionAlgo::Truncate16
+        );
+    }
+
+    /// #1157 regression: compressed bytes round-trip correctly for every algorithm
+    /// on a non-uniform hash, so byte-order or fold mistakes are caught.
+    #[test]
+    fn test_compressed_bytes_round_trip_regression() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+
+        let mut raw = [0u8; 32];
+        for (i, b) in raw.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(7).wrapping_add(3);
+        }
+        let hash = BytesN::from_array(&env, &raw);
+        let ip_id = client.commit_ip(&owner, &hash, &0u32);
+
+        client.set_commitment_compression(&ip_id, &CompressionAlgo::None);
+        assert_eq!(
+            client.get_compressed_bytes(&ip_id),
+            soroban_sdk::Bytes::from_slice(&env, &raw)
+        );
+
+        client.set_commitment_compression(&ip_id, &CompressionAlgo::Truncate16);
+        assert_eq!(
+            client.get_compressed_bytes(&ip_id),
+            soroban_sdk::Bytes::from_slice(&env, &raw[..16])
+        );
+
+        let fold = raw.iter().fold(0u8, |acc, b| acc ^ b);
+        client.set_commitment_compression(&ip_id, &CompressionAlgo::Xor8);
+        assert_eq!(
+            client.get_compressed_bytes(&ip_id),
+            soroban_sdk::Bytes::from_slice(&env, &[fold; 8])
+        );
     }
 
     // ── Issue #457: Commitment Encryption Tests ───────────────────────────────
