@@ -137,6 +137,28 @@ pub struct OwnershipChallenge {
     pub expires_at: u64,
 }
 
+/// Issue #1104: Open random-nonce ownership challenge for a commitment.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CommitmentChallenge {
+    /// 32 random bytes generated on-chain by `challenge_ownership`.
+    pub challenge: Bytes,
+    pub issued_at: u64,
+    /// Unix timestamp (seconds) after which the challenge can no longer be answered.
+    pub expires_at: u64,
+    /// True once the holder has answered, correctly or not. Each challenge is single-use.
+    pub answered: bool,
+}
+
+/// Issue #1104: Outcome counters for commitment ownership challenges.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct ChallengeStats {
+    pub issued: u64,
+    pub succeeded: u64,
+    pub failed: u64,
+}
+
 /// Issue #973: Encrypted metadata for commitment discovery and discoverability.
 /// Stores encrypted title, description, and searchable tags for each IP commitment.
 /// The metadata is encrypted to preserve privacy while enabling search.

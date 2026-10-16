@@ -51,6 +51,9 @@ mod commitment_property_tests;
 mod commitment_sybil_resistance_tests;
 
 #[cfg(test)]
+mod commitment_challenge_tests;
+
+#[cfg(test)]
 mod validator_network_tests;
 
 // ── Error Codes ────────────────────────────────────────────────────────────
@@ -159,6 +162,12 @@ pub enum ContractError {
     InsuranceDisputeMismatch = 58,
     /// #1073: Dispute must be resolved before the claim can be verified.
     InsuranceDisputeUnresolved = 59,
+    /// Issue #811 / #1104: Ownership challenge TTL has elapsed.
+    ChallengeExpired = 60,
+    /// Issue #811 / #1104: Ownership challenge has already been answered.
+    ChallengeAlreadyAnswered = 61,
+    /// Issue #1104: No open ownership challenge exists for this commitment.
+    CommitmentChallengeNotFound = 62,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -318,6 +327,9 @@ pub enum DataKey {
     NextClaimId,                  // monotonic claim ID counter
     IpInsurancePolicy(u64),       // maps ip_id -> policy_id (one policy per IP)
     PolicyClaim(u64),             // maps policy_id -> claim_id (one claim per policy)
+    // Issue #1104: Random-nonce ownership challenge and its outcome counters
+    CommitmentChallenge(u64),     // maps commitment_id -> open CommitmentChallenge
+    ChallengeStats(u64),          // maps commitment_id -> ChallengeStats
 }
 
 // ── Upgrade Compatibility Manifest (#791) ───────────────────────────────────
@@ -4797,6 +4809,152 @@ impl IpRegistry {
             (symbol_short!("ch_exp"), challenge.challenger),
             (challenge_id, challenge.ip_id),
         );
+    }
+
+    // ── Issue #1104: Random-nonce ownership challenge ──────────────────────────
+
+    /// Issue a random ownership challenge for a commitment.
+    ///
+    /// Generates 32 random bytes on-chain and stores them as the open challenge
+    /// for `commitment_id`. Issuing a new challenge replaces any earlier challenge
+    /// that is still unanswered. The holder proves control by calling
+    /// `respond_to_commitment_challenge` before the challenge expires.
+    ///
+    /// Returns the challenge bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the commitment does not exist or has been revoked.
+    pub fn challenge_ownership(env: Env, commitment_id: u64) -> Bytes {
+        let record = require_ip_exists(&env, commitment_id);
+        if record.revoked {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::IpAlreadyRevoked as u32,
+            ));
+        }
+
+        let challenge: Bytes = env.prng().gen_len(32);
+        let now = env.ledger().timestamp();
+        let ttl_seconds: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ChallengeTtl)
+            .unwrap_or(DEFAULT_CHALLENGE_TTL_SECONDS);
+
+        let record_key = DataKey::CommitmentChallenge(commitment_id);
+        let open = CommitmentChallenge {
+            challenge: challenge.clone(),
+            issued_at: now,
+            expires_at: now + ttl_seconds,
+            answered: false,
+        };
+        env.storage().persistent().set(&record_key, &open);
+        env.storage()
+            .persistent()
+            .extend_ttl(&record_key, LEDGER_BUMP, LEDGER_BUMP);
+
+        let mut stats = Self::load_challenge_stats(&env, commitment_id);
+        stats.issued += 1;
+        Self::save_challenge_stats(&env, commitment_id, &stats);
+
+        challenge
+    }
+
+    /// Answer the open ownership challenge for a commitment.
+    ///
+    /// Only the commitment owner can answer, enforced with `require_auth`. That
+    /// signature is the proof of control. The response must equal
+    /// `sha256(commitment_hash || challenge)`.
+    ///
+    /// The challenge is single-use. A wrong response is recorded as a failure and
+    /// returns `false` without reverting, so the failure counter persists. A
+    /// correct response returns `true` and is recorded as a success.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the caller is not the owner, no challenge is open, the challenge
+    /// was already answered, or it has expired.
+    pub fn respond_to_commitment_challenge(env: Env, commitment_id: u64, response: BytesN<32>) -> bool {
+        let record = require_ip_exists(&env, commitment_id);
+        record.owner.require_auth();
+
+        let record_key = DataKey::CommitmentChallenge(commitment_id);
+        let mut open: CommitmentChallenge = env
+            .storage()
+            .persistent()
+            .get(&record_key)
+            .unwrap_or_else(|| {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::CommitmentChallengeNotFound as u32,
+                ))
+            });
+
+        if open.answered {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::ChallengeAlreadyAnswered as u32,
+            ));
+        }
+        if env.ledger().timestamp() > open.expires_at {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::ChallengeExpired as u32,
+            ));
+        }
+
+        let mut preimage = Bytes::new(&env);
+        preimage.append(&record.commitment_hash.into());
+        preimage.append(&open.challenge);
+        let expected: BytesN<32> = env.crypto().sha256(&preimage).into();
+        let matched = response == expected;
+
+        open.answered = true;
+        env.storage().persistent().set(&record_key, &open);
+        env.storage()
+            .persistent()
+            .extend_ttl(&record_key, LEDGER_BUMP, LEDGER_BUMP);
+
+        let mut stats = Self::load_challenge_stats(&env, commitment_id);
+        if matched {
+            stats.succeeded += 1;
+        } else {
+            stats.failed += 1;
+        }
+        Self::save_challenge_stats(&env, commitment_id, &stats);
+
+        env.events().publish(
+            (symbol_short!("ch_ans"), record.owner),
+            (commitment_id, matched),
+        );
+
+        matched
+    }
+
+    /// Outcome counters for a commitment's ownership challenges.
+    pub fn get_challenge_stats(env: Env, commitment_id: u64) -> ChallengeStats {
+        Self::load_challenge_stats(&env, commitment_id)
+    }
+
+    /// Success rate of answered ownership challenges, in basis points
+    /// (0–10_000). Returns 0 when no challenge has been answered yet.
+    pub fn get_challenge_success_rate_bps(env: Env, commitment_id: u64) -> u32 {
+        let stats = Self::load_challenge_stats(&env, commitment_id);
+        let answered = stats.succeeded + stats.failed;
+        if answered == 0 {
+            return 0;
+        }
+        ((stats.succeeded * 10_000) / answered) as u32
+    }
+
+    fn load_challenge_stats(env: &Env, commitment_id: u64) -> ChallengeStats {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ChallengeStats(commitment_id))
+            .unwrap_or_default()
+    }
+
+    fn save_challenge_stats(env: &Env, commitment_id: u64, stats: &ChallengeStats) {
+        let key = DataKey::ChallengeStats(commitment_id);
+        env.storage().persistent().set(&key, stats);
+        env.storage().persistent().extend_ttl(&key, LEDGER_BUMP, LEDGER_BUMP);
     }
 
     // ── Issue #434: Encryption Key Rotation ───────────────────────────────────
