@@ -55,6 +55,16 @@ static WATCHLISTS: Lazy<Mutex<HashMap<String, BTreeSet<u64>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 static COMMITMENT_INDEX: Lazy<DashMap<u64, IpRecord>> = Lazy::new(DashMap::new);
 
+/// Look up one indexed commitment by ID, for read-side features (#1095).
+pub(crate) fn indexed_record(ip_id: u64) -> Option<IpRecord> {
+    COMMITMENT_INDEX.get(&ip_id).map(|entry| entry.value().clone())
+}
+
+/// Snapshot of every indexed commitment, for read-side features (#1095, #1097).
+pub(crate) fn indexed_records() -> Vec<IpRecord> {
+    COMMITMENT_INDEX.iter().map(|entry| entry.value().clone()).collect()
+}
+
 /// Audit log store for tracking all API access and sensitive operations
 static AUDIT_LOG_STORE: Lazy<Arc<AuditLogStore>> = Lazy::new(|| {
     let audit_key = std::env::var("AUDIT_HMAC_KEY")
