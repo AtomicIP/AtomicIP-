@@ -14,7 +14,7 @@ use tokio::time::{Duration, Instant};
 use tracing::instrument;
 use sha2::{Digest, Sha256};
 use crate::cache;
-use crate::deduplication::{create_store, DeduplicationStore};
+use crate::deduplication::{create_store, create_store_with_backend, DeduplicationBackend, DeduplicationStore};
 use crate::graphql::SorobanQueryClient;
 use crate::schemas::*;
 use std::sync::Arc;
@@ -22,6 +22,26 @@ use crate::webhook;
 use crate::websocket;
 use crate::audit::{AuditLogStore, AuditLogQuery, SuspiciousPattern};
 use dashmap::DashMap;
+use crate::soroban_rpc::{
+    self, LiveSorobanRpcClient, MockSorobanRpcClient, SorobanRpcClient,
+};
+
+// ── Shared Soroban RPC client ─────────────────────────────────────────────────
+//
+// In production (`SOROBAN_RPC_URL` and `IP_REGISTRY_CONTRACT` are set) this
+// uses the live reqwest-backed client.  In test environments where those env
+// vars are absent the mock client is substituted automatically so unit tests
+// never require a live network.
+static SOROBAN_CLIENT: Lazy<Arc<dyn SorobanRpcClient>> = Lazy::new(|| {
+    let use_mock = std::env::var("IP_REGISTRY_CONTRACT")
+        .map(|v| v.is_empty())
+        .unwrap_or(true);
+    if use_mock {
+        Arc::new(MockSorobanRpcClient::default()) as Arc<dyn SorobanRpcClient>
+    } else {
+        Arc::new(LiveSorobanRpcClient::from_env()) as Arc<dyn SorobanRpcClient>
+    }
+});
 
 // #523/#800: Per-handler idempotency store for batch swap operations. Uses a
 // shared Redis backend when REDIS_URL is configured, so a client's retry is
@@ -73,7 +93,7 @@ static AUDIT_LOG_STORE: Lazy<Arc<AuditLogStore>> = Lazy::new(|| {
 });
 
 /// Current Unix timestamp in seconds (substitute for the ledger timestamp).
-fn now_timestamp() -> u64 {
+pub(crate) fn now_timestamp() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs())
@@ -584,7 +604,7 @@ pub async fn find_similar_commitments(
         (status = 200, description = "Paginated list of IP IDs", body = ListIpByOwnerResponse),
     )
 )]
-#[instrument]
+#[instrument(skip_all)]
 pub async fn list_ip_by_owner(
     Path(owner): Path<String>,
     Query(pagination): Query<PaginationParams>,
@@ -646,7 +666,7 @@ pub async fn list_ip_by_owner(
         (status = 200, description = "Cursor-paginated list of IP IDs", body = PaginatedResponse<u64>),
     )
 )]
-#[instrument]
+#[instrument(skip_all)]
 pub async fn list_ip_by_owner_cursor(
     Path(owner): Path<String>,
     Query(pagination): Query<CursorPaginationParams>,
@@ -868,10 +888,9 @@ pub async fn batch_initiate_swap(Json(body): Json<BatchInitiateSwapRequest>) -> 
     // #523: Cache the result under the idempotency key so replays return the
     // same swap IDs instead of allocating new ones.
     if let Some(ref key) = body.idempotency_key {
-        BATCH_SWAP_IDEMPOTENCY.insert(
-            key.clone(),
-            (serde_json::to_value(&response).unwrap(), Instant::now()),
-        );
+        BATCH_SWAP_IDEMPOTENCY
+            .set(key.as_str(), serde_json::to_value(&response).unwrap())
+            .await;
     }
 
     Ok(Json(response))
@@ -1013,7 +1032,7 @@ pub async fn cancel_expired_swap(Path(swap_id): Path<u64>, Json(body): Json<Canc
         (status = 404, description = "Swap not found", body = ErrorResponse),
     )
 )]
-#[instrument]
+#[instrument(skip_all)]
 pub async fn get_swap(
     State(rpc_client): State<Arc<dyn crate::graphql::SorobanRpcClient>>,
     Path(swap_id): Path<u64>,
@@ -1061,7 +1080,7 @@ pub async fn get_swap(
         (status = 502, description = "Escrow status unavailable", body = ErrorResponse),
     )
 )]
-#[instrument]
+#[instrument(skip_all)]
 pub async fn get_swap_escrow(
     State(rpc_client): State<Arc<dyn crate::graphql::SorobanRpcClient>>,
     Path(swap_id): Path<u64>,
@@ -1113,7 +1132,7 @@ pub async fn get_swap_escrow(
     params(("swap_id" = u64, Path, description = "Swap identifier")),
     responses((status = 200, description = "Swap history", body = [SwapHistoryEntry]))
 )]
-#[instrument]
+#[instrument(skip_all)]
 pub async fn get_swap_history(
     State(rpc_client): State<Arc<dyn crate::graphql::SorobanRpcClient>>,
     Path(swap_id): Path<u64>,
@@ -1152,7 +1171,7 @@ pub async fn get_swap_history(
     params(("swap_id" = u64, Path, description = "Swap identifier")),
     responses((status = 200, description = "Dispute evidence history", body = [DisputeEvidenceEntry]))
 )]
-#[instrument]
+#[instrument(skip_all)]
 pub async fn get_swap_disputes(
     State(rpc_client): State<Arc<dyn crate::graphql::SorobanRpcClient>>,
     Path(swap_id): Path<u64>,
@@ -1190,7 +1209,7 @@ pub async fn get_swap_disputes(
         (status = 400, description = "At least one seller, buyer, or ip_id selector is required", body = ErrorResponse),
     )
 )]
-#[instrument]
+#[instrument(skip_all)]
 pub async fn list_swaps(
     State(rpc_client): State<Arc<dyn crate::graphql::SorobanRpcClient>>,
     Query(filters): Query<SwapFilterParams>,
@@ -1297,7 +1316,7 @@ async fn marketplace_response(
     get,
     path = "/v1/swap/marketplace/seller/{seller}",
     tag = "Marketplace",
-    params(("seller" = String, Path), CursorPaginationParams),
+    params(("seller" = String, Path, description = "Seller address"), CursorPaginationParams),
     responses((status = 200, description = "Seller marketplace listings", body = MarketplaceResponse))
 )]
 pub async fn marketplace_by_seller(
@@ -1313,7 +1332,7 @@ pub async fn marketplace_by_seller(
     get,
     path = "/v1/swap/marketplace/buyer/{buyer}",
     tag = "Marketplace",
-    params(("buyer" = String, Path), CursorPaginationParams),
+    params(("buyer" = String, Path, description = "Buyer address"), CursorPaginationParams),
     responses((status = 200, description = "Buyer marketplace listings", body = MarketplaceResponse))
 )]
 pub async fn marketplace_by_buyer(
@@ -1329,7 +1348,7 @@ pub async fn marketplace_by_buyer(
     get,
     path = "/v1/swap/marketplace/ip/{ip_id}",
     tag = "Marketplace",
-    params(("ip_id" = u64, Path), CursorPaginationParams),
+    params(("ip_id" = u64, Path, description = "IP record identifier"), CursorPaginationParams),
     responses((status = 200, description = "IP marketplace listings", body = MarketplaceResponse))
 )]
 pub async fn marketplace_by_ip(

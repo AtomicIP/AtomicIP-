@@ -36,16 +36,29 @@
 //! - `X-Public-Key`: Stellar public key
 
 pub mod account_recovery;
+pub mod alerting;
+pub mod auth_2fa;
+pub mod commitment_monitoring;
+pub mod connection_pool;
+pub mod incidents;
+pub mod otel;
+pub mod sdk;
+pub mod session;
 pub mod auth;
 pub mod audit;
 pub mod batch;
 pub mod cache;
 pub mod commitments;
+pub mod licensing;
+pub mod portfolio;
+pub mod transfers;
+pub mod valuation;
 pub mod analytics;
 pub mod circuit_breaker;
 pub mod compression;
 pub mod deduplication;
 pub mod distributed_tracing;
+pub mod event_topics;
 pub mod events;
 pub mod graphql;
 pub mod handlers;

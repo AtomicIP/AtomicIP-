@@ -46,6 +46,10 @@ mod session;
 mod batch;
 mod cache;
 mod commitments;
+mod licensing;
+mod portfolio;
+mod transfers;
+mod valuation;
 mod analytics;
 mod circuit_breaker;
 mod commitment_monitoring;
@@ -488,6 +492,19 @@ fn build_app() -> Router {
         .route("/v1/bulk/commit-ip", post(handlers::bulk_commit_ip))
         .route("/v1/bulk/initiate-swap", post(handlers::bulk_initiate_swap))
         .route("/v1/swaps/execute-batch", post(handlers::execute_batch_swaps))
+        .route("/v1/portfolio/{owner}", get(portfolio::get_portfolio))
+        .route("/v1/portfolio/{owner}/holdings", post(portfolio::put_holdings))
+        .route("/v1/valuation/sales", post(valuation::post_sale))
+        .route("/v1/valuation/{commitment_id}", get(valuation::get_valuation))
+        .route("/v1/transfers", post(transfers::create_transfer).layer(signed.clone()))
+        .route("/v1/transfers/{id}", get(transfers::get_transfer))
+        .route("/v1/transfers/{id}/validate", post(transfers::validate_transfer))
+        .route("/v1/transfers/{id}/escrow", post(transfers::fund_transfer_escrow))
+        .route("/v1/transfers/{id}/cancel", post(transfers::cancel_transfer))
+        .route("/v1/licenses", post(licensing::create_license))
+        .route("/v1/licenses/{id}", get(licensing::get_license))
+        .route("/v1/licenses/{id}/terms", post(licensing::update_license_terms))
+        .route("/v1/licenses/{id}/royalties", post(licensing::record_license_royalty))
         .route("/auth/2fa/enable", post(handlers::enable_2fa))
         .route("/auth/2fa/verify", post(handlers::verify_2fa))
         .route("/auth/2fa/backup-code", post(handlers::use_backup_code))
