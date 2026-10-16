@@ -775,3 +775,21 @@ pub struct PoolSwapEvent {
     pub token_reserve: i128,
 }
 
+// ── #1089: Settlement Finality Types ──────────────────────────────────────────
+
+/// A contract call executed once a swap's settlement is final. The callee
+/// receives the swap id as its only argument.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct FinalityCallback {
+    pub contract: Address,
+    pub function: soroban_sdk::Symbol,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct FinalityCallbackExecutedEvent {
+    pub swap_id: u64,
+    pub contract: Address,
+    pub function: soroban_sdk::Symbol,
+}

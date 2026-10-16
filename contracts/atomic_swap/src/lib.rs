@@ -135,6 +135,14 @@ pub enum ContractError {
     PoolAlreadyExists = 73,
     /// #1088: Pool reserves, slippage or amount parameters are out of range.
     InvalidPoolParams = 74,
+    /// #1089: The swap has not settled, or settlement is not yet final.
+    SettlementNotFinal = 75,
+    /// #1089: A swap may register at most `MAX_FINALITY_CALLBACKS` callbacks.
+    TooManyFinalityCallbacks = 76,
+    /// #1089: Finality blocks must be between 1 and `MAX_FINALITY_BLOCKS`.
+    InvalidFinalityBlocks = 77,
+    /// #1089: Callbacks can only be registered on a swap that has settled.
+    SwapNotSettled = 78,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -142,6 +150,14 @@ pub enum ContractError {
 /// Minimum ledger TTL bump applied to every persistent storage write.
 /// ~1 year at ~5s per ledger: 365 * 24 * 3600 / 5 ≈ 6_307_200 ledgers.
 pub const LEDGER_BUMP: u32 = 6_307_200;
+
+/// #1089: Ledgers that must pass after settlement before it is final, unless the
+/// admin has configured a different value with `set_finality_blocks`.
+pub const DEFAULT_FINALITY_BLOCKS: u32 = 5;
+/// #1089: Upper bound accepted by `set_finality_blocks`.
+pub const MAX_FINALITY_BLOCKS: u32 = 100_000;
+/// #1089: Maximum callbacks a single swap may register.
+pub const MAX_FINALITY_CALLBACKS: u32 = 5;
 
 /// Maximum number of items allowed in a single batch operation.
 pub const MAX_BATCH_SIZE: u32 = 50;
@@ -284,6 +300,12 @@ pub enum DataKey {
     EscrowReleased(u64),
     /// #1087: Maps swap_id → bool; `true` while a dispute lock blocks escrow releases.
     EscrowLocked(u64),
+    /// #1089: Maps swap_id → ledger sequence at which the swap settled.
+    SettlementLedger(u64),
+    /// #1089: Maps swap_id → Vec<FinalityCallback> registered for post-finality execution.
+    FinalityCallbacks(u64),
+    /// #1089: Number of ledgers that must pass after settlement before it is final.
+    FinalityBlocks,
     /// #1088: Maps commitment_id → LiquidityPool reserves and parameters.
     LiquidityPool(u64),
     /// #1088: Maps (commitment_id, buyer) → IP units the buyer has acquired via pool swaps.
@@ -1037,6 +1059,8 @@ impl AtomicSwap {
             LEDGER_BUMP,
             LEDGER_BUMP,
         );
+        // #1089: start the finality clock
+        Self::record_settlement(&env, swap_id);
 
         // Release the IP lock
         env.storage()
@@ -5217,6 +5241,7 @@ impl AtomicSwap {
                 .persistent()
                 .remove(&DataKey::ActiveSwap(swap.ip_id));
             Self::append_history(env, swap_id, SwapStatus::Completed);
+            Self::record_settlement(env, swap_id);
         }
 
         env.events().publish(
@@ -5405,6 +5430,133 @@ impl AtomicSwap {
         let key = DataKey::LiquidityPool(pool.commitment_id);
         env.storage().persistent().set(&key, pool);
         env.storage().persistent().extend_ttl(&key, LEDGER_BUMP, LEDGER_BUMP);
+    }
+
+    // ── #1089: Settlement finality ────────────────────────────────────────────
+
+    /// #1089: Admin sets how many ledgers must pass after settlement before it
+    /// counts as final. Must be between 1 and `MAX_FINALITY_BLOCKS`.
+    pub fn set_finality_blocks(env: Env, caller: Address, blocks: u32) {
+        caller.require_auth();
+        require_admin(&env, &caller);
+        if blocks == 0 || blocks > MAX_FINALITY_BLOCKS {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::InvalidFinalityBlocks as u32,
+            ));
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::FinalityBlocks, &blocks);
+    }
+
+    /// #1089: Ledgers elapsed since the swap settled. Returns 0 if it has not settled.
+    pub fn get_settlement_finality(env: Env, swap_id: u64) -> u64 {
+        match env
+            .storage()
+            .persistent()
+            .get::<_, u32>(&DataKey::SettlementLedger(swap_id))
+        {
+            Some(settled_at) => env.ledger().sequence().saturating_sub(settled_at) as u64,
+            None => 0,
+        }
+    }
+
+    /// #1089: `true` once the swap has settled and the configured number of
+    /// finality blocks has passed.
+    pub fn is_settlement_final(env: Env, swap_id: u64) -> bool {
+        Self::settlement_is_final(&env, swap_id)
+    }
+
+    /// #1089: Registers a contract call to run once the swap's settlement is
+    /// final. The callee is invoked as `function(swap_id)`. Only the seller or
+    /// buyer may register, and only after the swap has settled.
+    pub fn register_finality_callback(
+        env: Env,
+        swap_id: u64,
+        caller: Address,
+        contract: Address,
+        function: soroban_sdk::Symbol,
+    ) {
+        let swap = require_swap_exists(&env, swap_id);
+        caller.require_auth();
+        require_seller_or_buyer(&env, &caller, &swap);
+
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::SettlementLedger(swap_id))
+        {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::SwapNotSettled as u32,
+            ));
+        }
+
+        let key = DataKey::FinalityCallbacks(swap_id);
+        let mut callbacks: Vec<FinalityCallback> =
+            env.storage().persistent().get(&key).unwrap_or(Vec::new(&env));
+        if callbacks.len() >= MAX_FINALITY_CALLBACKS {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::TooManyFinalityCallbacks as u32,
+            ));
+        }
+        callbacks.push_back(FinalityCallback { contract, function });
+        env.storage().persistent().set(&key, &callbacks);
+        env.storage().persistent().extend_ttl(&key, LEDGER_BUMP, LEDGER_BUMP);
+    }
+
+    /// #1089: Runs and clears the swap's finality callbacks. Callable by anyone
+    /// once settlement is final. Returns how many callbacks ran. Callbacks are
+    /// cleared before any is invoked, so a re-entrant call cannot repeat them.
+    pub fn execute_finality_callbacks(env: Env, swap_id: u64) -> u32 {
+        if !Self::settlement_is_final(&env, swap_id) {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::SettlementNotFinal as u32,
+            ));
+        }
+
+        let key = DataKey::FinalityCallbacks(swap_id);
+        let callbacks: Vec<FinalityCallback> =
+            env.storage().persistent().get(&key).unwrap_or(Vec::new(&env));
+        if callbacks.is_empty() {
+            return 0;
+        }
+        env.storage().persistent().remove(&key);
+
+        let args: Vec<Val> = Vec::from_array(&env, [swap_id.into_val(&env)]);
+        for callback in callbacks.iter() {
+            let _: Val = env.invoke_contract(&callback.contract, &callback.function, args.clone());
+            env.events().publish(
+                (soroban_sdk::symbol_short!("fin_cb"),),
+                FinalityCallbackExecutedEvent {
+                    swap_id,
+                    contract: callback.contract.clone(),
+                    function: callback.function.clone(),
+                },
+            );
+        }
+        callbacks.len()
+    }
+
+    fn record_settlement(env: &Env, swap_id: u64) {
+        let key = DataKey::SettlementLedger(swap_id);
+        env.storage().persistent().set(&key, &env.ledger().sequence());
+        env.storage().persistent().extend_ttl(&key, LEDGER_BUMP, LEDGER_BUMP);
+    }
+
+    fn settlement_is_final(env: &Env, swap_id: u64) -> bool {
+        let Some(settled_at) = env
+            .storage()
+            .persistent()
+            .get::<_, u32>(&DataKey::SettlementLedger(swap_id))
+        else {
+            return false;
+        };
+        let required: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::FinalityBlocks)
+            .unwrap_or(DEFAULT_FINALITY_BLOCKS);
+        env.ledger().sequence().saturating_sub(settled_at) >= required
     }
 
     // ── Rollback ──────────────────────────────────────────────────────────────
@@ -6224,6 +6376,8 @@ mod escrow_tests;
 mod escrow_release_tests;
 #[cfg(test)]
 mod liquidity_pool_tests;
+#[cfg(test)]
+mod finality_tests;
 
 // #781: re-enabled — was blocked by 3 pre-existing, unrelated compile errors
 // (a dropped `commit_ip` arg, and two obsolete `accept_swap_with_quantity`
