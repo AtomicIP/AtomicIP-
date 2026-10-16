@@ -2501,7 +2501,9 @@ impl IpRegistry {
 
     // ── Issue #455: Batch Metadata ──────────────────────────────────────────
     pub fn set_batch_metadata(env: Env, ip_id: u64, batch_id: BytesN<32>, description: Bytes) {
-        require_ip_exists(&env, ip_id);
+        // Only the IP owner may describe its batch; reads remain public.
+        let record = require_ip_exists(&env, ip_id);
+        record.owner.require_auth();
         if description.len() > MAX_METADATA_BYTES {
             panic_with_error!(&env, ContractError::BatchMetadataTooLarge);
         }
@@ -8466,6 +8468,71 @@ mod tests {
             client.get_batch_metadata(&ip_id).unwrap().batch_id,
             batch_id2
         );
+    }
+
+    /// #1156: a non-owner must not be able to rewrite an IP's batch metadata.
+    #[test]
+    fn test_set_batch_metadata_rejects_non_owner() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+        let attacker = Address::generate(&env);
+
+        let hash = BytesN::from_array(&env, &[0x15u8; 32]);
+        let ip_id = client.commit_ip(&owner, &hash, &0u32);
+
+        let batch_id = BytesN::from_array(&env, &[0xCAu8; 32]);
+        let description = soroban_sdk::Bytes::from_array(&env, b"forged");
+
+        // Only the attacker's auth is mocked; the owner's auth is absent.
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &attacker,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "set_batch_metadata",
+                args: (ip_id, batch_id.clone(), description.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        assert!(client
+            .try_set_batch_metadata(&ip_id, &batch_id, &description)
+            .is_err());
+
+        // Nothing was written.
+        assert!(client.get_batch_metadata(&ip_id).is_none());
+    }
+
+    /// #1156: the owner can still write, and reads stay public without auth.
+    #[test]
+    fn test_set_batch_metadata_owner_writes_and_reads_are_public() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+
+        let hash = BytesN::from_array(&env, &[0x16u8; 32]);
+        let ip_id = client.commit_ip(&owner, &hash, &0u32);
+
+        let batch_id = BytesN::from_array(&env, &[0xDAu8; 32]);
+        let description = soroban_sdk::Bytes::from_array(&env, b"owner");
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &owner,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "set_batch_metadata",
+                args: (ip_id, batch_id.clone(), description.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.set_batch_metadata(&ip_id, &batch_id, &description);
+
+        // Read with no auth mocked at all.
+        env.mock_auths(&[]);
+        let meta = client.get_batch_metadata(&ip_id).unwrap();
+        assert_eq!(meta.description, description);
     }
 
     // ── Issue #456: Compression Algorithm Selection Tests ────────────────────
