@@ -57,6 +57,9 @@ mod commitment_challenge_tests;
 mod metadata_encryption_tests;
 
 #[cfg(test)]
+mod audit_trail_tests;
+
+#[cfg(test)]
 mod validator_network_tests;
 
 // ── Error Codes ────────────────────────────────────────────────────────────
@@ -1850,6 +1853,12 @@ impl IpRegistry {
             .persistent()
             .set(&DataKey::CommitmentOwner(new_hash), &ip_record.owner);
 
+        Self::append_audit_entry(
+            &env,
+            commitment_id,
+            symbol_short!("amended"),
+            ip_record.owner.clone(),
+        );
         env.events().publish(
             (symbol_short!("amend_cmt"),),
             (commitment_id, amendment_id),
@@ -1920,6 +1929,12 @@ impl IpRegistry {
                 LEDGER_BUMP,
             );
 
+        Self::append_audit_entry(
+            &env,
+            commitment_id,
+            symbol_short!("privacy"),
+            ip_record.owner.clone(),
+        );
         env.events()
             .publish((symbol_short!("privacy_set"),), (commitment_id, privacy_level));
 
@@ -2892,7 +2907,17 @@ impl IpRegistry {
         }
 
         record.owner.require_auth();
-        Self::reveal_partial_authorized(&env, &record, ip_id, partial_hash, blinding_factor)
+        let revealed =
+            Self::reveal_partial_authorized(&env, &record, ip_id, partial_hash, blinding_factor);
+        if revealed {
+            Self::append_audit_entry(
+                &env,
+                ip_id,
+                symbol_short!("revealed"),
+                record.owner.clone(),
+            );
+        }
+        revealed
     }
 
     /// Reveal a commitment through an authority delegated by its owner.
@@ -2977,6 +3002,12 @@ impl IpRegistry {
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::Archived(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+        Self::append_audit_entry(
+            &env,
+            ip_id,
+            symbol_short!("archived"),
+            record.owner.clone(),
+        );
         env.events()
             .publish((symbol_short!("archived"),), (ip_id, record.owner));
     }
@@ -3074,6 +3105,12 @@ impl IpRegistry {
                 terms_hash,
             });
         }
+        Self::append_audit_entry(
+            &env,
+            ip_id,
+            symbol_short!("lic_grnt"),
+            record.owner.clone(),
+        );
 
         env.storage()
             .persistent()
@@ -3098,6 +3135,12 @@ impl IpRegistry {
 
         if let Some(pos) = licenses.iter().position(|e| e.licensee == licensee) {
             licenses.remove(pos as u32);
+            Self::append_audit_entry(
+                &env,
+                ip_id,
+                symbol_short!("lic_rvk"),
+                record.owner.clone(),
+            );
         } else {
             env.panic_with_error(Error::from_contract_error(
                 ContractError::LicenseeNotFound as u32,
@@ -3942,6 +3985,12 @@ impl IpRegistry {
             LEDGER_BUMP,
         );
 
+        Self::append_audit_entry(
+            &env,
+            ip_id,
+            symbol_short!("acc_grnt"),
+            record.owner.clone(),
+        );
         env.events()
             .publish((symbol_short!("ac_grant"), ip_id), (grantee, access_level));
     }
@@ -3969,6 +4018,12 @@ impl IpRegistry {
                 LEDGER_BUMP,
             );
 
+            Self::append_audit_entry(
+                &env,
+                ip_id,
+                symbol_short!("acc_rvk"),
+                record.owner.clone(),
+            );
             env.events()
                 .publish((symbol_short!("ac_revoke"), ip_id), grantee);
         }
@@ -5053,6 +5108,12 @@ impl IpRegistry {
             .persistent()
             .extend_ttl(&DataKey::IpRecord(ip_id), LEDGER_BUMP, LEDGER_BUMP);
 
+        Self::append_audit_entry(
+            &env,
+            ip_id,
+            symbol_short!("key_rot"),
+            record.owner.clone(),
+        );
         env.events().publish(
             (symbol_short!("key_rot"), record.owner.clone()),
             (ip_id, new_commitment_hash),
@@ -6959,6 +7020,12 @@ impl IpRegistry {
             });
 
         metadata::store_encrypted_fields(&env, ip_id, key_id, fields, tag_hashes);
+        Self::append_audit_entry(
+            &env,
+            ip_id,
+            symbol_short!("md_store"),
+            record.owner.clone(),
+        );
     }
 
     /// Public summary of an IP's encrypted metadata: key ID, field names and
@@ -6983,11 +7050,18 @@ impl IpRegistry {
         requester: Address,
     ) -> Option<EncryptedField> {
         requester.require_auth();
-        if !Self::check_ip_access(env.clone(), ip_id, requester, METADATA_FIELD_ACCESS_LEVEL) {
+        if !Self::check_ip_access(
+            env.clone(),
+            ip_id,
+            requester.clone(),
+            METADATA_FIELD_ACCESS_LEVEL,
+        ) {
             env.panic_with_error(Error::from_contract_error(
                 ContractError::AccessDenied as u32,
             ));
         }
+        // Track who read which field, and when, in the immutable audit trail.
+        Self::append_audit_entry(&env, ip_id, symbol_short!("md_read"), requester);
         metadata::get_encrypted_field(&env, ip_id, field)
     }
 

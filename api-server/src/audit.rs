@@ -577,6 +577,20 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
         == 0
 }
 
+/// #1106: Admin check for the audit log endpoints.
+///
+/// Fails closed. `expected` must be set and non-empty, and `provided` must match
+/// it in constant time. An unset key therefore locks the endpoints rather than
+/// opening them.
+pub fn admin_key_matches(provided: Option<&str>, expected: Option<&str>) -> bool {
+    match (provided, expected) {
+        (Some(provided), Some(expected)) if !expected.is_empty() => {
+            constant_time_eq(provided.as_bytes(), expected.as_bytes())
+        }
+        _ => false,
+    }
+}
+
 fn lock_path_for(base_path: &Path) -> PathBuf {
     let mut os_string = base_path.as_os_str().to_owned();
     os_string.push(".lock");
@@ -971,5 +985,34 @@ mod tests {
         let dirty = verify_persisted_chain(temp.path(), &key).unwrap();
         assert_eq!(dirty.status, AuditIntegrityStatus::Invalid);
         assert_eq!(dirty.broken_at_sequence, Some(1));
+    }
+}
+
+#[cfg(test)]
+mod admin_key_tests {
+    use super::admin_key_matches;
+
+    #[test]
+    fn matching_key_is_accepted() {
+        assert!(admin_key_matches(Some("s3cret"), Some("s3cret")));
+    }
+
+    #[test]
+    fn wrong_or_missing_key_is_rejected() {
+        assert!(!admin_key_matches(Some("wrong"), Some("s3cret")));
+        assert!(!admin_key_matches(Some("s3cre"), Some("s3cret")));
+        assert!(!admin_key_matches(None, Some("s3cret")));
+    }
+
+    #[test]
+    fn unset_expected_key_locks_endpoint() {
+        assert!(!admin_key_matches(Some("anything"), None));
+        assert!(!admin_key_matches(Some(""), None));
+    }
+
+    #[test]
+    fn empty_expected_key_locks_endpoint() {
+        assert!(!admin_key_matches(Some(""), Some("")));
+        assert!(!admin_key_matches(None, Some("")));
     }
 }

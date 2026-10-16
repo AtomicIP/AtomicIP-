@@ -1,6 +1,6 @@
 use axum::{
     extract::{Path, Query, State},
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     body::Body,
     Json,
@@ -20,7 +20,10 @@ use crate::schemas::*;
 use std::sync::Arc;
 use crate::webhook;
 use crate::websocket;
-use crate::audit::{AuditLogStore, AuditLogQuery, SuspiciousPattern};
+use crate::audit::{
+    admin_key_matches, AuditEventCategory, AuditEventInput, AuditLogQuery, AuditLogQueryResponse,
+    AuditLogStore, SuspiciousPattern,
+};
 use dashmap::DashMap;
 
 // #523/#800: Per-handler idempotency store for batch swap operations. Uses a
@@ -117,6 +120,17 @@ pub async fn commit_ip(
                 }),
             )
         })?;
+
+    // #1106: Every successful commitment is recorded in the audit trail, before
+    // any later check can fail the request.
+    record_audit(
+        AuditEventInput::new(AuditEventCategory::Commitment, "ip.commit")
+            .actor_hash(Some(AUDIT_LOG_STORE.hash_identifier(&body.owner)))
+            .ip_id(Some(ip_id))
+            .success(true)
+            .status_code(Some(200)),
+    )
+    .await;
 
     // #983: Check per-user commitment rate limit after successful commit
     let (allowed, _remaining, reset_after) = rate_limiter.check_commitment_rate_limit(&body.owner).await;
@@ -234,15 +248,92 @@ pub async fn transfer_ip(Json(body): Json<TransferIpRequest>) -> Result<StatusCo
         (status = 404, description = "IP record not found", body = ErrorResponse),
     )
 )]
-#[instrument(skip(body))]
-pub async fn verify_commitment(Json(body): Json<VerifyCommitmentRequest>) -> Result<Json<VerifyCommitmentResponse>, (StatusCode, Json<ErrorResponse>)> {
+#[instrument(skip(body, headers))]
+pub async fn verify_commitment(
+    headers: HeaderMap,
+    Json(body): Json<VerifyCommitmentRequest>,
+) -> Result<Json<VerifyCommitmentResponse>, (StatusCode, Json<ErrorResponse>)> {
     // TODO: Call Soroban RPC to invoke ip_registry.verify_commitment
-    Err((
+    let error = (
         StatusCode::NOT_FOUND,
         Json(ErrorResponse {
             error: format!("IP record {} not found", body.ip_id),
         }),
+    );
+
+    // #1106: Record who asked to verify which commitment, and the outcome.
+    record_audit(access_audit(
+        "ip.verify",
+        &headers,
+        body.ip_id,
+        error.0.as_u16(),
     ))
+    .await;
+
+    Err(error)
+}
+
+/// #1106: Append an audit event. A failed write is logged, not returned: the
+/// commitment has already happened on-chain, so the caller should still get the
+/// real result. Failures are logged at error level so they can be alerted on.
+async fn record_audit(input: AuditEventInput) {
+    if let Err(err) = AUDIT_LOG_STORE.append(input).await {
+        tracing::error!("audit log append failed: {err}");
+    }
+}
+
+/// #1106: Build an access-audit event for a request. The actor is the HMAC of its
+/// `x-api-key`, never the raw key, and is absent for unauthenticated requests.
+fn access_audit(event_type: &str, headers: &HeaderMap, ip_id: u64, status: u16) -> AuditEventInput {
+    let actor_hash = headers
+        .get("x-api-key")
+        .and_then(|value| value.to_str().ok())
+        .filter(|key| !key.is_empty())
+        .map(|key| AUDIT_LOG_STORE.hash_identifier(key));
+
+    AuditEventInput::new(AuditEventCategory::Commitment, event_type)
+        .actor_hash(actor_hash)
+        .ip_id(Some(ip_id))
+        .success(status < 400)
+        .status_code(Some(status))
+}
+
+/// #1106: Query the immutable audit trail (`GET /audit-logs`).
+///
+/// Admin only. The request must send the `x-admin-key` header matching the
+/// `AUDIT_ADMIN_API_KEY` environment variable. The endpoint is locked when that
+/// variable is unset.
+#[instrument(skip(headers))]
+pub async fn get_audit_logs(
+    headers: HeaderMap,
+    Query(query): Query<AuditLogQuery>,
+) -> Result<Json<AuditLogQueryResponse>, (StatusCode, Json<ErrorResponse>)> {
+    require_audit_admin(&headers)?;
+    Ok(Json(AUDIT_LOG_STORE.query(&query).await))
+}
+
+/// #1106: Accounts with repeated failed access, from the audit trail. Admin only.
+#[instrument(skip(headers))]
+pub async fn get_suspicious_patterns(
+    headers: HeaderMap,
+) -> Result<Json<Vec<SuspiciousPattern>>, (StatusCode, Json<ErrorResponse>)> {
+    require_audit_admin(&headers)?;
+    Ok(Json(AUDIT_LOG_STORE.detect_suspicious_patterns().await))
+}
+
+fn require_audit_admin(headers: &HeaderMap) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let provided = headers.get("x-admin-key").and_then(|value| value.to_str().ok());
+    let expected = std::env::var("AUDIT_ADMIN_API_KEY").ok();
+    if admin_key_matches(provided, expected.as_deref()) {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "admin key required to read audit logs".to_string(),
+            }),
+        ))
+    }
 }
 
 /// Reveal and verify multiple IP commitments in one request.
