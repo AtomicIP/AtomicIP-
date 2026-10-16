@@ -19,6 +19,9 @@ use types::*;
 
 mod zk_commitment;
 
+/// #1100: verification-result cache for hiding proofs.
+mod zk_cache;
+
 /// Issue #973: Commitment metadata storage and search.
 mod metadata;
 
@@ -273,6 +276,12 @@ pub enum DataKey {
     CompressedCommitment(u64), // Issue #438: stores compressed commitment bytes for a given ip_id
     // Issue #458: Batch verification result cache
     BatchVerifyResult(BytesN<32>), // maps batch_proof_id -> BatchVerifyResult
+    // #1100: ZK proof verification cache
+    ZkCacheEntry(BytesN<32>), // maps cache key -> cached verdict (bool)
+    ZkCacheEpoch(BytesN<32>), // maps commitment -> invalidation epoch (u32)
+    ZkCacheSlot(u32),         // maps FIFO slot -> cache key occupying it
+    ZkCacheCursor,            // next slot to evict once the cache is full (u32)
+    ZkCacheStats,             // ZkCacheStats hit/miss/eviction counters
     // Issue #456: Compression algorithm selection
     CompressionSelection(u64), // maps ip_id -> CompressionSelection
     // Issue #459: Hierarchical storage
@@ -393,6 +402,7 @@ const CURRENT_STORAGE_KEYS: &[&str] = &[
     "CompressedCommitment", "BatchVerifyResult", "CompressionSelection", "HierarchyNode",
     "OwnerCategories", "CategoryDepth", "ThresholdConfig", "ThresholdSignatures", "BatchMetadata",
     "EncryptedCommitment", "BatchEscrow", "MerkleProof", "CommitmentAlgorithm", "CommitmentLinks", "LinkedCommitments",
+    "ZkCacheEntry", "ZkCacheEpoch", "ZkCacheSlot", "ZkCacheCursor", "ZkCacheStats",
 ];
 
 /// (error name, error code) pairs defined by the currently deployed contract.
@@ -1806,6 +1816,9 @@ impl IpRegistry {
                 LEDGER_BUMP,
             );
 
+        // #1100: verdicts cached against either commitment value are now stale.
+        zk_cache::invalidate(&env, &ip_record.commitment_hash);
+        zk_cache::invalidate(&env, &new_hash);
         ip_record.commitment_hash = new_hash.clone();
         env.storage()
             .persistent()
@@ -4869,6 +4882,10 @@ impl IpRegistry {
             LEDGER_BUMP,
         );
 
+        // #1100: verdicts cached against either commitment value are now stale.
+        zk_cache::invalidate(&env, &record.commitment_hash);
+        zk_cache::invalidate(&env, &new_commitment_hash);
+
         // Update the record
         record.commitment_hash = new_commitment_hash.clone();
         env.storage()
@@ -5927,8 +5944,9 @@ impl IpRegistry {
         for req in requests.iter() {
             let record = require_ip_exists(&env, req.ip_id);
 
+            // #1100: reuse a cached verdict when this exact proof was checked before.
             let valid =
-                zk_commitment::verify_hiding_proof(&env, &record.commitment_hash, &req.proof);
+                zk_cache::verify_cached(&env, &record.commitment_hash, &req.proof);
             results.push_back(VerifyResult {
                 ip_id: req.ip_id,
                 valid,
@@ -5938,6 +5956,12 @@ impl IpRegistry {
                 valid_hashes.push_back(record.commitment_hash);
             }
         }
+
+        let cache = zk_cache::stats(&env);
+        env.events().publish(
+            (symbol_short!("zk_cache"),),
+            (cache.hits, cache.misses, cache.hit_rate_bps()),
+        );
 
         let valid_count = valid_hashes.len();
         let aggregate_proof = aggregate_batch_proof(&env, &valid_hashes);
