@@ -289,7 +289,60 @@ impl Clone for ServiceContainer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graphql::{IpRecord, MockSorobanRpcClient, SorobanRpcClient, SwapRecord, SwapStatus};
+    use crate::graphql::{IpRecord, SorobanRpcClient, SwapRecord, SwapStatus};
+
+    /// Canned-data RPC stub for DI resolution tests. Unset fields return empty results.
+    #[derive(Default, Clone)]
+    struct StubRpc {
+        ip: Option<IpRecord>,
+        owner_ips: Vec<u64>,
+        swap: Option<SwapRecord>,
+    }
+
+    impl StubRpc {
+        fn with_ip_record(mut self, record: IpRecord) -> Self {
+            self.ip = Some(record);
+            self
+        }
+
+        fn with_owner_ips(mut self, ids: Vec<u64>) -> Self {
+            self.owner_ips = ids;
+            self
+        }
+
+        fn with_swap_record(mut self, record: SwapRecord) -> Self {
+            self.swap = Some(record);
+            self
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SorobanRpcClient for StubRpc {
+        async fn get_ip_record(&self, _ip_id: u64) -> Result<Option<IpRecord>, String> {
+            Ok(self.ip.clone())
+        }
+        async fn get_ips_by_owner(&self, _owner: &str) -> Result<Vec<u64>, String> {
+            Ok(self.owner_ips.clone())
+        }
+        async fn get_swap_record(&self, _swap_id: u64) -> Result<Option<SwapRecord>, String> {
+            Ok(self.swap.clone())
+        }
+        async fn get_swaps_by_seller(&self, _seller: &str, _limit: u64, _cursor: Option<String>) -> Result<crate::graphql::SwapConnection, String> {
+            Err("not used in DI tests".to_string())
+        }
+        async fn get_swaps_by_buyer(&self, _buyer: &str, _limit: u64, _cursor: Option<String>) -> Result<crate::graphql::SwapConnection, String> {
+            Err("not used in DI tests".to_string())
+        }
+        async fn get_swaps_by_ip(&self, _ip_id: u64, _limit: u64, _cursor: Option<String>) -> Result<crate::graphql::SwapConnection, String> {
+            Err("not used in DI tests".to_string())
+        }
+        async fn get_dispute_evidence(&self, _swap_id: u64) -> Result<Vec<crate::graphql::DisputeEvidence>, String> {
+            Err("not used in DI tests".to_string())
+        }
+        async fn get_reputation(&self, _address: &str) -> Result<Option<crate::graphql::Reputation>, String> {
+            Err("not used in DI tests".to_string())
+        }
+    }
 
     struct MockService {
         value: String,
@@ -391,7 +444,7 @@ mod tests {
     async fn test_rpc_client_registration_and_resolution() {
         let container = ServiceContainer::new();
         let mock_rpc = Arc::new(
-            MockSorobanRpcClient::new().with_swap_record(SwapRecord {
+            StubRpc::default().with_swap_record(SwapRecord {
                 swap_id: 100,
                 ip_registry_id: "CREG123".to_string(),
                 ip_id: 42,
@@ -420,7 +473,7 @@ mod tests {
     async fn test_query_client_registration_and_resolution() {
         let container = ServiceContainer::new();
         let mock_rpc = Arc::new(
-            MockSorobanRpcClient::new().with_owner_ips("GOWNER123", vec![1, 2, 3]),
+            StubRpc::default().with_owner_ips(vec![1, 2, 3]),
         );
         let query_client = Arc::new(crate::graphql::SorobanQueryClient::new(mock_rpc));
 
@@ -444,7 +497,7 @@ mod tests {
     #[tokio::test]
     async fn test_mock_rpc_client_unit_test_isolation() {
         let mock_rpc = Arc::new(
-            MockSorobanRpcClient::new()
+            StubRpc::default()
                 .with_ip_record(IpRecord {
                     ip_id: 1,
                     owner: "GOWNER".to_string(),

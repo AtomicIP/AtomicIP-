@@ -189,9 +189,6 @@ impl HealthChecker {
         *self.rpc_endpoint.write().await = endpoint;
     }
 
-    /// Check Soroban RPC reachability and contract connectivity
-    pub async fn check_contract_connectivity(&self) -> ComponentStatus {
-        let start = std::time::Instant::now();
     /// Probes the configured Soroban RPC endpoint with a lightweight
     /// `getHealth` JSON-RPC call. When `SOROBAN_RPC_URL` isn't set there is
     /// no contract dependency wired into this deployment, so it is reported
