@@ -77,6 +77,7 @@ mod rate_limit;
 mod validation;
 mod validation_middleware;
 mod user_data;
+mod threat_detection;
 #[cfg(test)]
 mod validation_fuzz_tests;
 #[cfg(test)]

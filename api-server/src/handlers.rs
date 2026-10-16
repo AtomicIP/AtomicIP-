@@ -118,6 +118,13 @@ pub async fn commit_ip(
             )
         })?;
 
+    // #1108: feed the successful commit into rapid-fire detection.
+    if let Some(alert) = crate::threat_detection::THREAT_DETECTOR
+        .record_commit(&body.owner, crate::alerting::now_secs())
+    {
+        crate::threat_detection::dispatch(&alert);
+    }
+
     // #983: Check per-user commitment rate limit after successful commit
     let (allowed, _remaining, reset_after) = rate_limiter.check_commitment_rate_limit(&body.owner).await;
     if !allowed {
@@ -237,6 +244,12 @@ pub async fn transfer_ip(Json(body): Json<TransferIpRequest>) -> Result<StatusCo
 #[instrument(skip(body))]
 pub async fn verify_commitment(Json(body): Json<VerifyCommitmentRequest>) -> Result<Json<VerifyCommitmentResponse>, (StatusCode, Json<ErrorResponse>)> {
     // TODO: Call Soroban RPC to invoke ip_registry.verify_commitment
+    // #1108: this path currently always fails, so each attempt counts as a failed verification.
+    if let Some(alert) = crate::threat_detection::THREAT_DETECTOR
+        .record_verification(body.ip_id, false, crate::alerting::now_secs())
+    {
+        crate::threat_detection::dispatch(&alert);
+    }
     Err((
         StatusCode::NOT_FOUND,
         Json(ErrorResponse {
@@ -515,6 +528,16 @@ pub async fn batch_reveal_commitments(
             BatchRevealResult { ip_id, valid, error }
         })
         .collect();
+
+    // #1108: each reveal outcome feeds the verification-chain detector.
+    let now = crate::alerting::now_secs();
+    for result in &results {
+        if let Some(alert) = crate::threat_detection::THREAT_DETECTOR
+            .record_verification(result.ip_id, result.valid, now)
+        {
+            crate::threat_detection::dispatch(&alert);
+        }
+    }
 
     Ok(Json(BatchRevealCommitmentsResponse { results }))
 }
