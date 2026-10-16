@@ -6560,9 +6560,13 @@ impl IpRegistry {
         true
     }
 
-    /// Remove expired IPs that are past their grace period. Anyone can call.
+    /// Remove expired IPs that are past their grace period. Admin-only.
     /// Skips IPs with expiry_timestamp == 0 (no expiry set).
+    /// Removes the record plus its `OwnerIps` and `CommitmentOwner` index entries.
     pub fn cleanup_expired_ips(env: Env, ip_ids: Vec<u64>) {
+        // Admin-only: deleting records must not be open to arbitrary callers.
+        Self::require_admin(&env).require_auth();
+
         let now = env.ledger().timestamp();
         for ip_id in ip_ids.iter() {
             let record: Option<IpRecord> =
@@ -6576,6 +6580,28 @@ impl IpRegistry {
                         .expiry_timestamp
                         .saturating_add(rec.grace_period_seconds)
                 {
+                    // Drop index entries in the same call so no dangling references remain.
+                    let owner_ids: Option<Vec<u64>> = env
+                        .storage()
+                        .persistent()
+                        .get(&DataKey::OwnerIps(rec.owner.clone()));
+                    if let Some(owner_ids) = owner_ids {
+                        if owner_ids.iter().any(|id| id == ip_id) {
+                            let mut kept: Vec<u64> = Vec::new(&env);
+                            for id in owner_ids.iter() {
+                                if id != ip_id {
+                                    kept.push_back(id);
+                                }
+                            }
+                            env.storage()
+                                .persistent()
+                                .set(&DataKey::OwnerIps(rec.owner.clone()), &kept);
+                        }
+                    }
+                    env.storage()
+                        .persistent()
+                        .remove(&DataKey::CommitmentOwner(rec.commitment_hash.clone()));
+
                     env.storage().persistent().remove(&DataKey::IpRecord(ip_id));
                     env.events()
                         .publish((symbol_short!("ip_clean"),), (ip_id, now));
