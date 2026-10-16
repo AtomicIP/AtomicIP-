@@ -4,7 +4,8 @@
 /// without compromising privacy. Metadata is AES-GCM encrypted and indexed by tags
 /// for efficient searching.
 
-use crate::types::{DataKey, IpMetadata, MetadataSearchResult};
+use crate::types::{IpMetadata, MetadataSearchResult};
+use crate::DataKey;
 use soroban_sdk::{Bytes, BytesN, Env, Vec};
 
 /// Maximum number of results per search page
@@ -97,7 +98,7 @@ pub fn search_by_metadata(
         limit
     };
 
-    let key = DataKey::MetadataTagIndex(tag_hash);
+    let key = DataKey::MetadataTagIndex(tag_hash.clone());
     let ip_ids: Vec<u64> = env
         .storage()
         .persistent()
@@ -108,11 +109,11 @@ pub fn search_by_metadata(
 
     // Calculate pagination
     let start = offset as usize;
-    let end = ((offset + limit) as usize).min(ip_ids.len());
+    let end = ((offset + limit) as usize).min(ip_ids.len() as usize);
 
     let mut result_ids = Vec::new(env);
 
-    if start < ip_ids.len() {
+    if start < ip_ids.len() as usize {
         for i in start..end {
             if let Some(ip_id) = ip_ids.get(i as u32) {
                 result_ids.push_back(ip_id);
@@ -121,7 +122,7 @@ pub fn search_by_metadata(
     }
 
     // Determine if there are more results
-    let next_cursor = if end < ip_ids.len() {
+    let next_cursor = if end < ip_ids.len() as usize {
         // Store cursor as hash of (tag_hash || offset)
         let mut cursor_bytes = Bytes::new(env);
         cursor_bytes.append(&Bytes::from(tag_hash.clone()));
