@@ -42,6 +42,7 @@ pub mod batch;
 pub mod cache;
 pub mod commitments;
 pub mod due_diligence;
+pub mod marketplace_analytics;
 pub mod analytics;
 pub mod circuit_breaker;
 pub mod compression;

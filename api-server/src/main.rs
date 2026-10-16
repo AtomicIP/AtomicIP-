@@ -47,6 +47,7 @@ mod batch;
 mod cache;
 mod commitments;
 mod due_diligence;
+mod marketplace_analytics;
 mod analytics;
 mod circuit_breaker;
 mod commitment_monitoring;
@@ -334,6 +335,7 @@ async fn main() {
         .route("/ip/owner/{owner}/cursor",        get(handlers::list_ip_by_owner_cursor))
         .route("/ip/tag/{tag}",                   get(handlers::list_commitments_by_tag))
         .route("/analytics/commitments",          get(handlers::commitment_analytics))
+        .route("/analytics/marketplace",          get(marketplace_analytics::marketplace_analytics_handler))
         .route("/ip/{ip_id}/due-diligence",       get(due_diligence::get_due_diligence))
         .route("/webhooks",                       post(handlers::register_webhook).get(handlers::list_webhooks))
         .route("/webhooks/{id}",                  axum::routing::delete(handlers::unregister_webhook))

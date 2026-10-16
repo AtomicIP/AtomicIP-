@@ -870,6 +870,13 @@ pub async fn batch_initiate_swap(Json(body): Json<BatchInitiateSwapRequest>) -> 
         };
         cache::set_with_ttl(&cache::swap_key(swap_id), &record, SWAP_EXPIRY_SECONDS);
         crate::analytics::record_swap_initiated();
+        crate::marketplace_analytics::record_initiated(
+            swap_id,
+            &crate::commitments::get_tags(ip_id),
+            &body.seller,
+            &body.buyer,
+            price,
+        );
         swap_ids.push(swap_id);
     }
 
