@@ -46,6 +46,7 @@ mod session;
 mod batch;
 mod cache;
 mod commitments;
+mod portfolio;
 mod analytics;
 mod circuit_breaker;
 mod commitment_monitoring;
@@ -488,6 +489,8 @@ fn build_app() -> Router {
         .route("/v1/bulk/commit-ip", post(handlers::bulk_commit_ip))
         .route("/v1/bulk/initiate-swap", post(handlers::bulk_initiate_swap))
         .route("/v1/swaps/execute-batch", post(handlers::execute_batch_swaps))
+        .route("/v1/portfolio/{owner}", get(portfolio::get_portfolio))
+        .route("/v1/portfolio/{owner}/holdings", post(portfolio::put_holdings))
         .route("/auth/2fa/enable", post(handlers::enable_2fa))
         .route("/auth/2fa/verify", post(handlers::verify_2fa))
         .route("/auth/2fa/backup-code", post(handlers::use_backup_code))

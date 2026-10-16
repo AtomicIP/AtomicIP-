@@ -49,6 +49,7 @@ pub mod audit;
 pub mod batch;
 pub mod cache;
 pub mod commitments;
+pub mod portfolio;
 pub mod analytics;
 pub mod circuit_breaker;
 pub mod compression;
