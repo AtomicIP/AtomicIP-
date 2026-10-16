@@ -70,6 +70,10 @@ Each entry below references an issue number from our GitHub repository. When rev
 - **#66-67** — Error code definitions and security validations
 - **#781** — Arbitrator committee mechanism with M-of-N signatures and time-locked ruling enforcement
 - **#906** — Treasury address validation: guard against hardcoded placeholder addresses
+- **#1148** — Notarization is write-once: a second `notarize_ip_timestamp` is rejected with `AlreadyNotarized` (code 60) instead of silently replacing the signature
+- **#1149** — Notary signatures are domain-separated (version byte, domain tag, network id, contract address); legacy untagged signatures are rejected. See `docs/notary-signature-format.md`
+- **#1150** — Out-of-range access levels return `InvalidAccessLevel` (code 61) instead of `Unauthorized`
+- **#1151** — Access grants accept an optional `expires_at` (`grant_ip_access_with_expiry`), expired grants are ignored by `check_ip_access`, and self-grants are rejected with `SelfGrantNotAllowed` (code 62)
 
 ### Operations & Reliability
 - **#1066** — Automated backup verification: daily/weekly restore tests, integrity checks, RTO measurement, failure alerts (`scripts/ops/backup-verify.sh`, `docs/backup-strategy.md`)
