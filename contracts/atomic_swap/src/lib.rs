@@ -125,6 +125,24 @@ pub enum ContractError {
     /// #906: Treasury address validation - rejects zero or placeholder addresses
     InvalidTreasuryAddress = 68,
     BatchDependencyNotMet = 69,
+    /// #1087: Escrow is locked by an open dispute; funds cannot move until it is resolved.
+    EscrowLocked = 70,
+    /// #1087: Partial release amount must be positive and no greater than the remaining balance.
+    InvalidReleaseAmount = 71,
+    /// #1088: No liquidity pool exists for this commitment.
+    PoolNotFound = 72,
+    /// #1088: A liquidity pool already exists for this commitment.
+    PoolAlreadyExists = 73,
+    /// #1088: Pool reserves, slippage or amount parameters are out of range.
+    InvalidPoolParams = 74,
+    /// #1089: The swap has not settled, or settlement is not yet final.
+    SettlementNotFinal = 75,
+    /// #1089: A swap may register at most `MAX_FINALITY_CALLBACKS` callbacks.
+    TooManyFinalityCallbacks = 76,
+    /// #1089: Finality blocks must be between 1 and `MAX_FINALITY_BLOCKS`.
+    InvalidFinalityBlocks = 77,
+    /// #1089: Callbacks can only be registered on a swap that has settled.
+    SwapNotSettled = 78,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -132,6 +150,14 @@ pub enum ContractError {
 /// Minimum ledger TTL bump applied to every persistent storage write.
 /// ~1 year at ~5s per ledger: 365 * 24 * 3600 / 5 ≈ 6_307_200 ledgers.
 pub const LEDGER_BUMP: u32 = 6_307_200;
+
+/// #1089: Ledgers that must pass after settlement before it is final, unless the
+/// admin has configured a different value with `set_finality_blocks`.
+pub const DEFAULT_FINALITY_BLOCKS: u32 = 5;
+/// #1089: Upper bound accepted by `set_finality_blocks`.
+pub const MAX_FINALITY_BLOCKS: u32 = 100_000;
+/// #1089: Maximum callbacks a single swap may register.
+pub const MAX_FINALITY_CALLBACKS: u32 = 5;
 
 /// Maximum number of items allowed in a single batch operation.
 pub const MAX_BATCH_SIZE: u32 = 50;
@@ -270,6 +296,20 @@ pub enum DataKey {
     BatchDependencies(u64),
     /// #1086: Ordered contingency clauses attached to a swap.
     SwapContingencies(u64),
+    /// #1087: Maps swap_id → cumulative amount released from escrow to the seller.
+    EscrowReleased(u64),
+    /// #1087: Maps swap_id → bool; `true` while a dispute lock blocks escrow releases.
+    EscrowLocked(u64),
+    /// #1089: Maps swap_id → ledger sequence at which the swap settled.
+    SettlementLedger(u64),
+    /// #1089: Maps swap_id → Vec<FinalityCallback> registered for post-finality execution.
+    FinalityCallbacks(u64),
+    /// #1089: Number of ledgers that must pass after settlement before it is final.
+    FinalityBlocks,
+    /// #1088: Maps commitment_id → LiquidityPool reserves and parameters.
+    LiquidityPool(u64),
+    /// #1088: Maps (commitment_id, buyer) → IP units the buyer has acquired via pool swaps.
+    PoolHoldings(u64, Address),
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -1019,6 +1059,8 @@ impl AtomicSwap {
             LEDGER_BUMP,
             LEDGER_BUMP,
         );
+        // #1089: start the finality clock
+        Self::record_settlement(&env, swap_id);
 
         // Release the IP lock
         env.storage()
@@ -1029,11 +1071,14 @@ impl AtomicSwap {
         Self::append_history(&env, swap_id, SwapStatus::Completed);
 
         // Protocol fee deduction
+        // #1087: any partial escrow releases already paid the seller; only the
+        // unreleased balance is still payable through reveal.
+        let payable = Self::escrow_remaining(&env, swap_id);
         let token_client = token::Client::new(&env, &swap.token);
         let config = Self::protocol_config(&env);
         let fee_bps = config.protocol_fee_bps as i128;
-        let fee_amount = if fee_bps > 0 && swap.price > 0 {
-            (swap.price * fee_bps) / 10000
+        let fee_amount = if fee_bps > 0 && payable > 0 {
+            (payable * fee_bps) / 10000
         } else {
             0
         };
@@ -1041,8 +1086,8 @@ impl AtomicSwap {
         // #311: Referral fee deduction (from seller proceeds, only if referrer set)
         let referral_amount = if let Some(ref _referrer) = swap.referrer {
             let rbps = config.referral_fee_bps as i128;
-            if rbps > 0 && swap.price > 0 {
-                (swap.price * rbps) / 10000
+            if rbps > 0 && payable > 0 {
+                (payable * rbps) / 10000
             } else {
                 0
             }
@@ -1050,7 +1095,7 @@ impl AtomicSwap {
             0
         };
 
-        let seller_amount = swap.price - fee_amount - referral_amount;
+        let seller_amount = payable - fee_amount - referral_amount;
         if fee_amount > 0 {
             token_client.transfer(
                 &env.current_contract_address(),
@@ -4957,11 +5002,13 @@ impl AtomicSwap {
             env.panic_with_error(Error::from_contract_error(ContractError::NotExpired as u32));
         }
 
-        let deposit: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::EscrowDeposit(swap_id))
-            .unwrap_or(0);
+        // #1087: funds frozen by an open dispute cannot be withdrawn unilaterally
+        if Self::is_escrow_locked(&env, swap_id) {
+            env.panic_with_error(Error::from_contract_error(ContractError::EscrowLocked as u32));
+        }
+
+        // #1087: refund only what has not already been released to the seller
+        let deposit: i128 = Self::escrow_remaining(&env, swap_id);
 
         swap.status = SwapStatus::Cancelled;
         swap::save_swap(&env, swap_id, &swap);
@@ -4989,6 +5036,527 @@ impl AtomicSwap {
                 canceller: swap.buyer,
             },
         );
+    }
+
+    // ── #1087: Buyer-controlled escrow release ────────────────────────────────
+
+    /// #1087: Buyer releases the remaining escrowed balance to the seller.
+    ///
+    /// Only the buyer can call this, on an escrow-mode swap in `Accepted` state.
+    /// Returns `true` when the remaining balance was paid out (the swap becomes
+    /// `Completed` once the full price has been released). Returns `false`
+    /// without moving funds if the escrow is locked by a dispute or nothing
+    /// remains to release.
+    pub fn release_to_seller(env: Env, swap_id: u64) -> bool {
+        let remaining = Self::escrow_remaining(&env, swap_id);
+        Self::release_escrow_to_seller(&env, swap_id, remaining)
+    }
+
+    /// #1087: Buyer releases part of the escrowed balance to the seller.
+    ///
+    /// `amount` must be positive and no greater than the remaining balance.
+    /// Returns `true` if the partial release was paid, `false` if the escrow is
+    /// locked by a dispute. Releasing the final unit completes the swap.
+    pub fn release_partial_to_seller(env: Env, swap_id: u64, amount: i128) -> bool {
+        if amount <= 0 || amount > Self::escrow_remaining(&env, swap_id) {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::InvalidReleaseAmount as u32,
+            ));
+        }
+        Self::release_escrow_to_seller(&env, swap_id, amount)
+    }
+
+    /// #1087: Dispute trigger. The buyer or seller locks an escrow-mode swap in
+    /// `Accepted` state. While locked, buyer releases return `false` and
+    /// `escrow_withdraw` panics until an admin resolves the dispute via
+    /// `resolve_escrow_dispute`. Returns `false` if the escrow was already locked.
+    pub fn lock_escrow(env: Env, swap_id: u64, caller: Address) -> bool {
+        let swap = require_swap_exists(&env, swap_id);
+        caller.require_auth();
+        require_seller_or_buyer(&env, &caller, &swap);
+        Self::require_escrow_mode(&env, swap_id);
+        require_swap_status(&env, &swap, SwapStatus::Accepted, ContractError::NotAccepted);
+
+        if Self::is_escrow_locked(&env, swap_id) {
+            return false;
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::EscrowLocked(swap_id), &true);
+        env.storage().persistent().extend_ttl(
+            &DataKey::EscrowLocked(swap_id),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("esc_lck"),),
+            EscrowLockedEvent { swap_id, caller },
+        );
+        true
+    }
+
+    /// #1087: Admin resolves an escrow dispute.
+    ///
+    /// `release_to_seller = true` is an early release: the unreleased balance is
+    /// paid to the seller and the swap completes. `false` refunds the unreleased
+    /// balance to the buyer and cancels the swap. Returns `false` if the escrow
+    /// is not locked.
+    pub fn resolve_escrow_dispute(
+        env: Env,
+        swap_id: u64,
+        caller: Address,
+        release_to_seller: bool,
+    ) -> bool {
+        caller.require_auth();
+        require_admin(&env, &caller);
+        let mut swap = require_swap_exists(&env, swap_id);
+        Self::require_escrow_mode(&env, swap_id);
+
+        if !Self::is_escrow_locked(&env, swap_id) {
+            return false;
+        }
+        env.storage()
+            .persistent()
+            .remove(&DataKey::EscrowLocked(swap_id));
+
+        let remaining = Self::escrow_remaining(&env, swap_id);
+        if release_to_seller {
+            Self::pay_escrow_to_seller(&env, swap_id, &mut swap, remaining);
+        } else {
+            swap.status = SwapStatus::Cancelled;
+            swap::save_swap(&env, swap_id, &swap);
+            env.storage()
+                .persistent()
+                .remove(&DataKey::ActiveSwap(swap.ip_id));
+            Self::append_history(&env, swap_id, SwapStatus::Cancelled);
+            if remaining > 0 {
+                token::Client::new(&env, &swap.token).transfer(
+                    &env.current_contract_address(),
+                    &swap.buyer,
+                    &remaining,
+                );
+            }
+        }
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("esc_res"),),
+            EscrowDisputeResolvedEvent {
+                swap_id,
+                released_to_seller: release_to_seller,
+                amount: remaining,
+            },
+        );
+        true
+    }
+
+    /// #1087: Amount still held in escrow for `swap_id` (deposit minus releases).
+    pub fn get_escrow_remaining(env: Env, swap_id: u64) -> i128 {
+        Self::escrow_remaining(&env, swap_id)
+    }
+
+    /// #1087: Whether an escrow-mode swap is currently locked by a dispute.
+    pub fn is_escrow_locked_for(env: Env, swap_id: u64) -> bool {
+        Self::is_escrow_locked(&env, swap_id)
+    }
+
+    fn require_escrow_mode(env: &Env, swap_id: u64) {
+        let mode: SwapMode = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SwapMode(swap_id))
+            .unwrap_or(SwapMode::Atomic);
+        if mode != SwapMode::Escrow {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::Unauthorized as u32,
+            ));
+        }
+    }
+
+    fn is_escrow_locked(env: &Env, swap_id: u64) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::EscrowLocked(swap_id))
+            .unwrap_or(false)
+    }
+
+    fn escrow_released(env: &Env, swap_id: u64) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::EscrowReleased(swap_id))
+            .unwrap_or(0)
+    }
+
+    /// Unreleased escrow balance: the deposit (or price, if none recorded) minus
+    /// everything already paid to the seller.
+    fn escrow_remaining(env: &Env, swap_id: u64) -> i128 {
+        let deposit: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EscrowDeposit(swap_id))
+            .unwrap_or(0);
+        (deposit - Self::escrow_released(env, swap_id)).max(0)
+    }
+
+    /// Shared buyer-release path for full and partial releases.
+    fn release_escrow_to_seller(env: &Env, swap_id: u64, amount: i128) -> bool {
+        let mut swap = require_swap_exists(env, swap_id);
+        swap.buyer.require_auth();
+        Self::require_escrow_mode(env, swap_id);
+        require_swap_status(env, &swap, SwapStatus::Accepted, ContractError::NotAccepted);
+
+        if Self::is_escrow_locked(env, swap_id) || amount <= 0 {
+            return false;
+        }
+        Self::pay_escrow_to_seller(env, swap_id, &mut swap, amount);
+        true
+    }
+
+    /// Pays `amount` from escrow to the seller, recording the release. Completes
+    /// the swap when the whole deposit has been released.
+    fn pay_escrow_to_seller(env: &Env, swap_id: u64, swap: &mut SwapRecord, amount: i128) {
+        let total_released = Self::escrow_released(env, swap_id) + amount;
+        env.storage()
+            .persistent()
+            .set(&DataKey::EscrowReleased(swap_id), &total_released);
+        env.storage().persistent().extend_ttl(
+            &DataKey::EscrowReleased(swap_id),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        if amount > 0 {
+            token::Client::new(env, &swap.token).transfer(
+                &env.current_contract_address(),
+                &swap.seller,
+                &amount,
+            );
+        }
+
+        if Self::escrow_remaining(env, swap_id) == 0 {
+            swap.status = SwapStatus::Completed;
+            swap::save_swap(env, swap_id, swap);
+            env.storage()
+                .persistent()
+                .remove(&DataKey::ActiveSwap(swap.ip_id));
+            Self::append_history(env, swap_id, SwapStatus::Completed);
+            Self::record_settlement(env, swap_id);
+        }
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("esc_rel"),),
+            EscrowReleasedEvent {
+                swap_id,
+                seller: swap.seller.clone(),
+                amount,
+                total_released,
+            },
+        );
+    }
+
+    // ── #1088: Liquidity pool integration ─────────────────────────────────────
+
+    /// #1088: Admin opens a constant-product (x·y = k) pool for an IP commitment.
+    /// Funds `token_reserve` tokens from the admin and offers `ip_reserve` IP units.
+    /// `max_slippage_bps` caps how far a single swap may move the price.
+    pub fn create_liquidity_pool(
+        env: Env,
+        admin: Address,
+        commitment_id: u64,
+        token: Address,
+        ip_reserve: u64,
+        token_reserve: i128,
+        max_slippage_bps: u32,
+    ) {
+        require_not_paused(&env);
+        admin.require_auth();
+        require_admin(&env, &admin);
+
+        if ip_reserve == 0 || token_reserve <= 0 || max_slippage_bps > 10_000 {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::InvalidPoolParams as u32,
+            ));
+        }
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::LiquidityPool(commitment_id))
+        {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::PoolAlreadyExists as u32,
+            ));
+        }
+
+        token::Client::new(&env, &token).transfer(
+            &admin,
+            &env.current_contract_address(),
+            &token_reserve,
+        );
+
+        let pool = LiquidityPool {
+            commitment_id,
+            token: token.clone(),
+            ip_reserve,
+            token_reserve,
+            max_slippage_bps,
+        };
+        Self::save_pool(&env, &pool);
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("pool_new"),),
+            PoolCreatedEvent {
+                commitment_id,
+                token,
+                ip_reserve,
+                token_reserve,
+            },
+        );
+    }
+
+    /// #1088: Buys IP units from a pool by paying `amount` tokens.
+    ///
+    /// Output follows x·y = k: `ip_out = ip_reserve * amount / (token_reserve + amount)`.
+    /// Returns `true` when the trade executes. Returns `false`, with no transfer
+    /// and no state change, when the output would be zero or the price impact
+    /// exceeds the pool's `max_slippage_bps`.
+    ///
+    /// `buyer` is the signer paying the tokens. The issue sketch omitted it, but
+    /// the trade cannot be authorized or funded without it.
+    pub fn swap_via_pool(env: Env, buyer: Address, commitment_id: u64, amount: u64) -> bool {
+        require_not_paused(&env);
+        buyer.require_auth();
+        let mut pool = Self::load_pool(&env, commitment_id);
+
+        if amount == 0 {
+            return false;
+        }
+        let token_in = amount as i128;
+        let ip_reserve = pool.ip_reserve as i128;
+
+        let Some(numerator) = ip_reserve.checked_mul(token_in) else {
+            return false;
+        };
+        let Some(new_token_reserve) = pool.token_reserve.checked_add(token_in) else {
+            return false;
+        };
+        let ip_out = numerator / new_token_reserve;
+        if ip_out <= 0 || ip_out > ip_reserve {
+            return false;
+        }
+
+        // Price impact against the pre-trade spot price (ideal = amount * ip / token).
+        let ideal = numerator / pool.token_reserve;
+        let Some(impact_numerator) = (ideal - ip_out).checked_mul(10_000) else {
+            return false;
+        };
+        let impact_bps = impact_numerator / ideal;
+        if impact_bps > pool.max_slippage_bps as i128 {
+            return false;
+        }
+
+        let holdings_key = DataKey::PoolHoldings(commitment_id, buyer.clone());
+        let held: u64 = env.storage().persistent().get(&holdings_key).unwrap_or(0);
+        let Some(new_held) = held.checked_add(ip_out as u64) else {
+            return false;
+        };
+
+        token::Client::new(&env, &pool.token).transfer(
+            &buyer,
+            &env.current_contract_address(),
+            &token_in,
+        );
+
+        pool.token_reserve = new_token_reserve;
+        pool.ip_reserve -= ip_out as u64;
+        Self::save_pool(&env, &pool);
+
+        env.storage().persistent().set(&holdings_key, &new_held);
+        env.storage()
+            .persistent()
+            .extend_ttl(&holdings_key, LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("pool_swp"),),
+            PoolSwapEvent {
+                commitment_id,
+                buyer,
+                token_in,
+                ip_out: ip_out as u64,
+                ip_reserve: pool.ip_reserve,
+                token_reserve: pool.token_reserve,
+            },
+        );
+        true
+    }
+
+    /// #1088: Current pool state, including reserves and slippage limit.
+    pub fn get_liquidity_pool(env: Env, commitment_id: u64) -> Option<LiquidityPool> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::LiquidityPool(commitment_id))
+    }
+
+    /// #1088: Pool reserve ratio as token units per IP unit, scaled by 1_000_000.
+    /// Returns 0 when the pool has no IP left to sell.
+    pub fn get_pool_price(env: Env, commitment_id: u64) -> i128 {
+        let pool = Self::load_pool(&env, commitment_id);
+        if pool.ip_reserve == 0 {
+            return 0;
+        }
+        pool.token_reserve.saturating_mul(1_000_000) / pool.ip_reserve as i128
+    }
+
+    /// #1088: IP units a buyer has acquired from a pool.
+    pub fn get_pool_holdings(env: Env, commitment_id: u64, buyer: Address) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PoolHoldings(commitment_id, buyer))
+            .unwrap_or(0)
+    }
+
+    fn load_pool(env: &Env, commitment_id: u64) -> LiquidityPool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::LiquidityPool(commitment_id))
+            .unwrap_or_else(|| {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::PoolNotFound as u32,
+                ))
+            })
+    }
+
+    fn save_pool(env: &Env, pool: &LiquidityPool) {
+        let key = DataKey::LiquidityPool(pool.commitment_id);
+        env.storage().persistent().set(&key, pool);
+        env.storage().persistent().extend_ttl(&key, LEDGER_BUMP, LEDGER_BUMP);
+    }
+
+    // ── #1089: Settlement finality ────────────────────────────────────────────
+
+    /// #1089: Admin sets how many ledgers must pass after settlement before it
+    /// counts as final. Must be between 1 and `MAX_FINALITY_BLOCKS`.
+    pub fn set_finality_blocks(env: Env, caller: Address, blocks: u32) {
+        caller.require_auth();
+        require_admin(&env, &caller);
+        if blocks == 0 || blocks > MAX_FINALITY_BLOCKS {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::InvalidFinalityBlocks as u32,
+            ));
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::FinalityBlocks, &blocks);
+    }
+
+    /// #1089: Ledgers elapsed since the swap settled. Returns 0 if it has not settled.
+    pub fn get_settlement_finality(env: Env, swap_id: u64) -> u64 {
+        match env
+            .storage()
+            .persistent()
+            .get::<_, u32>(&DataKey::SettlementLedger(swap_id))
+        {
+            Some(settled_at) => env.ledger().sequence().saturating_sub(settled_at) as u64,
+            None => 0,
+        }
+    }
+
+    /// #1089: `true` once the swap has settled and the configured number of
+    /// finality blocks has passed.
+    pub fn is_settlement_final(env: Env, swap_id: u64) -> bool {
+        Self::settlement_is_final(&env, swap_id)
+    }
+
+    /// #1089: Registers a contract call to run once the swap's settlement is
+    /// final. The callee is invoked as `function(swap_id)`. Only the seller or
+    /// buyer may register, and only after the swap has settled.
+    pub fn register_finality_callback(
+        env: Env,
+        swap_id: u64,
+        caller: Address,
+        contract: Address,
+        function: soroban_sdk::Symbol,
+    ) {
+        let swap = require_swap_exists(&env, swap_id);
+        caller.require_auth();
+        require_seller_or_buyer(&env, &caller, &swap);
+
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::SettlementLedger(swap_id))
+        {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::SwapNotSettled as u32,
+            ));
+        }
+
+        let key = DataKey::FinalityCallbacks(swap_id);
+        let mut callbacks: Vec<FinalityCallback> =
+            env.storage().persistent().get(&key).unwrap_or(Vec::new(&env));
+        if callbacks.len() >= MAX_FINALITY_CALLBACKS {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::TooManyFinalityCallbacks as u32,
+            ));
+        }
+        callbacks.push_back(FinalityCallback { contract, function });
+        env.storage().persistent().set(&key, &callbacks);
+        env.storage().persistent().extend_ttl(&key, LEDGER_BUMP, LEDGER_BUMP);
+    }
+
+    /// #1089: Runs and clears the swap's finality callbacks. Callable by anyone
+    /// once settlement is final. Returns how many callbacks ran. Callbacks are
+    /// cleared before any is invoked, so a re-entrant call cannot repeat them.
+    pub fn execute_finality_callbacks(env: Env, swap_id: u64) -> u32 {
+        if !Self::settlement_is_final(&env, swap_id) {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::SettlementNotFinal as u32,
+            ));
+        }
+
+        let key = DataKey::FinalityCallbacks(swap_id);
+        let callbacks: Vec<FinalityCallback> =
+            env.storage().persistent().get(&key).unwrap_or(Vec::new(&env));
+        if callbacks.is_empty() {
+            return 0;
+        }
+        env.storage().persistent().remove(&key);
+
+        let args: Vec<Val> = Vec::from_array(&env, [swap_id.into_val(&env)]);
+        for callback in callbacks.iter() {
+            let _: Val = env.invoke_contract(&callback.contract, &callback.function, args.clone());
+            env.events().publish(
+                (soroban_sdk::symbol_short!("fin_cb"),),
+                FinalityCallbackExecutedEvent {
+                    swap_id,
+                    contract: callback.contract.clone(),
+                    function: callback.function.clone(),
+                },
+            );
+        }
+        callbacks.len()
+    }
+
+    fn record_settlement(env: &Env, swap_id: u64) {
+        let key = DataKey::SettlementLedger(swap_id);
+        env.storage().persistent().set(&key, &env.ledger().sequence());
+        env.storage().persistent().extend_ttl(&key, LEDGER_BUMP, LEDGER_BUMP);
+    }
+
+    fn settlement_is_final(env: &Env, swap_id: u64) -> bool {
+        let Some(settled_at) = env
+            .storage()
+            .persistent()
+            .get::<_, u32>(&DataKey::SettlementLedger(swap_id))
+        else {
+            return false;
+        };
+        let required: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::FinalityBlocks)
+            .unwrap_or(DEFAULT_FINALITY_BLOCKS);
+        env.ledger().sequence().saturating_sub(settled_at) >= required
     }
 
     // ── Rollback ──────────────────────────────────────────────────────────────
@@ -5804,6 +6372,12 @@ mod upgrade_chaos_tests;
 // #830: compile errors fixed — re-enabled
 #[cfg(test)]
 mod escrow_tests;
+#[cfg(test)]
+mod escrow_release_tests;
+#[cfg(test)]
+mod liquidity_pool_tests;
+#[cfg(test)]
+mod finality_tests;
 
 // #781: re-enabled — was blocked by 3 pre-existing, unrelated compile errors
 // (a dropped `commit_ip` arg, and two obsolete `accept_swap_with_quantity`

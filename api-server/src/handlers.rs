@@ -14,6 +14,7 @@ use tokio::time::{Duration, Instant};
 use tracing::instrument;
 use sha2::{Digest, Sha256};
 use crate::cache;
+use crate::ip_search::{IpSearchFilters, IpSearchMetadata, IpSearchResponse, SaveSearchRequest, SavedSearch};
 use crate::deduplication::{create_store, DeduplicationStore};
 use crate::graphql::SorobanQueryClient;
 use crate::schemas::*;
@@ -1338,6 +1339,101 @@ pub async fn marketplace_by_ip(
     Query(pagination): Query<CursorPaginationParams>,
 ) -> impl IntoResponse {
     marketplace_response(rpc_client.get_swaps_by_ip(ip_id, pagination.limit.min(200), pagination.cursor).await).await
+}
+
+// ── #1090: IP marketplace search ──────────────────────────────────────────────
+
+/// Search indexed IP listings by price, registration date, category,
+/// jurisdiction and metadata text. Returns a page of matches plus facet counts.
+#[utoipa::path(
+    get,
+    path = "/v1/ip/search",
+    tag = "Marketplace",
+    params(IpSearchFilters),
+    responses((status = 200, description = "Matching IP listings with facet counts", body = IpSearchResponse))
+)]
+pub async fn search_ip(Query(filters): Query<IpSearchFilters>) -> impl IntoResponse {
+    Json(crate::ip_search::search(&crate::ip_search::listings(), &filters))
+}
+
+/// Index an IP for marketplace search, or replace the metadata of an already
+/// indexed IP. The IP record must be known to the cache.
+#[utoipa::path(
+    put,
+    path = "/v1/ip/{ip_id}/metadata",
+    tag = "Marketplace",
+    params(("ip_id" = u64, Path, description = "IP record identifier")),
+    request_body = IpSearchMetadata,
+    responses(
+        (status = 200, description = "Metadata indexed", body = IpSearchMetadata),
+        (status = 400, description = "Invalid metadata", body = ErrorResponse),
+        (status = 404, description = "IP not found", body = ErrorResponse)
+    )
+)]
+pub async fn put_ip_search_metadata(
+    Path(ip_id): Path<u64>,
+    Json(metadata): Json<IpSearchMetadata>,
+) -> impl IntoResponse {
+    let Some(record) = cache::get::<IpRecord>(&cache::ip_key(ip_id)) else {
+        return (StatusCode::NOT_FOUND, Json(ErrorResponse { error: "IP not found".to_string() })).into_response();
+    };
+    match crate::ip_search::index_listing(record, metadata) {
+        Ok(stored) => (StatusCode::OK, Json(stored)).into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response(),
+    }
+}
+
+/// Save a named search for an owner (at most 20 per owner, names unique).
+#[utoipa::path(
+    post,
+    path = "/v1/ip/search/saved/{owner}",
+    tag = "Marketplace",
+    params(("owner" = String, Path, description = "Owner address")),
+    request_body = SaveSearchRequest,
+    responses(
+        (status = 201, description = "Saved search created", body = SavedSearch),
+        (status = 400, description = "Invalid name or limit reached", body = ErrorResponse)
+    )
+)]
+pub async fn save_ip_search(
+    Path(owner): Path<String>,
+    Json(request): Json<SaveSearchRequest>,
+) -> impl IntoResponse {
+    match crate::ip_search::save_search(&owner, &request.name, request.filters) {
+        Ok(saved) => (StatusCode::CREATED, Json(saved)).into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response(),
+    }
+}
+
+/// List an owner's saved searches.
+#[utoipa::path(
+    get,
+    path = "/v1/ip/search/saved/{owner}",
+    tag = "Marketplace",
+    params(("owner" = String, Path, description = "Owner address")),
+    responses((status = 200, description = "Saved searches", body = Vec<SavedSearch>))
+)]
+pub async fn list_ip_saved_searches(Path(owner): Path<String>) -> impl IntoResponse {
+    Json(crate::ip_search::list_saved_searches(&owner))
+}
+
+/// Delete one of an owner's saved searches.
+#[utoipa::path(
+    delete,
+    path = "/v1/ip/search/saved/{owner}/{id}",
+    tag = "Marketplace",
+    params(("owner" = String, Path, description = "Owner address"), ("id" = u64, Path, description = "Saved search identifier")),
+    responses(
+        (status = 204, description = "Saved search deleted"),
+        (status = 404, description = "No saved search with that id", body = ErrorResponse)
+    )
+)]
+pub async fn delete_ip_saved_search(Path((owner, id)): Path<(String, u64)>) -> impl IntoResponse {
+    if crate::ip_search::delete_saved_search(&owner, id) {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        (StatusCode::NOT_FOUND, Json(ErrorResponse { error: "saved search not found".to_string() })).into_response()
+    }
 }
 
 // ── Webhooks ──────────────────────────────────────────────────────────────────
