@@ -346,7 +346,7 @@ pub enum DataKey {
     CommitmentPrivacy(u64),
     /// #809: OwnershipShare cap table for an IP (sums to exactly 100)
     OwnershipShares(u64),
-    /// Issue #795-era: records that expiry-transition event was already emitted
+    /// Records that the EXPIRY_TOPIC event was already emitted for the current expiry
     ExpiryNotified(u64),
 }
 
