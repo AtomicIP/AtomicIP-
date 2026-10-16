@@ -58,6 +58,9 @@ mod notary_key_rotation_tests;
 mod admin_handover_tests;
 
 #[cfg(test)]
+mod per_ip_auth_tests;
+
+#[cfg(test)]
 mod commitment_property_tests;
 
 // Temporarily disabled: calls contract methods that are not implemented yet.
@@ -2683,13 +2686,15 @@ impl IpRegistry {
     }
 
     // ── Issue #454: Threshold Signatures ───────────────────────────────────
+    /// #1155: Only the IP owner may configure the signing threshold.
     pub fn require_threshold_signatures(
         env: Env,
         ip_id: u64,
         threshold: u32,
         signers: soroban_sdk::Vec<Address>,
     ) {
-        require_ip_exists(&env, ip_id);
+        let record = require_ip_exists(&env, ip_id);
+        record.owner.require_auth();
         if threshold == 0 || threshold > signers.len() {
             panic_with_error!(&env, ContractError::ThresholdNotMet);
         }
@@ -2728,6 +2733,7 @@ impl IpRegistry {
             .get(&DataKey::ThresholdConfig(ip_id))
     }
 
+    /// #1155: The signer must authorize their own signature.
     pub fn add_threshold_signature(
         env: Env,
         ip_id: u64,
@@ -2735,6 +2741,7 @@ impl IpRegistry {
         signature_hash: BytesN<32>,
     ) {
         require_ip_exists(&env, ip_id);
+        signer.require_auth();
         let config: ThresholdConfig = env
             .storage()
             .persistent()
@@ -2879,8 +2886,14 @@ impl IpRegistry {
     }
 
     // ── Issue #457: Commitment Encryption ───────────────────────────────────
+    /// #1155: Only the IP owner may set the encrypted commitment.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the IP does not exist, or if the owner has not authorized the call.
     pub fn encrypt_commitment(env: Env, ip_id: u64, encrypted_hash: Bytes, key_hint: BytesN<32>) {
-        require_ip_exists(&env, ip_id);
+        let record = require_ip_exists(&env, ip_id);
+        record.owner.require_auth();
         if encrypted_hash.len() > 256 {
             panic_with_error!(&env, ContractError::EncryptedDataTooLarge);
         }
