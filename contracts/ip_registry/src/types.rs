@@ -226,3 +226,12 @@ pub struct CommitmentPrivacy {
     pub privacy_level: u32,
     pub allowed_addresses: soroban_sdk::Vec<Address>,
 }
+
+/// #1153: One notary key rotation. The key is in force from `effective_ledger`
+/// until the next rotation.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct NotaryKeyRecord {
+    pub effective_ledger: u32,
+    pub public_key: BytesN<32>,
+}

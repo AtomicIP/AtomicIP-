@@ -52,6 +52,9 @@ mod upgrade_tests;
 mod upgrade_timelock_tests;
 
 #[cfg(test)]
+mod notary_key_rotation_tests;
+
+#[cfg(test)]
 mod commitment_property_tests;
 
 // Temporarily disabled: calls contract methods that are not implemented yet.
@@ -338,6 +341,8 @@ pub enum DataKey {
     PendingUpgrade,
     /// #1152: WASM hash installed by the most recent `upgrade` call
     CurrentWasmHash,
+    /// #1153: Ordered Vec<NotaryKeyRecord> of every notary key rotation
+    NotaryKeyHistory,
     // Issue #979: Commitment linking for related IPs
     CommitmentLinks(u64), // maps ip_id -> Vec<CommitmentLink> of linked commitments
     LinkedCommitments(u64), // maps linked_ip_id -> Vec<u64> of ip_ids linking to it (reverse index)
@@ -411,7 +416,7 @@ const CURRENT_FUNCTIONS: &[&str] = &[
     "get_compressed_bytes", "get_compressed_commitment", "get_dispute", "get_encrypted_commitment",
     "get_commitment_back_references", "get_ip", "get_ip_access_grants", "get_ip_audit_trail", "get_ip_lineage",
     "get_ip_notary_signature", "get_ip_strength", "get_ip_suggested_price", "get_ip_version_chain",
-    "get_pending_upgrade", "get_upgrade_timelock",
+    "get_pending_upgrade", "get_upgrade_timelock", "get_notary_key_at", "get_notary_key_history",
     "get_linked_commitments",
     "get_ip_versions", "get_key_rotation_history", "get_licenses", "get_ownership_challenge",
     "get_partial_disclosure", "get_pow_difficulty", "get_renewal_count", "get_reputation",
@@ -438,7 +443,7 @@ const CURRENT_FUNCTIONS: &[&str] = &[
 /// `validate_upgrade`.
 const CURRENT_STORAGE_KEYS: &[&str] = &[
     "IpRecord", "OwnerIps", "NextId", "CommitmentOwner", "AnonymousOwner", "UsedBlindedOwner",
-    "UpgradeTimelockLedgers", "PendingUpgrade", "CurrentWasmHash",
+    "UpgradeTimelockLedgers", "PendingUpgrade", "CurrentWasmHash", "NotaryKeyHistory",
     "Admin", "PartialDisclosure", "IpLicenses", "CategoryIps", "PowDifficulty", "IpVersions",
     "SuggestedPrice", "IpCommitmentChecksum", "IpAccessGrants", "NotarySignature", "IpVersionChain",
     "OwnershipChallenge", "NextChallengeId", "EncryptionKeyRotation", "NotaryPublicKey",
@@ -4213,12 +4218,83 @@ impl IpRegistry {
             ));
         }
 
+        let old_key: Option<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NotaryPublicKey);
+        if old_key.as_ref() == Some(&public_key) {
+            // Re-setting the active key is not a rotation: no event, no history entry.
+            return;
+        }
+
+        // #1153: record the rotation keyed by the ledger it takes effect in.
+        // Several rotations within one ledger collapse into the last one.
+        let now = env.ledger().sequence();
+        let mut history: Vec<NotaryKeyRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NotaryKeyHistory)
+            .unwrap_or(Vec::new(&env));
+        let record = NotaryKeyRecord {
+            effective_ledger: now,
+            public_key: public_key.clone(),
+        };
+        let last_index = history.len().saturating_sub(1);
+        match history.last() {
+            Some(last) if last.effective_ledger == now => history.set(last_index, record),
+            _ => history.push_back(record),
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::NotaryKeyHistory, &history);
+        env.storage().persistent().extend_ttl(
+            &DataKey::NotaryKeyHistory,
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
         env.storage()
             .persistent()
             .set(&DataKey::NotaryPublicKey, &public_key);
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::NotaryPublicKey, LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish(
+            (Symbol::new(&env, "notary_key_rotated"),),
+            (old_key, public_key),
+        );
+    }
+
+    /// #1153: The notary public key that was active at `ledger`, or `None`
+    /// if no key had been set by then.
+    ///
+    /// A rotation takes effect in the ledger it was made in, so a notarization
+    /// checked at ledger `L` must be verified against `get_notary_key_at(L)`.
+    pub fn get_notary_key_at(env: Env, ledger: u32) -> Option<BytesN<32>> {
+        let history: Vec<NotaryKeyRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NotaryKeyHistory)
+            .unwrap_or(Vec::new(&env));
+
+        let mut active = None;
+        for record in history.iter() {
+            if record.effective_ledger <= ledger {
+                active = Some(record.public_key);
+            } else {
+                break;
+            }
+        }
+        active
+    }
+
+    /// #1153: Every notary key rotation, in ascending ledger order.
+    pub fn get_notary_key_history(env: Env) -> Vec<NotaryKeyRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::NotaryKeyHistory)
+            .unwrap_or(Vec::new(&env))
     }
 
     /// Notarize an IP timestamp with a notary Ed25519 signature.
