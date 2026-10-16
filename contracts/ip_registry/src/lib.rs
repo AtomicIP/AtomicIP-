@@ -1706,7 +1706,10 @@ impl IpRegistry {
 
     /// Unlock and reveal a time-locked commitment.
     ///
-    /// Only callable after unlock_time has passed.
+    /// Authorization: only the IP owner may reveal the commitment, matching the
+    /// owner-signature model used by `amend_commitment`. The time lock itself
+    /// decides *when* the reveal is allowed: the owner may call this only once
+    /// `unlock_time` has passed.
     ///
     /// # Arguments
     ///
@@ -1725,6 +1728,9 @@ impl IpRegistry {
         if timelock.is_none() {
             return false;
         }
+
+        let record = require_ip_exists(&env, commitment_id);
+        record.owner.require_auth();
 
         let mut lock = timelock.unwrap();
         let current_time = env.ledger().timestamp();

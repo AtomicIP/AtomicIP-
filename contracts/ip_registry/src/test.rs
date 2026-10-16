@@ -4309,6 +4309,69 @@ mod batch_escrow_tests {
         assert!(result.is_err(), "creation with past unlock time should fail");
     }
 
+    /// #1158: the owner cannot reveal a time-locked commitment before unlock_time.
+    #[test]
+    fn test_unlock_commitment_before_unlock_time_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[0x51u8; 32]);
+        let now = env.ledger().timestamp();
+        let ip_id = client.create_time_locked_commitment(&owner, &hash, &(now + 3600));
+
+        // Owner is authorized, but the time lock has not expired.
+        assert!(client.try_unlock_commitment(&ip_id).is_err());
+    }
+
+    /// #1158: the owner can reveal once unlock_time has passed.
+    #[test]
+    fn test_unlock_commitment_after_unlock_time_by_owner_succeeds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[0x52u8; 32]);
+        let now = env.ledger().timestamp();
+        let unlock_time = now + 3600;
+        let ip_id = client.create_time_locked_commitment(&owner, &hash, &unlock_time);
+
+        env.ledger().with_mut(|l| l.timestamp = unlock_time);
+        assert!(client.unlock_commitment(&ip_id));
+    }
+
+    /// #1158: a non-owner cannot reveal the commitment, even after unlock_time.
+    #[test]
+    fn test_unlock_commitment_rejects_non_owner_after_unlock_time() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let attacker = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[0x53u8; 32]);
+        let now = env.ledger().timestamp();
+        let unlock_time = now + 3600;
+        let ip_id = client.create_time_locked_commitment(&owner, &hash, &unlock_time);
+
+        env.ledger().with_mut(|l| l.timestamp = unlock_time);
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &attacker,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "unlock_commitment",
+                args: (ip_id,).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        assert!(client.try_unlock_commitment(&ip_id).is_err());
+    }
+
     // ── Tests for Issue #976: Commitment Amendment ────────────────────────
 
     #[test]
