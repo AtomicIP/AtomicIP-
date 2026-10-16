@@ -739,3 +739,39 @@ pub struct EscrowDisputeResolvedEvent {
     pub amount: i128,
 }
 
+// ── #1088: Liquidity Pool Types ───────────────────────────────────────────────
+
+/// Constant-product (x·y = k) pool for trading one IP commitment against a token.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct LiquidityPool {
+    pub commitment_id: u64,
+    pub token: Address,
+    /// IP units held by the pool.
+    pub ip_reserve: u64,
+    /// Token units held by the pool.
+    pub token_reserve: i128,
+    /// Maximum price impact, in basis points, a single swap may cause.
+    pub max_slippage_bps: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PoolCreatedEvent {
+    pub commitment_id: u64,
+    pub token: Address,
+    pub ip_reserve: u64,
+    pub token_reserve: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PoolSwapEvent {
+    pub commitment_id: u64,
+    pub buyer: Address,
+    pub token_in: i128,
+    pub ip_out: u64,
+    pub ip_reserve: u64,
+    pub token_reserve: i128,
+}
+

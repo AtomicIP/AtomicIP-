@@ -129,6 +129,12 @@ pub enum ContractError {
     EscrowLocked = 70,
     /// #1087: Partial release amount must be positive and no greater than the remaining balance.
     InvalidReleaseAmount = 71,
+    /// #1088: No liquidity pool exists for this commitment.
+    PoolNotFound = 72,
+    /// #1088: A liquidity pool already exists for this commitment.
+    PoolAlreadyExists = 73,
+    /// #1088: Pool reserves, slippage or amount parameters are out of range.
+    InvalidPoolParams = 74,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -278,6 +284,10 @@ pub enum DataKey {
     EscrowReleased(u64),
     /// #1087: Maps swap_id → bool; `true` while a dispute lock blocks escrow releases.
     EscrowLocked(u64),
+    /// #1088: Maps commitment_id → LiquidityPool reserves and parameters.
+    LiquidityPool(u64),
+    /// #1088: Maps (commitment_id, buyer) → IP units the buyer has acquired via pool swaps.
+    PoolHoldings(u64, Address),
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -5220,6 +5230,183 @@ impl AtomicSwap {
         );
     }
 
+    // ── #1088: Liquidity pool integration ─────────────────────────────────────
+
+    /// #1088: Admin opens a constant-product (x·y = k) pool for an IP commitment.
+    /// Funds `token_reserve` tokens from the admin and offers `ip_reserve` IP units.
+    /// `max_slippage_bps` caps how far a single swap may move the price.
+    pub fn create_liquidity_pool(
+        env: Env,
+        admin: Address,
+        commitment_id: u64,
+        token: Address,
+        ip_reserve: u64,
+        token_reserve: i128,
+        max_slippage_bps: u32,
+    ) {
+        require_not_paused(&env);
+        admin.require_auth();
+        require_admin(&env, &admin);
+
+        if ip_reserve == 0 || token_reserve <= 0 || max_slippage_bps > 10_000 {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::InvalidPoolParams as u32,
+            ));
+        }
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::LiquidityPool(commitment_id))
+        {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::PoolAlreadyExists as u32,
+            ));
+        }
+
+        token::Client::new(&env, &token).transfer(
+            &admin,
+            &env.current_contract_address(),
+            &token_reserve,
+        );
+
+        let pool = LiquidityPool {
+            commitment_id,
+            token: token.clone(),
+            ip_reserve,
+            token_reserve,
+            max_slippage_bps,
+        };
+        Self::save_pool(&env, &pool);
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("pool_new"),),
+            PoolCreatedEvent {
+                commitment_id,
+                token,
+                ip_reserve,
+                token_reserve,
+            },
+        );
+    }
+
+    /// #1088: Buys IP units from a pool by paying `amount` tokens.
+    ///
+    /// Output follows x·y = k: `ip_out = ip_reserve * amount / (token_reserve + amount)`.
+    /// Returns `true` when the trade executes. Returns `false`, with no transfer
+    /// and no state change, when the output would be zero or the price impact
+    /// exceeds the pool's `max_slippage_bps`.
+    ///
+    /// `buyer` is the signer paying the tokens. The issue sketch omitted it, but
+    /// the trade cannot be authorized or funded without it.
+    pub fn swap_via_pool(env: Env, buyer: Address, commitment_id: u64, amount: u64) -> bool {
+        require_not_paused(&env);
+        buyer.require_auth();
+        let mut pool = Self::load_pool(&env, commitment_id);
+
+        if amount == 0 {
+            return false;
+        }
+        let token_in = amount as i128;
+        let ip_reserve = pool.ip_reserve as i128;
+
+        let Some(numerator) = ip_reserve.checked_mul(token_in) else {
+            return false;
+        };
+        let Some(new_token_reserve) = pool.token_reserve.checked_add(token_in) else {
+            return false;
+        };
+        let ip_out = numerator / new_token_reserve;
+        if ip_out <= 0 || ip_out > ip_reserve {
+            return false;
+        }
+
+        // Price impact against the pre-trade spot price (ideal = amount * ip / token).
+        let ideal = numerator / pool.token_reserve;
+        let Some(impact_numerator) = (ideal - ip_out).checked_mul(10_000) else {
+            return false;
+        };
+        let impact_bps = impact_numerator / ideal;
+        if impact_bps > pool.max_slippage_bps as i128 {
+            return false;
+        }
+
+        let holdings_key = DataKey::PoolHoldings(commitment_id, buyer.clone());
+        let held: u64 = env.storage().persistent().get(&holdings_key).unwrap_or(0);
+        let Some(new_held) = held.checked_add(ip_out as u64) else {
+            return false;
+        };
+
+        token::Client::new(&env, &pool.token).transfer(
+            &buyer,
+            &env.current_contract_address(),
+            &token_in,
+        );
+
+        pool.token_reserve = new_token_reserve;
+        pool.ip_reserve -= ip_out as u64;
+        Self::save_pool(&env, &pool);
+
+        env.storage().persistent().set(&holdings_key, &new_held);
+        env.storage()
+            .persistent()
+            .extend_ttl(&holdings_key, LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("pool_swp"),),
+            PoolSwapEvent {
+                commitment_id,
+                buyer,
+                token_in,
+                ip_out: ip_out as u64,
+                ip_reserve: pool.ip_reserve,
+                token_reserve: pool.token_reserve,
+            },
+        );
+        true
+    }
+
+    /// #1088: Current pool state, including reserves and slippage limit.
+    pub fn get_liquidity_pool(env: Env, commitment_id: u64) -> Option<LiquidityPool> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::LiquidityPool(commitment_id))
+    }
+
+    /// #1088: Pool reserve ratio as token units per IP unit, scaled by 1_000_000.
+    /// Returns 0 when the pool has no IP left to sell.
+    pub fn get_pool_price(env: Env, commitment_id: u64) -> i128 {
+        let pool = Self::load_pool(&env, commitment_id);
+        if pool.ip_reserve == 0 {
+            return 0;
+        }
+        pool.token_reserve.saturating_mul(1_000_000) / pool.ip_reserve as i128
+    }
+
+    /// #1088: IP units a buyer has acquired from a pool.
+    pub fn get_pool_holdings(env: Env, commitment_id: u64, buyer: Address) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PoolHoldings(commitment_id, buyer))
+            .unwrap_or(0)
+    }
+
+    fn load_pool(env: &Env, commitment_id: u64) -> LiquidityPool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::LiquidityPool(commitment_id))
+            .unwrap_or_else(|| {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::PoolNotFound as u32,
+                ))
+            })
+    }
+
+    fn save_pool(env: &Env, pool: &LiquidityPool) {
+        let key = DataKey::LiquidityPool(pool.commitment_id);
+        env.storage().persistent().set(&key, pool);
+        env.storage().persistent().extend_ttl(&key, LEDGER_BUMP, LEDGER_BUMP);
+    }
+
     // ── Rollback ──────────────────────────────────────────────────────────────
 
     /// Buyer-only. Within 24 hours of swap completion, the buyer can call this
@@ -6035,6 +6222,8 @@ mod upgrade_chaos_tests;
 mod escrow_tests;
 #[cfg(test)]
 mod escrow_release_tests;
+#[cfg(test)]
+mod liquidity_pool_tests;
 
 // #781: re-enabled — was blocked by 3 pre-existing, unrelated compile errors
 // (a dropped `commit_ip` arg, and two obsolete `accept_swap_with_quantity`
