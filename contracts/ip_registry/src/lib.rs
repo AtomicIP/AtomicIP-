@@ -5944,6 +5944,15 @@ impl IpRegistry {
         for req in requests.iter() {
             let record = require_ip_exists(&env, req.ip_id);
 
+            // #1101: audit commitment parameter problems. The verdict below is
+            // already false for these, the event records why.
+            if let Err(err) = zk_commitment::validate_commitment_point(&record.commitment_hash) {
+                env.events().publish(
+                    (symbol_short!("param_aud"),),
+                    (req.ip_id, err.audit_code()),
+                );
+            }
+
             // #1100: reuse a cached verdict when this exact proof was checked before.
             let valid =
                 zk_cache::verify_cached(&env, &record.commitment_hash, &req.proof);
