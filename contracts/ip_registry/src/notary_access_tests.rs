@@ -29,8 +29,18 @@ mod notary_access_tests {
         (contract_id, owner)
     }
 
-    /// Sign the legacy notarization message `ip_id || timestamp`.
-    fn sign_for(env: &Env, _contract: &Address, ip_id: u64, timestamp: u64) -> Bytes {
+    /// Sign the current notarization message bound to `contract`.
+    fn sign_for(env: &Env, contract: &Address, ip_id: u64, timestamp: u64) -> Bytes {
+        let msg = crate::notary_signing_message(env, contract, ip_id, timestamp);
+        let mut buf = [0u8; 256];
+        let len = msg.len() as usize;
+        msg.copy_into_slice(&mut buf[..len]);
+        let sig = notary_key().sign(&buf[..len]);
+        Bytes::from_slice(env, &sig.to_bytes())
+    }
+
+    /// Sign the pre-#1149 untagged message `ip_id || timestamp`.
+    fn sign_legacy(env: &Env, ip_id: u64, timestamp: u64) -> Bytes {
         let mut msg = [0u8; 16];
         msg[..8].copy_from_slice(&ip_id.to_be_bytes());
         msg[8..].copy_from_slice(&timestamp.to_be_bytes());
@@ -55,6 +65,50 @@ mod notary_access_tests {
         // A second, valid signature must be refused, not overwrite the first.
         let second = sign_for(&env, &contract_id, ip_id, timestamp);
         client.notarize_ip_timestamp(&ip_id, &second);
+    }
+
+    // ── #1149: domain-separated notary signatures ────────────────────────────
+
+    #[test]
+    fn notarize_with_current_format_succeeds() {
+        let env = Env::default();
+        let (contract_id, owner) = setup(&env);
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[9u8; 32]), &0u32);
+        let timestamp = client.get_ip(&ip_id).timestamp;
+
+        let sig = sign_for(&env, &contract_id, ip_id, timestamp);
+        client.notarize_ip_timestamp(&ip_id, &sig);
+        assert_eq!(client.get_ip_notary_signature(&ip_id), Some(sig));
+    }
+
+    #[test]
+    #[should_panic]
+    fn signature_from_another_deployment_is_rejected() {
+        let env = Env::default();
+        // Two deployments share the same notary key.
+        let (contract_a, owner_a) = setup(&env);
+        let (contract_b, _owner_b) = setup(&env);
+        let client_a = IpRegistryClient::new(&env, &contract_a);
+        let ip_id = client_a.commit_ip(&owner_a, &BytesN::from_array(&env, &[10u8; 32]), &0u32);
+        let timestamp = client_a.get_ip(&ip_id).timestamp;
+
+        // Signed for deployment B, replayed against deployment A.
+        let replayed = sign_for(&env, &contract_b, ip_id, timestamp);
+        client_a.notarize_ip_timestamp(&ip_id, &replayed);
+    }
+
+    #[test]
+    #[should_panic]
+    fn legacy_untagged_signature_is_rejected() {
+        let env = Env::default();
+        let (contract_id, owner) = setup(&env);
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[11u8; 32]), &0u32);
+        let timestamp = client.get_ip(&ip_id).timestamp;
+
+        let legacy = sign_legacy(&env, ip_id, timestamp);
+        client.notarize_ip_timestamp(&ip_id, &legacy);
     }
 
     #[test]

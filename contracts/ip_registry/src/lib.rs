@@ -183,6 +183,33 @@ pub const MAX_METADATA_BYTES: u32 = 1024;
 /// This is a placeholder - should be set during contract initialization
 pub const NOTARY_PUBLIC_KEY: &[u8] = b"notary_public_key_placeholder";
 
+/// Version byte that prefixes every notary signing message (#1149).
+/// The original untagged `ip_id || timestamp` format is no longer accepted.
+pub const NOTARY_MESSAGE_VERSION: u8 = 1;
+
+/// Domain-separation tag for notary signing messages (#1149).
+pub const NOTARY_DOMAIN_TAG: &[u8] = b"AtomicIP/notary";
+
+/// Build the exact bytes a notary signs to notarize `ip_id` at `timestamp`
+/// for the deployment at `contract` (#1149). Layout, all concatenated:
+///
+/// 1. version byte (`NOTARY_MESSAGE_VERSION`, 1 byte)
+/// 2. domain tag (`NOTARY_DOMAIN_TAG`)
+/// 3. network id (32 bytes, `Ledger::network_id`)
+/// 4. contract address (XDR encoding)
+/// 5. `ip_id` (8 bytes, big-endian)
+/// 6. `timestamp` (8 bytes, big-endian)
+pub fn notary_signing_message(env: &Env, contract: &Address, ip_id: u64, timestamp: u64) -> Bytes {
+    let mut message = Bytes::new(env);
+    message.push_back(NOTARY_MESSAGE_VERSION);
+    message.append(&Bytes::from_slice(env, NOTARY_DOMAIN_TAG));
+    message.append(&Bytes::from(env.ledger().network_id()));
+    message.append(&contract.clone().to_xdr(env));
+    message.append(&Bytes::from_array(env, &ip_id.to_be_bytes()));
+    message.append(&Bytes::from_array(env, &timestamp.to_be_bytes()));
+    message
+}
+
 /// Issue #437: Number of storage shards for commitment distribution.
 pub const NUM_SHARDS: u32 = 16;
 
@@ -4021,9 +4048,11 @@ impl IpRegistry {
 
     /// Notarize an IP timestamp with a notary Ed25519 signature.
     ///
-    /// The notary must sign the message `ip_id_be_bytes || timestamp_be_bytes`
-    /// (8 bytes each, big-endian) with the private key corresponding to the
-    /// stored notary public key. The 64-byte signature is verified on-chain.
+    /// The notary must sign the message built by `notary_signing_message` (see
+    /// `docs/notary-signature-format.md`) with the private key corresponding to
+    /// the stored notary public key. The 64-byte signature is verified on-chain.
+    /// The message is bound to this contract's address and network, so a
+    /// signature issued for one deployment is rejected by any other (#1149).
     ///
     /// # Panics
     ///
@@ -4073,10 +4102,12 @@ impl IpRegistry {
             }
         };
 
-        // Message: ip_id (8 bytes BE) || timestamp (8 bytes BE)
-        let mut message = Bytes::new(&env);
-        message.append(&Bytes::from_array(&env, &ip_id.to_be_bytes()));
-        message.append(&Bytes::from_array(&env, &record.timestamp.to_be_bytes()));
+        let message = notary_signing_message(
+            &env,
+            &env.current_contract_address(),
+            ip_id,
+            record.timestamp,
+        );
 
         // Verify Ed25519 signature — panics if invalid
         env.crypto().ed25519_verify(&public_key, &message, &sig);
