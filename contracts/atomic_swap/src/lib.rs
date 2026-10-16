@@ -5611,7 +5611,7 @@ impl AtomicSwap {
     /// Execute a batch while enforcing per-swap prerequisites. Dependencies
     /// included in the batch are ordered first; external dependencies must
     /// already be completed.
-    pub fn execute_batch_swaps_with_dependencies(
+    pub fn execute_batch_with_deps(
         env: Env,
         swap_ids: Vec<u64>,
         atomic: bool,
@@ -5631,7 +5631,7 @@ impl AtomicSwap {
                 let candidate = remaining.get(i).unwrap();
                 let original_index = swap_ids.iter().position(|id| id == candidate).unwrap();
                 let mut ready = true;
-                for dependency in dependencies.get(original_index).unwrap().iter() {
+                for dependency in dependencies.get(original_index as u32).unwrap().iter() {
                     if remaining.iter().any(|id| id == dependency) {
                         ready = false;
                         break;
