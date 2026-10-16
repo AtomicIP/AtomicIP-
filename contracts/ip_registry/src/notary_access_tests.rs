@@ -124,4 +124,39 @@ mod notary_access_tests {
 
         assert_eq!(client.get_ip_notary_signature(&ip_id), Some(first));
     }
+
+    // ── #1150: dedicated error for invalid access levels ─────────────────────
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #61)")]
+    fn grant_level_zero_returns_invalid_access_level() {
+        let env = Env::default();
+        let (contract_id, owner) = setup(&env);
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[12u8; 32]), &0u32);
+        client.grant_ip_access(&ip_id, &Address::generate(&env), &0u32);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #61)")]
+    fn grant_level_above_three_returns_invalid_access_level() {
+        let env = Env::default();
+        let (contract_id, owner) = setup(&env);
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[13u8; 32]), &0u32);
+        client.grant_ip_access(&ip_id, &Address::generate(&env), &4u32);
+    }
+
+    #[test]
+    fn grant_each_valid_level_is_accepted() {
+        let env = Env::default();
+        let (contract_id, owner) = setup(&env);
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[14u8; 32]), &0u32);
+        let grantee = Address::generate(&env);
+        for level in 1u32..=3 {
+            client.grant_ip_access(&ip_id, &grantee, &level);
+            assert!(client.check_ip_access(&ip_id, &grantee, &level));
+        }
+    }
 }

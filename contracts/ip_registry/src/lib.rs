@@ -164,6 +164,8 @@ pub enum ContractError {
     InsuranceDisputeUnresolved = 59,
     /// #1148: The IP already has a notary signature. Notarization is write-once.
     AlreadyNotarized = 60,
+    /// #1150: Access level is outside the accepted range `1..=3`.
+    InvalidAccessLevel = 61,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -3898,14 +3900,15 @@ impl IpRegistry {
     ///
     /// # Panics
     ///
-    /// Panics with `Unauthorized` if `access_level` is 0 or > 3, or if caller is not the owner.
+    /// Panics with `InvalidAccessLevel` if `access_level` is 0 or > 3 (#1150),
+    /// or with `Unauthorized` if caller is not the owner.
     pub fn grant_ip_access(env: Env, ip_id: u64, grantee: Address, access_level: u32) {
         let record = require_ip_exists(&env, ip_id);
         record.owner.require_auth();
 
         if !(1..=3).contains(&access_level) {
             env.panic_with_error(Error::from_contract_error(
-                ContractError::Unauthorized as u32,
+                ContractError::InvalidAccessLevel as u32,
             ));
         }
 
