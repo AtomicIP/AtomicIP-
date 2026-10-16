@@ -125,6 +125,10 @@ pub enum ContractError {
     /// #906: Treasury address validation - rejects zero or placeholder addresses
     InvalidTreasuryAddress = 68,
     BatchDependencyNotMet = 69,
+    /// #1087: Escrow is locked by an open dispute; funds cannot move until it is resolved.
+    EscrowLocked = 70,
+    /// #1087: Partial release amount must be positive and no greater than the remaining balance.
+    InvalidReleaseAmount = 71,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -270,6 +274,10 @@ pub enum DataKey {
     BatchDependencies(u64),
     /// #1086: Ordered contingency clauses attached to a swap.
     SwapContingencies(u64),
+    /// #1087: Maps swap_id → cumulative amount released from escrow to the seller.
+    EscrowReleased(u64),
+    /// #1087: Maps swap_id → bool; `true` while a dispute lock blocks escrow releases.
+    EscrowLocked(u64),
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -1029,11 +1037,14 @@ impl AtomicSwap {
         Self::append_history(&env, swap_id, SwapStatus::Completed);
 
         // Protocol fee deduction
+        // #1087: any partial escrow releases already paid the seller; only the
+        // unreleased balance is still payable through reveal.
+        let payable = Self::escrow_remaining(&env, swap_id);
         let token_client = token::Client::new(&env, &swap.token);
         let config = Self::protocol_config(&env);
         let fee_bps = config.protocol_fee_bps as i128;
-        let fee_amount = if fee_bps > 0 && swap.price > 0 {
-            (swap.price * fee_bps) / 10000
+        let fee_amount = if fee_bps > 0 && payable > 0 {
+            (payable * fee_bps) / 10000
         } else {
             0
         };
@@ -1041,8 +1052,8 @@ impl AtomicSwap {
         // #311: Referral fee deduction (from seller proceeds, only if referrer set)
         let referral_amount = if let Some(ref _referrer) = swap.referrer {
             let rbps = config.referral_fee_bps as i128;
-            if rbps > 0 && swap.price > 0 {
-                (swap.price * rbps) / 10000
+            if rbps > 0 && payable > 0 {
+                (payable * rbps) / 10000
             } else {
                 0
             }
@@ -1050,7 +1061,7 @@ impl AtomicSwap {
             0
         };
 
-        let seller_amount = swap.price - fee_amount - referral_amount;
+        let seller_amount = payable - fee_amount - referral_amount;
         if fee_amount > 0 {
             token_client.transfer(
                 &env.current_contract_address(),
@@ -4957,11 +4968,13 @@ impl AtomicSwap {
             env.panic_with_error(Error::from_contract_error(ContractError::NotExpired as u32));
         }
 
-        let deposit: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::EscrowDeposit(swap_id))
-            .unwrap_or(0);
+        // #1087: funds frozen by an open dispute cannot be withdrawn unilaterally
+        if Self::is_escrow_locked(&env, swap_id) {
+            env.panic_with_error(Error::from_contract_error(ContractError::EscrowLocked as u32));
+        }
+
+        // #1087: refund only what has not already been released to the seller
+        let deposit: i128 = Self::escrow_remaining(&env, swap_id);
 
         swap.status = SwapStatus::Cancelled;
         swap::save_swap(&env, swap_id, &swap);
@@ -4987,6 +5000,222 @@ impl AtomicSwap {
             SwapCancelledEvent {
                 swap_id,
                 canceller: swap.buyer,
+            },
+        );
+    }
+
+    // ── #1087: Buyer-controlled escrow release ────────────────────────────────
+
+    /// #1087: Buyer releases the remaining escrowed balance to the seller.
+    ///
+    /// Only the buyer can call this, on an escrow-mode swap in `Accepted` state.
+    /// Returns `true` when the remaining balance was paid out (the swap becomes
+    /// `Completed` once the full price has been released). Returns `false`
+    /// without moving funds if the escrow is locked by a dispute or nothing
+    /// remains to release.
+    pub fn release_to_seller(env: Env, swap_id: u64) -> bool {
+        let remaining = Self::escrow_remaining(&env, swap_id);
+        Self::release_escrow_to_seller(&env, swap_id, remaining)
+    }
+
+    /// #1087: Buyer releases part of the escrowed balance to the seller.
+    ///
+    /// `amount` must be positive and no greater than the remaining balance.
+    /// Returns `true` if the partial release was paid, `false` if the escrow is
+    /// locked by a dispute. Releasing the final unit completes the swap.
+    pub fn release_partial_to_seller(env: Env, swap_id: u64, amount: i128) -> bool {
+        if amount <= 0 || amount > Self::escrow_remaining(&env, swap_id) {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::InvalidReleaseAmount as u32,
+            ));
+        }
+        Self::release_escrow_to_seller(&env, swap_id, amount)
+    }
+
+    /// #1087: Dispute trigger. The buyer or seller locks an escrow-mode swap in
+    /// `Accepted` state. While locked, buyer releases return `false` and
+    /// `escrow_withdraw` panics until an admin resolves the dispute via
+    /// `resolve_escrow_dispute`. Returns `false` if the escrow was already locked.
+    pub fn lock_escrow(env: Env, swap_id: u64, caller: Address) -> bool {
+        let swap = require_swap_exists(&env, swap_id);
+        caller.require_auth();
+        require_seller_or_buyer(&env, &caller, &swap);
+        Self::require_escrow_mode(&env, swap_id);
+        require_swap_status(&env, &swap, SwapStatus::Accepted, ContractError::NotAccepted);
+
+        if Self::is_escrow_locked(&env, swap_id) {
+            return false;
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::EscrowLocked(swap_id), &true);
+        env.storage().persistent().extend_ttl(
+            &DataKey::EscrowLocked(swap_id),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("esc_lck"),),
+            EscrowLockedEvent { swap_id, caller },
+        );
+        true
+    }
+
+    /// #1087: Admin resolves an escrow dispute.
+    ///
+    /// `release_to_seller = true` is an early release: the unreleased balance is
+    /// paid to the seller and the swap completes. `false` refunds the unreleased
+    /// balance to the buyer and cancels the swap. Returns `false` if the escrow
+    /// is not locked.
+    pub fn resolve_escrow_dispute(
+        env: Env,
+        swap_id: u64,
+        caller: Address,
+        release_to_seller: bool,
+    ) -> bool {
+        caller.require_auth();
+        require_admin(&env, &caller);
+        let mut swap = require_swap_exists(&env, swap_id);
+        Self::require_escrow_mode(&env, swap_id);
+
+        if !Self::is_escrow_locked(&env, swap_id) {
+            return false;
+        }
+        env.storage()
+            .persistent()
+            .remove(&DataKey::EscrowLocked(swap_id));
+
+        let remaining = Self::escrow_remaining(&env, swap_id);
+        if release_to_seller {
+            Self::pay_escrow_to_seller(&env, swap_id, &mut swap, remaining);
+        } else {
+            swap.status = SwapStatus::Cancelled;
+            swap::save_swap(&env, swap_id, &swap);
+            env.storage()
+                .persistent()
+                .remove(&DataKey::ActiveSwap(swap.ip_id));
+            Self::append_history(&env, swap_id, SwapStatus::Cancelled);
+            if remaining > 0 {
+                token::Client::new(&env, &swap.token).transfer(
+                    &env.current_contract_address(),
+                    &swap.buyer,
+                    &remaining,
+                );
+            }
+        }
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("esc_res"),),
+            EscrowDisputeResolvedEvent {
+                swap_id,
+                released_to_seller: release_to_seller,
+                amount: remaining,
+            },
+        );
+        true
+    }
+
+    /// #1087: Amount still held in escrow for `swap_id` (deposit minus releases).
+    pub fn get_escrow_remaining(env: Env, swap_id: u64) -> i128 {
+        Self::escrow_remaining(&env, swap_id)
+    }
+
+    /// #1087: Whether an escrow-mode swap is currently locked by a dispute.
+    pub fn is_escrow_locked_for(env: Env, swap_id: u64) -> bool {
+        Self::is_escrow_locked(&env, swap_id)
+    }
+
+    fn require_escrow_mode(env: &Env, swap_id: u64) {
+        let mode: SwapMode = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SwapMode(swap_id))
+            .unwrap_or(SwapMode::Atomic);
+        if mode != SwapMode::Escrow {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::Unauthorized as u32,
+            ));
+        }
+    }
+
+    fn is_escrow_locked(env: &Env, swap_id: u64) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::EscrowLocked(swap_id))
+            .unwrap_or(false)
+    }
+
+    fn escrow_released(env: &Env, swap_id: u64) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::EscrowReleased(swap_id))
+            .unwrap_or(0)
+    }
+
+    /// Unreleased escrow balance: the deposit (or price, if none recorded) minus
+    /// everything already paid to the seller.
+    fn escrow_remaining(env: &Env, swap_id: u64) -> i128 {
+        let deposit: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EscrowDeposit(swap_id))
+            .unwrap_or(0);
+        (deposit - Self::escrow_released(env, swap_id)).max(0)
+    }
+
+    /// Shared buyer-release path for full and partial releases.
+    fn release_escrow_to_seller(env: &Env, swap_id: u64, amount: i128) -> bool {
+        let mut swap = require_swap_exists(env, swap_id);
+        swap.buyer.require_auth();
+        Self::require_escrow_mode(env, swap_id);
+        require_swap_status(env, &swap, SwapStatus::Accepted, ContractError::NotAccepted);
+
+        if Self::is_escrow_locked(env, swap_id) || amount <= 0 {
+            return false;
+        }
+        Self::pay_escrow_to_seller(env, swap_id, &mut swap, amount);
+        true
+    }
+
+    /// Pays `amount` from escrow to the seller, recording the release. Completes
+    /// the swap when the whole deposit has been released.
+    fn pay_escrow_to_seller(env: &Env, swap_id: u64, swap: &mut SwapRecord, amount: i128) {
+        let total_released = Self::escrow_released(env, swap_id) + amount;
+        env.storage()
+            .persistent()
+            .set(&DataKey::EscrowReleased(swap_id), &total_released);
+        env.storage().persistent().extend_ttl(
+            &DataKey::EscrowReleased(swap_id),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        if amount > 0 {
+            token::Client::new(env, &swap.token).transfer(
+                &env.current_contract_address(),
+                &swap.seller,
+                &amount,
+            );
+        }
+
+        if Self::escrow_remaining(env, swap_id) == 0 {
+            swap.status = SwapStatus::Completed;
+            swap::save_swap(env, swap_id, swap);
+            env.storage()
+                .persistent()
+                .remove(&DataKey::ActiveSwap(swap.ip_id));
+            Self::append_history(env, swap_id, SwapStatus::Completed);
+        }
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("esc_rel"),),
+            EscrowReleasedEvent {
+                swap_id,
+                seller: swap.seller.clone(),
+                amount,
+                total_released,
             },
         );
     }
@@ -5804,6 +6033,8 @@ mod upgrade_chaos_tests;
 // #830: compile errors fixed — re-enabled
 #[cfg(test)]
 mod escrow_tests;
+#[cfg(test)]
+mod escrow_release_tests;
 
 // #781: re-enabled — was blocked by 3 pre-existing, unrelated compile errors
 // (a dropped `commit_ip` arg, and two obsolete `accept_swap_with_quantity`

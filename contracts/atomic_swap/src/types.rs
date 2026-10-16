@@ -712,3 +712,30 @@ pub struct BatchExecutionFailedEvent {
     pub failed_swap_ids: Vec<u64>,
     pub reason: String,
 }
+
+// ── #1087: Buyer Escrow Release Events ────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct EscrowReleasedEvent {
+    pub swap_id: u64,
+    pub seller: Address,
+    pub amount: i128,
+    pub total_released: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct EscrowLockedEvent {
+    pub swap_id: u64,
+    pub caller: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct EscrowDisputeResolvedEvent {
+    pub swap_id: u64,
+    pub released_to_seller: bool,
+    pub amount: i128,
+}
+
