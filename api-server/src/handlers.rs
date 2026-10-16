@@ -51,12 +51,12 @@ const SWAP_EXPIRY_SECONDS: u64 = 604800;
 /// Process-local swap ID counter standing in for the contract's `NextId`
 /// until the handlers are wired to a live Soroban RPC client.
 static NEXT_SWAP_ID: AtomicU64 = AtomicU64::new(0);
-static WATCHLISTS: Lazy<Mutex<HashMap<String, BTreeSet<u64>>>> =
+pub(crate) static WATCHLISTS: Lazy<Mutex<HashMap<String, BTreeSet<u64>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
-static COMMITMENT_INDEX: Lazy<DashMap<u64, IpRecord>> = Lazy::new(DashMap::new);
+pub(crate) static COMMITMENT_INDEX: Lazy<DashMap<u64, IpRecord>> = Lazy::new(DashMap::new);
 
 /// Audit log store for tracking all API access and sensitive operations
-static AUDIT_LOG_STORE: Lazy<Arc<AuditLogStore>> = Lazy::new(|| {
+pub(crate) static AUDIT_LOG_STORE: Lazy<Arc<AuditLogStore>> = Lazy::new(|| {
     let audit_key = std::env::var("AUDIT_HMAC_KEY")
         .unwrap_or_else(|_| "default_audit_key_for_testing".to_string());
     let audit_path = std::env::var("AUDIT_LOG_PATH")
@@ -117,6 +117,13 @@ pub async fn commit_ip(
                 }),
             )
         })?;
+
+    // #1108: feed the successful commit into rapid-fire detection.
+    if let Some(alert) = crate::threat_detection::THREAT_DETECTOR
+        .record_commit(&body.owner, crate::alerting::now_secs())
+    {
+        crate::threat_detection::dispatch(&alert);
+    }
 
     // #983: Check per-user commitment rate limit after successful commit
     let (allowed, _remaining, reset_after) = rate_limiter.check_commitment_rate_limit(&body.owner).await;
@@ -237,6 +244,12 @@ pub async fn transfer_ip(Json(body): Json<TransferIpRequest>) -> Result<StatusCo
 #[instrument(skip(body))]
 pub async fn verify_commitment(Json(body): Json<VerifyCommitmentRequest>) -> Result<Json<VerifyCommitmentResponse>, (StatusCode, Json<ErrorResponse>)> {
     // TODO: Call Soroban RPC to invoke ip_registry.verify_commitment
+    // #1108: this path currently always fails, so each attempt counts as a failed verification.
+    if let Some(alert) = crate::threat_detection::THREAT_DETECTOR
+        .record_verification(body.ip_id, false, crate::alerting::now_secs())
+    {
+        crate::threat_detection::dispatch(&alert);
+    }
     Err((
         StatusCode::NOT_FOUND,
         Json(ErrorResponse {
@@ -482,7 +495,7 @@ pub async fn batch_reveal_commitments(
         output
     }
 
-    let results = body
+    let results: Vec<BatchRevealResult> = body
         .commitments
         .into_iter()
         .map(|item| {
@@ -515,6 +528,16 @@ pub async fn batch_reveal_commitments(
             BatchRevealResult { ip_id, valid, error }
         })
         .collect();
+
+    // #1108: each reveal outcome feeds the verification-chain detector.
+    let now = crate::alerting::now_secs();
+    for result in &results {
+        if let Some(alert) = crate::threat_detection::THREAT_DETECTOR
+            .record_verification(result.ip_id, result.valid, now)
+        {
+            crate::threat_detection::dispatch(&alert);
+        }
+    }
 
     Ok(Json(BatchRevealCommitmentsResponse { results }))
 }
@@ -1574,7 +1597,7 @@ pub async fn execute_batch_swaps(
 
 // ── #984: Two-Factor Authentication ────────────────────────────────────────
 
-static TWO_FACTOR_STORE: once_cell::sync::Lazy<crate::auth_2fa::TwoFactorStore> =
+pub(crate) static TWO_FACTOR_STORE: once_cell::sync::Lazy<crate::auth_2fa::TwoFactorStore> =
     once_cell::sync::Lazy::new(crate::auth_2fa::TwoFactorStore::new);
 
 /// #984: Enable 2FA for a user
@@ -1798,7 +1821,7 @@ pub async fn use_backup_code(
 
 // ── #985: Session Management ───────────────────────────────────────────────
 
-static SESSION_STORE: once_cell::sync::Lazy<crate::session::SessionStore> =
+pub(crate) static SESSION_STORE: once_cell::sync::Lazy<crate::session::SessionStore> =
     once_cell::sync::Lazy::new(|| crate::session::SessionStore::new(crate::session::SessionConfig::default()));
 
 /// #985: Check current session status

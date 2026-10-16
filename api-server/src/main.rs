@@ -76,6 +76,8 @@ mod request_queue;
 mod rate_limit;
 mod validation;
 mod validation_middleware;
+mod user_data;
+mod threat_detection;
 #[cfg(test)]
 mod validation_fuzz_tests;
 #[cfg(test)]
@@ -293,6 +295,7 @@ async fn main() {
         .route("/swap/{swap_id}/reveal",          post(handlers::reveal_key))
         .route("/swap/{swap_id}/cancel",          post(handlers::cancel_swap))
         .route("/swap/{swap_id}/cancel-expired",  post(handlers::cancel_expired_swap))
+        .route("/users/{user_id}",                axum::routing::delete(user_data::delete_user_handler))
         .route_layer(middleware::from_fn(request_signing::verify_request_signature));
 
     let app = Router::new()

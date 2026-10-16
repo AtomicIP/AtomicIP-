@@ -214,6 +214,20 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Remove every session belonging to `user_id` (#1107). Returns the count removed.
+    pub fn remove_user_sessions(&self, user_id: &str) -> Result<usize, String> {
+        let mut store = self.sessions.lock().map_err(|e| e.to_string())?;
+        let before = store.len();
+        store.retain(|_, session| session.user_id != user_id);
+        Ok(before - store.len())
+    }
+
+    /// Count sessions still held for `user_id`.
+    pub fn count_user_sessions(&self, user_id: &str) -> Result<usize, String> {
+        let store = self.sessions.lock().map_err(|e| e.to_string())?;
+        Ok(store.values().filter(|session| session.user_id == user_id).count())
+    }
+
     /// Clean up expired sessions
     pub fn cleanup_expired_sessions(&self) -> Result<usize, String> {
         let mut store = self.sessions.lock().map_err(|e| e.to_string())?;

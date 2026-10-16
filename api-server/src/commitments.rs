@@ -24,6 +24,11 @@ pub fn set_tags(ip_id: u64, tags: Vec<String>) -> Result<Vec<String>, String> {
     Ok(normalized)
 }
 
+/// Drop all tags for `ip_id` (#1107 cascade). Returns whether any existed.
+pub fn remove_tags(ip_id: u64) -> bool {
+    TAGS.remove(&ip_id).is_some()
+}
+
 pub fn get_tags(ip_id: u64) -> Vec<String> {
     TAGS.get(&ip_id).map(|tags| tags.clone()).unwrap_or_default()
 }
