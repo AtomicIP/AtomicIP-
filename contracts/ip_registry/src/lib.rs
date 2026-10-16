@@ -22,6 +22,9 @@ mod zk_commitment;
 /// #1100: verification-result cache for hiding proofs.
 mod zk_cache;
 
+/// #1102: commitment randomness verification and weak-entropy alerts.
+mod commitment_randomness;
+
 /// Issue #973: Commitment metadata storage and search.
 mod metadata;
 
@@ -5950,6 +5953,18 @@ impl IpRegistry {
                 env.events().publish(
                     (symbol_short!("param_aud"),),
                     (req.ip_id, err.audit_code()),
+                );
+            }
+
+            // #1102: alert on commitments showing weak-randomness signatures.
+            // The commitment is still verified; the alert is advisory.
+            let assessment =
+                commitment_randomness::assess(&record.commitment_hash.to_array());
+            if assessment.is_suspicious() {
+                let code = assessment.pattern.map_or(0, |p| p.alert_code());
+                env.events().publish(
+                    (Symbol::new(&env, "rand_alert"),),
+                    (req.ip_id, code, assessment.distinct_bytes),
                 );
             }
 
