@@ -53,6 +53,9 @@ mod commitment_sybil_resistance_tests;
 #[cfg(test)]
 mod validator_network_tests;
 
+#[cfg(test)]
+mod notary_access_tests;
+
 // ── Error Codes ────────────────────────────────────────────────────────────
 
 #[contracterror]
@@ -159,6 +162,8 @@ pub enum ContractError {
     InsuranceDisputeMismatch = 58,
     /// #1073: Dispute must be resolved before the claim can be verified.
     InsuranceDisputeUnresolved = 59,
+    /// #1148: The IP already has a notary signature. Notarization is write-once.
+    AlreadyNotarized = 60,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -4022,13 +4027,25 @@ impl IpRegistry {
     ///
     /// # Panics
     ///
+    /// Notarization is write-once: a second call for the same IP is rejected
+    /// rather than silently replacing the first signature (#1148).
+    ///
+    /// # Panics
+    ///
     /// Panics if:
     /// * The IP does not exist (IpNotFound error)
+    /// * The IP is already notarized (AlreadyNotarized error)
     /// * The notary public key has not been set (Unauthorized error)
     /// * The signature is not exactly 64 bytes (Unauthorized error)
     /// * The Ed25519 signature verification fails (Unauthorized error)
     pub fn notarize_ip_timestamp(env: Env, ip_id: u64, notary_signature: Bytes) {
         let mut record = require_ip_exists(&env, ip_id);
+
+        if record.notary_signature.is_some() {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::AlreadyNotarized as u32,
+            ));
+        }
 
         // Require notary public key to be configured
         let public_key: BytesN<32> = match env.storage().persistent().get(&DataKey::NotaryPublicKey)
