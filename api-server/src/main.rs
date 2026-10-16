@@ -47,6 +47,7 @@ mod batch;
 mod cache;
 mod commitments;
 mod portfolio;
+mod valuation;
 mod analytics;
 mod circuit_breaker;
 mod commitment_monitoring;
@@ -491,6 +492,8 @@ fn build_app() -> Router {
         .route("/v1/swaps/execute-batch", post(handlers::execute_batch_swaps))
         .route("/v1/portfolio/{owner}", get(portfolio::get_portfolio))
         .route("/v1/portfolio/{owner}/holdings", post(portfolio::put_holdings))
+        .route("/v1/valuation/sales", post(valuation::post_sale))
+        .route("/v1/valuation/{commitment_id}", get(valuation::get_valuation))
         .route("/auth/2fa/enable", post(handlers::enable_2fa))
         .route("/auth/2fa/verify", post(handlers::verify_2fa))
         .route("/auth/2fa/backup-code", post(handlers::use_backup_code))
