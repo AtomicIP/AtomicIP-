@@ -51,12 +51,12 @@ const SWAP_EXPIRY_SECONDS: u64 = 604800;
 /// Process-local swap ID counter standing in for the contract's `NextId`
 /// until the handlers are wired to a live Soroban RPC client.
 static NEXT_SWAP_ID: AtomicU64 = AtomicU64::new(0);
-static WATCHLISTS: Lazy<Mutex<HashMap<String, BTreeSet<u64>>>> =
+pub(crate) static WATCHLISTS: Lazy<Mutex<HashMap<String, BTreeSet<u64>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
-static COMMITMENT_INDEX: Lazy<DashMap<u64, IpRecord>> = Lazy::new(DashMap::new);
+pub(crate) static COMMITMENT_INDEX: Lazy<DashMap<u64, IpRecord>> = Lazy::new(DashMap::new);
 
 /// Audit log store for tracking all API access and sensitive operations
-static AUDIT_LOG_STORE: Lazy<Arc<AuditLogStore>> = Lazy::new(|| {
+pub(crate) static AUDIT_LOG_STORE: Lazy<Arc<AuditLogStore>> = Lazy::new(|| {
     let audit_key = std::env::var("AUDIT_HMAC_KEY")
         .unwrap_or_else(|_| "default_audit_key_for_testing".to_string());
     let audit_path = std::env::var("AUDIT_LOG_PATH")
@@ -482,7 +482,7 @@ pub async fn batch_reveal_commitments(
         output
     }
 
-    let results = body
+    let results: Vec<BatchRevealResult> = body
         .commitments
         .into_iter()
         .map(|item| {
@@ -1574,7 +1574,7 @@ pub async fn execute_batch_swaps(
 
 // ── #984: Two-Factor Authentication ────────────────────────────────────────
 
-static TWO_FACTOR_STORE: once_cell::sync::Lazy<crate::auth_2fa::TwoFactorStore> =
+pub(crate) static TWO_FACTOR_STORE: once_cell::sync::Lazy<crate::auth_2fa::TwoFactorStore> =
     once_cell::sync::Lazy::new(crate::auth_2fa::TwoFactorStore::new);
 
 /// #984: Enable 2FA for a user
@@ -1798,7 +1798,7 @@ pub async fn use_backup_code(
 
 // ── #985: Session Management ───────────────────────────────────────────────
 
-static SESSION_STORE: once_cell::sync::Lazy<crate::session::SessionStore> =
+pub(crate) static SESSION_STORE: once_cell::sync::Lazy<crate::session::SessionStore> =
     once_cell::sync::Lazy::new(|| crate::session::SessionStore::new(crate::session::SessionConfig::default()));
 
 /// #985: Check current session status
