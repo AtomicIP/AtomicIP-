@@ -55,6 +55,9 @@ mod upgrade_timelock_tests;
 mod notary_key_rotation_tests;
 
 #[cfg(test)]
+mod admin_handover_tests;
+
+#[cfg(test)]
 mod commitment_property_tests;
 
 // Temporarily disabled: calls contract methods that are not implemented yet.
@@ -183,6 +186,8 @@ pub enum ContractError {
     ChallengeAlreadyAnswered = 63,
     /// #1152: Timelocked upgrade was executed without a matching proposal.
     UpgradeNotProposed = 64,
+    /// #1154: `accept_admin` was called with no nominated admin.
+    NoPendingAdmin = 65,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -343,6 +348,8 @@ pub enum DataKey {
     CurrentWasmHash,
     /// #1153: Ordered Vec<NotaryKeyRecord> of every notary key rotation
     NotaryKeyHistory,
+    /// #1154: Address nominated by `propose_admin`, awaiting `accept_admin`
+    PendingAdmin,
     // Issue #979: Commitment linking for related IPs
     CommitmentLinks(u64), // maps ip_id -> Vec<CommitmentLink> of linked commitments
     LinkedCommitments(u64), // maps linked_ip_id -> Vec<u64> of ip_ids linking to it (reverse index)
@@ -428,11 +435,12 @@ const CURRENT_FUNCTIONS: &[&str] = &[
     "remove_co_owner", "renew_ip", "renew_ip_commitment", "require_threshold_signatures",
     "resolve_dispute", "respond_to_ownership_challenge", "reveal_and_verify_commitments", "reveal_partial",
     "revoke_delegation", "revoke_ip", "revoke_ip_access", "revoke_license",
-    "rotate_commitment_key", "set_admin", "set_batch_metadata", "set_commitment_compression",
+    "rotate_commitment_key", "set_batch_metadata", "set_commitment_compression",
     "set_ip_expiry", "set_ip_suggested_price", "set_notary_public_key", "slash_stake",
     "stake_commitment", "submit_dispute_evidence", "transfer_ip", "transfer_ip_ownership",
     "unstake", "update_reputation", "upgrade", "validate_category",
     "cancel_upgrade", "propose_upgrade", "set_upgrade_timelock",
+    "propose_admin", "accept_admin", "cancel_admin_proposal", "get_pending_admin",
     "validate_upgrade", "verify_batch_proof", "verify_commitment", "verify_commitment_integrity",
     "verify_commitment_pow", "verify_ip_merkle_proof", "verify_ownership_challenge", "verify_threshold_signatures",
     "vote_on_dispute",
@@ -443,7 +451,7 @@ const CURRENT_FUNCTIONS: &[&str] = &[
 /// `validate_upgrade`.
 const CURRENT_STORAGE_KEYS: &[&str] = &[
     "IpRecord", "OwnerIps", "NextId", "CommitmentOwner", "AnonymousOwner", "UsedBlindedOwner",
-    "UpgradeTimelockLedgers", "PendingUpgrade", "CurrentWasmHash", "NotaryKeyHistory",
+    "UpgradeTimelockLedgers", "PendingUpgrade", "CurrentWasmHash", "NotaryKeyHistory", "PendingAdmin",
     "Admin", "PartialDisclosure", "IpLicenses", "CategoryIps", "PowDifficulty", "IpVersions",
     "SuggestedPrice", "IpCommitmentChecksum", "IpAccessGrants", "NotarySignature", "IpVersionChain",
     "OwnershipChallenge", "NextChallengeId", "EncryptionKeyRotation", "NotaryPublicKey",
@@ -1011,20 +1019,94 @@ impl IpRegistry {
             .extend_ttl(&DataKey::Admin, LEDGER_BUMP, LEDGER_BUMP);
     }
 
-    /// Rotate the admin address. Only the current admin may do this.
+    /// #1154: Step 1 of an admin handover. The current admin nominates
+    /// `new_admin`. Admin rights do not move until `new_admin` calls
+    /// `accept_admin`. Proposing again replaces the earlier nomination.
+    ///
+    /// Emits `adm_prop` with the nominee.
     ///
     /// # Panics
     ///
     /// Panics if the contract has not been initialized or the caller is not
     /// the current admin.
-    pub fn set_admin(env: Env, new_admin: Address) {
+    pub fn propose_admin(env: Env, new_admin: Address) {
         let admin = Self::require_admin(&env);
         admin.require_auth();
 
-        env.storage().persistent().set(&DataKey::Admin, &new_admin);
+        env.storage()
+            .persistent()
+            .set(&DataKey::PendingAdmin, &new_admin);
+        env.storage().persistent().extend_ttl(
+            &DataKey::PendingAdmin,
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        env.events()
+            .publish((symbol_short!("adm_prop"),), new_admin);
+    }
+
+    /// #1154: Step 2 of an admin handover. The pending admin must authorize
+    /// this call, which proves the nominee controls the address before the
+    /// admin rights move.
+    ///
+    /// Emits `adm_acc` with the old and new admin.
+    ///
+    /// # Panics
+    ///
+    /// * `NoPendingAdmin` if there is no nomination.
+    /// * The nominee's auth is required; a call without it fails auth.
+    pub fn accept_admin(env: Env) {
+        let pending: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingAdmin)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NoPendingAdmin));
+        pending.require_auth();
+
+        let old_admin = Self::require_admin(&env);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Admin, &pending);
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::Admin, LEDGER_BUMP, LEDGER_BUMP);
+        env.storage().persistent().remove(&DataKey::PendingAdmin);
+
+        env.events()
+            .publish((symbol_short!("adm_acc"),), (old_admin, pending));
+    }
+
+    /// #1154: The current admin withdraws a pending nomination. Does nothing
+    /// if there is no nomination.
+    ///
+    /// Emits `adm_cncl` with the withdrawn nominee when one existed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the contract has not been initialized or the caller is not
+    /// the current admin.
+    pub fn cancel_admin_proposal(env: Env) {
+        let admin = Self::require_admin(&env);
+        admin.require_auth();
+
+        let pending: Option<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingAdmin);
+        if let Some(nominee) = pending {
+            env.storage().persistent().remove(&DataKey::PendingAdmin);
+            env.events()
+                .publish((symbol_short!("adm_cncl"),), nominee);
+        }
+    }
+
+    /// #1154: The nominated admin awaiting `accept_admin`, if any.
+    pub fn get_pending_admin(env: Env) -> Option<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PendingAdmin)
     }
 
     /// Fetch the stored admin address, panicking if the contract has not been
@@ -8321,24 +8403,6 @@ mod tests {
         env.mock_all_auths();
         client.initialize(&admin);
         client.initialize(&attacker);
-    }
-
-    /// Issue #790: `set_admin` lets the current admin rotate to a new admin,
-    /// after which only the new admin can call admin-gated functions.
-    #[test]
-    fn test_set_admin_rotates_admin() {
-        let env = Env::default();
-        let contract_id = env.register(IpRegistry, ());
-        let client = IpRegistryClient::new(&env, &contract_id);
-
-        let admin = Address::generate(&env);
-        let new_admin = Address::generate(&env);
-        let arbitrator = Address::generate(&env);
-
-        env.mock_all_auths();
-        client.initialize(&admin);
-        client.set_admin(&new_admin);
-        client.nominate_arbitrator(&arbitrator);
     }
 
     /// Bug Condition Exploration Test — Property 1
