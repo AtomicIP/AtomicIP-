@@ -49,6 +49,9 @@ mod invariant_tests;
 mod upgrade_tests;
 
 #[cfg(test)]
+mod upgrade_timelock_tests;
+
+#[cfg(test)]
 mod commitment_property_tests;
 
 // Temporarily disabled: calls contract methods that are not implemented yet.
@@ -175,6 +178,8 @@ pub enum ContractError {
     ChallengeExpired = 62,
     /// #811: Ownership challenge already has a response.
     ChallengeAlreadyAnswered = 63,
+    /// #1152: Timelocked upgrade was executed without a matching proposal.
+    UpgradeNotProposed = 64,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -327,6 +332,12 @@ pub enum DataKey {
     AmendmentHistory(u64),
     /// #977: Privacy level for each commitment
     CommitmentPrivacy(u64),
+    /// #1152: Number of ledgers an upgrade must wait after being proposed (0 = off)
+    UpgradeTimelockLedgers,
+    /// #1152: The single pending upgrade proposal
+    PendingUpgrade,
+    /// #1152: WASM hash installed by the most recent `upgrade` call
+    CurrentWasmHash,
     // Issue #979: Commitment linking for related IPs
     CommitmentLinks(u64), // maps ip_id -> Vec<CommitmentLink> of linked commitments
     LinkedCommitments(u64), // maps linked_ip_id -> Vec<u64> of ip_ids linking to it (reverse index)
@@ -375,6 +386,17 @@ pub struct UpgradeManifest {
     pub error_codes: Vec<ManifestErrorCode>,
 }
 
+/// #1152: A proposed WASM upgrade waiting for its timelock to expire.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingUpgrade {
+    pub wasm_hash: BytesN<32>,
+    /// Ledger sequence at which `propose_upgrade` was called.
+    pub proposed_ledger: u32,
+    /// First ledger sequence at which `upgrade` may execute this hash.
+    pub executable_ledger: u32,
+}
+
 /// Names of every function exported by the currently deployed contract.
 /// Used as the compatibility baseline in `validate_upgrade`.
 const CURRENT_FUNCTIONS: &[&str] = &[
@@ -389,6 +411,7 @@ const CURRENT_FUNCTIONS: &[&str] = &[
     "get_compressed_bytes", "get_compressed_commitment", "get_dispute", "get_encrypted_commitment",
     "get_commitment_back_references", "get_ip", "get_ip_access_grants", "get_ip_audit_trail", "get_ip_lineage",
     "get_ip_notary_signature", "get_ip_strength", "get_ip_suggested_price", "get_ip_version_chain",
+    "get_pending_upgrade", "get_upgrade_timelock",
     "get_linked_commitments",
     "get_ip_versions", "get_key_rotation_history", "get_licenses", "get_ownership_challenge",
     "get_partial_disclosure", "get_pow_difficulty", "get_renewal_count", "get_reputation",
@@ -404,6 +427,7 @@ const CURRENT_FUNCTIONS: &[&str] = &[
     "set_ip_expiry", "set_ip_suggested_price", "set_notary_public_key", "slash_stake",
     "stake_commitment", "submit_dispute_evidence", "transfer_ip", "transfer_ip_ownership",
     "unstake", "update_reputation", "upgrade", "validate_category",
+    "cancel_upgrade", "propose_upgrade", "set_upgrade_timelock",
     "validate_upgrade", "verify_batch_proof", "verify_commitment", "verify_commitment_integrity",
     "verify_commitment_pow", "verify_ip_merkle_proof", "verify_ownership_challenge", "verify_threshold_signatures",
     "vote_on_dispute",
@@ -414,6 +438,7 @@ const CURRENT_FUNCTIONS: &[&str] = &[
 /// `validate_upgrade`.
 const CURRENT_STORAGE_KEYS: &[&str] = &[
     "IpRecord", "OwnerIps", "NextId", "CommitmentOwner", "AnonymousOwner", "UsedBlindedOwner",
+    "UpgradeTimelockLedgers", "PendingUpgrade", "CurrentWasmHash",
     "Admin", "PartialDisclosure", "IpLicenses", "CategoryIps", "PowDifficulty", "IpVersions",
     "SuggestedPrice", "IpCommitmentChecksum", "IpAccessGrants", "NotarySignature", "IpVersionChain",
     "OwnershipChallenge", "NextChallengeId", "EncryptionKeyRotation", "NotaryPublicKey",
@@ -2376,11 +2401,25 @@ impl IpRegistry {
         false
     }
 
-    /// Admin-only contract upgrade.
+    /// Admin-only contract upgrade (#1152).
+    ///
+    /// When the upgrade timelock is `0` (the default) the WASM is replaced
+    /// immediately. When it is non-zero, the upgrade must first be proposed
+    /// with `propose_upgrade`, and it can only execute once the proposal's
+    /// `executable_ledger` has been reached. The proposal is consumed on
+    /// success.
+    ///
+    /// Emits an `upgraded` event with the previous and new WASM hashes. The
+    /// previous hash is `None` until this contract has recorded at least one
+    /// upgrade, because a contract cannot read its own deployed WASM hash.
     ///
     /// # Panics
     ///
-    /// Panics if caller is not admin or admin not initialized.
+    /// * `UnauthorizedUpgrade` if the admin is not initialized.
+    /// * `UpgradeNotProposed` if the timelock is enabled and no matching
+    ///   proposal exists.
+    /// * `TimeLockNotExpired` if the timelock is enabled and the proposal has
+    ///   not matured yet.
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
         let admin_opt: Option<Address> = env.storage().persistent().get(&DataKey::Admin);
         if admin_opt.is_none() {
@@ -2391,7 +2430,145 @@ impl IpRegistry {
         let admin = admin_opt.unwrap();
         admin.require_auth();
 
-        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        if Self::upgrade_timelock_ledgers(&env) > 0 {
+            let pending: Option<PendingUpgrade> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::PendingUpgrade);
+            match pending {
+                Some(p) if p.wasm_hash == new_wasm_hash => {
+                    if env.ledger().sequence() < p.executable_ledger {
+                        env.panic_with_error(Error::from_contract_error(
+                            ContractError::TimeLockNotExpired as u32,
+                        ));
+                    }
+                }
+                _ => env.panic_with_error(Error::from_contract_error(
+                    ContractError::UpgradeNotProposed as u32,
+                )),
+            }
+            env.storage().persistent().remove(&DataKey::PendingUpgrade);
+        }
+
+        let old_hash: Option<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CurrentWasmHash);
+
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::CurrentWasmHash, &new_wasm_hash);
+        env.storage().persistent().extend_ttl(
+            &DataKey::CurrentWasmHash,
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        env.events().publish(
+            (symbol_short!("upgraded"),),
+            (old_hash, new_wasm_hash),
+        );
+    }
+
+    /// Admin: set how many ledgers an upgrade must wait after it is proposed.
+    /// `0` disables the timelock.
+    ///
+    /// # Panics
+    ///
+    /// Panics with `Unauthorized` if the caller is not the admin.
+    pub fn set_upgrade_timelock(env: Env, delay_ledgers: u32) {
+        let admin = Self::require_admin(&env);
+        admin.require_auth();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::UpgradeTimelockLedgers, &delay_ledgers);
+        env.storage().persistent().extend_ttl(
+            &DataKey::UpgradeTimelockLedgers,
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+    }
+
+    /// Current upgrade timelock in ledgers (`0` = disabled).
+    pub fn get_upgrade_timelock(env: Env) -> u32 {
+        Self::upgrade_timelock_ledgers(&env)
+    }
+
+    /// Admin: propose a WASM upgrade. Replaces any existing pending proposal.
+    ///
+    /// Returns the ledger sequence at which `upgrade` may execute this hash.
+    /// Emits `upg_prop` with the hash and the executable ledger.
+    ///
+    /// # Panics
+    ///
+    /// Panics with `Unauthorized` if the caller is not the admin.
+    pub fn propose_upgrade(env: Env, new_wasm_hash: BytesN<32>) -> u32 {
+        let admin = Self::require_admin(&env);
+        admin.require_auth();
+
+        let now = env.ledger().sequence();
+        let executable_ledger = now.saturating_add(Self::upgrade_timelock_ledgers(&env));
+        let proposal = PendingUpgrade {
+            wasm_hash: new_wasm_hash.clone(),
+            proposed_ledger: now,
+            executable_ledger,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::PendingUpgrade, &proposal);
+        env.storage().persistent().extend_ttl(
+            &DataKey::PendingUpgrade,
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        env.events().publish(
+            (symbol_short!("upg_prop"),),
+            (new_wasm_hash, executable_ledger),
+        );
+
+        executable_ledger
+    }
+
+    /// Admin: cancel the pending upgrade proposal, if any.
+    ///
+    /// Emits `upg_cncl` with the cancelled hash when a proposal existed.
+    ///
+    /// # Panics
+    ///
+    /// Panics with `Unauthorized` if the caller is not the admin.
+    pub fn cancel_upgrade(env: Env) {
+        let admin = Self::require_admin(&env);
+        admin.require_auth();
+
+        let pending: Option<PendingUpgrade> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingUpgrade);
+        if let Some(p) = pending {
+            env.storage().persistent().remove(&DataKey::PendingUpgrade);
+            env.events()
+                .publish((symbol_short!("upg_cncl"),), p.wasm_hash);
+        }
+    }
+
+    /// The pending upgrade proposal, or `None` if there is none.
+    pub fn get_pending_upgrade(env: Env) -> Option<PendingUpgrade> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PendingUpgrade)
+    }
+
+    fn upgrade_timelock_ledgers(env: &Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::UpgradeTimelockLedgers)
+            .unwrap_or(0)
     }
 
     /// Retrieve an IP record by ID.
