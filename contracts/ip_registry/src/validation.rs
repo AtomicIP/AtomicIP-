@@ -259,6 +259,8 @@ mod tests {
             notary_signature: None,
             expiry_timestamp: 0,
             grace_period_seconds: 0,
+            unlock_time: 0,
+            privacy_level: 0,
         };
         // Should not panic
         require_not_revoked(&env, &record);
@@ -280,6 +282,8 @@ mod tests {
             notary_signature: None,
             expiry_timestamp: 0,
             grace_period_seconds: 0,
+            unlock_time: 0,
+            privacy_level: 0,
         };
         require_not_revoked(&env, &record);
     }
@@ -299,6 +303,8 @@ mod tests {
             notary_signature: None,
             expiry_timestamp: 0,
             grace_period_seconds: 0,
+            unlock_time: 0,
+            privacy_level: 0,
         };
         // Should not panic
         require_owner(&env, &owner, &record);
@@ -322,6 +328,8 @@ mod tests {
             notary_signature: None,
             expiry_timestamp: 0,
             grace_period_seconds: 0,
+            unlock_time: 0,
+            privacy_level: 0,
         };
         require_owner(&env, &not_owner, &record);
     }

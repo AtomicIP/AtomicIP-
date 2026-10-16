@@ -171,6 +171,16 @@ fn verify_commitment(
 }
 ```
 
+### On-chain behavior of `verify_commitment`
+
+The on-chain `verify_commitment` is stricter than the hash comparison above. It returns
+`false` without comparing hashes when the IP is no longer valid for verification:
+
+- **Revoked IPs (#1144).** If the IP record has `revoked = true`, verification returns `false`
+  even when the secret and blinding factor are correct. Revocation is terminal, so downstream
+  swap logic cannot accept a revoked commitment.
+- **Archived commitments.** If the commitment has been archived, verification returns `false`.
+
 ## Commitment Strength Scoring
 
 Every IP commitment is assigned a **strength score** (0–100) that reflects the entropy and complexity of the commitment hash. Weak commitments (e.g. all-same-byte hashes or zero PoW) score low; strong, high-entropy commitments with meaningful PoW score near 100.

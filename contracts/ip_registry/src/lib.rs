@@ -51,6 +51,9 @@ mod commitment_property_tests;
 mod commitment_sybil_resistance_tests;
 
 #[cfg(test)]
+mod lifecycle_tests;
+
+#[cfg(test)]
 mod validator_network_tests;
 
 // ── Error Codes ────────────────────────────────────────────────────────────
@@ -2675,6 +2678,9 @@ impl IpRegistry {
         blinding_factor: BytesN<32>,
     ) -> bool {
         let record = require_ip_exists(&env, ip_id);
+        if record.revoked {
+            return false;
+        }
         if env
             .storage()
             .persistent()
