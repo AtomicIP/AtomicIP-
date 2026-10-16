@@ -19,7 +19,7 @@ use axum::{
     Json,
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -99,6 +99,13 @@ pub struct RateLimitConfig {
     /// [`RateLimitBackend::InProcess`]; set to [`RateLimitBackend::Redis`]
     /// for correct enforcement across multiple replicas.
     pub backend: RateLimitBackend,
+    /// #1103: Per-IP quota applied only to verification requests
+    /// (see [`VERIFICATION_PATHS`]), on top of the general per-IP quota.
+    pub verification_per_ip: BucketQuota,
+    /// #1103: Trusted verifiers, identified by client IP or by user id / API
+    /// key. Listed verifiers bypass the verification-specific quota. The
+    /// global and general per-IP quotas still apply as a DoS backstop.
+    pub trusted_verifiers: HashSet<String>,
 }
 
 impl Default for RateLimitConfig {
@@ -116,8 +123,19 @@ impl Default for RateLimitConfig {
             max_tracked_users: 100_000,
             idle_ttl: Duration::from_secs(15 * 60),
             backend: RateLimitBackend::InProcess,
+            verification_per_ip: BucketQuota::new(100, 20),
+            trusted_verifiers: HashSet::new(),
         }
     }
+}
+
+/// #1103: Request paths treated as verification requests for the
+/// verification-specific per-IP quota.
+pub const VERIFICATION_PATHS: &[&str] = &["/ip/verify", "/v1/ip/verify"];
+
+/// #1103: Whether a request path is a verification request.
+pub fn is_verification_path(path: &str) -> bool {
+    VERIFICATION_PATHS.contains(&path)
 }
 
 impl RateLimitConfig {
@@ -388,6 +406,8 @@ struct LocalState {
     cardinality_users: HashMap<String, Instant>,
     violations: HashMap<String, Violation>,
     user_tiers: HashMap<String, RateLimitTier>,
+    /// #1103: Denied requests per limiting scope, for violation tracking.
+    violations_by_scope: HashMap<&'static str, u64>,
     checks: u64,
 }
 
@@ -483,7 +503,41 @@ impl RateLimitMiddleware {
         (allowed, remaining, reset_after)
     }
 
+    /// #1103: Read-only access to denied-request counts per limiting scope.
+    pub fn violations_by_scope(&self) -> HashMap<&'static str, u64> {
+        self.local.lock().unwrap().violations_by_scope.clone()
+    }
+
+    /// #1103: Trusted verifiers match by client IP or by user id / API key.
+    fn is_trusted_verifier(&self, ip: &str, user: Option<&str>) -> bool {
+        self.config.trusted_verifiers.contains(ip)
+            || user.is_some_and(|u| self.config.trusted_verifiers.contains(u))
+    }
+
+    fn record_denial(&self, scope: &'static str) {
+        *self
+            .local
+            .lock()
+            .unwrap()
+            .violations_by_scope
+            .entry(scope)
+            .or_default() += 1;
+    }
+
     async fn check(&self, ip: &str, user: Option<&str>, now: Instant) -> Decision {
+        self.check_request(ip, user, false, now).await
+    }
+
+    /// Check one request. `verification` marks requests to a verification
+    /// endpoint, which additionally consume the verification per-IP quota
+    /// unless the caller is a trusted verifier.
+    async fn check_request(
+        &self,
+        ip: &str,
+        user: Option<&str>,
+        verification: bool,
+        now: Instant,
+    ) -> Decision {
         let (tier, violation_key, bucket_keys, early_denial) = {
             let mut local = self.local.lock().unwrap();
             local.checks += 1;
@@ -578,11 +632,19 @@ impl RateLimitMiddleware {
             if let Some(ref key) = user_key {
                 bucket_keys.push((format!("user:{key}"), user_quota, "user"));
             }
+            if verification && !self.is_trusted_verifier(ip, user) {
+                bucket_keys.push((
+                    format!("verify:ip:{ip_key}"),
+                    self.config.verification_per_ip,
+                    "verify",
+                ));
+            }
 
             (tier, violation_key, bucket_keys, early_denial)
         };
 
         if let Some(decision) = early_denial {
+            self.record_denial(decision.scope);
             return decision;
         }
 
@@ -623,6 +685,7 @@ impl RateLimitMiddleware {
                 .expect("store reported denial without an exhausted bucket");
 
             let mut local = self.local.lock().unwrap();
+            *local.violations_by_scope.entry(failed_scope).or_default() += 1;
             let violation = local.violations.entry(violation_key).or_default();
             violation.count = violation.count.saturating_add(1).min(31);
             violation.last_seen = Some(now);
@@ -735,7 +798,10 @@ pub async fn rate_limit_middleware(
                 .and_then(|v| v.to_str().ok())
                 .filter(|key| key.len() <= 256)
         });
-    let decision = limiter.check(&ip, user, Instant::now()).await;
+    let verification = is_verification_path(req.uri().path());
+    let decision = limiter
+        .check_request(&ip, user, verification, Instant::now())
+        .await;
     let mut response = if decision.allowed {
         next.run(req).await
     } else {
@@ -964,5 +1030,120 @@ mod tests {
                 .allowed,
             "independent in-process stores each grant their own full quota"
         );
+    }
+
+    /// #1103: Verification requests are limited per IP by the verification quota.
+    fn verification_config() -> RateLimitConfig {
+        RateLimitConfig {
+            // Generous general quotas so only the verification bucket can deny.
+            per_ip: BucketQuota::new(600, 100),
+            free: BucketQuota::new(600, 100),
+            verification_per_ip: BucketQuota::new(100, 3),
+            ..config()
+        }
+    }
+
+    #[test]
+    fn verification_paths_are_recognised_exactly() {
+        assert!(is_verification_path("/ip/verify"));
+        assert!(is_verification_path("/v1/ip/verify"));
+        assert!(!is_verification_path("/v1/ip/verify/extra"));
+        assert!(!is_verification_path("/v1/ip/verify-token"));
+        assert!(!is_verification_path("/v1/ip/commit"));
+    }
+
+    #[tokio::test]
+    async fn verification_requests_are_limited_per_ip() {
+        let limiter = RateLimitMiddleware::new(verification_config());
+        let now = Instant::now();
+        for _ in 0..3 {
+            assert!(
+                limiter
+                    .check_request("5.5.5.5", Some("a"), true, now)
+                    .await
+                    .allowed
+            );
+        }
+        let denied = limiter
+            .check_request("5.5.5.5", Some("b"), true, now)
+            .await;
+        assert!(!denied.allowed);
+        assert_eq!(denied.scope, "verify");
+    }
+
+    #[tokio::test]
+    async fn non_verification_requests_ignore_verification_quota() {
+        let limiter = RateLimitMiddleware::new(verification_config());
+        let now = Instant::now();
+        for _ in 0..5 {
+            assert!(
+                limiter
+                    .check_request("6.6.6.6", Some("a"), false, now)
+                    .await
+                    .allowed
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn trusted_verifier_by_ip_bypasses_verification_quota() {
+        let cfg = RateLimitConfig {
+            trusted_verifiers: HashSet::from(["7.7.7.7".to_string()]),
+            ..verification_config()
+        };
+        let limiter = RateLimitMiddleware::new(cfg);
+        let now = Instant::now();
+        for _ in 0..10 {
+            assert!(
+                limiter
+                    .check_request("7.7.7.7", Some("a"), true, now)
+                    .await
+                    .allowed
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn trusted_verifier_by_api_key_bypasses_verification_quota() {
+        let cfg = RateLimitConfig {
+            trusted_verifiers: HashSet::from(["partner-key".to_string()]),
+            ..verification_config()
+        };
+        let limiter = RateLimitMiddleware::new(cfg);
+        let now = Instant::now();
+        for _ in 0..10 {
+            assert!(
+                limiter
+                    .check_request("8.8.4.4", Some("partner-key"), true, now)
+                    .await
+                    .allowed
+            );
+        }
+        // An untrusted caller on the same IP is still limited.
+        for _ in 0..3 {
+            limiter
+                .check_request("8.8.4.4", Some("other"), true, now)
+                .await;
+        }
+        assert!(
+            !limiter
+                .check_request("8.8.4.4", Some("other"), true, now)
+                .await
+                .allowed
+        );
+    }
+
+    #[tokio::test]
+    async fn denials_are_counted_per_scope() {
+        let limiter = RateLimitMiddleware::new(verification_config());
+        let now = Instant::now();
+        assert!(limiter.violations_by_scope().is_empty());
+        for _ in 0..4 {
+            limiter
+                .check_request("9.9.9.1", Some("c"), true, now)
+                .await;
+        }
+        let counts = limiter.violations_by_scope();
+        assert_eq!(counts.get("verify").copied(), Some(1));
     }
 }
