@@ -6,6 +6,47 @@
 use crate::{ContractError, DataKey, IpRecord, OwnershipShare};
 use soroban_sdk::{symbol_short, Address, BytesN, Env, Error, Vec};
 
+/// Clears per-IP state that grants authority to the outgoing owner (#1146).
+///
+/// Called by `transfer_ip`. Authority state is removed so the new owner starts
+/// with a clean slate and the previous owner's grantees, licensees, delegates,
+/// co-owners and threshold signers lose access.
+///
+/// | Storage key                         | Policy   |
+/// |-------------------------------------|----------|
+/// | `IpAccessGrants(ip_id)`             | clear    |
+/// | `IpLicenses(ip_id)`                 | clear    |
+/// | `AccessDelegationList` + `AccessDelegation(ip_id, _)` | clear |
+/// | `OwnershipShares(ip_id)`            | clear (co-owners reset in the record) |
+/// | `ThresholdConfig(ip_id)`            | clear    |
+/// | `ThresholdSignatures(ip_id)`        | clear    |
+///
+/// Every other per-IP key is history or attestation, not authority, and is
+/// retained: `IpVersions`, `IpVersionChain`, `IpLineage`, `IpAuditTrail`,
+/// `RenewalCount`, `NotarySignature`, `MultiNotaryRecord`, `PartialDisclosure`,
+/// `IpDisputes`, `IpStake`, `CommitmentAlgorithm`, `IpPowDifficulty`,
+/// `CommitmentPrivacy`, `EncryptedCommitment`, `CompressedCommitment`,
+/// `CompressionSelection`, `EncryptionKeyRotation`, `BatchMetadata`,
+/// `CommitmentLinks`, `LinkedCommitments`, `MerkleRootRecord`, `TimeLockRecord`,
+/// `AmendmentHistory`, `Archived`, `ExpiryNotified`, `IpMetadata`,
+/// `SuggestedPrice` and `IpInsurancePolicy`.
+pub fn clear_owner_scoped_state(env: &Env, ip_id: u64) {
+    let storage = env.storage().persistent();
+    storage.remove(&DataKey::IpAccessGrants(ip_id));
+    storage.remove(&DataKey::IpLicenses(ip_id));
+    storage.remove(&DataKey::OwnershipShares(ip_id));
+    storage.remove(&DataKey::ThresholdConfig(ip_id));
+    storage.remove(&DataKey::ThresholdSignatures(ip_id));
+
+    let list_key = DataKey::AccessDelegationList(ip_id);
+    if let Some(delegates) = storage.get::<_, Vec<Address>>(&list_key) {
+        for delegate in delegates.iter() {
+            storage.remove(&DataKey::AccessDelegation(ip_id, delegate));
+        }
+    }
+    storage.remove(&list_key);
+}
+
 /// Retrieves an IP record by ID, panicking if not found.
 ///
 /// # Arguments

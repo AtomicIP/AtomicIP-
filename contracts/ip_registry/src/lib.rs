@@ -2210,6 +2210,11 @@ impl IpRegistry {
             LEDGER_BUMP,
         );
 
+        // #1146: authority state belongs to the outgoing owner, so clear it.
+        // The new owner starts with a single-owner cap table and no grants.
+        validation::clear_owner_scoped_state(&env, ip_id);
+        record.co_owners = Vec::new(&env);
+
         record.owner = new_owner.clone();
         env.storage()
             .persistent()

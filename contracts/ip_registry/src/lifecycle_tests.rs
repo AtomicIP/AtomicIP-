@@ -148,3 +148,89 @@ fn notify_ip_expiry_fires_once_per_transition() {
     f.env.ledger().with_mut(|l| l.timestamp = now + 1100);
     assert!(f.client.notify_ip_expiry(&f.ip_id));
 }
+
+// ── #1146: per-IP authority state does not survive ownership transfer ────────
+
+#[test]
+fn transfer_clears_access_grants() {
+    let f = setup();
+    let grantee = Address::generate(&f.env);
+    let new_owner = Address::generate(&f.env);
+
+    f.client.grant_ip_access(&f.ip_id, &grantee, &3u32);
+    assert!(f.client.check_ip_access(&f.ip_id, &grantee, &1u32));
+
+    f.client.transfer_ip(&f.ip_id, &new_owner);
+
+    assert_eq!(f.client.get_ip_access_grants(&f.ip_id).len(), 0);
+    assert!(!f.client.check_ip_access(&f.ip_id, &grantee, &1u32));
+}
+
+#[test]
+fn transfer_clears_licenses() {
+    let f = setup();
+    let licensee = Address::generate(&f.env);
+    let new_owner = Address::generate(&f.env);
+    let terms = BytesN::from_array(&f.env, &[7u8; 32]);
+
+    f.client.grant_license(&f.ip_id, &licensee, &terms);
+    assert_eq!(f.client.get_licenses(&f.ip_id).len(), 1);
+
+    f.client.transfer_ip(&f.ip_id, &new_owner);
+
+    assert_eq!(f.client.get_licenses(&f.ip_id).len(), 0);
+}
+
+#[test]
+fn transfer_resets_co_owners_and_cap_table() {
+    let f = setup();
+    let co_owner = Address::generate(&f.env);
+    let new_owner = Address::generate(&f.env);
+
+    f.client.add_co_owner(&f.ip_id, &co_owner, &20u32);
+    assert_eq!(f.client.get_ip(&f.ip_id).co_owners.len(), 1);
+
+    f.client.transfer_ip(&f.ip_id, &new_owner);
+
+    assert_eq!(f.client.get_ip(&f.ip_id).co_owners.len(), 0);
+    assert_eq!(f.client.get_ownership_shares(&f.ip_id).len(), 0);
+}
+
+#[test]
+fn transfer_clears_threshold_configuration() {
+    let f = setup();
+    let signer = Address::generate(&f.env);
+    let new_owner = Address::generate(&f.env);
+    let signers = soroban_sdk::Vec::from_array(&f.env, [signer]);
+
+    f.client.require_threshold_signatures(&f.ip_id, &1u32, &signers);
+    assert!(f.client.get_threshold_config(&f.ip_id).is_some());
+
+    f.client.transfer_ip(&f.ip_id, &new_owner);
+
+    assert!(f.client.get_threshold_config(&f.ip_id).is_none());
+}
+
+#[test]
+fn transfer_retains_audit_history() {
+    let f = setup();
+    let new_owner = Address::generate(&f.env);
+    let before = f.client.get_ip_audit_trail(&f.ip_id).len();
+
+    f.client.transfer_ip(&f.ip_id, &new_owner);
+
+    // History is retained and gains an entry for the transfer.
+    assert_eq!(f.client.get_ip_audit_trail(&f.ip_id).len(), before + 1);
+}
+
+#[test]
+fn new_owner_can_grant_access_after_transfer() {
+    let f = setup();
+    let grantee = Address::generate(&f.env);
+    let new_owner = Address::generate(&f.env);
+
+    f.client.transfer_ip(&f.ip_id, &new_owner);
+    f.client.grant_ip_access(&f.ip_id, &grantee, &1u32);
+
+    assert!(f.client.check_ip_access(&f.ip_id, &grantee, &1u32));
+}
