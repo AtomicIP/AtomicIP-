@@ -54,6 +54,9 @@ mod commitment_sybil_resistance_tests;
 mod commitment_challenge_tests;
 
 #[cfg(test)]
+mod metadata_encryption_tests;
+
+#[cfg(test)]
 mod validator_network_tests;
 
 // ── Error Codes ────────────────────────────────────────────────────────────
@@ -168,6 +171,14 @@ pub enum ContractError {
     ChallengeAlreadyAnswered = 61,
     /// Issue #1104: No open ownership challenge exists for this commitment.
     CommitmentChallengeNotFound = 62,
+    /// Issue #1105: Encrypted metadata is empty, has too many fields, or is too large.
+    EncryptedMetadataInvalid = 63,
+    /// Issue #1105: No metadata key is registered, or none is active for writes.
+    MetadataKeyNotFound = 64,
+    /// Issue #1105: A metadata key with this ID is already registered.
+    MetadataKeyAlreadyRegistered = 65,
+    /// Issue #1105: The metadata key has been retired and cannot be used for writes.
+    MetadataKeyRetired = 66,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -182,6 +193,9 @@ pub const DEFAULT_CHALLENGE_TTL_SECONDS: u64 = 86_400;
 
 /// Maximum metadata size: 1 KB
 pub const MAX_METADATA_BYTES: u32 = 1024;
+
+/// Issue #1105: Minimum `grant_ip_access` level that may read an encrypted metadata field.
+pub const METADATA_FIELD_ACCESS_LEVEL: u32 = 1;
 
 /// Trusted notary public key for timestamp notarization (Issue #345)
 /// This is a placeholder - should be set during contract initialization
@@ -330,6 +344,9 @@ pub enum DataKey {
     // Issue #1104: Random-nonce ownership challenge and its outcome counters
     CommitmentChallenge(u64),     // maps commitment_id -> open CommitmentChallenge
     ChallengeStats(u64),          // maps commitment_id -> ChallengeStats
+    // Issue #1105: Encrypted metadata key management and field-level records
+    MetadataKey(u32),             // maps key_id -> MetadataKeyRecord
+    ActiveMetadataKey,            // the key_id used for new encrypted metadata writes
 }
 
 // ── Upgrade Compatibility Manifest (#791) ───────────────────────────────────
@@ -6792,6 +6809,186 @@ impl IpRegistry {
     /// Option<IpMetadata> containing the encrypted metadata if it exists
     pub fn get_commitment_metadata(env: Env, ip_id: u64) -> Option<types::IpMetadata> {
         metadata::get_metadata(&env, ip_id)
+    }
+
+    // ── Issue #1105: Encrypted metadata key management ────────────────────────
+
+    /// Register a metadata encryption key (admin only).
+    ///
+    /// Only the key's fingerprint (e.g. its SHA-256) is stored on-chain, never the
+    /// key itself. A registered key is not used for writes until
+    /// `rotate_metadata_key` makes it active.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the caller is not the admin or `key_id` is already registered.
+    pub fn register_metadata_key(env: Env, key_id: u32, fingerprint: BytesN<32>) {
+        Self::require_admin(&env).require_auth();
+
+        let key = DataKey::MetadataKey(key_id);
+        if env.storage().persistent().has(&key) {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::MetadataKeyAlreadyRegistered as u32,
+            ));
+        }
+
+        let record = MetadataKeyRecord {
+            key_id,
+            fingerprint,
+            registered_at: env.ledger().timestamp(),
+            retired: false,
+        };
+        env.storage().persistent().set(&key, &record);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, LEDGER_BUMP, LEDGER_BUMP);
+    }
+
+    /// Make a registered key the active key for new encrypted metadata writes (admin only).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the caller is not the admin, the key is not registered, or the key is retired.
+    pub fn rotate_metadata_key(env: Env, key_id: u32) {
+        Self::require_admin(&env).require_auth();
+
+        let record = Self::load_metadata_key(&env, key_id);
+        if record.retired {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::MetadataKeyRetired as u32,
+            ));
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ActiveMetadataKey, &key_id);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::ActiveMetadataKey, LEDGER_BUMP, LEDGER_BUMP);
+    }
+
+    /// Retire a metadata key (admin only). A retired key can no longer be used for
+    /// writes but its existing ciphertext stays readable. Retiring the active key
+    /// clears it, so writes fail until another key is activated.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the caller is not the admin or the key is not registered.
+    pub fn retire_metadata_key(env: Env, key_id: u32) {
+        Self::require_admin(&env).require_auth();
+
+        let mut record = Self::load_metadata_key(&env, key_id);
+        record.retired = true;
+        let key = DataKey::MetadataKey(key_id);
+        env.storage().persistent().set(&key, &record);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, LEDGER_BUMP, LEDGER_BUMP);
+
+        let active: Option<u32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActiveMetadataKey);
+        if active == Some(key_id) {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::ActiveMetadataKey);
+        }
+    }
+
+    /// Look up a registered metadata key by ID.
+    pub fn get_metadata_key(env: Env, key_id: u32) -> Option<MetadataKeyRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MetadataKey(key_id))
+    }
+
+    /// The key ID currently used for new encrypted metadata writes, if any.
+    pub fn get_active_metadata_key(env: Env) -> Option<u32> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ActiveMetadataKey)
+    }
+
+    fn load_metadata_key(env: &Env, key_id: u32) -> MetadataKeyRecord {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MetadataKey(key_id))
+            .unwrap_or_else(|| {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::MetadataKeyNotFound as u32,
+                ))
+            })
+    }
+
+    // ── Issue #1105: Field-level encrypted metadata ───────────────────────────
+
+    /// Store field-level encrypted metadata for a commitment (owner only).
+    ///
+    /// The owner encrypts each field client-side under the active metadata key and
+    /// passes the ciphertexts here. `tag_hashes` are blinded search tags, indexed
+    /// for `search_commitment_metadata`, so search still works without plaintext.
+    /// A new record replaces the previous one, and its tags are re-indexed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the IP does not exist or is revoked, the caller is not the owner,
+    /// no metadata key is active, or the fields or tags fail validation.
+    pub fn store_encrypted_metadata(
+        env: Env,
+        ip_id: u64,
+        fields: soroban_sdk::Map<soroban_sdk::Symbol, EncryptedField>,
+        tag_hashes: soroban_sdk::Vec<BytesN<32>>,
+    ) {
+        let record = require_ip_exists(&env, ip_id);
+        if record.revoked {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::IpAlreadyRevoked as u32,
+            ));
+        }
+        record.owner.require_auth();
+
+        let key_id: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActiveMetadataKey)
+            .unwrap_or_else(|| {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::MetadataKeyNotFound as u32,
+                ))
+            });
+
+        metadata::store_encrypted_fields(&env, ip_id, key_id, fields, tag_hashes);
+    }
+
+    /// Public summary of an IP's encrypted metadata: key ID, field names and
+    /// timestamp. Ciphertexts are not included. Use `get_encrypted_metadata_field`.
+    pub fn get_encrypted_metadata_info(env: Env, ip_id: u64) -> Option<EncryptedMetadataInfo> {
+        metadata::get_encrypted_info(&env, ip_id)
+    }
+
+    /// Ciphertext of one field, released only to an authorized requester.
+    ///
+    /// The requester must authenticate and must be the owner or hold any grant from
+    /// `grant_ip_access` (levels 1–3). Other fields stay encrypted. Returns `None`
+    /// if the field does not exist.
+    ///
+    /// # Panics
+    ///
+    /// Panics with `AccessDenied` if the requester is not authorized.
+    pub fn get_encrypted_metadata_field(
+        env: Env,
+        ip_id: u64,
+        field: soroban_sdk::Symbol,
+        requester: Address,
+    ) -> Option<EncryptedField> {
+        requester.require_auth();
+        if !Self::check_ip_access(env.clone(), ip_id, requester, METADATA_FIELD_ACCESS_LEVEL) {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::AccessDenied as u32,
+            ));
+        }
+        metadata::get_encrypted_field(&env, ip_id, field)
     }
 
     // ── Issue #1070: Verifiable Commitment Timestamps with Notary ─────────────
