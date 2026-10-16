@@ -49,6 +49,7 @@ pub mod audit;
 pub mod batch;
 pub mod cache;
 pub mod commitments;
+pub mod licensing;
 pub mod portfolio;
 pub mod transfers;
 pub mod valuation;

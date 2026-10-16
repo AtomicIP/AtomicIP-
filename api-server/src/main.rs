@@ -46,6 +46,7 @@ mod session;
 mod batch;
 mod cache;
 mod commitments;
+mod licensing;
 mod portfolio;
 mod transfers;
 mod valuation;
@@ -500,6 +501,10 @@ fn build_app() -> Router {
         .route("/v1/transfers/{id}/validate", post(transfers::validate_transfer))
         .route("/v1/transfers/{id}/escrow", post(transfers::fund_transfer_escrow))
         .route("/v1/transfers/{id}/cancel", post(transfers::cancel_transfer))
+        .route("/v1/licenses", post(licensing::create_license))
+        .route("/v1/licenses/{id}", get(licensing::get_license))
+        .route("/v1/licenses/{id}/terms", post(licensing::update_license_terms))
+        .route("/v1/licenses/{id}/royalties", post(licensing::record_license_royalty))
         .route("/auth/2fa/enable", post(handlers::enable_2fa))
         .route("/auth/2fa/verify", post(handlers::verify_2fa))
         .route("/auth/2fa/backup-code", post(handlers::use_backup_code))
