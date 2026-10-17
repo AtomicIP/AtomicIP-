@@ -1592,6 +1592,7 @@ static TWO_FACTOR_STORE: once_cell::sync::Lazy<crate::auth_2fa::TwoFactorStore> 
 )]
 #[instrument(skip(body))]
 pub async fn enable_2fa(
+    crate::auth::AuthExtension(claims): crate::auth::AuthExtension,
     Json(body): Json<Enable2faRequest>,
 ) -> Result<Json<Enable2faResponse>, (StatusCode, Json<ErrorResponse>)> {
     if body.user_id.is_empty() {
@@ -1599,6 +1600,15 @@ pub async fn enable_2fa(
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
                 error: "user_id must not be empty".to_string(),
+            }),
+        ));
+    }
+
+    if claims.sub != body.user_id {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                error: "Cannot manage 2FA for another user".to_string(),
             }),
         ));
     }
@@ -1658,6 +1668,7 @@ pub async fn enable_2fa(
 )]
 #[instrument(skip(body))]
 pub async fn verify_2fa(
+    crate::auth::AuthExtension(claims): crate::auth::AuthExtension,
     Json(body): Json<Verify2faRequest>,
 ) -> Result<Json<Verify2faResponse>, (StatusCode, Json<ErrorResponse>)> {
     if body.user_id.is_empty() {
@@ -1665,6 +1676,15 @@ pub async fn verify_2fa(
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
                 error: "user_id must not be empty".to_string(),
+            }),
+        ));
+    }
+
+    if claims.sub != body.user_id {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                error: "Cannot manage 2FA for another user".to_string(),
             }),
         ));
     }
@@ -1761,6 +1781,7 @@ pub async fn verify_2fa(
 )]
 #[instrument(skip(body))]
 pub async fn use_backup_code(
+    crate::auth::AuthExtension(claims): crate::auth::AuthExtension,
     Json(body): Json<UseBackupCodeRequest>,
 ) -> Result<Json<Verify2faResponse>, (StatusCode, Json<ErrorResponse>)> {
     if body.user_id.is_empty() || body.backup_code.is_empty() {
@@ -1768,6 +1789,15 @@ pub async fn use_backup_code(
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
                 error: "user_id and backup_code must not be empty".to_string(),
+            }),
+        ));
+    }
+
+    if claims.sub != body.user_id {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                error: "Cannot manage 2FA for another user".to_string(),
             }),
         ));
     }
