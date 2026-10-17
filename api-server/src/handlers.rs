@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::time::{Duration, Instant};
 use tracing::instrument;
 use sha2::{Digest, Sha256};
+use crate::auth::AuthExtension;
 use crate::cache;
 use crate::deduplication::{create_store, DeduplicationStore};
 use crate::graphql::SorobanQueryClient;
@@ -269,219 +270,6 @@ pub async fn batch_reveal_commitments(
         ));
     }
 
-    /// Export selected commitment records as JSON, CSV, or XML.
-    #[utoipa::path(
-        get,
-        path = "/v1/ip/export",
-        tag = "IP Registry",
-        params(ExportCommitmentsParams),
-        responses(
-            (status = 200, description = "Commitments exported"),
-            (status = 400, description = "Invalid format or IP IDs", body = ErrorResponse),
-            (status = 404, description = "An IP record was not found", body = ErrorResponse),
-        )
-    )]
-    #[instrument]
-    pub async fn export_commitments(
-        Query(params): Query<ExportCommitmentsParams>,
-    ) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
-        let ids: Result<Vec<u64>, _> = params
-            .ip_ids
-            .split(',')
-            .filter(|value| !value.trim().is_empty())
-            .map(|value| value.trim().parse::<u64>())
-            .collect();
-        let ids = ids.map_err(|_| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse { error: "ip_ids must be comma-separated unsigned integers".to_string() }),
-            )
-        })?;
-        if ids.is_empty() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse { error: "ip_ids must not be empty".to_string() }),
-            ));
-        }
-
-        /// Add a commitment to a user's watchlist.
-        #[utoipa::path(
-            post,
-            path = "/v1/watchlist",
-            tag = "IP Registry",
-            request_body = WatchlistRequest,
-            responses(
-                (status = 200, description = "Commitment added to watchlist", body = WatchlistResponse),
-                (status = 400, description = "Invalid user ID", body = ErrorResponse),
-            )
-        )]
-        #[instrument(skip(body))]
-        pub async fn add_to_watchlist(
-            Json(body): Json<WatchlistRequest>,
-        ) -> Result<Json<WatchlistResponse>, (StatusCode, Json<ErrorResponse>)> {
-            if body.user_id.trim().is_empty() {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse { error: "user_id must not be empty".to_string() }),
-                ));
-            }
-            let mut watchlists = WATCHLISTS.lock().map_err(|_| {
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "watchlist unavailable".to_string() }))
-            })?;
-            let ids = watchlists.entry(body.user_id.clone()).or_default();
-            ids.insert(body.ip_id);
-            Ok(Json(WatchlistResponse {
-                user_id: body.user_id,
-                ip_ids: ids.iter().copied().collect(),
-            }))
-        }
-
-        /// List all commitments on a user's watchlist.
-        #[utoipa::path(
-            get,
-            path = "/v1/watchlist",
-            tag = "IP Registry",
-            params(WatchlistQuery),
-            responses((status = 200, description = "User watchlist", body = WatchlistResponse))
-        )]
-        #[instrument]
-        pub async fn get_watchlist(
-            Query(query): Query<WatchlistQuery>,
-        ) -> Result<Json<WatchlistResponse>, (StatusCode, Json<ErrorResponse>)> {
-            if query.user_id.trim().is_empty() {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse { error: "user_id must not be empty".to_string() }),
-                ));
-            }
-            let watchlists = WATCHLISTS.lock().map_err(|_| {
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "watchlist unavailable".to_string() }))
-            })?;
-            Ok(Json(WatchlistResponse {
-                user_id: query.user_id.clone(),
-                ip_ids: watchlists
-                    .get(&query.user_id)
-                    .map(|ids| ids.iter().copied().collect())
-                    .unwrap_or_default(),
-            }))
-        }
-
-        /// Remove a commitment from a user's watchlist.
-        #[utoipa::path(
-            delete,
-            path = "/v1/watchlist/{user_id}/{ip_id}",
-            tag = "IP Registry",
-            params(
-                ("user_id" = String, Path, description = "User identifier"),
-                ("ip_id" = u64, Path, description = "IP commitment identifier")
-            ),
-            responses((status = 200, description = "Commitment removed", body = WatchlistResponse))
-        )]
-        #[instrument]
-        pub async fn remove_from_watchlist(
-            Path((user_id, ip_id)): Path<(String, u64)>,
-        ) -> Result<Json<WatchlistResponse>, (StatusCode, Json<ErrorResponse>)> {
-            if user_id.trim().is_empty() {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse { error: "user_id must not be empty".to_string() }),
-                ));
-            }
-            let mut watchlists = WATCHLISTS.lock().map_err(|_| {
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "watchlist unavailable".to_string() }))
-            })?;
-            let ids = watchlists.entry(user_id.clone()).or_default();
-            ids.remove(&ip_id);
-            Ok(Json(WatchlistResponse {
-                user_id,
-                ip_ids: ids.iter().copied().collect(),
-            }))
-        }
-
-        let mut records = Vec::with_capacity(ids.len());
-        for id in ids {
-            match cache::get::<IpRecord>(&cache::ip_key(id)) {
-                Some(record) => records.push(record),
-                None => {
-                    return Err((
-                        StatusCode::NOT_FOUND,
-                        Json(ErrorResponse { error: format!("IP record {} not found", id) }),
-                    ))
-                }
-            }
-        }
-
-        let format = params.format.to_ascii_lowercase();
-        let (content_type, extension, body) = match format.as_str() {
-            "json" => (
-                "application/json",
-                "json",
-                serde_json::to_string_pretty(&records).map_err(|error| {
-                    (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: error.to_string() }))
-                })?,
-            ),
-            "csv" => ("text/csv; charset=utf-8", "csv", commitment_csv(&records)),
-            "xml" => ("application/xml; charset=utf-8", "xml", commitment_xml(&records)),
-            _ => {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse { error: "format must be one of json, csv, or xml".to_string() }),
-                ))
-            }
-        };
-
-        Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, content_type)
-            .header(header::CONTENT_DISPOSITION, format!("attachment; filename=\"commitments.{}\"", extension))
-            .body(Body::from(body))
-            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: error.to_string() })))
-    }
-
-    fn csv_field(value: &str) -> String {
-        if value.chars().any(|character| matches!(character, ',' | '"' | '\n' | '\r')) {
-            format!("\"{}\"", value.replace('"', "\"\""))
-        } else {
-            value.to_string()
-        }
-    }
-
-    fn commitment_csv(records: &[IpRecord]) -> String {
-        let mut output = "ip_id,owner,commitment_hash,timestamp,revoked\n".to_string();
-        for record in records {
-            output.push_str(&format!(
-                "{},{},{},{},{}\n",
-                record.ip_id,
-                csv_field(&record.owner),
-                csv_field(&record.commitment_hash),
-                record.timestamp,
-                record.revoked
-            ));
-        }
-        output
-    }
-
-    fn xml_field(value: &str) -> String {
-        value
-            .replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;")
-            .replace('"', "&quot;")
-            .replace('\'', "&apos;")
-    }
-
-    fn commitment_xml(records: &[IpRecord]) -> String {
-        let mut output = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<commitments>\n".to_string();
-        for record in records {
-            output.push_str(&format!(
-                "  <commitment><ip_id>{}</ip_id><owner>{}</owner><commitment_hash>{}</commitment_hash><timestamp>{}</timestamp><revoked>{}</revoked></commitment>\n",
-                record.ip_id, xml_field(&record.owner), xml_field(&record.commitment_hash), record.timestamp, record.revoked
-            ));
-        }
-        output.push_str("</commitments>\n");
-        output
-    }
-
     let results = body
         .commitments
         .into_iter()
@@ -517,6 +305,269 @@ pub async fn batch_reveal_commitments(
         .collect();
 
     Ok(Json(BatchRevealCommitmentsResponse { results }))
+}
+
+/// Export selected commitment records as JSON, CSV, or XML.
+#[utoipa::path(
+    get,
+    path = "/v1/ip/export",
+    tag = "IP Registry",
+    params(ExportCommitmentsParams),
+    responses(
+        (status = 200, description = "Commitments exported"),
+        (status = 400, description = "Invalid format or IP IDs", body = ErrorResponse),
+        (status = 404, description = "An IP record was not found", body = ErrorResponse),
+    )
+)]
+#[instrument]
+pub async fn export_commitments(
+    Query(params): Query<ExportCommitmentsParams>,
+) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    let ids: Result<Vec<u64>, _> = params
+        .ip_ids
+        .split(',')
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim().parse::<u64>())
+        .collect();
+    let ids = ids.map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse { error: "ip_ids must be comma-separated unsigned integers".to_string() }),
+        )
+    })?;
+    if ids.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse { error: "ip_ids must not be empty".to_string() }),
+        ));
+    }
+
+    let mut records = Vec::with_capacity(ids.len());
+    for id in ids {
+        match cache::get::<IpRecord>(&cache::ip_key(id)) {
+            Some(record) => records.push(record),
+            None => {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    Json(ErrorResponse { error: format!("IP record {} not found", id) }),
+                ))
+            }
+        }
+    }
+
+    let format = params.format.to_ascii_lowercase();
+    let (content_type, extension, body) = match format.as_str() {
+        "json" => (
+            "application/json",
+            "json",
+            serde_json::to_string_pretty(&records).map_err(|error| {
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: error.to_string() }))
+            })?,
+        ),
+        "csv" => ("text/csv; charset=utf-8", "csv", commitment_csv(&records)),
+        "xml" => ("application/xml; charset=utf-8", "xml", commitment_xml(&records)),
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse { error: "format must be one of json, csv, or xml".to_string() }),
+            ))
+        }
+    };
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_DISPOSITION, format!("attachment; filename=\"commitments.{}\"", extension))
+        .body(Body::from(body))
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: error.to_string() })))
+}
+
+fn csv_field(value: &str) -> String {
+    if value.chars().any(|character| matches!(character, ',' | '"' | '\n' | '\r')) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
+fn commitment_csv(records: &[IpRecord]) -> String {
+    let mut output = "ip_id,owner,commitment_hash,timestamp,revoked\n".to_string();
+    for record in records {
+        output.push_str(&format!(
+            "{},{},{},{},{}\n",
+            record.ip_id,
+            csv_field(&record.owner),
+            csv_field(&record.commitment_hash),
+            record.timestamp,
+            record.revoked
+        ));
+    }
+    output
+}
+
+fn xml_field(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn commitment_xml(records: &[IpRecord]) -> String {
+    let mut output = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<commitments>\n".to_string();
+    for record in records {
+        output.push_str(&format!(
+            "  <commitment><ip_id>{}</ip_id><owner>{}</owner><commitment_hash>{}</commitment_hash><timestamp>{}</timestamp><revoked>{}</revoked></commitment>\n",
+            record.ip_id, xml_field(&record.owner), xml_field(&record.commitment_hash), record.timestamp, record.revoked
+        ));
+    }
+    output.push_str("</commitments>\n");
+    output
+}
+
+fn verify_watchlist_owner(
+    claims: &AuthExtension,
+    requested_user_id: &str,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if claims.0.sub != requested_user_id {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse { error: "user_id must match the authenticated account".to_string() }),
+        ));
+    }
+    Ok(())
+}
+
+/// Add a commitment to the authenticated user's watchlist.
+#[utoipa::path(
+    post,
+    path = "/v1/watchlist",
+    tag = "IP Registry",
+    request_body = WatchlistRequest,
+    responses(
+        (status = 200, description = "Commitment added to watchlist", body = WatchlistResponse),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "user_id does not match authenticated account", body = ErrorResponse),
+        (status = 400, description = "Invalid user ID", body = ErrorResponse),
+    )
+)]
+#[instrument(skip(body))]
+pub async fn add_to_watchlist(
+    AuthExtension(claims): AuthExtension,
+    Json(body): Json<WatchlistRequest>,
+) -> Result<Json<WatchlistResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if body.user_id.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse { error: "user_id must not be empty".to_string() }),
+        ));
+    }
+    verify_watchlist_owner(&AuthExtension(claims), &body.user_id)?;
+    let mut watchlists = WATCHLISTS.lock().map_err(|_| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "watchlist unavailable".to_string() }))
+    })?;
+    let ids = watchlists.entry(body.user_id.clone()).or_default();
+    ids.insert(body.ip_id);
+    Ok(Json(WatchlistResponse {
+        user_id: body.user_id,
+        ip_ids: ids.iter().copied().collect(),
+    }))
+}
+
+/// List the authenticated user's watchlist.
+#[utoipa::path(
+    get,
+    path = "/v1/watchlist",
+    tag = "IP Registry",
+    params(WatchlistQuery),
+    responses(
+        (status = 200, description = "User watchlist", body = WatchlistResponse),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "user_id does not match authenticated account", body = ErrorResponse)
+    )
+)]
+#[instrument]
+pub async fn get_watchlist(
+    AuthExtension(claims): AuthExtension,
+    Query(query): Query<WatchlistQuery>,
+) -> Result<Json<WatchlistResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if query.user_id.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse { error: "user_id must not be empty".to_string() }),
+        ));
+    }
+    verify_watchlist_owner(&AuthExtension(claims), &query.user_id)?;
+    let watchlists = WATCHLISTS.lock().map_err(|_| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "watchlist unavailable".to_string() }))
+    })?;
+    Ok(Json(WatchlistResponse {
+        user_id: query.user_id.clone(),
+        ip_ids: watchlists
+            .get(&query.user_id)
+            .map(|ids| ids.iter().copied().collect())
+            .unwrap_or_default(),
+    }))
+}
+
+/// Remove a commitment from the authenticated user's watchlist.
+#[utoipa::path(
+    delete,
+    path = "/v1/watchlist/{user_id}/{ip_id}",
+    tag = "IP Registry",
+    params(
+        ("user_id" = String, Path, description = "Authenticated user identifier"),
+        ("ip_id" = u64, Path, description = "IP commitment identifier")
+    ),
+    responses(
+        (status = 200, description = "Commitment removed", body = WatchlistResponse),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "user_id does not match authenticated account", body = ErrorResponse)
+    )
+)]
+#[instrument]
+pub async fn remove_from_watchlist(
+    AuthExtension(claims): AuthExtension,
+    Path((user_id, ip_id)): Path<(String, u64)>,
+) -> Result<Json<WatchlistResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if user_id.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse { error: "user_id must not be empty".to_string() }),
+        ));
+    }
+    verify_watchlist_owner(&AuthExtension(claims), &user_id)?;
+    let mut watchlists = WATCHLISTS.lock().map_err(|_| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "watchlist unavailable".to_string() }))
+    })?;
+    let ids = watchlists.entry(user_id.clone()).or_default();
+    ids.remove(&ip_id);
+    Ok(Json(WatchlistResponse {
+        user_id,
+        ip_ids: ids.iter().copied().collect(),
+    }))
+}
+
+#[cfg(test)]
+mod watchlist_tests {
+    use super::*;
+
+    fn auth_extension(user_id: &str) -> AuthExtension {
+        AuthExtension(crate::auth::Claims {
+            sub: user_id.to_string(),
+            exp: 0,
+            iat: 0,
+            token_type: "access".to_string(),
+        })
+    }
+
+    #[test]
+    fn watchlist_owner_must_match_authenticated_user() {
+        assert!(verify_watchlist_owner(&auth_extension("alice"), "alice").is_ok());
+        let error = verify_watchlist_owner(&auth_extension("alice"), "bob").unwrap_err();
+        assert_eq!(error.0, StatusCode::FORBIDDEN);
+    }
 }
 
 /// Find indexed commitments by Hamming distance from a supplied hash.
