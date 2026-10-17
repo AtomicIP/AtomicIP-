@@ -38,8 +38,7 @@ impl Default for RecoveryConfig {
 /// Recovery token data
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct RecoveryToken {
-    pub email: String,
-    pub token: String,
+    pub token_hash: String,
     pub created_at: i64,
     pub expires_at: i64,
     pub used: bool,
@@ -81,12 +80,6 @@ pub struct VerifyRecoveryTokenRequest {
     pub email: String,
     pub token: String,
     pub new_password: String,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct VerifyRecoveryTokenResponse {
-    pub message: String,
-    pub password_reset: bool,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -140,6 +133,29 @@ fn generate_recovery_token() -> String {
         .collect()
 }
 
+fn normalize_email(email: &str) -> String {
+    email.trim().to_ascii_lowercase()
+}
+
+fn consume_recovery_token(
+    store: &mut RecoveryStore,
+    email: &str,
+    token: &str,
+    now: i64,
+) -> bool {
+    let Some(stored_token) = store.tokens.get_mut(&normalize_email(email)) else {
+        return false;
+    };
+    if stored_token.used
+        || now >= stored_token.expires_at
+        || stored_token.token_hash != hash_string(token)
+    {
+        return false;
+    }
+    stored_token.used = true;
+    true
+}
+
 /// Initiate account recovery via email
 /// Sends a recovery email with a secure token
 #[utoipa::path(
@@ -178,12 +194,12 @@ pub async fn initiate_recovery(
     let expires_at = (now + Duration::minutes(config.token_expiry_minutes)).timestamp();
 
     let recovery_token = RecoveryToken {
-        email: req.email.clone(),
-        token: token.clone(),
+        token_hash: hash_string(&token),
         created_at: now.timestamp(),
         expires_at,
         used: false,
     };
+    store.tokens.insert(normalize_email(&req.email), recovery_token);
 
     // In production, this would:
     // 1. Send an email with the recovery link containing the token
@@ -203,26 +219,14 @@ pub async fn initiate_recovery(
     tag = "Auth",
     request_body = VerifyRecoveryTokenRequest,
     responses(
-        (status = 200, description = "Password reset successfully", body = VerifyRecoveryTokenResponse),
+        (status = 501, description = "Password reset unavailable until credential storage is configured", body = crate::schemas::ErrorResponse),
+        (status = 429, description = "Too many recovery attempts", body = crate::schemas::ErrorResponse),
         (status = 400, description = "Invalid or expired token", body = crate::schemas::ErrorResponse),
     )
 )]
 pub async fn verify_recovery_token(
     axum::Json(req): axum::Json<VerifyRecoveryTokenRequest>,
-) -> Result<axum::Json<VerifyRecoveryTokenResponse>, (axum::http::StatusCode, axum::Json<crate::schemas::ErrorResponse>)> {
-    let store = RECOVERY_STORE.read().await;
-
-    // TODO: In production, verify the token against the database
-    // For now, return success for valid token format
-    if req.token.len() < 20 {
-        return Err((
-            axum::http::StatusCode::BAD_REQUEST,
-            axum::Json(crate::schemas::ErrorResponse {
-                error: "Invalid or expired recovery token".to_string(),
-            }),
-        ));
-    }
-
+) -> Result<axum::Json<()>, (axum::http::StatusCode, axum::Json<crate::schemas::ErrorResponse>)> {
     // Validate password strength (example validation)
     if req.new_password.len() < 12 {
         return Err((
@@ -233,10 +237,23 @@ pub async fn verify_recovery_token(
         ));
     }
 
-    Ok(axum::Json(VerifyRecoveryTokenResponse {
-        message: "Password reset successfully. You can now log in with your new password.".to_string(),
-        password_reset: true,
-    }))
+    let mut store = RECOVERY_STORE.write().await;
+    if !consume_recovery_token(&mut store, &req.email, &req.token, Utc::now().timestamp()) {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(crate::schemas::ErrorResponse {
+                error: "Invalid or expired recovery token".to_string(),
+            }),
+        ));
+    }
+
+    Err((
+        axum::http::StatusCode::NOT_IMPLEMENTED,
+        axum::Json(crate::schemas::ErrorResponse {
+            error: "Password reset is unavailable because account credential storage is not configured."
+                .to_string(),
+        }),
+    ))
 }
 
 /// Get available security questions
@@ -328,15 +345,36 @@ mod tests {
     #[test]
     fn test_recovery_token_creation() {
         let token = RecoveryToken {
-            email: "test@example.com".to_string(),
-            token: "test_token_123".to_string(),
+            token_hash: hash_string("test_token_123"),
             created_at: 100,
             expires_at: 200,
             used: false,
         };
 
-        assert_eq!(token.email, "test@example.com");
         assert!(!token.used);
+    }
+
+    #[test]
+    fn recovery_tokens_expire_and_are_single_use() {
+        let mut store = RecoveryStore {
+            tokens: HashMap::new(),
+            lockouts: HashMap::new(),
+            security_answers: HashMap::new(),
+        };
+        store.tokens.insert(
+            "test@example.com".to_string(),
+            RecoveryToken {
+                token_hash: hash_string("valid-token"),
+                created_at: 100,
+                expires_at: 200,
+                used: false,
+            },
+        );
+
+        assert!(!consume_recovery_token(&mut store, "test@example.com", "wrong-token", 150));
+        assert!(!consume_recovery_token(&mut store, "test@example.com", "valid-token", 200));
+        assert!(consume_recovery_token(&mut store, "test@example.com", "valid-token", 199));
+        assert!(!consume_recovery_token(&mut store, "test@example.com", "valid-token", 199));
     }
 
     #[test]
