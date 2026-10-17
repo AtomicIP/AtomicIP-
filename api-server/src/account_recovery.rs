@@ -101,6 +101,7 @@ pub struct SecurityQuestionAnswerResponse {
 struct RecoveryStore {
     tokens: HashMap<String, RecoveryToken>,
     lockouts: HashMap<String, i64>,  // email -> lockout_until_timestamp
+    attempts: HashMap<String, usize>,
     security_answers: HashMap<String, HashMap<u32, String>>, // email -> (question_id -> answer_hash)
 }
 
@@ -108,6 +109,7 @@ static RECOVERY_STORE: Lazy<RwLock<RecoveryStore>> = Lazy::new(|| {
     RwLock::new(RecoveryStore {
         tokens: HashMap::new(),
         lockouts: HashMap::new(),
+        attempts: HashMap::new(),
         security_answers: HashMap::new(),
     })
 });
@@ -135,6 +137,50 @@ fn generate_recovery_token() -> String {
 
 fn normalize_email(email: &str) -> String {
     email.trim().to_ascii_lowercase()
+}
+
+fn allow_recovery_attempt(
+    store: &mut RecoveryStore,
+    email: &str,
+    config: &RecoveryConfig,
+    now: i64,
+) -> bool {
+    let email = normalize_email(email);
+    if store
+        .lockouts
+        .get(&email)
+        .is_some_and(|lockout_until| now < *lockout_until)
+    {
+        return false;
+    }
+
+    if store.lockouts.remove(&email).is_some() {
+        store.attempts.remove(&email);
+    }
+
+    let attempts = store.attempts.entry(email.clone()).or_default();
+    if *attempts >= config.max_recovery_attempts {
+        store.lockouts.insert(
+            email,
+            now + Duration::minutes(config.lockout_duration_minutes).num_seconds(),
+        );
+        return false;
+    }
+    *attempts += 1;
+    true
+}
+
+fn security_answer_matches(
+    store: &RecoveryStore,
+    email: &str,
+    question_id: u32,
+    answer: &str,
+) -> bool {
+    store
+        .security_answers
+        .get(&normalize_email(email))
+        .and_then(|answers| answers.get(&question_id))
+        .is_some_and(|expected_hash| hash_string(answer.trim()) == *expected_hash)
 }
 
 fn consume_recovery_token(
@@ -173,19 +219,22 @@ pub async fn initiate_recovery(
     axum::Json(req): axum::Json<InitiateRecoveryRequest>,
 ) -> Result<axum::Json<InitiateRecoveryResponse>, (axum::http::StatusCode, axum::Json<crate::schemas::ErrorResponse>)> {
     let config = RecoveryConfig::default();
-    let store = RECOVERY_STORE.write().await;
-
-    // Check lockout status
-    if let Some(lockout_until) = store.lockouts.get(&req.email) {
-        let now = Utc::now().timestamp();
-        if now < *lockout_until {
-            return Err((
-                axum::http::StatusCode::TOO_MANY_REQUESTS,
-                axum::Json(crate::schemas::ErrorResponse {
-                    error: "Too many recovery attempts. Please try again later.".to_string(),
-                }),
-            ));
-        }
+    if req.email.trim().is_empty() {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(crate::schemas::ErrorResponse {
+                error: "email must not be empty".to_string(),
+            }),
+        ));
+    }
+    let mut store = RECOVERY_STORE.write().await;
+    if !allow_recovery_attempt(&mut store, &req.email, &config, Utc::now().timestamp()) {
+        return Err((
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            axum::Json(crate::schemas::ErrorResponse {
+                error: "Too many recovery attempts. Please try again later.".to_string(),
+            }),
+        ));
     }
 
     // Generate recovery token
@@ -237,7 +286,28 @@ pub async fn verify_recovery_token(
         ));
     }
 
+    if req.email.trim().is_empty() {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(crate::schemas::ErrorResponse {
+                error: "email must not be empty".to_string(),
+            }),
+        ));
+    }
     let mut store = RECOVERY_STORE.write().await;
+    if !allow_recovery_attempt(
+        &mut store,
+        &req.email,
+        &RecoveryConfig::default(),
+        Utc::now().timestamp(),
+    ) {
+        return Err((
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            axum::Json(crate::schemas::ErrorResponse {
+                error: "Too many recovery attempts. Please try again later.".to_string(),
+            }),
+        ));
+    }
     if !consume_recovery_token(&mut store, &req.email, &req.token, Utc::now().timestamp()) {
         return Err((
             axum::http::StatusCode::BAD_REQUEST,
@@ -279,16 +349,35 @@ pub async fn get_security_questions(
     request_body = SecurityQuestionAnswerRequest,
     responses(
         (status = 200, description = "Security answer verified, recovery token issued", body = SecurityQuestionAnswerResponse),
+        (status = 429, description = "Too many recovery attempts", body = crate::schemas::ErrorResponse),
         (status = 400, description = "Incorrect answer or invalid email", body = crate::schemas::ErrorResponse),
     )
 )]
 pub async fn verify_security_question(
     axum::Json(req): axum::Json<SecurityQuestionAnswerRequest>,
 ) -> Result<axum::Json<SecurityQuestionAnswerResponse>, (axum::http::StatusCode, axum::Json<crate::schemas::ErrorResponse>)> {
-    let store = RECOVERY_STORE.read().await;
+    if req.email.trim().is_empty() {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(crate::schemas::ErrorResponse {
+                error: "email must not be empty".to_string(),
+            }),
+        ));
+    }
+    let mut store = RECOVERY_STORE.write().await;
+    let config = RecoveryConfig::default();
+    if !allow_recovery_attempt(&mut store, &req.email, &config, Utc::now().timestamp()) {
+        return Err((
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            axum::Json(crate::schemas::ErrorResponse {
+                error: "Too many recovery attempts. Please try again later.".to_string(),
+            }),
+        ));
+    }
 
     // Check if user has security questions set up
-    if !store.security_answers.contains_key(&req.email) {
+    let email = normalize_email(&req.email);
+    if !store.security_answers.contains_key(&email) {
         return Err((
             axum::http::StatusCode::BAD_REQUEST,
             axum::Json(crate::schemas::ErrorResponse {
@@ -297,9 +386,7 @@ pub async fn verify_security_question(
         ));
     }
 
-    // TODO: In production, verify the answer against the hashed stored answer
-    // For now, accept any answer longer than 3 characters
-    if req.answer.len() < 3 {
+    if !security_answer_matches(&store, &email, req.question_id, &req.answer) {
         return Err((
             axum::http::StatusCode::BAD_REQUEST,
             axum::Json(crate::schemas::ErrorResponse {
@@ -310,6 +397,16 @@ pub async fn verify_security_question(
 
     // Generate a temporary recovery token
     let recovery_token = generate_recovery_token();
+    let now = Utc::now();
+    store.tokens.insert(
+        email,
+        RecoveryToken {
+            token_hash: hash_string(&recovery_token),
+            created_at: now.timestamp(),
+            expires_at: (now + Duration::minutes(config.token_expiry_minutes)).timestamp(),
+            used: false,
+        },
+    );
 
     Ok(axum::Json(SecurityQuestionAnswerResponse {
         message: "Security question answered correctly. Use the recovery token to reset your password.".to_string(),
@@ -359,6 +456,7 @@ mod tests {
         let mut store = RecoveryStore {
             tokens: HashMap::new(),
             lockouts: HashMap::new(),
+            attempts: HashMap::new(),
             security_answers: HashMap::new(),
         };
         store.tokens.insert(
@@ -375,6 +473,50 @@ mod tests {
         assert!(!consume_recovery_token(&mut store, "test@example.com", "valid-token", 200));
         assert!(consume_recovery_token(&mut store, "test@example.com", "valid-token", 199));
         assert!(!consume_recovery_token(&mut store, "test@example.com", "valid-token", 199));
+    }
+
+    #[test]
+    fn recovery_attempts_lock_and_reset_after_the_lockout_expires() {
+        let mut store = RecoveryStore {
+            tokens: HashMap::new(),
+            lockouts: HashMap::new(),
+            attempts: HashMap::new(),
+            security_answers: HashMap::new(),
+        };
+        let config = RecoveryConfig {
+            max_recovery_attempts: 2,
+            lockout_duration_minutes: 30,
+            ..RecoveryConfig::default()
+        };
+
+        assert!(allow_recovery_attempt(&mut store, "Test@example.com", &config, 100));
+        assert!(allow_recovery_attempt(&mut store, "test@example.com", &config, 101));
+        assert!(!allow_recovery_attempt(&mut store, "TEST@example.com", &config, 102));
+        assert!(!allow_recovery_attempt(&mut store, "test@example.com", &config, 103));
+        assert!(allow_recovery_attempt(
+            &mut store,
+            "test@example.com",
+            &config,
+            102 + Duration::minutes(30).num_seconds()
+        ));
+    }
+
+    #[test]
+    fn security_answers_must_match_the_stored_hash() {
+        let mut store = RecoveryStore {
+            tokens: HashMap::new(),
+            lockouts: HashMap::new(),
+            attempts: HashMap::new(),
+            security_answers: HashMap::new(),
+        };
+        store.security_answers.insert(
+            "test@example.com".to_string(),
+            HashMap::from([(1, hash_string("correct answer"))]),
+        );
+
+        assert!(security_answer_matches(&store, "TEST@example.com", 1, "correct answer"));
+        assert!(!security_answer_matches(&store, "test@example.com", 1, "any answer"));
+        assert!(!security_answer_matches(&store, "test@example.com", 2, "correct answer"));
     }
 
     #[test]
