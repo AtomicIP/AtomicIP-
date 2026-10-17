@@ -326,11 +326,11 @@ async fn main() {
         .route("/swap/marketplace/buyer/{buyer}",  get(handlers::marketplace_by_buyer))
         .route("/swap/marketplace/ip/{ip_id}",     get(handlers::marketplace_by_ip))
         .route("/swap/initiate",                  post(handlers::initiate_swap).layer(signed.clone()))
-        .route("/swap/batch-initiate",            post(handlers::batch_initiate_swap))
+        .route("/swap/batch-initiate",            post(handlers::batch_initiate_swap).layer(signed.clone()))
         .route("/swap/{swap_id}/accept",          post(handlers::accept_swap).layer(signed.clone()))
-        .route("/swap/{swap_id}/reveal",          post(handlers::reveal_key).layer(signed.clone()))
-        .route("/swap/{swap_id}/cancel",          post(handlers::cancel_swap).layer(signed.clone()))
-        .route("/swap/{swap_id}/cancel-expired",  post(handlers::cancel_expired_swap))
+        .route("/swap/{swap_id}/reveal",           post(handlers::reveal_key).layer(signed.clone()))
+        .route("/swap/{swap_id}/cancel",            post(handlers::cancel_swap).layer(signed.clone()))
+        .route("/swap/{swap_id}/cancel-expired",  post(handlers::cancel_expired_swap).layer(signed.clone()))
         .route("/swap/{swap_id}",                 get(handlers::get_swap))
         .route("/openapi.json", get(openapi_handler))
         .with_state(state)
@@ -406,6 +406,7 @@ fn build_app() -> Router {
         sse_broadcaster: Arc::new(events::create_event_broadcaster().0),
         health_checker,
         rpc_client,
+        rate_limiter: Arc::new(rate_limiter.clone()),
     };
 
     // #535: same signing enforcement as the production router, so the test
@@ -451,13 +452,13 @@ fn build_app() -> Router {
         .route("/v1/swap/marketplace/buyer/{buyer}",  get(handlers::marketplace_by_buyer))
         .route("/v1/swap/marketplace/ip/{ip_id}",     get(handlers::marketplace_by_ip))
         .route("/v1/ip/owner/{owner}/cursor", get(handlers::list_ip_by_owner_cursor))
-        .route("/v1/swap/initiate", post(handlers::initiate_swap))
-        .route("/v1/swap/batch-initiate", post(handlers::batch_initiate_swap))
-        .route("/v1/swap/bulk/initiate", post(handlers::batch_initiate_swap))
+        .route("/v1/swap/initiate", post(handlers::initiate_swap).layer(signed.clone()))
+        .route("/v1/swap/batch-initiate", post(handlers::batch_initiate_swap).layer(signed.clone()))
+        .route("/v1/swap/bulk/initiate", post(handlers::batch_initiate_swap).layer(signed.clone()))
         .route("/v1/swap/{swap_id}/accept", post(handlers::accept_swap).layer(signed.clone()))
         .route("/v1/swap/{swap_id}/reveal", post(handlers::reveal_key).layer(signed.clone()))
         .route("/v1/swap/{swap_id}/cancel", post(handlers::cancel_swap).layer(signed.clone()))
-        .route("/v1/swap/{swap_id}/cancel-expired", post(handlers::cancel_expired_swap))
+        .route("/v1/swap/{swap_id}/cancel-expired", post(handlers::cancel_expired_swap).layer(signed.clone()))
         .route("/v1/swap/{swap_id}", get(handlers::get_swap))
         .route("/v1/swap/{swap_id}/escrow", get(handlers::get_swap_escrow))
         .route("/v1/swap/{swap_id}/history", get(handlers::get_swap_history))
@@ -504,6 +505,46 @@ mod tests {
     };
     use tower::ServiceExt;
 
+    #[tokio::test]
+    async fn test_incident_administration_requires_authentication() {
+        let response = incident_routes()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/admin/incidents")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_versioned_swap_writes_require_request_signatures() {
+        let app = build_app();
+        for uri in [
+            "/v1/swap/initiate",
+            "/v1/swap/batch-initiate",
+            "/v1/swap/bulk/initiate",
+            "/v1/swap/1/cancel-expired",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
+        }
+    }
+
     /// Test router with an injectable RPC client, used by the swap read-path
     /// tests to exercise `GET /v1/swap/{id}` against a stub client.
     fn app_with_rpc_client(rpc_client: Arc<dyn graphql::SorobanRpcClient>) -> Router {
@@ -517,6 +558,7 @@ mod tests {
             ws_broadcaster:  Arc::new(websocket::EventBroadcaster::new()),
             sse_broadcaster: Arc::new(events::create_event_broadcaster().0),
             health_checker,
+            rate_limiter: Arc::new(rate_limit::RateLimitMiddleware::new(rate_limit::RateLimitConfig::default())),
         };
         Router::new()
             .route("/v1/swap/{swap_id}", get(handlers::get_swap))
