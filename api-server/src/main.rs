@@ -295,8 +295,17 @@ async fn main() {
         .route("/swap/{swap_id}/cancel-expired",  post(handlers::cancel_expired_swap))
         .route_layer(middleware::from_fn(request_signing::verify_request_signature));
 
+    let watchlist_routes = Router::new()
+        .route("/watchlist", post(handlers::add_to_watchlist).get(handlers::get_watchlist))
+        .route(
+            "/watchlist/{user_id}/{ip_id}",
+            axum::routing::delete(handlers::remove_from_watchlist),
+        )
+        .route_layer(middleware::from_fn(auth::require_auth));
+
     let app = Router::new()
         .merge(signed_routes)
+        .merge(watchlist_routes)
         .route("/health",          get(health::health_handler))
         .route("/health/detailed", get(health::detailed_health_handler))
         .route("/metrics",         get(metrics::metrics_handler))
@@ -326,8 +335,6 @@ async fn main() {
         .route("/ip/verify",                      post(handlers::verify_commitment))
         .route("/ip/reveal-batch",                post(handlers::batch_reveal_commitments))
         .route("/ip/export",                     get(handlers::export_commitments))
-        .route("/watchlist",                    post(handlers::add_to_watchlist).get(handlers::get_watchlist))
-        .route("/watchlist/{user_id}/{ip_id}",  axum::routing::delete(handlers::remove_from_watchlist))
         .route("/ip/similar",                  get(handlers::find_similar_commitments))
         .route("/ip/owner/{owner}",               get(handlers::list_ip_by_owner))
         .route("/ip/owner/{owner}/cursor",        get(handlers::list_ip_by_owner_cursor))
