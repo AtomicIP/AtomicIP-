@@ -72,6 +72,8 @@ pub struct UseBackupCodeRequest {
 pub struct Verify2faResponse {
     pub success: bool,
     pub message: String,
+    /// Opaque token for the session created after successful verification.
+    pub session_token: String,
 }
 
 /// In-process 2FA store (for demo/testing)

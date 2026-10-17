@@ -502,6 +502,8 @@ pub struct Verify2faRequest {
 pub struct Verify2faResponse {
     pub success: bool,
     pub message: String,
+    /// Opaque token used with the session status and extension endpoints.
+    pub session_token: String,
 }
 
 /// #984: Request to use backup code for account recovery

@@ -323,6 +323,11 @@ async fn main() {
         .route("/v1/auth/recovery/verify-token",  post(account_recovery::verify_recovery_token))
         .route("/v1/auth/recovery/questions",     get(account_recovery::get_security_questions))
         .route("/v1/auth/recovery/verify-question", post(account_recovery::verify_security_question))
+        .route("/auth/2fa/enable", post(handlers::enable_2fa))
+        .route("/auth/2fa/verify", post(handlers::verify_2fa))
+        .route("/auth/2fa/backup-code", post(handlers::use_backup_code))
+        .route("/auth/session/status", post(handlers::check_session))
+        .route("/auth/extend-session", post(handlers::extend_session))
         .route("/ip/{ip_id}",                     get(handlers::get_ip))
         .route("/ip/verify",                      post(handlers::verify_commitment))
         .route("/ip/reveal-batch",                post(handlers::batch_reveal_commitments))
@@ -591,6 +596,67 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    #[tokio::test]
+    async fn successful_2fa_verification_creates_checkable_session() {
+        let app = build_app();
+        let user_id = uuid::Uuid::new_v4().to_string();
+
+        let enable_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/2fa/enable")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(r#"{{"user_id":"{user_id}"}}"#)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(enable_response.status(), StatusCode::OK);
+
+        let verify_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/2fa/verify")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"user_id":"{user_id}","totp_code":"123456"}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(verify_response.status(), StatusCode::OK);
+        let verify_body = axum::body::to_bytes(verify_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let verify_json: serde_json::Value = serde_json::from_slice(&verify_body).unwrap();
+        let session_token = verify_json["session_token"].as_str().unwrap();
+
+        let status_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/session/status")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"token":"{session_token}"}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status_response.status(), StatusCode::OK);
+        let status_body = axum::body::to_bytes(status_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let status_json: serde_json::Value = serde_json::from_slice(&status_body).unwrap();
+        assert_eq!(status_json["active"], true);
     }
 
     #[tokio::test]
