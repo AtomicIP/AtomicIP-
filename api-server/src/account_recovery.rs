@@ -12,6 +12,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use tokio::sync::RwLock;
+use std::time::Duration as StdDuration;
 use utoipa::ToSchema;
 use once_cell::sync::Lazy;
 
@@ -180,7 +181,7 @@ fn security_answer_matches(
         .security_answers
         .get(&normalize_email(email))
         .and_then(|answers| answers.get(&question_id))
-        .is_some_and(|expected_hash| hash_string(answer.trim()) == *expected_hash)
+        .is_some_and(|expected_hash| hash_string(answer.trim()).as_str() == expected_hash.as_str())
 }
 
 fn consume_recovery_token(
@@ -202,6 +203,70 @@ fn consume_recovery_token(
     true
 }
 
+#[derive(Debug)]
+enum RecoveryEmailError {
+    MissingConfiguration(&'static str),
+    InvalidEndpoint,
+    InsecureEndpoint,
+    Client(reqwest::Error),
+    Request(reqwest::Error),
+    Rejected(reqwest::StatusCode),
+}
+
+#[derive(Serialize)]
+struct RecoveryEmailPayload<'a> {
+    from: &'a str,
+    to: &'a str,
+    subject: &'static str,
+    text: String,
+}
+
+async fn send_recovery_email(
+    email: &str,
+    token: &str,
+    expiry_minutes: i64,
+) -> Result<(), RecoveryEmailError> {
+    let endpoint = std::env::var("RECOVERY_EMAIL_API_URL")
+        .map_err(|_| RecoveryEmailError::MissingConfiguration("RECOVERY_EMAIL_API_URL"))?;
+    let api_key = std::env::var("RECOVERY_EMAIL_API_KEY")
+        .map_err(|_| RecoveryEmailError::MissingConfiguration("RECOVERY_EMAIL_API_KEY"))?;
+    let from = std::env::var("RECOVERY_FROM_EMAIL")
+        .map_err(|_| RecoveryEmailError::MissingConfiguration("RECOVERY_FROM_EMAIL"))?;
+    if api_key.is_empty() || from.is_empty() {
+        return Err(RecoveryEmailError::MissingConfiguration(
+            "RECOVERY_EMAIL_API_KEY or RECOVERY_FROM_EMAIL",
+        ));
+    }
+
+    let endpoint = reqwest::Url::parse(&endpoint).map_err(|_| RecoveryEmailError::InvalidEndpoint)?;
+    if endpoint.scheme() != "https" {
+        return Err(RecoveryEmailError::InsecureEndpoint);
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(StdDuration::from_secs(10))
+        .build()
+        .map_err(RecoveryEmailError::Client)?;
+    let response = client
+        .post(endpoint)
+        .bearer_auth(api_key)
+        .json(&RecoveryEmailPayload {
+            from: &from,
+            to: email,
+            subject: "Account recovery instructions",
+            text: format!(
+                "Your account recovery token is: {token}\n\nThis token expires in {expiry_minutes} minutes. If you did not request account recovery, you can ignore this email."
+            ),
+        })
+        .send()
+        .await
+        .map_err(RecoveryEmailError::Request)?;
+    if !response.status().is_success() {
+        return Err(RecoveryEmailError::Rejected(response.status()));
+    }
+    Ok(())
+}
+
 /// Initiate account recovery via email
 /// Sends a recovery email with a secure token
 #[utoipa::path(
@@ -211,8 +276,9 @@ fn consume_recovery_token(
     request_body = InitiateRecoveryRequest,
     responses(
         (status = 200, description = "Recovery email initiated", body = InitiateRecoveryResponse),
-        (status = 400, description = "Invalid email or locked out", body = crate::schemas::ErrorResponse),
+        (status = 400, description = "Invalid email", body = crate::schemas::ErrorResponse),
         (status = 429, description = "Too many recovery attempts", body = crate::schemas::ErrorResponse),
+        (status = 503, description = "Recovery email delivery is not configured or unavailable", body = crate::schemas::ErrorResponse),
     )
 )]
 pub async fn initiate_recovery(
@@ -227,36 +293,42 @@ pub async fn initiate_recovery(
             }),
         ));
     }
-    let mut store = RECOVERY_STORE.write().await;
-    if !allow_recovery_attempt(&mut store, &req.email, &config, Utc::now().timestamp()) {
+    {
+        let mut store = RECOVERY_STORE.write().await;
+        if !allow_recovery_attempt(&mut store, &req.email, &config, Utc::now().timestamp()) {
+            return Err((
+                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                axum::Json(crate::schemas::ErrorResponse {
+                    error: "Too many recovery attempts. Please try again later.".to_string(),
+                }),
+            ));
+        }
+    }
+
+    let token = generate_recovery_token();
+    if let Err(error) = send_recovery_email(&req.email, &token, config.token_expiry_minutes).await {
+        tracing::error!(?error, "recovery email delivery failed");
         return Err((
-            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
             axum::Json(crate::schemas::ErrorResponse {
-                error: "Too many recovery attempts. Please try again later.".to_string(),
+                error: "Recovery email delivery is unavailable. Please try again later.".to_string(),
             }),
         ));
     }
 
-    // Generate recovery token
-    let token = generate_recovery_token();
     let now = Utc::now();
-    let expires_at = (now + Duration::minutes(config.token_expiry_minutes)).timestamp();
-
-    let recovery_token = RecoveryToken {
-        token_hash: hash_string(&token),
-        created_at: now.timestamp(),
-        expires_at,
-        used: false,
-    };
-    store.tokens.insert(normalize_email(&req.email), recovery_token);
-
-    // In production, this would:
-    // 1. Send an email with the recovery link containing the token
-    // 2. Store the token in a database
-    // 3. Log the recovery attempt
+    RECOVERY_STORE.write().await.tokens.insert(
+        normalize_email(&req.email),
+        RecoveryToken {
+            token_hash: hash_string(&token),
+            created_at: now.timestamp(),
+            expires_at: (now + Duration::minutes(config.token_expiry_minutes)).timestamp(),
+            used: false,
+        },
+    );
 
     Ok(axum::Json(InitiateRecoveryResponse {
-        message: format!("Recovery email sent to {}. Check your inbox for recovery instructions.", req.email),
+        message: "If recovery is available for this address, instructions have been sent.".to_string(),
         recovery_email_sent: true,
     }))
 }
