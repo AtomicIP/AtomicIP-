@@ -1801,6 +1801,22 @@ pub async fn use_backup_code(
 static SESSION_STORE: once_cell::sync::Lazy<crate::session::SessionStore> =
     once_cell::sync::Lazy::new(|| crate::session::SessionStore::new(crate::session::SessionConfig::default()));
 
+pub fn spawn_session_cleanup_task() {
+    tokio::spawn(async {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            match SESSION_STORE.cleanup_expired_sessions() {
+                Ok(removed) if removed > 0 => {
+                    tracing::debug!(removed, "cleaned up expired sessions");
+                }
+                Ok(_) => {}
+                Err(error) => tracing::error!(%error, "failed to clean up expired sessions"),
+            }
+        }
+    });
+}
+
 /// #985: Check current session status
 /// Returns session status including timeout warnings and grace period info
 #[utoipa::path(

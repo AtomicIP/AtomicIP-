@@ -258,6 +258,7 @@ async fn main() {
     metrics::init();
     // #1064/#1065: periodic lifecycle anomaly detection + alert escalation.
     commitment_monitoring::spawn_background_evaluator();
+    handlers::spawn_session_cleanup_task();
 
     let subscription_broadcaster = init_subscription_broadcaster().await;
     let rpc_client: Arc<dyn graphql::SorobanRpcClient> = Arc::new(graphql::MockSorobanRpcClient::default());
