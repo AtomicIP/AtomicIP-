@@ -267,7 +267,7 @@ async fn main() {
         subscription_broadcaster.clone(),
     );
 
-    let rate_limiter = Arc::new(rate_limit::RateLimitMiddleware::new(rate_limit::RateLimitConfig::default()));
+    let rate_limiter = rate_limit::RateLimitMiddleware::new(rate_limit::RateLimitConfig::default());
 
     let state = AppState {
         schema,
@@ -276,27 +276,21 @@ async fn main() {
         ws_broadcaster:  Arc::new(websocket::EventBroadcaster::new()),
         sse_broadcaster: Arc::new(events::create_event_broadcaster().0),
         health_checker:  Arc::new(health::HealthChecker::new()),
-        rate_limiter: rate_limiter.clone(),
+        rate_limiter: Arc::new(rate_limiter.clone()),
     };
     let request_queue = Arc::new(request_queue::RequestQueue::new(
         request_queue::QueueConfig::default(),
     ));
+    let signed = middleware::from_fn(request_signing::verify_request_signature);
+    let signed_ip_routes = Router::new()
+        .route("/ip/commit", post(handlers::commit_ip))
+        .route("/ip/transfer", post(handlers::transfer_ip))
+        .route_layer(middleware::from_fn(request_signing::verify_request_signature));
 
     // Mutating endpoints that move or commit IP/swap state require a signed
     // request (see request_signing.rs) on top of the layers applied below.
-    let signed_routes = Router::new()
-        .route("/ip/commit",                      post(handlers::commit_ip))
-        .route("/ip/transfer",                    post(handlers::transfer_ip))
-        .route("/swap/initiate",                  post(handlers::initiate_swap))
-        .route("/swap/batch-initiate",            post(handlers::batch_initiate_swap))
-        .route("/swap/{swap_id}/accept",          post(handlers::accept_swap))
-        .route("/swap/{swap_id}/reveal",          post(handlers::reveal_key))
-        .route("/swap/{swap_id}/cancel",          post(handlers::cancel_swap))
-        .route("/swap/{swap_id}/cancel-expired",  post(handlers::cancel_expired_swap))
-        .route_layer(middleware::from_fn(request_signing::verify_request_signature));
-
     let app = Router::new()
-        .merge(signed_routes)
+        .merge(signed_ip_routes)
         .route("/health",          get(health::health_handler))
         .route("/health/detailed", get(health::detailed_health_handler))
         .route("/metrics",         get(metrics::metrics_handler))
