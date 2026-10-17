@@ -85,6 +85,16 @@ impl TwoFactorStore {
         Self::default()
     }
 
+    /// Create a user's 2FA configuration without replacing an existing one.
+    pub fn create_config(&self, config: TwoFactorConfig) -> Result<bool, String> {
+        let mut store = self.configs.lock().map_err(|e| e.to_string())?;
+        if store.contains_key(&config.user_id) {
+            return Ok(false);
+        }
+        store.insert(config.user_id.clone(), config);
+        Ok(true)
+    }
+
     /// Store user's 2FA configuration
     pub fn store_config(&self, config: TwoFactorConfig) -> Result<(), String> {
         let mut store = self.configs.lock().map_err(|e| e.to_string())?;
@@ -179,4 +189,35 @@ pub fn mark_backup_code_used(
         }
     }
     Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(user_id: &str, secret: &str) -> TwoFactorConfig {
+        TwoFactorConfig {
+            user_id: user_id.to_string(),
+            totp: Some(TotpSecret {
+                secret: secret.to_string(),
+                enabled_at: 0,
+                verified: true,
+            }),
+            backup_codes: Vec::new(),
+            created_at: 0,
+            last_verified: None,
+        }
+    }
+
+    #[test]
+    fn create_config_does_not_replace_existing_secret() {
+        let store = TwoFactorStore::new();
+        assert!(store.create_config(config("user", "original")).unwrap());
+        assert!(!store.create_config(config("user", "replacement")).unwrap());
+
+        assert_eq!(
+            store.get_config("user").unwrap().unwrap().totp.unwrap().secret,
+            "original"
+        );
+    }
 }

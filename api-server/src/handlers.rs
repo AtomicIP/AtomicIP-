@@ -1586,8 +1586,9 @@ static TWO_FACTOR_STORE: once_cell::sync::Lazy<crate::auth_2fa::TwoFactorStore> 
     request_body = Enable2faRequest,
     responses(
         (status = 200, description = "2FA enabled successfully, returns secret and backup codes", body = Enable2faResponse),
-        (status = 400, description = "Invalid user ID", body = ErrorResponse),
-        (status = 500, description = "Internal server error", body = ErrorResponse),
+    (status = 409, description = "2FA is already configured for this user", body = ErrorResponse),
+    (status = 400, description = "Invalid user ID", body = ErrorResponse),
+    (status = 500, description = "Internal server error", body = ErrorResponse),
     )
 )]
 #[instrument(skip(body))]
@@ -1638,12 +1639,22 @@ pub async fn enable_2fa(
         last_verified: None,
     };
 
-    TWO_FACTOR_STORE.store_config(config).map_err(|err| {
+    match TWO_FACTOR_STORE.create_config(config).map_err(|err| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse { error: err }),
         )
-    })?;
+    })? {
+        true => {}
+        false => {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(ErrorResponse {
+                    error: "2FA is already configured for this user".to_string(),
+                }),
+            ));
+        }
+    }
 
     Ok(Json(Enable2faResponse {
         secret,
