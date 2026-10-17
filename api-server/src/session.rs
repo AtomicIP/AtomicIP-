@@ -288,4 +288,20 @@ mod tests {
 
         assert!(new_expiry > original_expiry);
     }
+
+    #[test]
+    fn test_cleanup_expired_sessions_removes_expired_sessions() {
+        let mut config = SessionConfig::default();
+        config.idle_timeout_minutes = 0;
+        config.grace_period_minutes = 0;
+        let store = SessionStore::new(config);
+        store
+            .create_session("user123", "token123")
+            .expect("Failed to create session");
+
+        std::thread::sleep(std::time::Duration::from_secs(1));
+
+        assert_eq!(store.cleanup_expired_sessions().unwrap(), 1);
+        assert!(store.get_session("token123").unwrap().is_none());
+    }
 }
