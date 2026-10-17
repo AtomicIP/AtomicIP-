@@ -267,7 +267,7 @@ async fn main() {
         subscription_broadcaster.clone(),
     );
 
-    let rate_limiter = Arc::new(rate_limit::RateLimitMiddleware::new(rate_limit::RateLimitConfig::default()));
+    let rate_limiter = rate_limit::RateLimitMiddleware::new(rate_limit::RateLimitConfig::default());
 
     let state = AppState {
         schema,
@@ -276,27 +276,21 @@ async fn main() {
         ws_broadcaster:  Arc::new(websocket::EventBroadcaster::new()),
         sse_broadcaster: Arc::new(events::create_event_broadcaster().0),
         health_checker:  Arc::new(health::HealthChecker::new()),
-        rate_limiter: rate_limiter.clone(),
+        rate_limiter: Arc::new(rate_limiter.clone()),
     };
     let request_queue = Arc::new(request_queue::RequestQueue::new(
         request_queue::QueueConfig::default(),
     ));
+    let signed = middleware::from_fn(request_signing::verify_request_signature);
+    let signed_ip_routes = Router::new()
+        .route("/ip/commit", post(handlers::commit_ip))
+        .route("/ip/transfer", post(handlers::transfer_ip))
+        .route_layer(middleware::from_fn(request_signing::verify_request_signature));
 
     // Mutating endpoints that move or commit IP/swap state require a signed
     // request (see request_signing.rs) on top of the layers applied below.
-    let signed_routes = Router::new()
-        .route("/ip/commit",                      post(handlers::commit_ip))
-        .route("/ip/transfer",                    post(handlers::transfer_ip))
-        .route("/swap/initiate",                  post(handlers::initiate_swap))
-        .route("/swap/batch-initiate",            post(handlers::batch_initiate_swap))
-        .route("/swap/{swap_id}/accept",          post(handlers::accept_swap))
-        .route("/swap/{swap_id}/reveal",          post(handlers::reveal_key))
-        .route("/swap/{swap_id}/cancel",          post(handlers::cancel_swap))
-        .route("/swap/{swap_id}/cancel-expired",  post(handlers::cancel_expired_swap))
-        .route_layer(middleware::from_fn(request_signing::verify_request_signature));
-
     let app = Router::new()
-        .merge(signed_routes)
+        .merge(signed_ip_routes)
         .route("/health",          get(health::health_handler))
         .route("/health/detailed", get(health::detailed_health_handler))
         .route("/metrics",         get(metrics::metrics_handler))
@@ -309,15 +303,8 @@ async fn main() {
         .route("/v1/admin/audit/suspicious-patterns", get(handlers::get_suspicious_patterns))
         .route("/v1/admin/commitments/lifecycle", get(commitment_monitoring::lifecycle_handler))
         .route("/v1/admin/alerts", get(commitment_monitoring::open_alerts_handler))
-        // #1068: incident management (PagerDuty / Opsgenie).
-        .route("/v1/admin/incidents",                  get(incidents::list_handler).post(incidents::create_handler))
-        .route("/v1/admin/incidents/stats",            get(incidents::stats_handler))
-        .route("/v1/admin/incidents/alertmanager",     post(incidents::alertmanager_webhook_handler))
-        .route("/v1/admin/incidents/{id}",             get(incidents::get_handler))
-        .route("/v1/admin/incidents/{id}/acknowledge", post(incidents::acknowledge_handler))
-        .route("/v1/admin/incidents/{id}/resolve",     post(incidents::resolve_handler))
-        .route("/v1/admin/incidents/{id}/notes",       post(incidents::note_handler))
-        .route("/v1/admin/incidents/{id}/postmortem",  post(incidents::postmortem_handler))
+        .merge(incident_routes())
+        .route("/v1/admin/incidents/alertmanager", post(incidents::alertmanager_webhook_handler))
         .route("/v1/auth/recovery/initiate",      post(account_recovery::initiate_recovery))
         .route("/v1/auth/recovery/verify-token",  post(account_recovery::verify_recovery_token))
         .route("/v1/auth/recovery/questions",     get(account_recovery::get_security_questions))
@@ -339,11 +326,11 @@ async fn main() {
         .route("/swap/marketplace/buyer/{buyer}",  get(handlers::marketplace_by_buyer))
         .route("/swap/marketplace/ip/{ip_id}",     get(handlers::marketplace_by_ip))
         .route("/swap/initiate",                  post(handlers::initiate_swap).layer(signed.clone()))
-        .route("/swap/batch-initiate",            post(handlers::batch_initiate_swap))
+        .route("/swap/batch-initiate",            post(handlers::batch_initiate_swap).layer(signed.clone()))
         .route("/swap/{swap_id}/accept",          post(handlers::accept_swap).layer(signed.clone()))
-        .route("/swap/{swap_id}/reveal",          post(handlers::reveal_key).layer(signed.clone()))
-        .route("/swap/{swap_id}/cancel",          post(handlers::cancel_swap).layer(signed.clone()))
-        .route("/swap/{swap_id}/cancel-expired",  post(handlers::cancel_expired_swap))
+        .route("/swap/{swap_id}/reveal",           post(handlers::reveal_key).layer(signed.clone()))
+        .route("/swap/{swap_id}/cancel",            post(handlers::cancel_swap).layer(signed.clone()))
+        .route("/swap/{swap_id}/cancel-expired",  post(handlers::cancel_expired_swap).layer(signed.clone()))
         .route("/swap/{swap_id}",                 get(handlers::get_swap))
         .route("/openapi.json", get(openapi_handler))
         .with_state(state)
@@ -419,6 +406,7 @@ fn build_app() -> Router {
         sse_broadcaster: Arc::new(events::create_event_broadcaster().0),
         health_checker,
         rpc_client,
+        rate_limiter: Arc::new(rate_limiter.clone()),
     };
 
     // #535: same signing enforcement as the production router, so the test
@@ -438,15 +426,8 @@ fn build_app() -> Router {
         .route("/v1/admin/audit/suspicious-patterns", get(handlers::get_suspicious_patterns))
         .route("/v1/admin/commitments/lifecycle", get(commitment_monitoring::lifecycle_handler))
         .route("/v1/admin/alerts", get(commitment_monitoring::open_alerts_handler))
-        // #1068: incident management (PagerDuty / Opsgenie).
-        .route("/v1/admin/incidents",                  get(incidents::list_handler).post(incidents::create_handler))
-        .route("/v1/admin/incidents/stats",            get(incidents::stats_handler))
-        .route("/v1/admin/incidents/alertmanager",     post(incidents::alertmanager_webhook_handler))
-        .route("/v1/admin/incidents/{id}",             get(incidents::get_handler))
-        .route("/v1/admin/incidents/{id}/acknowledge", post(incidents::acknowledge_handler))
-        .route("/v1/admin/incidents/{id}/resolve",     post(incidents::resolve_handler))
-        .route("/v1/admin/incidents/{id}/notes",       post(incidents::note_handler))
-        .route("/v1/admin/incidents/{id}/postmortem",  post(incidents::postmortem_handler))
+        .merge(incident_routes())
+        .route("/v1/admin/incidents/alertmanager", post(incidents::alertmanager_webhook_handler))
         .route("/v1/auth/recovery/initiate", post(account_recovery::initiate_recovery))
         .route("/v1/auth/recovery/verify-token", post(account_recovery::verify_recovery_token))
         .route("/v1/auth/recovery/questions", get(account_recovery::get_security_questions))
@@ -471,13 +452,13 @@ fn build_app() -> Router {
         .route("/v1/swap/marketplace/buyer/{buyer}",  get(handlers::marketplace_by_buyer))
         .route("/v1/swap/marketplace/ip/{ip_id}",     get(handlers::marketplace_by_ip))
         .route("/v1/ip/owner/{owner}/cursor", get(handlers::list_ip_by_owner_cursor))
-        .route("/v1/swap/initiate", post(handlers::initiate_swap))
-        .route("/v1/swap/batch-initiate", post(handlers::batch_initiate_swap))
-        .route("/v1/swap/bulk/initiate", post(handlers::batch_initiate_swap))
+        .route("/v1/swap/initiate", post(handlers::initiate_swap).layer(signed.clone()))
+        .route("/v1/swap/batch-initiate", post(handlers::batch_initiate_swap).layer(signed.clone()))
+        .route("/v1/swap/bulk/initiate", post(handlers::batch_initiate_swap).layer(signed.clone()))
         .route("/v1/swap/{swap_id}/accept", post(handlers::accept_swap).layer(signed.clone()))
         .route("/v1/swap/{swap_id}/reveal", post(handlers::reveal_key).layer(signed.clone()))
         .route("/v1/swap/{swap_id}/cancel", post(handlers::cancel_swap).layer(signed.clone()))
-        .route("/v1/swap/{swap_id}/cancel-expired", post(handlers::cancel_expired_swap))
+        .route("/v1/swap/{swap_id}/cancel-expired", post(handlers::cancel_expired_swap).layer(signed.clone()))
         .route("/v1/swap/{swap_id}", get(handlers::get_swap))
         .route("/v1/swap/{swap_id}/escrow", get(handlers::get_swap_escrow))
         .route("/v1/swap/{swap_id}/history", get(handlers::get_swap_history))
@@ -503,6 +484,18 @@ fn build_app() -> Router {
         .layer(middleware::from_fn(require_json_content_type))
 }
 
+fn incident_routes() -> Router {
+    Router::new()
+        .route("/v1/admin/incidents", get(incidents::list_handler).post(incidents::create_handler))
+        .route("/v1/admin/incidents/stats", get(incidents::stats_handler))
+        .route("/v1/admin/incidents/{id}", get(incidents::get_handler))
+        .route("/v1/admin/incidents/{id}/acknowledge", post(incidents::acknowledge_handler))
+        .route("/v1/admin/incidents/{id}/resolve", post(incidents::resolve_handler))
+        .route("/v1/admin/incidents/{id}/notes", post(incidents::note_handler))
+        .route("/v1/admin/incidents/{id}/postmortem", post(incidents::postmortem_handler))
+        .route_layer(middleware::from_fn(auth::require_auth))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -511,6 +504,46 @@ mod tests {
         http::{Request, StatusCode},
     };
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn test_incident_administration_requires_authentication() {
+        let response = incident_routes()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/admin/incidents")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_versioned_swap_writes_require_request_signatures() {
+        let app = build_app();
+        for uri in [
+            "/v1/swap/initiate",
+            "/v1/swap/batch-initiate",
+            "/v1/swap/bulk/initiate",
+            "/v1/swap/1/cancel-expired",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
+        }
+    }
 
     /// Test router with an injectable RPC client, used by the swap read-path
     /// tests to exercise `GET /v1/swap/{id}` against a stub client.
@@ -525,6 +558,7 @@ mod tests {
             ws_broadcaster:  Arc::new(websocket::EventBroadcaster::new()),
             sse_broadcaster: Arc::new(events::create_event_broadcaster().0),
             health_checker,
+            rate_limiter: Arc::new(rate_limit::RateLimitMiddleware::new(rate_limit::RateLimitConfig::default())),
         };
         Router::new()
             .route("/v1/swap/{swap_id}", get(handlers::get_swap))
