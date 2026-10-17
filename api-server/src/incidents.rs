@@ -26,12 +26,13 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use axum::extract::Path;
-use axum::http::StatusCode;
+use axum::http::{header::AUTHORIZATION, HeaderMap, StatusCode};
 use axum::Json;
 use metrics::{counter, histogram};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use crate::alerting::{self, Notification, Severity};
 
@@ -714,9 +715,16 @@ pub struct AlertmanagerWebhook {
     pub alerts: Vec<AlertmanagerAlert>,
 }
 
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AlertmanagerStatus {
+    Firing,
+    Resolved,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct AlertmanagerAlert {
-    pub status: String,
+    pub status: AlertmanagerStatus,
     #[serde(default)]
     pub labels: HashMap<String, String>,
     #[serde(default)]
@@ -729,13 +737,24 @@ pub struct AlertmanagerAlert {
 
 /// `POST /v1/admin/incidents/alertmanager` – Alertmanager webhook receiver.
 /// Firing alerts open (or re-trigger) incidents; resolved alerts resolve them.
-pub async fn alertmanager_webhook_handler(Json(hook): Json<AlertmanagerWebhook>) -> Json<serde_json::Value> {
+pub async fn alertmanager_webhook_handler(
+    headers: HeaderMap,
+    Json(hook): Json<AlertmanagerWebhook>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    verify_alertmanager_token(&headers)?;
+    if hook.alerts.iter().any(|alert| {
+        alert.fingerprint.trim().is_empty()
+            || alert.labels.get("alertname").map_or(true, |name| name.trim().is_empty())
+    }) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
     let now = alerting::now_secs();
     let (mut opened, mut resolved) = (Vec::new(), Vec::new());
     for a in hook.alerts {
         let name = a.labels.get("alertname").cloned().unwrap_or_else(|| "UnknownAlert".into());
-        let dedup_key = format!("am-{}", if a.fingerprint.is_empty() { &name } else { &a.fingerprint });
-        if a.status == "resolved" {
+        let dedup_key = format!("am-{}", a.fingerprint);
+        if a.status == AlertmanagerStatus::Resolved {
             if let Some(inc) = INCIDENTS.resolve_by_key(&dedup_key, "alertmanager", now) {
                 resolved.push(inc.id);
             }
@@ -760,5 +779,54 @@ pub async fn alertmanager_webhook_handler(Json(hook): Json<AlertmanagerWebhook>)
         );
         opened.push(id);
     }
-    Json(json!({ "opened_or_retriggered": opened, "resolved": resolved }))
+    Ok(Json(json!({ "opened_or_retriggered": opened, "resolved": resolved })))
+}
+
+fn verify_alertmanager_token(headers: &HeaderMap) -> Result<(), StatusCode> {
+    let expected = std::env::var("ALERTMANAGER_WEBHOOK_TOKEN").map_err(|_| {
+        tracing::error!("ALERTMANAGER_WEBHOOK_TOKEN is not configured");
+        StatusCode::SERVICE_UNAVAILABLE
+    })?;
+    if expected.is_empty() {
+        tracing::error!("ALERTMANAGER_WEBHOOK_TOKEN is empty");
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    let provided = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+    if !alertmanager_tokens_match(&expected, provided) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(())
+}
+
+fn alertmanager_tokens_match(expected: &str, provided: &str) -> bool {
+    let expected_hash = Sha256::digest(expected.as_bytes());
+    let provided_hash = Sha256::digest(provided.as_bytes());
+    expected_hash
+        .iter()
+        .zip(provided_hash.iter())
+        .fold(0u8, |diff, (left, right)| diff | (left ^ right))
+        == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn alertmanager_token_comparison_requires_exact_secret() {
+        assert!(alertmanager_tokens_match("shared-token", "shared-token"));
+        assert!(!alertmanager_tokens_match("shared-token", "wrong-token"));
+        assert!(!alertmanager_tokens_match("shared-token", ""));
+    }
+
+    #[test]
+    fn alertmanager_payload_rejects_unknown_status() {
+        let payload = r#"{"alerts":[{"status":"suppressed","fingerprint":"abc","labels":{"alertname":"test"}}]}"#;
+        assert!(serde_json::from_str::<AlertmanagerWebhook>(payload).is_err());
+    }
 }

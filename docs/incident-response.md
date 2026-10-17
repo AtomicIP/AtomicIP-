@@ -21,7 +21,15 @@ flowchart LR
   evaluator, and Prometheus alerts via the Alertmanager `incident-tracker`
   webhook (`POST /v1/admin/incidents/alertmanager`). Re-fires of the same alert
   are deduplicated onto the open incident (`trigger_count` + timeline entry);
-  when the alert resolves, the incident resolves.
+  when the alert resolves, the incident resolves. Configure matching secret
+  values in the API server's `ALERTMANAGER_WEBHOOK_TOKEN` environment variable
+  and Alertmanager's mounted
+  `/etc/alertmanager/secrets/incident-tracker-token` file; the webhook rejects
+  requests if the API token is unset or does not match.
+* **API access.** Incident administration endpoints require a valid access JWT
+  in `Authorization: Bearer …`. Postmortem authors are taken from the JWT
+  subject, not from the submitted body, and an incident's postmortem can only
+  be submitted once.
 * **Paging.** Set `INCIDENT_PROVIDER=pagerduty` (+ `PAGERDUTY_ROUTING_KEY`) or
   `INCIDENT_PROVIDER=opsgenie` (+ `OPSGENIE_API_KEY`, optional `OPSGENIE_API_URL`).
   Incidents from in-process alerts and manual declarations are sent to the
