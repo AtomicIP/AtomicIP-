@@ -120,6 +120,7 @@ pub struct ActionItem {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Postmortem {
+    #[serde(default)]
     pub author: String,
     pub summary: String,
     pub impact: String,
@@ -516,6 +517,9 @@ impl IncidentManager {
         if inc.status != IncidentStatus::Resolved {
             return Err(IncidentError::InvalidState("postmortem can only be attached to a resolved incident"));
         }
+        if inc.postmortem.is_some() {
+            return Err(IncidentError::InvalidState("postmortem has already been submitted"));
+        }
         pm.submitted_at = now;
         let author = pm.author.clone();
         inc.postmortem = Some(pm);
@@ -695,7 +699,12 @@ pub async fn note_handler(Path(id): Path<String>, Json(req): Json<NoteRequest>) 
 }
 
 /// `POST /v1/admin/incidents/{id}/postmortem`
-pub async fn postmortem_handler(Path(id): Path<String>, Json(pm): Json<Postmortem>) -> ApiResult<Incident> {
+pub async fn postmortem_handler(
+    Path(id): Path<String>,
+    crate::auth::AuthExtension(claims): crate::auth::AuthExtension,
+    Json(mut pm): Json<Postmortem>,
+) -> ApiResult<Incident> {
+    pm.author = claims.sub;
     INCIDENTS.submit_postmortem(&id, pm, alerting::now_secs()).map(Json).map_err(map_err)
 }
 

@@ -309,15 +309,8 @@ async fn main() {
         .route("/v1/admin/audit/suspicious-patterns", get(handlers::get_suspicious_patterns))
         .route("/v1/admin/commitments/lifecycle", get(commitment_monitoring::lifecycle_handler))
         .route("/v1/admin/alerts", get(commitment_monitoring::open_alerts_handler))
-        // #1068: incident management (PagerDuty / Opsgenie).
-        .route("/v1/admin/incidents",                  get(incidents::list_handler).post(incidents::create_handler))
-        .route("/v1/admin/incidents/stats",            get(incidents::stats_handler))
-        .route("/v1/admin/incidents/alertmanager",     post(incidents::alertmanager_webhook_handler))
-        .route("/v1/admin/incidents/{id}",             get(incidents::get_handler))
-        .route("/v1/admin/incidents/{id}/acknowledge", post(incidents::acknowledge_handler))
-        .route("/v1/admin/incidents/{id}/resolve",     post(incidents::resolve_handler))
-        .route("/v1/admin/incidents/{id}/notes",       post(incidents::note_handler))
-        .route("/v1/admin/incidents/{id}/postmortem",  post(incidents::postmortem_handler))
+        .merge(incident_routes())
+        .route("/v1/admin/incidents/alertmanager", post(incidents::alertmanager_webhook_handler))
         .route("/v1/auth/recovery/initiate",      post(account_recovery::initiate_recovery))
         .route("/v1/auth/recovery/verify-token",  post(account_recovery::verify_recovery_token))
         .route("/v1/auth/recovery/questions",     get(account_recovery::get_security_questions))
@@ -438,15 +431,8 @@ fn build_app() -> Router {
         .route("/v1/admin/audit/suspicious-patterns", get(handlers::get_suspicious_patterns))
         .route("/v1/admin/commitments/lifecycle", get(commitment_monitoring::lifecycle_handler))
         .route("/v1/admin/alerts", get(commitment_monitoring::open_alerts_handler))
-        // #1068: incident management (PagerDuty / Opsgenie).
-        .route("/v1/admin/incidents",                  get(incidents::list_handler).post(incidents::create_handler))
-        .route("/v1/admin/incidents/stats",            get(incidents::stats_handler))
-        .route("/v1/admin/incidents/alertmanager",     post(incidents::alertmanager_webhook_handler))
-        .route("/v1/admin/incidents/{id}",             get(incidents::get_handler))
-        .route("/v1/admin/incidents/{id}/acknowledge", post(incidents::acknowledge_handler))
-        .route("/v1/admin/incidents/{id}/resolve",     post(incidents::resolve_handler))
-        .route("/v1/admin/incidents/{id}/notes",       post(incidents::note_handler))
-        .route("/v1/admin/incidents/{id}/postmortem",  post(incidents::postmortem_handler))
+        .merge(incident_routes())
+        .route("/v1/admin/incidents/alertmanager", post(incidents::alertmanager_webhook_handler))
         .route("/v1/auth/recovery/initiate", post(account_recovery::initiate_recovery))
         .route("/v1/auth/recovery/verify-token", post(account_recovery::verify_recovery_token))
         .route("/v1/auth/recovery/questions", get(account_recovery::get_security_questions))
@@ -501,6 +487,18 @@ fn build_app() -> Router {
         .layer(middleware::from_fn(compression::compression_middleware))
         .layer(middleware::from_fn(validation_middleware::validation_logging_middleware))
         .layer(middleware::from_fn(require_json_content_type))
+}
+
+fn incident_routes() -> Router {
+    Router::new()
+        .route("/v1/admin/incidents", get(incidents::list_handler).post(incidents::create_handler))
+        .route("/v1/admin/incidents/stats", get(incidents::stats_handler))
+        .route("/v1/admin/incidents/{id}", get(incidents::get_handler))
+        .route("/v1/admin/incidents/{id}/acknowledge", post(incidents::acknowledge_handler))
+        .route("/v1/admin/incidents/{id}/resolve", post(incidents::resolve_handler))
+        .route("/v1/admin/incidents/{id}/notes", post(incidents::note_handler))
+        .route("/v1/admin/incidents/{id}/postmortem", post(incidents::postmortem_handler))
+        .route_layer(middleware::from_fn(auth::require_auth))
 }
 
 #[cfg(test)]
