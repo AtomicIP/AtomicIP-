@@ -148,7 +148,7 @@ impl HealthChecker {
     pub fn new() -> Self {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
 
         Self {
@@ -226,7 +226,7 @@ impl HealthChecker {
         let latency_ms = start.elapsed().as_millis() as u64;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
 
         let status = if latency_ms >= 2000 {
@@ -264,7 +264,7 @@ impl HealthChecker {
     ) -> ComponentStatus {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
 
         let (status, message) = if !is_reachable {
@@ -360,7 +360,7 @@ impl HealthChecker {
         let latency_ms = start.elapsed().as_millis() as u64;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
 
         let component = ComponentStatus {
@@ -391,7 +391,7 @@ impl HealthChecker {
         let latency_ms = start.elapsed().as_millis() as u64;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
 
         let component = ComponentStatus {
@@ -424,7 +424,7 @@ impl HealthChecker {
         let latency_ms = start.elapsed().as_millis() as u64;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
 
         let component = ComponentStatus {
@@ -456,7 +456,7 @@ impl HealthChecker {
         let latency_ms = start.elapsed().as_millis() as u64;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
 
         let component = ComponentStatus {
@@ -513,7 +513,7 @@ impl HealthChecker {
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
 
         let checks = vec![
@@ -865,6 +865,28 @@ mod tests {
 
         let health = checker.get_health().await;
         assert_eq!(health.status, "down");
+    }
+
+    #[tokio::test]
+    async fn test_failing_probe_reports_degraded_not_panic() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // An unreachable dependency must surface as a degraded overall
+        // status, never as a panic from the probe itself.
+        std::env::set_var("SOROBAN_RPC_URL", "http://127.0.0.1:1");
+        std::env::remove_var("DATABASE_URL");
+
+        let checker = HealthChecker::new();
+        checker.check_contract_connectivity().await;
+        checker.check_database().await;
+        checker.check_cache().await;
+        checker.check_memory().await;
+        checker.check_disk().await;
+
+        let health = checker.get_health().await;
+        std::env::remove_var("SOROBAN_RPC_URL");
+
+        assert_eq!(health.status, "degraded");
+        assert_ne!(health.status, "down");
     }
 
     #[tokio::test]
