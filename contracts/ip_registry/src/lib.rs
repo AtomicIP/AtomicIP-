@@ -53,6 +53,9 @@ mod commitment_sybil_resistance_tests;
 #[cfg(test)]
 mod validator_network_tests;
 
+#[cfg(test)]
+mod revocation_property_tests;
+
 // ── Error Codes ────────────────────────────────────────────────────────────
 
 #[contracterror]
@@ -9519,5 +9522,166 @@ mod tests {
 
         // id2 must appear in cat_into.
         assert!(in_into.contains(&id2));
+    }
+}
+
+// ── Issue #1232: Revocation property tests ────────────────────────────────
+//
+// Property: once an IP has been revoked, no subsequent operation may
+// transfer it or successfully verify its commitment. Random sequences of
+// revoke / transfer / verify operations are generated and, after every
+// revoke, the invariant is asserted directly.
+#[cfg(test)]
+mod revocation_property_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use proptest::test_runner::{Config as ProptestConfig, RngAlgorithm, TestRng};
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    /// Fixed seed so CI runs are reproducible.
+    const FIXED_SEED: [u8; 32] = [0x12u8; 32];
+
+    /// A single operation in a random sequence.
+    #[derive(Clone, Copy, Debug)]
+    enum Op {
+        Revoke,
+        Transfer,
+        Verify,
+    }
+
+    fn op_strategy() -> impl Strategy<Value = Op> {
+        prop_oneof![
+            Just(Op::Revoke),
+            Just(Op::Transfer),
+            Just(Op::Verify),
+        ]
+    }
+
+    fn sequence_strategy() -> impl Strategy<Value = std::vec::Vec<Op>> {
+        prop::collection::vec(op_strategy(), 1..12)
+    }
+
+    fn fixed_config() -> ProptestConfig {
+        let mut config = ProptestConfig::default();
+        config.cases = 32;
+        config.rng_algorithm = RngAlgorithm::ChaCha;
+        config.rng_seed = TestRng::from_seed(RngAlgorithm::ChaCha, &FIXED_SEED);
+        config
+    }
+
+    /// Runs one random sequence against a fresh contract instance and
+    /// asserts the revocation invariant after every revoke.
+    fn run_sequence(ops: &[Op]) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let secret = BytesN::from_array(&env, &[0x5Au8; 32]);
+        let blinding = BytesN::from_array(&env, &[0xA5u8; 32]);
+        let mut preimage = Bytes::new(&env);
+        preimage.append(&secret.clone().into());
+        preimage.append(&blinding.clone().into());
+        let commitment: BytesN<32> = env.crypto().sha256(&preimage).into();
+
+        let ip_id = client.commit_ip(&owner, &commitment, &0u32);
+
+        let mut revoked = false;
+
+        for op in ops {
+            match op {
+                Op::Revoke => {
+                    if revoked {
+                        // Double revoke must fail; invariant already holds.
+                        let result = catch_unwind(AssertUnwindSafe(|| {
+                            client.revoke_ip(&ip_id);
+                        }));
+                        assert!(result.is_err(), "double revoke must fail");
+                        continue;
+                    }
+                    client.revoke_ip(&ip_id);
+                    revoked = true;
+
+                    // Invariant: the record is marked revoked.
+                    assert!(
+                        client.get_ip(&ip_id).revoked,
+                        "record must be marked revoked"
+                    );
+
+                    // Invariant: transfer after revoke must fail.
+                    let transfer_result = catch_unwind(AssertUnwindSafe(|| {
+                        client.transfer_ip(&ip_id, &owner, &recipient);
+                    }));
+                    assert!(
+                        transfer_result.is_err(),
+                        "transfer of a revoked IP must fail"
+                    );
+
+                    // Invariant: verification after revoke must not succeed.
+                    let verify_result = catch_unwind(AssertUnwindSafe(|| {
+                        client.verify_commitment(&ip_id, &secret, &blinding)
+                    }));
+                    match verify_result {
+                        Ok(valid) => assert!(
+                            !valid,
+                            "verification of a revoked IP must not succeed"
+                        ),
+                        Err(_) => { /* erroring out is also acceptable */ }
+                    }
+
+                    // Ownership must be unchanged by the failed transfer.
+                    assert_eq!(
+                        client.get_ip(&ip_id).owner,
+                        owner,
+                        "owner must not change after a failed transfer"
+                    );
+                }
+                Op::Transfer => {
+                    let result = catch_unwind(AssertUnwindSafe(|| {
+                        client.transfer_ip(&ip_id, &owner, &recipient);
+                    }));
+                    if revoked {
+                        assert!(result.is_err(), "transfer of a revoked IP must fail");
+                    }
+                }
+                Op::Verify => {
+                    let result = catch_unwind(AssertUnwindSafe(|| {
+                        client.verify_commitment(&ip_id, &secret, &blinding)
+                    }));
+                    if revoked {
+                        match result {
+                            Ok(valid) => assert!(
+                                !valid,
+                                "verification of a revoked IP must not succeed"
+                            ),
+                            Err(_) => { /* erroring out is also acceptable */ }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(fixed_config())]
+
+        /// Issue #1232: random revoke/transfer/verify sequences never allow a
+        /// revoked IP to be transferred or successfully verified.
+        #[test]
+        fn prop_revoked_ip_cannot_be_transferred_or_verified(
+            ops in sequence_strategy()
+        ) {
+            run_sequence(&ops);
+        }
+    }
+
+    /// Sanity check that the invariant is actually exercised: a sequence that
+    /// revokes first must leave the IP revoked and untransferable.
+    #[test]
+    fn test_revocation_invariant_smoke() {
+        run_sequence(&[Op::Revoke, Op::Transfer, Op::Verify]);
     }
 }

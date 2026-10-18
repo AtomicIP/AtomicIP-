@@ -104,6 +104,11 @@ jobs:
       - name: Test (JS)
         run: npm test -- --coverage
 
+      - name: Coverage threshold gate (JS)
+        # Enforces the per-module thresholds in coverage-config.json, including
+        # the royaltyCalculation.js (#1234) and swapMetrics.js (#1235) entries.
+        run: ./scripts/coverage-threshold-gate.sh
+
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v3
         with:
