@@ -53,6 +53,11 @@ const SWAP_EXPIRY_SECONDS: u64 = 604800;
 static NEXT_SWAP_ID: AtomicU64 = AtomicU64::new(0);
 static WATCHLISTS: Lazy<Mutex<HashMap<String, BTreeSet<u64>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+
+// #1200: Bound the WATCHLISTS global store so an attacker cannot grow it
+// without limit by inventing user IDs.
+const MAX_WATCHLIST_ENTRIES_PER_USER: usize = 1000;
+const MAX_WATCHLIST_USERS: usize = 100_000;
 static COMMITMENT_INDEX: Lazy<DashMap<u64, IpRecord>> = Lazy::new(DashMap::new);
 
 /// Audit log store for tracking all API access and sensitive operations
@@ -328,7 +333,32 @@ pub async fn batch_reveal_commitments(
             let mut watchlists = WATCHLISTS.lock().map_err(|_| {
                 (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "watchlist unavailable".to_string() }))
             })?;
+            // #1200: Reject new users once the total-user cap is reached.
+            if !watchlists.contains_key(&body.user_id) && watchlists.len() >= MAX_WATCHLIST_USERS {
+                return Err((
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(ErrorResponse {
+                        error: format!(
+                            "watchlist user cap of {} exceeded (WATCHLIST_USER_CAP_EXCEEDED)",
+                            MAX_WATCHLIST_USERS
+                        ),
+                    }),
+                ));
+            }
             let ids = watchlists.entry(body.user_id.clone()).or_default();
+            // #1200: Reject new entries once the per-user cap is reached,
+            // leaving the existing set unchanged.
+            if !ids.contains(&body.ip_id) && ids.len() >= MAX_WATCHLIST_ENTRIES_PER_USER {
+                return Err((
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(ErrorResponse {
+                        error: format!(
+                            "watchlist entry cap of {} exceeded (WATCHLIST_ENTRY_CAP_EXCEEDED)",
+                            MAX_WATCHLIST_ENTRIES_PER_USER
+                        ),
+                    }),
+                ));
+            }
             ids.insert(body.ip_id);
             Ok(Json(WatchlistResponse {
                 user_id: body.user_id,
@@ -1380,6 +1410,17 @@ pub async fn register_webhook(Json(body): Json<RegisterWebhookRequest>) -> Resul
         ));
     }
 
+    // #1202: Reject targets that resolve to loopback, private, or link-local
+    // addresses so webhook delivery cannot reach internal services.
+    if let Err(reason) = webhook::validate_webhook_target(&url).await {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("webhook URL rejected (WEBHOOK_SSRF_BLOCKED): {}", reason),
+            }),
+        ));
+    }
+
     let config = webhook::register(url.to_string(), body.events);
 
     Ok(Json(WebhookResponse {
@@ -1390,20 +1431,42 @@ pub async fn register_webhook(Json(body): Json<RegisterWebhookRequest>) -> Resul
     }))
 }
 
-/// List registered webhook subscriptions.
+/// Strip query strings and userinfo from a webhook URL so tokens embedded in
+/// it are never returned to a caller (#1201).
+fn redact_webhook_url(raw: &str) -> String {
+    match reqwest::Url::parse(raw) {
+        Ok(mut url) => {
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            url.set_query(None);
+            url.set_fragment(None);
+            url.to_string()
+        }
+        Err(_) => String::new(),
+    }
+}
+
+/// List the authenticated caller's webhook subscriptions (#1201).
 #[utoipa::path(
     get,
     path = "/v1/webhooks",
     tag = "Webhooks",
     responses((status = 200, description = "Registered webhooks", body = Vec<WebhookResponse>))
 )]
-pub async fn list_webhooks() -> impl IntoResponse {
-    let webhooks = webhook::list_all().into_iter().map(|config| WebhookResponse {
-        id: config.id.to_string(),
-        url: config.url,
-        events: config.events,
-        created_at: config.created_at,
-    }).collect::<Vec<_>>();
+pub async fn list_webhooks(
+    crate::auth::AuthExtension(auth): crate::auth::AuthExtension,
+) -> impl IntoResponse {
+    let owner = auth.address;
+    let webhooks = webhook::list_all()
+        .into_iter()
+        .filter(|config| config.owner == owner)
+        .map(|config| WebhookResponse {
+            id: config.id.to_string(),
+            url: redact_webhook_url(&config.url),
+            events: config.events,
+            created_at: config.created_at,
+        })
+        .collect::<Vec<_>>();
     Json(webhooks)
 }
 
