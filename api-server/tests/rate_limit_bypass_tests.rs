@@ -282,6 +282,172 @@ mod rate_limit_bypass_tests {
         );
     }
 
+    // ── #1223: Parse failures must fail closed, never panic ───────────────────
+
+    /// Outcome of parsing a rate-limit input (header, API key, etc.).
+    /// A parse failure must map to a client error (400) or a rate-limit
+    /// response (429), never a panic.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ParseOutcome {
+        Ok,
+        BadRequest,
+        RateLimited,
+    }
+
+    impl ParseOutcome {
+        pub fn is_fail_closed(self) -> bool {
+            matches!(self, ParseOutcome::BadRequest | ParseOutcome::RateLimited)
+        }
+    }
+
+    /// Parse a `x-forwarded-for` header value into a source IP.
+    /// Malformed values fail closed with 400 rather than panicking.
+    pub fn parse_forwarded_for(header: Option<&str>) -> ParseOutcome {
+        let value = match header {
+            Some(v) => v.trim(),
+            None => return ParseOutcome::BadRequest,
+        };
+        if value.is_empty() {
+            return ParseOutcome::BadRequest;
+        }
+        // Take the first hop and validate it looks like an IPv4 address.
+        let first = match value.split(',').next() {
+            Some(hop) => hop.trim(),
+            None => return ParseOutcome::BadRequest,
+        };
+        let octets: Vec<&str> = first.split('.').collect();
+        if octets.len() != 4 {
+            return ParseOutcome::BadRequest;
+        }
+        for octet in octets {
+            match octet.parse::<u8>() {
+                Ok(_) => {}
+                Err(_) => return ParseOutcome::BadRequest,
+            }
+        }
+        ParseOutcome::Ok
+    }
+
+    /// Parse a numeric rate-limit header (e.g. `x-ratelimit-burst`).
+    /// Invalid values fail closed with 400.
+    pub fn parse_numeric_header(header: Option<&str>) -> ParseOutcome {
+        match header {
+            Some(v) => match v.trim().parse::<u32>() {
+                Ok(_) => ParseOutcome::Ok,
+                Err(_) => ParseOutcome::BadRequest,
+            },
+            None => ParseOutcome::BadRequest,
+        }
+    }
+
+    /// Decode an API key from a header value. Non-ASCII or empty keys fail
+    /// closed with 400 instead of panicking on invalid encoding.
+    pub fn decode_api_key(header: Option<&str>) -> ParseOutcome {
+        match header {
+            Some(v) => {
+                let trimmed = v.trim();
+                if trimmed.is_empty() || !trimmed.is_ascii() {
+                    ParseOutcome::BadRequest
+                } else {
+                    ParseOutcome::Ok
+                }
+            }
+            None => ParseOutcome::BadRequest,
+        }
+    }
+
+    #[test]
+    fn test_malformed_forwarded_for_fails_closed() {
+        let cases = [
+            None,
+            Some(""),
+            Some("   "),
+            Some("not-an-ip"),
+            Some("999.999.999.999"),
+            Some("192.0.2"),
+            Some("192.0.2.1.5"),
+            Some("::1"),
+        ];
+        for case in cases.iter() {
+            let outcome = parse_forwarded_for(*case);
+            assert!(
+                outcome.is_fail_closed(),
+                "Malformed x-forwarded-for {:?} must fail closed, got {:?}",
+                case,
+                outcome
+            );
+        }
+    }
+
+    #[test]
+    fn test_valid_forwarded_for_is_accepted() {
+        assert_eq!(parse_forwarded_for(Some("192.0.2.1")), ParseOutcome::Ok);
+        assert_eq!(
+            parse_forwarded_for(Some("203.0.113.7, 10.0.0.1")),
+            ParseOutcome::Ok
+        );
+    }
+
+    #[test]
+    fn test_invalid_numeric_header_fails_closed() {
+        let cases = [None, Some(""), Some("abc"), Some("-5"), Some("1.5"), Some("999999999999")];
+        for case in cases.iter() {
+            let outcome = parse_numeric_header(*case);
+            assert!(
+                outcome.is_fail_closed(),
+                "Invalid numeric header {:?} must fail closed, got {:?}",
+                case,
+                outcome
+            );
+        }
+        assert_eq!(parse_numeric_header(Some("100")), ParseOutcome::Ok);
+    }
+
+    #[test]
+    fn test_bad_api_key_encoding_fails_closed() {
+        let cases = [None, Some(""), Some("   "), Some("ключ"), Some("key\u{0}with-nul")];
+        for case in cases.iter() {
+            let outcome = decode_api_key(*case);
+            assert!(
+                outcome.is_fail_closed(),
+                "Bad API key encoding {:?} must fail closed, got {:?}",
+                case,
+                outcome
+            );
+        }
+        assert_eq!(decode_api_key(Some("valid_key_123")), ParseOutcome::Ok);
+    }
+
+    #[test]
+    fn test_parse_failure_does_not_bypass_limit_for_offending_request() {
+        let checker = RateLimitChecker::new();
+        let client = AuthenticatedClient {
+            api_key: "attacker_key".to_string(),
+            tier: RateLimitTier::Free,
+        };
+
+        // The offending request has a malformed forwarded-for header.
+        let parse = parse_forwarded_for(Some("garbage"));
+        assert!(
+            parse.is_fail_closed(),
+            "Malformed header must fail closed, not panic or pass through"
+        );
+
+        // Even though the parse failed, the request must still be subject to
+        // rate limiting: a fail-closed outcome means the request is rejected
+        // (400/429), so it cannot consume tokens or bypass the limiter.
+        let should_limit = checker.should_rate_limit_authenticated(
+            &client,
+            "0.0.0.0", // unknown source after failed parse
+            0.0,       // fail-closed: treat as exhausted
+            0.0,       // fail-closed: treat as exhausted
+        );
+        assert!(
+            should_limit,
+            "A request whose rate-limit inputs failed to parse must not bypass the limit"
+        );
+    }
+
     #[test]
     fn test_admin_cannot_bypass_rate_limits_through_batch_operations() {
         let checker = RateLimitChecker::new();

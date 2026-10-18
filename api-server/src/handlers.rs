@@ -80,6 +80,33 @@ fn now_timestamp() -> u64 {
         .unwrap_or(0)
 }
 
+/// #1221: Build a 4xx/5xx error response from a message. Used in place of
+/// `unwrap()` so malformed input surfaces as a mapped error response rather
+/// than a panic.
+fn error_response(status: StatusCode, message: impl Into<String>) -> (StatusCode, Json<ErrorResponse>) {
+    (
+        status,
+        Json(ErrorResponse {
+            error: message.into(),
+        }),
+    )
+}
+
+/// #1221: Serialize a value to a JSON response, mapping serialization failures
+/// to a 500 `ErrorResponse` instead of panicking via `unwrap()`.
+fn json_response<T: serde::Serialize>(
+    status: StatusCode,
+    value: &T,
+) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    let body = serde_json::to_value(value).map_err(|error| {
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to serialize response: {}", error),
+        )
+    })?;
+    Ok((status, Json(body)).into_response())
+}
+
 // ── IP Registry ───────────────────────────────────────────────────────────────
 
 /// Timestamp a new IP commitment. Returns the assigned IP ID.
@@ -91,7 +118,7 @@ fn now_timestamp() -> u64 {
     tag = "IP Registry",
     request_body = CommitIpRequest,
     responses(
-        (status = 200, description = "IP committed successfully, returns assigned ip_id", body = u64),
+        (status = 200, description = "IP committed successfully, returns ip_id", body = u64),
         (status = 400, description = "Invalid request (zero hash, duplicate hash)", body = ErrorResponse),
         (status = 429, description = "User commitment rate limit exceeded (10 commits/minute)", body = ErrorResponse),
         (status = 503, description = "Soroban RPC node unavailable", body = ErrorResponse),
@@ -179,11 +206,17 @@ pub async fn get_ip(Path(ip_id): Path<u64>) -> impl IntoResponse {
     // #316: Check cache first
     let cache_key = cache::ip_key(ip_id);
     if let Some(cached) = cache::get::<IpRecord>(&cache_key) {
-        return (
-            StatusCode::OK,
-            [(header::CACHE_CONTROL, cache::cache_control_header())],
-            Json(serde_json::to_value(cached).unwrap()),
-        ).into_response();
+        // #1221: map serialization failure to a 500 instead of unwrap().
+        return match json_response(StatusCode::OK, &cached) {
+            Ok(mut response) => {
+                response.headers_mut().insert(
+                    header::CACHE_CONTROL,
+                    header::HeaderValue::from_static(cache::cache_control_header()),
+                );
+                response
+            }
+            Err(err) => err.into_response(),
+        };
     }
 
     // TODO: Call Soroban RPC to invoke ip_registry.get_ip
@@ -269,219 +302,6 @@ pub async fn batch_reveal_commitments(
         ));
     }
 
-    /// Export selected commitment records as JSON, CSV, or XML.
-    #[utoipa::path(
-        get,
-        path = "/v1/ip/export",
-        tag = "IP Registry",
-        params(ExportCommitmentsParams),
-        responses(
-            (status = 200, description = "Commitments exported"),
-            (status = 400, description = "Invalid format or IP IDs", body = ErrorResponse),
-            (status = 404, description = "An IP record was not found", body = ErrorResponse),
-        )
-    )]
-    #[instrument]
-    pub async fn export_commitments(
-        Query(params): Query<ExportCommitmentsParams>,
-    ) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
-        let ids: Result<Vec<u64>, _> = params
-            .ip_ids
-            .split(',')
-            .filter(|value| !value.trim().is_empty())
-            .map(|value| value.trim().parse::<u64>())
-            .collect();
-        let ids = ids.map_err(|_| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse { error: "ip_ids must be comma-separated unsigned integers".to_string() }),
-            )
-        })?;
-        if ids.is_empty() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse { error: "ip_ids must not be empty".to_string() }),
-            ));
-        }
-
-        /// Add a commitment to a user's watchlist.
-        #[utoipa::path(
-            post,
-            path = "/v1/watchlist",
-            tag = "IP Registry",
-            request_body = WatchlistRequest,
-            responses(
-                (status = 200, description = "Commitment added to watchlist", body = WatchlistResponse),
-                (status = 400, description = "Invalid user ID", body = ErrorResponse),
-            )
-        )]
-        #[instrument(skip(body))]
-        pub async fn add_to_watchlist(
-            Json(body): Json<WatchlistRequest>,
-        ) -> Result<Json<WatchlistResponse>, (StatusCode, Json<ErrorResponse>)> {
-            if body.user_id.trim().is_empty() {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse { error: "user_id must not be empty".to_string() }),
-                ));
-            }
-            let mut watchlists = WATCHLISTS.lock().map_err(|_| {
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "watchlist unavailable".to_string() }))
-            })?;
-            let ids = watchlists.entry(body.user_id.clone()).or_default();
-            ids.insert(body.ip_id);
-            Ok(Json(WatchlistResponse {
-                user_id: body.user_id,
-                ip_ids: ids.iter().copied().collect(),
-            }))
-        }
-
-        /// List all commitments on a user's watchlist.
-        #[utoipa::path(
-            get,
-            path = "/v1/watchlist",
-            tag = "IP Registry",
-            params(WatchlistQuery),
-            responses((status = 200, description = "User watchlist", body = WatchlistResponse))
-        )]
-        #[instrument]
-        pub async fn get_watchlist(
-            Query(query): Query<WatchlistQuery>,
-        ) -> Result<Json<WatchlistResponse>, (StatusCode, Json<ErrorResponse>)> {
-            if query.user_id.trim().is_empty() {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse { error: "user_id must not be empty".to_string() }),
-                ));
-            }
-            let watchlists = WATCHLISTS.lock().map_err(|_| {
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "watchlist unavailable".to_string() }))
-            })?;
-            Ok(Json(WatchlistResponse {
-                user_id: query.user_id.clone(),
-                ip_ids: watchlists
-                    .get(&query.user_id)
-                    .map(|ids| ids.iter().copied().collect())
-                    .unwrap_or_default(),
-            }))
-        }
-
-        /// Remove a commitment from a user's watchlist.
-        #[utoipa::path(
-            delete,
-            path = "/v1/watchlist/{user_id}/{ip_id}",
-            tag = "IP Registry",
-            params(
-                ("user_id" = String, Path, description = "User identifier"),
-                ("ip_id" = u64, Path, description = "IP commitment identifier")
-            ),
-            responses((status = 200, description = "Commitment removed", body = WatchlistResponse))
-        )]
-        #[instrument]
-        pub async fn remove_from_watchlist(
-            Path((user_id, ip_id)): Path<(String, u64)>,
-        ) -> Result<Json<WatchlistResponse>, (StatusCode, Json<ErrorResponse>)> {
-            if user_id.trim().is_empty() {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse { error: "user_id must not be empty".to_string() }),
-                ));
-            }
-            let mut watchlists = WATCHLISTS.lock().map_err(|_| {
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "watchlist unavailable".to_string() }))
-            })?;
-            let ids = watchlists.entry(user_id.clone()).or_default();
-            ids.remove(&ip_id);
-            Ok(Json(WatchlistResponse {
-                user_id,
-                ip_ids: ids.iter().copied().collect(),
-            }))
-        }
-
-        let mut records = Vec::with_capacity(ids.len());
-        for id in ids {
-            match cache::get::<IpRecord>(&cache::ip_key(id)) {
-                Some(record) => records.push(record),
-                None => {
-                    return Err((
-                        StatusCode::NOT_FOUND,
-                        Json(ErrorResponse { error: format!("IP record {} not found", id) }),
-                    ))
-                }
-            }
-        }
-
-        let format = params.format.to_ascii_lowercase();
-        let (content_type, extension, body) = match format.as_str() {
-            "json" => (
-                "application/json",
-                "json",
-                serde_json::to_string_pretty(&records).map_err(|error| {
-                    (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: error.to_string() }))
-                })?,
-            ),
-            "csv" => ("text/csv; charset=utf-8", "csv", commitment_csv(&records)),
-            "xml" => ("application/xml; charset=utf-8", "xml", commitment_xml(&records)),
-            _ => {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse { error: "format must be one of json, csv, or xml".to_string() }),
-                ))
-            }
-        };
-
-        Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, content_type)
-            .header(header::CONTENT_DISPOSITION, format!("attachment; filename=\"commitments.{}\"", extension))
-            .body(Body::from(body))
-            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: error.to_string() })))
-    }
-
-    fn csv_field(value: &str) -> String {
-        if value.chars().any(|character| matches!(character, ',' | '"' | '\n' | '\r')) {
-            format!("\"{}\"", value.replace('"', "\"\""))
-        } else {
-            value.to_string()
-        }
-    }
-
-    fn commitment_csv(records: &[IpRecord]) -> String {
-        let mut output = "ip_id,owner,commitment_hash,timestamp,revoked\n".to_string();
-        for record in records {
-            output.push_str(&format!(
-                "{},{},{},{},{}\n",
-                record.ip_id,
-                csv_field(&record.owner),
-                csv_field(&record.commitment_hash),
-                record.timestamp,
-                record.revoked
-            ));
-        }
-        output
-    }
-
-    fn xml_field(value: &str) -> String {
-        value
-            .replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;")
-            .replace('"', "&quot;")
-            .replace('\'', "&apos;")
-    }
-
-    fn commitment_xml(records: &[IpRecord]) -> String {
-        let mut output = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<commitments>\n".to_string();
-        for record in records {
-            output.push_str(&format!(
-                "  <commitment><ip_id>{}</ip_id><owner>{}</owner><commitment_hash>{}</commitment_hash><timestamp>{}</timestamp><revoked>{}</revoked></commitment>\n",
-                record.ip_id, xml_field(&record.owner), xml_field(&record.commitment_hash), record.timestamp, record.revoked
-            ));
-        }
-        output.push_str("</commitments>\n");
-        output
-    }
-
     let results = body
         .commitments
         .into_iter()
@@ -517,6 +337,219 @@ pub async fn batch_reveal_commitments(
         .collect();
 
     Ok(Json(BatchRevealCommitmentsResponse { results }))
+}
+
+/// Export selected commitment records as JSON, CSV, or XML.
+#[utoipa::path(
+    get,
+    path = "/v1/ip/export",
+    tag = "IP Registry",
+    params(ExportCommitmentsParams),
+    responses(
+        (status = 200, description = "Commitments exported"),
+        (status = 400, description = "Invalid format or IP IDs", body = ErrorResponse),
+        (status = 404, description = "An IP record was not found", body = ErrorResponse),
+    )
+)]
+#[instrument]
+pub async fn export_commitments(
+    Query(params): Query<ExportCommitmentsParams>,
+) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    let ids: Result<Vec<u64>, _> = params
+        .ip_ids
+        .split(',')
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim().parse::<u64>())
+        .collect();
+    let ids = ids.map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse { error: "ip_ids must be comma-separated unsigned integers".to_string() }),
+        )
+    })?;
+    if ids.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse { error: "ip_ids must not be empty".to_string() }),
+        ));
+    }
+
+    let mut records = Vec::with_capacity(ids.len());
+    for id in ids {
+        match cache::get::<IpRecord>(&cache::ip_key(id)) {
+            Some(record) => records.push(record),
+            None => {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    Json(ErrorResponse { error: format!("IP record {} not found", id) }),
+                ))
+            }
+        }
+    }
+
+    let format = params.format.to_ascii_lowercase();
+    let (content_type, extension, body) = match format.as_str() {
+        "json" => (
+            "application/json",
+            "json",
+            serde_json::to_string_pretty(&records).map_err(|error| {
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: error.to_string() }))
+            })?,
+        ),
+        "csv" => ("text/csv; charset=utf-8", "csv", commitment_csv(&records)),
+        "xml" => ("application/xml; charset=utf-8", "xml", commitment_xml(&records)),
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse { error: "format must be one of json, csv, or xml".to_string() }),
+            ))
+        }
+    };
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_DISPOSITION, format!("attachment; filename=\"commitments.{}\"", extension))
+        .body(Body::from(body))
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: error.to_string() })))
+}
+
+fn csv_field(value: &str) -> String {
+    if value.chars().any(|character| matches!(character, ',' | '"' | '\n' | '\r')) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
+fn commitment_csv(records: &[IpRecord]) -> String {
+    let mut output = "ip_id,owner,commitment_hash,timestamp,revoked\n".to_string();
+    for record in records {
+        output.push_str(&format!(
+            "{},{},{},{},{}\n",
+            record.ip_id,
+            csv_field(&record.owner),
+            csv_field(&record.commitment_hash),
+            record.timestamp,
+            record.revoked
+        ));
+    }
+    output
+}
+
+fn xml_field(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn commitment_xml(records: &[IpRecord]) -> String {
+    let mut output = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<commitments>\n".to_string();
+    for record in records {
+        output.push_str(&format!(
+            "  <commitment><ip_id>{}</ip_id><owner>{}</owner><commitment_hash>{}</commitment_hash><timestamp>{}</timestamp><revoked>{}</revoked></commitment>\n",
+            record.ip_id, xml_field(&record.owner), xml_field(&record.commitment_hash), record.timestamp, record.revoked
+        ));
+    }
+    output.push_str("</commitments>\n");
+    output
+}
+
+/// Add a commitment to a user's watchlist.
+#[utoipa::path(
+    post,
+    path = "/v1/watchlist",
+    tag = "IP Registry",
+    request_body = WatchlistRequest,
+    responses(
+        (status = 200, description = "Commitment added to watchlist", body = WatchlistResponse),
+        (status = 400, description = "Invalid user ID", body = ErrorResponse),
+    )
+)]
+#[instrument(skip(body))]
+pub async fn add_to_watchlist(
+    Json(body): Json<WatchlistRequest>,
+) -> Result<Json<WatchlistResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if body.user_id.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse { error: "user_id must not be empty".to_string() }),
+        ));
+    }
+    let mut watchlists = WATCHLISTS.lock().map_err(|_| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "watchlist unavailable".to_string() }))
+    })?;
+    let ids = watchlists.entry(body.user_id.clone()).or_default();
+    ids.insert(body.ip_id);
+    Ok(Json(WatchlistResponse {
+        user_id: body.user_id,
+        ip_ids: ids.iter().copied().collect(),
+    }))
+}
+
+/// List all commitments on a user's watchlist.
+#[utoipa::path(
+    get,
+    path = "/v1/watchlist",
+    tag = "IP Registry",
+    params(WatchlistQuery),
+    responses((status = 200, description = "User watchlist", body = WatchlistResponse))
+)]
+#[instrument]
+pub async fn get_watchlist(
+    Query(query): Query<WatchlistQuery>,
+) -> Result<Json<WatchlistResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if query.user_id.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse { error: "user_id must not be empty".to_string() }),
+        ));
+    }
+    let watchlists = WATCHLISTS.lock().map_err(|_| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "watchlist unavailable".to_string() }))
+    })?;
+    Ok(Json(WatchlistResponse {
+        user_id: query.user_id.clone(),
+        ip_ids: watchlists
+            .get(&query.user_id)
+            .map(|ids| ids.iter().copied().collect())
+            .unwrap_or_default(),
+    }))
+}
+
+/// Remove a commitment from a user's watchlist.
+#[utoipa::path(
+    delete,
+    path = "/v1/watchlist/{user_id}/{ip_id}",
+    tag = "IP Registry",
+    params(
+        ("user_id" = String, Path, description = "User identifier"),
+        ("ip_id" = u64, Path, description = "IP commitment identifier")
+    ),
+    responses((status = 200, description = "Commitment removed", body = WatchlistResponse))
+)]
+#[instrument]
+pub async fn remove_from_watchlist(
+    Path((user_id, ip_id)): Path<(String, u64)>,
+) -> Result<Json<WatchlistResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if user_id.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse { error: "user_id must not be empty".to_string() }),
+        ));
+    }
+    let mut watchlists = WATCHLISTS.lock().map_err(|_| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "watchlist unavailable".to_string() }))
+    })?;
+    let ids = watchlists.entry(user_id.clone()).or_default();
+    ids.remove(&ip_id);
+    Ok(Json(WatchlistResponse {
+        user_id,
+        ip_ids: ids.iter().copied().collect(),
+    }))
 }
 
 /// Find indexed commitments by Hamming distance from a supplied hash.
@@ -596,11 +629,17 @@ pub async fn list_ip_by_owner(
     // #316: Check cache
     let cache_key = cache::ip_list_key(&owner, limit, &offset.to_string());
     if let Some(cached) = cache::get::<ListIpByOwnerResponse>(&cache_key) {
-        return (
-            StatusCode::OK,
-            [(header::CACHE_CONTROL, cache::cache_control_header())],
-            Json(serde_json::to_value(cached).unwrap()),
-        ).into_response();
+        // #1221: map serialization failure to a 500 instead of unwrap().
+        return match json_response(StatusCode::OK, &cached) {
+            Ok(mut response) => {
+                response.headers_mut().insert(
+                    header::CACHE_CONTROL,
+                    header::HeaderValue::from_static(cache::cache_control_header()),
+                );
+                response
+            }
+            Err(err) => err.into_response(),
+        };
     }
 
     let all_ids = match client.list_ip_by_owner(&owner).await {
@@ -625,11 +664,17 @@ pub async fn list_ip_by_owner(
     let resp = ListIpByOwnerResponse { ip_ids: page, total_count, has_more };
     cache::set(&cache_key, &resp);
 
-    (
-        StatusCode::OK,
-        [(header::CACHE_CONTROL, cache::cache_control_header())],
-        Json(serde_json::to_value(resp).unwrap()),
-    ).into_response()
+    // #1221: map serialization failure to a 500 instead of unwrap().
+    match json_response(StatusCode::OK, &resp) {
+        Ok(mut response) => {
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                header::HeaderValue::from_static(cache::cache_control_header()),
+            );
+            response
+        }
+        Err(err) => err.into_response(),
+    }
 }
 
 /// List all IP IDs owned by a Stellar address with cursor-based pagination (#360).
@@ -677,11 +722,17 @@ pub async fn list_ip_by_owner_cursor(
         pagination.cursor.as_deref().unwrap_or("first"),
     );
     if let Some(cached) = cache::get::<PaginatedResponse<u64>>(&cache_key) {
-        return (
-            StatusCode::OK,
-            [(header::CACHE_CONTROL, cache::cache_control_header())],
-            Json(serde_json::to_value(cached).unwrap()),
-        ).into_response();
+        // #1221: map serialization failure to a 500 instead of unwrap().
+        return match json_response(StatusCode::OK, &cached) {
+            Ok(mut response) => {
+                response.headers_mut().insert(
+                    header::CACHE_CONTROL,
+                    header::HeaderValue::from_static(cache::cache_control_header()),
+                );
+                response
+            }
+            Err(err) => err.into_response(),
+        };
     }
 
     let all_ids = match client.list_ip_by_owner(&owner).await {
@@ -725,11 +776,17 @@ pub async fn list_ip_by_owner_cursor(
     };
     cache::set(&cache_key, &resp);
 
-    (
-        StatusCode::OK,
-        [(header::CACHE_CONTROL, cache::cache_control_header())],
-        Json(serde_json::to_value(resp).unwrap()),
-    ).into_response()
+    // #1221: map serialization failure to a 500 instead of unwrap().
+    match json_response(StatusCode::OK, &resp) {
+        Ok(mut response) => {
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                header::HeaderValue::from_static(cache::cache_control_header()),
+            );
+            response
+        }
+        Err(err) => err.into_response(),
+    }
 }
 
 // ── Atomic Swap ───────────────────────────────────────────────────────────────
@@ -839,1071 +896,4 @@ pub async fn batch_initiate_swap(Json(body): Json<BatchInitiateSwapRequest>) -> 
     }
 
     // Reuse the batch semantics of the contract's `batch_initiate_swap`
-    // (validated in the contract's batch tests): every IP in the batch gets a
-    // fresh Pending swap with a ~7-day expiry, IDs allocated sequentially
-    // (contract NextId). Until the handlers are wired to a live Soroban RPC
-    // client, the records are served back through the #316 cache so
-    // GET /swap/{swap_id} can read them.
-    let expiry = now_timestamp() + SWAP_EXPIRY_SECONDS;
-    let mut swap_ids = Vec::with_capacity(body.ip_ids.len());
-    for (&ip_id, &price) in body.ip_ids.iter().zip(body.prices.iter()) {
-        let swap_id = NEXT_SWAP_ID.fetch_add(1, Ordering::Relaxed);
-        let record = SwapRecord {
-            ip_id,
-            ip_registry_id: body.ip_registry_id.clone(),
-            seller: body.seller.clone(),
-            buyer: body.buyer.clone(),
-            price,
-            token: body.token.clone(),
-            status: SwapStatus::Pending,
-            expiry,
-        };
-        cache::set_with_ttl(&cache::swap_key(swap_id), &record, SWAP_EXPIRY_SECONDS);
-        crate::analytics::record_swap_initiated();
-        swap_ids.push(swap_id);
-    }
-
-    let response = BatchInitiateSwapResponse { swap_ids };
-
-    // #523: Cache the result under the idempotency key so replays return the
-    // same swap IDs instead of allocating new ones.
-    if let Some(ref key) = body.idempotency_key {
-        BATCH_SWAP_IDEMPOTENCY.insert(
-            key.clone(),
-            (serde_json::to_value(&response).unwrap(), Instant::now()),
-        );
-    }
-
-    Ok(Json(response))
-}
-
-/// Buyer accepts a pending swap.
-#[utoipa::path(
-    post,
-    path = "/v1/swap/{swap_id}/accept",
-    tag = "Atomic Swap",
-    params(("swap_id" = u64, Path, description = "Swap identifier")),
-    request_body = AcceptSwapRequest,
-    responses(
-        (status = 200, description = "Swap accepted"),
-        (status = 400, description = "Swap not in Pending state", body = ErrorResponse),
-        (status = 404, description = "Swap not found", body = ErrorResponse),
-    )
-)]
-#[instrument(skip(body))]
-pub async fn accept_swap(Path(swap_id): Path<u64>, Json(body): Json<AcceptSwapRequest>) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
-    // TODO: Call Soroban RPC to invoke atomic_swap.accept_swap
-    // #316: Invalidate AFTER the write commits (see `transfer_ip`) so a
-    // concurrent read cannot repopulate the cache with pre-write state. A
-    // state transition also changes seller/buyer list membership, so the
-    // swap record and both list prefixes are invalidated.
-    cache::invalidate_swap(swap_id);
-    webhook::trigger_swap_status_changed(swap_id, Some("Pending".to_string()), "Accepted".to_string());
-    crate::analytics::record_swap_status("Accepted");
-    websocket::trigger_swap_status_changed(swap_id, Some("Pending".to_string()), "Accepted".to_string());
-    Err((
-        StatusCode::NOT_FOUND,
-        Json(ErrorResponse {
-            error: format!("Swap {} not found", swap_id),
-        }),
-    ))
-}
-
-/// Seller reveals the decryption key; payment releases and swap completes.
-#[utoipa::path(
-    post,
-    path = "/v1/swap/{swap_id}/reveal",
-    tag = "Atomic Swap",
-    params(("swap_id" = u64, Path, description = "Swap identifier")),
-    request_body = RevealKeyRequest,
-    responses(
-        (status = 200, description = "Key revealed, swap completed"),
-        (status = 400, description = "Swap not in Accepted state or caller is not seller", body = ErrorResponse),
-        (status = 404, description = "Swap not found", body = ErrorResponse),
-    )
-)]
-#[instrument(skip(body))]
-pub async fn reveal_key(Path(swap_id): Path<u64>, Json(body): Json<RevealKeyRequest>) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
-    // TODO: Call Soroban RPC to invoke atomic_swap.reveal_key
-    // #316: Invalidate AFTER the write commits (see `transfer_ip`). A
-    // completed swap changes seller/buyer list membership and both parties'
-    // reputation, so the record, both list prefixes, and the reputation
-    // cache are all invalidated.
-    cache::invalidate_swap(swap_id);
-    cache::invalidate_prefix("reputation:");
-    webhook::trigger_swap_status_changed(swap_id, Some("Accepted".to_string()), "Completed".to_string());
-    crate::analytics::record_swap_status("Completed");
-    websocket::trigger_swap_status_changed(swap_id, Some("Accepted".to_string()), "Completed".to_string());
-    Err((
-        StatusCode::NOT_FOUND,
-        Json(ErrorResponse {
-            error: format!("Swap {} not found", swap_id),
-        }),
-    ))
-}
-
-/// Cancel a pending swap. Only the seller or buyer may cancel.
-#[utoipa::path(
-    post,
-    path = "/v1/swap/{swap_id}/cancel",
-    tag = "Atomic Swap",
-    params(("swap_id" = u64, Path, description = "Swap identifier")),
-    request_body = CancelSwapRequest,
-    responses(
-        (status = 200, description = "Swap cancelled"),
-        (status = 400, description = "Swap not in Pending state or canceller is not seller/buyer", body = ErrorResponse),
-        (status = 404, description = "Swap not found", body = ErrorResponse),
-    )
-)]
-#[instrument(skip(body))]
-pub async fn cancel_swap(Path(swap_id): Path<u64>, Json(body): Json<CancelSwapRequest>) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
-    // TODO: Call Soroban RPC to invoke atomic_swap.cancel_swap
-    // #316: Invalidate AFTER the write commits (see `transfer_ip`) — the
-    // swap record and both seller/buyer list prefixes.
-    cache::invalidate_swap(swap_id);
-    webhook::trigger_swap_status_changed(swap_id, Some("Pending".to_string()), "Cancelled".to_string());
-    crate::analytics::record_swap_status("Cancelled");
-    websocket::trigger_swap_status_changed(swap_id, Some("Pending".to_string()), "Cancelled".to_string());
-    Err((
-        StatusCode::NOT_FOUND,
-        Json(ErrorResponse {
-            error: format!("Swap {} not found", swap_id),
-        }),
-    ))
-}
-
-/// Buyer cancels an Accepted swap after the expiry timestamp.
-#[utoipa::path(
-    post,
-    path = "/v1/swap/{swap_id}/cancel-expired",
-    tag = "Atomic Swap",
-    params(("swap_id" = u64, Path, description = "Swap identifier")),
-    request_body = CancelExpiredSwapRequest,
-    responses(
-        (status = 200, description = "Expired swap cancelled"),
-        (status = 400, description = "Swap not expired, not Accepted, or caller is not buyer", body = ErrorResponse),
-        (status = 404, description = "Swap not found", body = ErrorResponse),
-    )
-)]
-#[instrument(skip(body))]
-pub async fn cancel_expired_swap(Path(swap_id): Path<u64>, Json(body): Json<CancelExpiredSwapRequest>) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
-    // TODO: Call Soroban RPC to invoke atomic_swap.cancel_expired_swap
-    // #316: Invalidate AFTER the write commits (see `transfer_ip`) — the
-    // swap record and both seller/buyer list prefixes.
-    cache::invalidate_swap(swap_id);
-    webhook::trigger_swap_status_changed(swap_id, Some("Accepted".to_string()), "Cancelled".to_string());
-    crate::analytics::record_swap_status("Cancelled");
-    websocket::trigger_swap_status_changed(swap_id, Some("Accepted".to_string()), "Cancelled".to_string());
-    Err((
-        StatusCode::NOT_FOUND,
-        Json(ErrorResponse {
-            error: format!("Swap {} not found", swap_id),
-        }),
-    ))
-}
-
-/// Read a swap record by ID.
-#[utoipa::path(
-    get,
-    path = "/v1/swap/{swap_id}",
-    tag = "Atomic Swap",
-    params(("swap_id" = u64, Path, description = "Swap identifier")),
-    responses(
-        (status = 200, description = "Swap record found", body = SwapRecord),
-        (status = 404, description = "Swap not found", body = ErrorResponse),
-    )
-)]
-#[instrument]
-pub async fn get_swap(
-    State(rpc_client): State<Arc<dyn crate::graphql::SorobanRpcClient>>,
-    Path(swap_id): Path<u64>,
-) -> impl IntoResponse {
-    // #316: Check cache first
-    let cache_key = cache::swap_key(swap_id);
-    if let Some(cached) = cache::get::<SwapRecord>(&cache_key) {
-        return (
-            StatusCode::OK,
-            [(header::CACHE_CONTROL, cache::cache_control_header())],
-            Json(serde_json::to_value(cached).unwrap()),
-        ).into_response();
-    }
-
-    // #316: On cache miss, read through to the Soroban RPC layer and backfill
-    // the cache so subsequent lookups hit the fast path.
-    match rpc_client.get_swap_record(swap_id).await {
-        Ok(Some(record)) => {
-            let record: SwapRecord = record.into();
-            cache::set(&cache_key, &record);
-            (
-                StatusCode::OK,
-                [(header::CACHE_CONTROL, cache::cache_control_header())],
-                Json(serde_json::to_value(record).unwrap()),
-            ).into_response()
-        }
-        // RPC miss or error: the swap does not exist (or is currently unreadable).
-        _ => (
-            StatusCode::NOT_FOUND,
-            [(header::CACHE_CONTROL, cache::no_cache_header())],
-            Json(serde_json::json!({ "error": format!("Swap {} not found", swap_id) })),
-        ).into_response(),
-    }
-}
-
-/// Return the amount currently held in escrow and whether it has been released.
-#[utoipa::path(
-    get,
-    path = "/v1/swap/{swap_id}/escrow",
-    tag = "Atomic Swap",
-    params(("swap_id" = u64, Path, description = "Swap identifier")),
-    responses(
-        (status = 200, description = "Escrow status", body = EscrowStatusResponse),
-        (status = 404, description = "Swap not found", body = ErrorResponse),
-        (status = 502, description = "Escrow status unavailable", body = ErrorResponse),
-    )
-)]
-#[instrument]
-pub async fn get_swap_escrow(
-    State(rpc_client): State<Arc<dyn crate::graphql::SorobanRpcClient>>,
-    Path(swap_id): Path<u64>,
-) -> impl IntoResponse {
-    let record = match rpc_client.get_swap_record(swap_id).await {
-        Ok(Some(record)) => record,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "error": format!("Swap {} not found", swap_id) })),
-            ).into_response();
-        }
-        Err(_) => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({ "error": "failed to query swap" })),
-            ).into_response();
-        }
-    };
-    let status: SwapRecord = record.into();
-    let deposited_amount = match rpc_client.get_swap_escrow(swap_id).await {
-        Ok(Some(amount)) => amount,
-        Ok(None) => 0,
-        Err(error) => {
-            tracing::error!(%error, swap_id, "failed to query escrow status");
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({ "error": "failed to query escrow status" })),
-            ).into_response();
-        }
-    };
-    let released = matches!(&status.status, SwapStatus::Completed | SwapStatus::Cancelled);
-    (
-        StatusCode::OK,
-        Json(serde_json::to_value(EscrowStatusResponse {
-            swap_id,
-            status: status.status,
-            deposited_amount,
-            released,
-        }).unwrap()),
-    ).into_response()
-}
-
-/// Return the immutable on-chain state-transition history for a swap.
-#[utoipa::path(
-    get,
-    path = "/v1/swap/{swap_id}/history",
-    tag = "Atomic Swap",
-    params(("swap_id" = u64, Path, description = "Swap identifier")),
-    responses((status = 200, description = "Swap history", body = [SwapHistoryEntry]))
-)]
-#[instrument]
-pub async fn get_swap_history(
-    State(rpc_client): State<Arc<dyn crate::graphql::SorobanRpcClient>>,
-    Path(swap_id): Path<u64>,
-) -> impl IntoResponse {
-    match rpc_client.get_swap_history(swap_id).await {
-        Ok(entries) => {
-            let entries: Vec<SwapHistoryEntry> = entries
-                .into_iter()
-                .map(|entry| SwapHistoryEntry {
-                    status: match entry.status {
-                        crate::graphql::SwapStatus::Pending => SwapStatus::Pending,
-                        crate::graphql::SwapStatus::Accepted => SwapStatus::Accepted,
-                        crate::graphql::SwapStatus::Completed => SwapStatus::Completed,
-                        crate::graphql::SwapStatus::Disputed => SwapStatus::Disputed,
-                        crate::graphql::SwapStatus::Cancelled => SwapStatus::Cancelled,
-                    },
-                    timestamp: entry.timestamp,
-                })
-                .collect();
-            (StatusCode::OK, Json(serde_json::to_value(entries).unwrap())).into_response()
-        }
-        Err(error) => {
-            tracing::error!(%error, swap_id, "failed to query swap history");
-            (StatusCode::BAD_GATEWAY, Json(serde_json::json!({
-                "error": "failed to query swap history"
-            }))).into_response()
-        }
-    }
-}
-
-/// Return all evidence submissions associated with a swap dispute.
-#[utoipa::path(
-    get,
-    path = "/v1/swap/{swap_id}/disputes",
-    tag = "Atomic Swap",
-    params(("swap_id" = u64, Path, description = "Swap identifier")),
-    responses((status = 200, description = "Dispute evidence history", body = [DisputeEvidenceEntry]))
-)]
-#[instrument]
-pub async fn get_swap_disputes(
-    State(rpc_client): State<Arc<dyn crate::graphql::SorobanRpcClient>>,
-    Path(swap_id): Path<u64>,
-) -> impl IntoResponse {
-    match rpc_client.get_dispute_evidence(swap_id).await {
-        Ok(entries) => {
-            let entries: Vec<DisputeEvidenceEntry> = entries
-                .into_iter()
-                .map(|entry| DisputeEvidenceEntry {
-                    swap_id: entry.swap_id,
-                    submitter: entry.submitter,
-                    evidence_hash: entry.evidence_hash,
-                    timestamp: entry.timestamp,
-                })
-                .collect();
-            (StatusCode::OK, Json(serde_json::to_value(entries).unwrap())).into_response()
-        }
-        Err(error) => {
-            tracing::error!(%error, swap_id, "failed to query dispute evidence");
-            (StatusCode::BAD_GATEWAY, Json(serde_json::json!({
-                "error": "failed to query dispute evidence"
-            }))).into_response()
-        }
-    }
-}
-
-/// List swaps using party/IP selectors and optional status, asset, and price filters.
-#[utoipa::path(
-    get,
-    path = "/v1/swaps",
-    tag = "Atomic Swap",
-    params(SwapFilterParams),
-    responses(
-        (status = 200, description = "Filtered swaps", body = SwapListResponse),
-        (status = 400, description = "At least one seller, buyer, or ip_id selector is required", body = ErrorResponse),
-    )
-)]
-#[instrument]
-pub async fn list_swaps(
-    State(rpc_client): State<Arc<dyn crate::graphql::SorobanRpcClient>>,
-    Query(filters): Query<SwapFilterParams>,
-) -> impl IntoResponse {
-    let limit = filters.limit.clamp(1, 200);
-    let connection = if let Some(seller) = filters.seller.as_deref() {
-        rpc_client.get_swaps_by_seller(seller, limit, filters.cursor.clone()).await
-    } else if let Some(buyer) = filters.buyer.as_deref() {
-        rpc_client.get_swaps_by_buyer(buyer, limit, filters.cursor.clone()).await
-    } else if let Some(ip_id) = filters.ip_id {
-        rpc_client.get_swaps_by_ip(ip_id, limit, filters.cursor.clone()).await
-    } else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "At least one of seller, buyer, or ip_id is required"
-            })),
-        ).into_response();
-    };
-
-    let connection = match connection {
-        Ok(connection) => connection,
-        Err(error) => {
-            tracing::error!(%error, "failed to query swaps");
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({ "error": "failed to query swaps" })),
-            ).into_response();
-        }
-    };
-
-    let crate::graphql::SwapConnection { swap_ids, has_next_page, cursor } = connection;
-    let mut swaps = Vec::new();
-    for swap_id in swap_ids {
-        if let Ok(Some(record)) = rpc_client.get_swap_record(swap_id).await {
-            let record: SwapRecord = record.into();
-            let price_matches = filters.min_price.map_or(true, |min| record.price >= min)
-                && filters.max_price.map_or(true, |max| record.price <= max);
-            let matches = filters.status.as_ref().map_or(true, |status| record.status == *status)
-                && filters.token.as_ref().map_or(true, |token| record.token == *token)
-                && price_matches;
-            if matches {
-                swaps.push(record);
-            }
-        }
-    }
-
-    let response = SwapListResponse {
-        swaps,
-        next_cursor: cursor,
-        has_more: has_next_page,
-    };
-    (StatusCode::OK, Json(serde_json::to_value(response).unwrap())).into_response()
-}
-
-/// Bridge the RPC layer's record shape (shared with GraphQL) to the REST
-/// schema returned by `GET /v1/swap/{swap_id}`.
-impl From<crate::graphql::SwapRecord> for SwapRecord {
-    fn from(record: crate::graphql::SwapRecord) -> Self {
-        Self {
-            ip_id: record.ip_id,
-            ip_registry_id: record.ip_registry_id,
-            seller: record.seller,
-            buyer: record.buyer,
-            // GraphQL stringifies i128 prices to stay JSON-safe.
-            price: record.price.parse().unwrap_or(0),
-            token: record.token,
-            status: match record.status {
-                crate::graphql::SwapStatus::Pending => SwapStatus::Pending,
-                crate::graphql::SwapStatus::Accepted => SwapStatus::Accepted,
-                crate::graphql::SwapStatus::Completed => SwapStatus::Completed,
-                crate::graphql::SwapStatus::Disputed => SwapStatus::Disputed,
-                crate::graphql::SwapStatus::Cancelled => SwapStatus::Cancelled,
-            },
-            expiry: record.expiry,
-        }
-    }
-}
-
-async fn marketplace_response(
-    result: Result<crate::graphql::SwapConnection, String>,
-) -> axum::response::Response {
-    match result {
-        Ok(connection) => (
-            StatusCode::OK,
-            Json(MarketplaceResponse {
-                swap_ids: connection.swap_ids,
-                next_cursor: connection.cursor,
-                has_more: connection.has_next_page,
-            }),
-        ).into_response(),
-        Err(error) => {
-            tracing::error!(%error, "failed to query marketplace swaps");
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(ErrorResponse { error: "failed to query swap marketplace".to_string() }),
-            ).into_response()
-        }
-    }
-}
-
-/// Discover swaps listed by a seller.
-#[utoipa::path(
-    get,
-    path = "/v1/swap/marketplace/seller/{seller}",
-    tag = "Marketplace",
-    params(("seller" = String, Path), CursorPaginationParams),
-    responses((status = 200, description = "Seller marketplace listings", body = MarketplaceResponse))
-)]
-pub async fn marketplace_by_seller(
-    State(rpc_client): State<Arc<dyn crate::graphql::SorobanRpcClient>>,
-    Path(seller): Path<String>,
-    Query(pagination): Query<CursorPaginationParams>,
-) -> impl IntoResponse {
-    marketplace_response(rpc_client.get_swaps_by_seller(&seller, pagination.limit.min(200), pagination.cursor).await).await
-}
-
-/// Discover swaps available to a buyer.
-#[utoipa::path(
-    get,
-    path = "/v1/swap/marketplace/buyer/{buyer}",
-    tag = "Marketplace",
-    params(("buyer" = String, Path), CursorPaginationParams),
-    responses((status = 200, description = "Buyer marketplace listings", body = MarketplaceResponse))
-)]
-pub async fn marketplace_by_buyer(
-    State(rpc_client): State<Arc<dyn crate::graphql::SorobanRpcClient>>,
-    Path(buyer): Path<String>,
-    Query(pagination): Query<CursorPaginationParams>,
-) -> impl IntoResponse {
-    marketplace_response(rpc_client.get_swaps_by_buyer(&buyer, pagination.limit.min(200), pagination.cursor).await).await
-}
-
-/// Discover swaps for an IP record.
-#[utoipa::path(
-    get,
-    path = "/v1/swap/marketplace/ip/{ip_id}",
-    tag = "Marketplace",
-    params(("ip_id" = u64, Path), CursorPaginationParams),
-    responses((status = 200, description = "IP marketplace listings", body = MarketplaceResponse))
-)]
-pub async fn marketplace_by_ip(
-    State(rpc_client): State<Arc<dyn crate::graphql::SorobanRpcClient>>,
-    Path(ip_id): Path<u64>,
-    Query(pagination): Query<CursorPaginationParams>,
-) -> impl IntoResponse {
-    marketplace_response(rpc_client.get_swaps_by_ip(ip_id, pagination.limit.min(200), pagination.cursor).await).await
-}
-
-// ── Webhooks ──────────────────────────────────────────────────────────────────
-
-/// Register a webhook URL to receive swap event notifications.
-#[utoipa::path(
-    post,
-    path = "/v1/webhooks",
-    tag = "Webhooks",
-    request_body = RegisterWebhookRequest,
-    responses(
-        (status = 200, description = "Webhook registered", body = WebhookResponse),
-        (status = 400, description = "Invalid request", body = ErrorResponse),
-    )
-)]
-pub async fn register_webhook(Json(body): Json<RegisterWebhookRequest>) -> Result<Json<WebhookResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let parsed_url = reqwest::Url::parse(&body.url);
-    if parsed_url.as_ref().map(|url| !matches!(url.scheme(), "http" | "https")).unwrap_or(true)
-        || body.events.is_empty()
-        || body.events.iter().any(|event| event != "*" && event != "swap.status_changed") {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "url must be an HTTP(S) URL and events must contain swap.status_changed or *".to_string(),
-            }),
-        ));
-    }
-    let url = reqwest::Url::parse(&body.url).map_err(|_| (
-        StatusCode::BAD_REQUEST,
-        Json(ErrorResponse {
-            error: "Webhook URL must be a valid HTTP(S) URL".to_string(),
-        }),
-    ))?;
-    if !matches!(url.scheme(), "http" | "https") {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "Webhook URL must use HTTP or HTTPS".to_string(),
-            }),
-        ));
-    }
-
-    let config = webhook::register(url.to_string(), body.events);
-
-    Ok(Json(WebhookResponse {
-        id: config.id.to_string(),
-        url: config.url,
-        events: config.events,
-        created_at: config.created_at,
-    }))
-}
-
-/// List registered webhook subscriptions.
-#[utoipa::path(
-    get,
-    path = "/v1/webhooks",
-    tag = "Webhooks",
-    responses((status = 200, description = "Registered webhooks", body = Vec<WebhookResponse>))
-)]
-pub async fn list_webhooks() -> impl IntoResponse {
-    let webhooks = webhook::list_all().into_iter().map(|config| WebhookResponse {
-        id: config.id.to_string(),
-        url: config.url,
-        events: config.events,
-        created_at: config.created_at,
-    }).collect::<Vec<_>>();
-    Json(webhooks)
-}
-
-/// Unregister a webhook by ID.
-#[utoipa::path(
-    delete,
-    path = "/v1/webhooks/{id}",
-    tag = "Webhooks",
-    params(("id" = String, Path, description = "Webhook UUID")),
-    responses(
-        (status = 200, description = "Webhook unregistered"),
-        (status = 404, description = "Webhook not found", body = ErrorResponse),
-    )
-)]
-pub async fn unregister_webhook(Path(id): Path<String>) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
-    let uuid = uuid::Uuid::parse_str(&id).map_err(|_| (
-        StatusCode::BAD_REQUEST,
-        Json(ErrorResponse {
-            error: "Invalid webhook ID format".to_string(),
-        }),
-    ))?;
-
-    if webhook::unregister(uuid) {
-        Ok(StatusCode::OK)
-    } else {
-        Err((
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: format!("Webhook {} not found", id),
-            }),
-        ))
-    }
-}
-
-// ── Bulk Operations ───────────────────────────────────────────────────────────
-
-/// Commit multiple IP records in a single request (#321).
-#[utoipa::path(
-    post,
-    path = "/v1/bulk/commit-ip",
-    tag = "IP Registry",
-    request_body = BulkCommitIpRequest,
-    responses(
-        (status = 200, description = "Bulk commit completed with individual results", body = BulkCommitIpResponse),
-        (status = 400, description = "Invalid request (empty hashes, etc.)", body = ErrorResponse),
-    )
-)]
-#[instrument(skip(body))]
-pub async fn bulk_commit_ip(Json(body): Json<BulkCommitIpRequest>) -> Result<Json<BulkCommitIpResponse>, (StatusCode, Json<ErrorResponse>)> {
-    if body.commitment_hashes.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "commitment_hashes must not be empty".to_string(),
-            }),
-        ));
-    }
-
-    let mut results = Vec::new();
-    for (index, hash) in body.commitment_hashes.iter().enumerate() {
-        // TODO: Call Soroban RPC to invoke ip_registry.commit_ip
-        results.push(BulkOperationResult {
-            index,
-            success: false,
-            data: None,
-            error: Some("bulk_commit_ip not yet implemented".to_string()),
-        });
-    }
-
-    Ok(Json(BulkCommitIpResponse { results }))
-}
-
-/// Initiate multiple swaps in a single request (#321).
-#[utoipa::path(
-    post,
-    path = "/v1/bulk/initiate-swap",
-    tag = "Atomic Swap",
-    request_body = BulkInitiateSwapRequest,
-    responses(
-        (status = 200, description = "Bulk swap initiation completed with individual results", body = BulkInitiateSwapResponse),
-        (status = 400, description = "Validation error (mismatched lengths, empty arrays, etc.)", body = ErrorResponse),
-    )
-)]
-#[instrument(skip(body))]
-pub async fn bulk_initiate_swap(Json(body): Json<BulkInitiateSwapRequest>) -> Result<Json<BulkInitiateSwapResponse>, (StatusCode, Json<ErrorResponse>)> {
-    if body.ip_ids.len() != body.prices.len() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "ip_ids and prices must have the same length".to_string(),
-            }),
-        ));
-    }
-    if body.ip_ids.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "ip_ids must not be empty".to_string(),
-            }),
-        ));
-    }
-
-    let mut results = Vec::new();
-    for (index, ip_id) in body.ip_ids.iter().enumerate() {
-        // TODO: Call Soroban RPC to invoke atomic_swap.initiate_swap
-        results.push(BulkOperationResult {
-            index,
-            success: false,
-            data: None,
-            error: Some("bulk_initiate_swap not yet implemented".to_string()),
-        });
-    }
-
-    Ok(Json(BulkInitiateSwapResponse { results }))
-}
-
-/// #982: Execute multiple swaps in batch with configurable modes.
-/// Supports atomic (all-or-nothing) and partial (fault-tolerant) execution.
-#[utoipa::path(
-    post,
-    path = "/v1/swaps/execute-batch",
-    tag = "Atomic Swap",
-    request_body = ExecuteBatchSwapsRequest,
-    responses(
-        (status = 200, description = "Batch swap execution completed", body = ExecuteBatchSwapsResponse),
-        (status = 400, description = "Validation error (empty batch, too large, etc.)", body = ErrorResponse),
-        (status = 503, description = "Soroban RPC node unavailable", body = ErrorResponse),
-    )
-)]
-#[instrument(skip(body))]
-pub async fn execute_batch_swaps(
-    Json(body): Json<ExecuteBatchSwapsRequest>,
-) -> Result<Json<ExecuteBatchSwapsResponse>, (StatusCode, Json<ErrorResponse>)> {
-    // Validate batch parameters
-    if body.swap_ids.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "swap_ids must not be empty".to_string(),
-            }),
-        ));
-    }
-
-    if body.swap_ids.len() > 50 {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "swap_ids exceeds maximum batch size of 50".to_string(),
-            }),
-        ));
-    }
-
-    // Call the contract's execute_batch_swaps function via Soroban RPC
-    // For now, return a placeholder response structure
-    // TODO: Implement Soroban RPC client call to execute the batch
-
-    let total_count = body.swap_ids.len() as u32;
-    let results: Vec<bool> = (0..total_count).map(|_| false).collect();
-    let successful_count = results.iter().filter(|&&r| r).count() as u32;
-
-    Ok(Json(ExecuteBatchSwapsResponse {
-        results,
-        successful_count,
-        total_count,
-        atomic: body.atomic,
-    }))
-}
-
-// ── #984: Two-Factor Authentication ────────────────────────────────────────
-
-static TWO_FACTOR_STORE: once_cell::sync::Lazy<crate::auth_2fa::TwoFactorStore> =
-    once_cell::sync::Lazy::new(crate::auth_2fa::TwoFactorStore::new);
-
-/// #984: Enable 2FA for a user
-/// Returns TOTP secret for QR code and backup codes for account recovery
-#[utoipa::path(
-    post,
-    path = "/auth/2fa/enable",
-    tag = "Authentication",
-    request_body = Enable2faRequest,
-    responses(
-        (status = 200, description = "2FA enabled successfully, returns secret and backup codes", body = Enable2faResponse),
-        (status = 400, description = "Invalid user ID", body = ErrorResponse),
-        (status = 500, description = "Internal server error", body = ErrorResponse),
-    )
-)]
-#[instrument(skip(body))]
-pub async fn enable_2fa(
-    Json(body): Json<Enable2faRequest>,
-) -> Result<Json<Enable2faResponse>, (StatusCode, Json<ErrorResponse>)> {
-    if body.user_id.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "user_id must not be empty".to_string(),
-            }),
-        ));
-    }
-
-    // Generate TOTP secret
-    let secret = crate::auth_2fa::generate_totp_secret();
-    let backup_codes = crate::auth_2fa::generate_backup_codes(8);
-    let qr_code_uri = crate::auth_2fa::generate_qr_code_uri(&body.user_id, &secret, "AtomicPatent");
-
-    // Store TOTP secret (not verified until verify_2fa is called)
-    let config = crate::auth_2fa::TwoFactorConfig {
-        user_id: body.user_id.clone(),
-        totp: Some(crate::auth_2fa::TotpSecret {
-            secret: secret.clone(),
-            enabled_at: chrono::Utc::now().timestamp(),
-            verified: false,
-        }),
-        backup_codes: backup_codes
-            .iter()
-            .map(|code| crate::auth_2fa::BackupCode {
-                code: code.clone(),
-                used: false,
-                created_at: chrono::Utc::now().timestamp(),
-            })
-            .collect(),
-        created_at: chrono::Utc::now().timestamp(),
-        last_verified: None,
-    };
-
-    TWO_FACTOR_STORE.store_config(config).map_err(|err| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error: err }),
-        )
-    })?;
-
-    Ok(Json(Enable2faResponse {
-        secret,
-        qr_code_uri,
-        backup_codes,
-    }))
-}
-
-/// #984: Verify 2FA code during login
-/// Returns success if TOTP code is valid and marks 2FA as verified
-#[utoipa::path(
-    post,
-    path = "/auth/2fa/verify",
-    tag = "Authentication",
-    request_body = Verify2faRequest,
-    responses(
-        (status = 200, description = "2FA code verified successfully", body = Verify2faResponse),
-        (status = 401, description = "Invalid 2FA code", body = ErrorResponse),
-        (status = 400, description = "Invalid request", body = ErrorResponse),
-        (status = 404, description = "2FA not configured for user", body = ErrorResponse),
-    )
-)]
-#[instrument(skip(body))]
-pub async fn verify_2fa(
-    Json(body): Json<Verify2faRequest>,
-) -> Result<Json<Verify2faResponse>, (StatusCode, Json<ErrorResponse>)> {
-    if body.user_id.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "user_id must not be empty".to_string(),
-            }),
-        ));
-    }
-
-    if body.totp_code.len() != 6 || !body.totp_code.chars().all(|c| c.is_numeric()) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "TOTP code must be 6 digits".to_string(),
-            }),
-        ));
-    }
-
-    // Get user's 2FA config
-    let mut config = match TWO_FACTOR_STORE
-        .get_config(&body.user_id)
-        .map_err(|err| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error: err }),
-            )
-        })?
-    {
-        Some(cfg) => cfg,
-        None => {
-            return Err((
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse {
-                    error: "2FA not configured for this user".to_string(),
-                }),
-            ))
-        }
-    };
-
-    // Get TOTP secret
-    let secret = match &config.totp {
-        Some(totp) => &totp.secret,
-        None => {
-            return Err((
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse {
-                    error: "2FA not configured for this user".to_string(),
-                }),
-            ))
-        }
-    };
-
-    // Verify TOTP code
-    match crate::auth_2fa::verify_totp_code(secret, &body.totp_code) {
-        Ok(true) => {
-            // Mark 2FA as verified
-            if let Some(ref mut totp) = config.totp {
-                totp.verified = true;
-            }
-            config.last_verified = Some(chrono::Utc::now().timestamp());
-
-            TWO_FACTOR_STORE.store_config(config).map_err(|err| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse { error: err }),
-                )
-            })?;
-
-            Ok(Json(Verify2faResponse {
-                success: true,
-                message: "2FA verified successfully".to_string(),
-            }))
-        }
-        Ok(false) => Err((
-            StatusCode::UNAUTHORIZED,
-            Json(ErrorResponse {
-                error: "Invalid TOTP code".to_string(),
-            }),
-        )),
-        Err(err) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error: err }),
-        )),
-    }
-}
-
-/// #984: Use backup code for account recovery
-/// Allows account access if backup code is valid (marks code as used)
-#[utoipa::path(
-    post,
-    path = "/auth/2fa/backup-code",
-    tag = "Authentication",
-    request_body = UseBackupCodeRequest,
-    responses(
-        (status = 200, description = "Backup code accepted, account recovered", body = Verify2faResponse),
-        (status = 401, description = "Invalid or already used backup code", body = ErrorResponse),
-        (status = 404, description = "User not found", body = ErrorResponse),
-    )
-)]
-#[instrument(skip(body))]
-pub async fn use_backup_code(
-    Json(body): Json<UseBackupCodeRequest>,
-) -> Result<Json<Verify2faResponse>, (StatusCode, Json<ErrorResponse>)> {
-    if body.user_id.is_empty() || body.backup_code.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "user_id and backup_code must not be empty".to_string(),
-            }),
-        ));
-    }
-
-    // Check if backup code exists and is valid
-    let used = crate::auth_2fa::mark_backup_code_used(&TWO_FACTOR_STORE, &body.user_id, &body.backup_code)
-        .map_err(|err| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error: err }),
-            )
-        })?;
-
-    if !used {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            Json(ErrorResponse {
-                error: "Invalid or already used backup code".to_string(),
-            }),
-        ));
-    }
-
-    Ok(Json(Verify2faResponse {
-        success: true,
-        message: "Account recovered with backup code. Please update your 2FA settings.".to_string(),
-    }))
-}
-
-// ── #985: Session Management ───────────────────────────────────────────────
-
-static SESSION_STORE: once_cell::sync::Lazy<crate::session::SessionStore> =
-    once_cell::sync::Lazy::new(|| crate::session::SessionStore::new(crate::session::SessionConfig::default()));
-
-/// #985: Check current session status
-/// Returns session status including timeout warnings and grace period info
-#[utoipa::path(
-    post,
-    path = "/auth/session/status",
-    tag = "Authentication",
-    request_body = CheckSessionRequest,
-    responses(
-        (status = 200, description = "Session status retrieved", body = CheckSessionResponse),
-        (status = 400, description = "Invalid token", body = ErrorResponse),
-        (status = 404, description = "Session not found", body = ErrorResponse),
-    )
-)]
-#[instrument(skip(body))]
-pub async fn check_session(
-    Json(body): Json<CheckSessionRequest>,
-) -> Result<Json<CheckSessionResponse>, (StatusCode, Json<ErrorResponse>)> {
-    if body.token.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "token must not be empty".to_string(),
-            }),
-        ));
-    }
-
-    match SESSION_STORE.check_session_status(&body.token) {
-        Ok(status) => Ok(Json(CheckSessionResponse {
-            active: status.active,
-            in_grace_period: status.in_grace_period,
-            minutes_until_timeout: status.minutes_until_timeout,
-            show_warning: status.show_warning,
-            message: status.message,
-        })),
-        Err(_) => Err((
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: "Session not found".to_string(),
-            }),
-        )),
-    }
-}
-
-/// #985: Extend session expiration
-/// Extends the current session by resetting the idle timeout counter.
-/// Can be called during grace period after timeout.
-#[utoipa::path(
-    post,
-    path = "/auth/extend-session",
-    tag = "Authentication",
-    request_body = ExtendSessionRequest,
-    responses(
-        (status = 200, description = "Session extended successfully", body = ExtendSessionResponse),
-        (status = 400, description = "Invalid token", body = ErrorResponse),
-        (status = 404, description = "Session not found or grace period expired", body = ErrorResponse),
-    )
-)]
-#[instrument(skip(body))]
-pub async fn extend_session(
-    Json(body): Json<ExtendSessionRequest>,
-) -> Result<Json<ExtendSessionResponse>, (StatusCode, Json<ErrorResponse>)> {
-    if body.token.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "token must not be empty".to_string(),
-            }),
-        ));
-    }
-
-    // First check if session exists and get status
-    match SESSION_STORE.check_session_status(&body.token) {
-        Ok(status) => {
-            // Allow extension if session is active OR in grace period
-            if !status.active && !status.in_grace_period {
-                return Err((
-                    StatusCode::NOT_FOUND,
-                    Json(ErrorResponse {
-                        error: "Session expired and grace period ended. Please log in again.".to_string(),
-                    }),
-                ));
-            }
-
-            // Extend the session
-            match SESSION_STORE.extend_session(&body.token) {
-                Ok(new_expiry) => {
-                    Ok(Json(ExtendSessionResponse {
-                        success: true,
-                        new_expiry,
-                        message: "Session extended successfully. You have another 30 minutes.".to_string(),
-                    }))
-                }
-                Err(err) => Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse { error: err }),
-                )),
-            }
-        }
-        Err(_) => Err((
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: "Session not found".to_string(),
-            }),
-        )),
-    }
-}
+    // (validated

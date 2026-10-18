@@ -199,7 +199,19 @@ impl RateLimitStore for InProcessStore {
         now: Instant,
         idle_ttl: Duration,
     ) -> RefillResult {
-        let mut store = self.buckets.lock().unwrap();
+        // A poisoned lock means a previous holder panicked mid-update; the
+        // bucket state may be inconsistent, so fail closed (deny) rather
+        // than panicking or allowing the request through.
+        let mut store = match self.buckets.lock() {
+            Ok(store) => store,
+            Err(err) => {
+                tracing::error!(error = %err, "rate-limit store lock poisoned, failing closed");
+                return RefillResult {
+                    allowed: false,
+                    tokens: vec![0.0; buckets.len()],
+                };
+            }
+        };
         store.checks += 1;
         if store.checks % 1024 == 0 {
             store
@@ -220,7 +232,9 @@ impl RateLimitStore for InProcessStore {
         let allowed = tokens.iter().all(|t| *t >= 1.0);
         if allowed {
             for (key, _) in buckets {
-                store.buckets.get_mut(key).unwrap().tokens -= 1.0;
+                if let Some(bucket) = store.buckets.get_mut(key) {
+                    bucket.tokens -= 1.0;
+                }
             }
         }
         RefillResult { allowed, tokens }
@@ -442,11 +456,14 @@ impl RateLimitMiddleware {
 
     /// Assign a verified user to a billing tier. Unknown users use the free tier.
     pub fn set_user_tier(&self, user_id: impl Into<String>, tier: RateLimitTier) {
-        self.local
-            .lock()
-            .unwrap()
-            .user_tiers
-            .insert(user_id.into(), tier);
+        match self.local.lock() {
+            Ok(mut local) => {
+                local.user_tiers.insert(user_id.into(), tier);
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "rate-limit local state lock poisoned, ignoring tier update");
+            }
+        }
     }
 
     /// #983: Check per-user commitment rate limit (10 commits/minute).
@@ -485,7 +502,23 @@ impl RateLimitMiddleware {
 
     async fn check(&self, ip: &str, user: Option<&str>, now: Instant) -> Decision {
         let (tier, violation_key, bucket_keys, early_denial) = {
-            let mut local = self.local.lock().unwrap();
+            // Fail closed if the local bookkeeping lock is poisoned: we cannot
+            // safely evaluate the quota, so deny rather than panic or allow.
+            let mut local = match self.local.lock() {
+                Ok(local) => local,
+                Err(err) => {
+                    tracing::error!(error = %err, "rate-limit local state lock poisoned, failing closed");
+                    return Decision {
+                        allowed: false,
+                        limit: 0,
+                        remaining: 0,
+                        reset_after: self.config.base_backoff,
+                        retry_after: self.config.base_backoff,
+                        scope: "internal",
+                        tier: RateLimitTier::Free,
+                    };
+                }
+            };
             local.checks += 1;
             if local.checks % 1024 == 0 {
                 let ttl = self.config.idle_ttl;
@@ -544,26 +577,39 @@ impl RateLimitMiddleware {
                 if until > now {
                     // Retrying inside the advertised penalty is itself a repeated
                     // violation, so abusive tight loops rapidly reach the cap.
-                    let violation = local.violations.get_mut(&violation_key).unwrap();
-                    violation.count = violation.count.saturating_add(1).min(31);
-                    violation.last_seen = Some(now);
-                    let multiplier = 1u32 << (violation.count - 1).min(16);
-                    let penalty = self
-                        .config
-                        .base_backoff
-                        .saturating_mul(multiplier)
-                        .min(self.config.max_backoff);
-                    let retry = until.duration_since(now).max(penalty);
-                    violation.blocked_until = Some(now + retry);
-                    Some(Decision {
-                        allowed: false,
-                        limit: violation.limit,
-                        remaining: 0,
-                        reset_after: retry,
-                        retry_after: retry,
-                        scope: violation.scope,
-                        tier,
-                    })
+                    if let Some(violation) = local.violations.get_mut(&violation_key) {
+                        violation.count = violation.count.saturating_add(1).min(31);
+                        violation.last_seen = Some(now);
+                        let multiplier = 1u32 << (violation.count - 1).min(16);
+                        let penalty = self
+                            .config
+                            .base_backoff
+                            .saturating_mul(multiplier)
+                            .min(self.config.max_backoff);
+                        let retry = until.duration_since(now).max(penalty);
+                        violation.blocked_until = Some(now + retry);
+                        Some(Decision {
+                            allowed: false,
+                            limit: violation.limit,
+                            remaining: 0,
+                            reset_after: retry,
+                            retry_after: retry,
+                            scope: violation.scope,
+                            tier,
+                        })
+                    } else {
+                        // The violation entry vanished between the lookup and
+                        // the mutation; fail closed rather than panic.
+                        Some(Decision {
+                            allowed: false,
+                            limit: 0,
+                            remaining: 0,
+                            reset_after: self.config.base_backoff,
+                            retry_after: self.config.base_backoff,
+                            scope: "internal",
+                            tier,
+                        })
+                    }
                 } else {
                     None
                 }
@@ -604,13 +650,27 @@ impl RateLimitMiddleware {
         candidates.sort_by(|a, b| {
             (a.2 / a.1.burst as f64)
                 .partial_cmp(&(b.2 / b.1.burst as f64))
-                .unwrap()
+                .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| a.1.burst.cmp(&b.1.burst))
         });
-        let (scope, quota, tokens) = candidates[0];
+        let (scope, quota, tokens) = match candidates.first() {
+            Some(first) => *first,
+            None => {
+                tracing::error!("rate-limit store returned no bucket results, failing closed");
+                return Decision {
+                    allowed: false,
+                    limit: 0,
+                    remaining: 0,
+                    reset_after: self.config.base_backoff,
+                    retry_after: self.config.base_backoff,
+                    scope: "internal",
+                    tier,
+                };
+            }
+        };
 
         if !result.allowed {
-            let (failed_scope, failed_quota, token_wait) = candidates
+            let (failed_scope, failed_quota, token_wait) = match candidates
                 .iter()
                 .filter(|(_, _, t)| *t < 1.0)
                 .map(|(scope, quota, tokens)| {
@@ -620,9 +680,33 @@ impl RateLimitMiddleware {
                     (*scope, *quota, wait)
                 })
                 .max_by_key(|(_, _, wait)| *wait)
-                .expect("store reported denial without an exhausted bucket");
+            {
+                Some(exhausted) => exhausted,
+                None => {
+                    // The store reported a denial without an exhausted bucket;
+                    // deny with a conservative default rather than panic.
+                    tracing::error!(
+                        "rate-limit store reported denial without an exhausted bucket, failing closed"
+                    );
+                    (scope, quota, self.config.base_backoff)
+                }
+            };
 
-            let mut local = self.local.lock().unwrap();
+            let mut local = match self.local.lock() {
+                Ok(local) => local,
+                Err(err) => {
+                    tracing::error!(error = %err, "rate-limit local state lock poisoned, failing closed");
+                    return Decision {
+                        allowed: false,
+                        limit: failed_quota.burst,
+                        remaining: 0,
+                        reset_after: token_wait,
+                        retry_after: token_wait.max(self.config.base_backoff),
+                        scope: failed_scope,
+                        tier,
+                    };
+                }
+            };
             let violation = local.violations.entry(violation_key).or_default();
             violation.count = violation.count.saturating_add(1).min(31);
             violation.last_seen = Some(now);
@@ -647,7 +731,23 @@ impl RateLimitMiddleware {
             };
         }
 
-        self.local.lock().unwrap().violations.remove(&violation_key);
+        match self.local.lock() {
+            Ok(mut local) => {
+                local.violations.remove(&violation_key);
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "rate-limit local state lock poisoned, failing closed");
+                return Decision {
+                    allowed: false,
+                    limit: quota.burst,
+                    remaining: 0,
+                    reset_after: self.config.base_backoff,
+                    retry_after: self.config.base_backoff,
+                    scope,
+                    tier,
+                };
+            }
+        }
         let remaining = tokens.floor().max(1.0) as u32 - 1;
         let reset_after = Duration::from_secs_f64(
             ((quota.burst as f64 - (tokens - 1.0)) / quota.refill_per_second()).max(0.0),
@@ -683,29 +783,58 @@ fn add_headers(response: &mut Response, decision: &Decision) {
         ("x-ratelimit-scope", decision.scope.to_string()),
         ("x-ratelimit-tier", decision.tier.as_str().to_string()),
     ] {
-        response.headers_mut().insert(
-            HeaderName::from_static(name),
-            HeaderValue::from_str(&value).unwrap(),
-        );
+        // A malformed header value must never panic the worker; skip the
+        // header and log instead, since the response itself is still valid.
+        match HeaderValue::from_str(&value) {
+            Ok(header_value) => {
+                response
+                    .headers_mut()
+                    .insert(HeaderName::from_static(name), header_value);
+            }
+            Err(err) => {
+                tracing::warn!(header = name, error = %err, "skipping invalid rate-limit header value");
+            }
+        }
     }
     if !decision.allowed {
-        response.headers_mut().insert(
-            "retry-after",
-            HeaderValue::from_str(&seconds_ceil(decision.retry_after).max(1).to_string()).unwrap(),
-        );
+        let retry_after = seconds_ceil(decision.retry_after).max(1).to_string();
+        match HeaderValue::from_str(&retry_after) {
+            Ok(header_value) => {
+                response.headers_mut().insert("retry-after", header_value);
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "skipping invalid retry-after header value");
+            }
+        }
     }
 }
 
-fn parse_forwarded_ip(req: &Request) -> Option<IpAddr> {
-    req.headers()
-        .get("x-forwarded-for")?
-        .to_str()
-        .ok()?
-        .split(',')
-        .next()?
-        .trim()
-        .parse()
-        .ok()
+/// Outcome of parsing the client-supplied forwarding headers.
+enum ForwardedIp {
+    /// No usable forwarding header was present; fall back to the peer address.
+    Absent,
+    /// A forwarding header was present and parsed to a valid IP.
+    Valid(IpAddr),
+    /// A forwarding header was present but malformed (non-UTF-8 or unparsable).
+    Malformed,
+}
+
+fn parse_forwarded_ip(req: &Request) -> ForwardedIp {
+    let header = match req.headers().get("x-forwarded-for") {
+        Some(header) => header,
+        None => return ForwardedIp::Absent,
+    };
+    let value = match header.to_str() {
+        Ok(value) => value,
+        Err(_) => return ForwardedIp::Malformed,
+    };
+    match value.split(',').next().map(str::trim) {
+        Some(first) => match first.parse::<IpAddr>() {
+            Ok(ip) => ForwardedIp::Valid(ip),
+            Err(_) => ForwardedIp::Malformed,
+        },
+        None => ForwardedIp::Malformed,
+    }
 }
 
 /// Axum middleware entry point for `from_fn_with_state`.
@@ -719,7 +848,21 @@ pub async fn rate_limit_middleware(
         .get::<ConnectInfo<SocketAddr>>()
         .map(|c| c.0.ip());
     let ip = if limiter.config.trust_proxy_headers {
-        parse_forwarded_ip(&req).or(peer_ip)
+        match parse_forwarded_ip(&req) {
+            ForwardedIp::Valid(ip) => Some(ip),
+            ForwardedIp::Absent => peer_ip,
+            // Malformed client input: fail closed with 400 rather than
+            // silently falling back to the peer address or panicking.
+            ForwardedIp::Malformed => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "invalid_forwarded_header",
+                    })),
+                )
+                    .into_response();
+            }
+        }
     } else {
         peer_ip
     }
@@ -856,6 +999,39 @@ mod tests {
         let local = limiter.local.lock().unwrap();
         assert_eq!(local.cardinality_ips.len(), 1);
         assert_eq!(local.cardinality_users.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn malformed_forwarded_header_fails_closed_without_panicking() {
+        let mut cfg = config();
+        cfg.trust_proxy_headers = true;
+        let app = Router::new()
+            .route("/", get(|| async { StatusCode::NO_CONTENT }))
+            .layer(middleware::from_fn_with_state(
+                RateLimitMiddleware::new(cfg),
+                rate_limit_middleware,
+            ));
+        let request = || {
+            let mut request = Request::builder()
+                .uri("/")
+                .header("x-forwarded-for", "not-an-ip")
+                .body(Body::empty())
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1234))));
+            request
+        };
+
+        let response = app.oneshot(request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"],
+            "invalid_forwarded_header"
+        );
     }
 
     #[tokio::test]

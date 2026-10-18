@@ -711,6 +711,96 @@ mod commit_ip_handler_tests {
     }
 }
 
+// ── #1222: Malformed Alertmanager payload tests for the incidents webhook ────
+//
+// The incidents webhook must reject malformed Alertmanager payloads with a
+// 400 response and a JSON error body instead of panicking (previously caused
+// by `unwrap()` calls in `incidents.rs`).
+
+#[cfg(test)]
+mod incidents_webhook_malformed_payload_tests {
+    use api_server::incidents::parse_alertmanager_payload;
+    use axum::http::StatusCode;
+
+    /// Assert that a payload is rejected with 400 and a JSON error body.
+    fn assert_rejected_with_400(body: &str) {
+        let result = parse_alertmanager_payload(body);
+        let err = result.err().expect("malformed payload must be rejected");
+        assert_eq!(
+            err.status,
+            StatusCode::BAD_REQUEST,
+            "malformed payload must map to 400, got {:?}",
+            err.status
+        );
+        assert!(
+            !err.message.is_empty(),
+            "error response must carry a descriptive message"
+        );
+    }
+
+    #[test]
+    fn test_malformed_json_body_returns_400() {
+        assert_rejected_with_400("{ this is not json ");
+        assert_rejected_with_400("");
+        assert_rejected_with_400("null");
+        assert_rejected_with_400("[]");
+    }
+
+    #[test]
+    fn test_missing_required_fields_returns_400() {
+        // Missing `alerts` entirely.
+        assert_rejected_with_400(r#"{"status": "firing"}"#);
+        // Missing `status`.
+        assert_rejected_with_400(r#"{"alerts": []}"#);
+        // Missing `labels` inside an alert.
+        assert_rejected_with_400(
+            r#"{"status": "firing", "alerts": [{"annotations": {}}]}"#,
+        );
+        // Missing `annotations` inside an alert.
+        assert_rejected_with_400(
+            r#"{"status": "firing", "alerts": [{"labels": {}}]}"#,
+        );
+    }
+
+    #[test]
+    fn test_wrong_json_types_returns_400() {
+        // `alerts` must be an array, not a string.
+        assert_rejected_with_400(r#"{"status": "firing", "alerts": "oops"}"#);
+        // `alerts` must be an array, not an object.
+        assert_rejected_with_400(r#"{"status": "firing", "alerts": {}}"#);
+        // `status` must be a string.
+        assert_rejected_with_400(r#"{"status": 42, "alerts": []}"#);
+        // `labels` must be an object.
+        assert_rejected_with_400(
+            r#"{"status": "firing", "alerts": [{"labels": "bad", "annotations": {}}]}"#,
+        );
+        // `annotations` must be an object.
+        assert_rejected_with_400(
+            r#"{"status": "firing", "alerts": [{"labels": {}, "annotations": 7}]}"#,
+        );
+    }
+
+    #[test]
+    fn test_empty_alerts_array_returns_400() {
+        assert_rejected_with_400(r#"{"status": "firing", "alerts": []}"#);
+    }
+
+    #[test]
+    fn test_valid_payload_is_accepted() {
+        let body = r#"{
+            "status": "firing",
+            "alerts": [
+                {
+                    "labels": {"alertname": "HighErrorRate", "severity": "critical"},
+                    "annotations": {"summary": "error rate above threshold"}
+                }
+            ]
+        }"#;
+        let parsed = parse_alertmanager_payload(body).expect("valid payload must be accepted");
+        assert_eq!(parsed.alerts.len(), 1);
+    }
+}
+
 // ── #926: Multi-Instance Load Balancer Integration Tests ─────────────────────
 
 #[cfg(test)]

@@ -249,6 +249,69 @@ async fn init_subscription_broadcaster() -> Arc<graphql::SubscriptionBroadcaster
     }
 }
 
+/// Typed error raised while resolving the application's dependencies at
+/// startup. Any missing dependency aborts startup with a clear message
+/// instead of panicking the process (#1220).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DependencyError {
+    /// A required dependency was not registered in the container.
+    Missing(&'static str),
+}
+
+impl std::fmt::Display for DependencyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DependencyError::Missing(name) => {
+                write!(f, "missing required dependency: {name}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DependencyError {}
+
+/// Resolve a required dependency from a container, returning a typed error
+/// instead of panicking when it is absent.
+fn require_dependency<T: Clone>(
+    container: &dependency_injection::ServiceContainer,
+    name: &'static str,
+) -> Result<T, DependencyError> {
+    container
+        .resolve::<T>()
+        .ok_or(DependencyError::Missing(name))
+}
+
+/// Build the shared application state, resolving every dependency through the
+/// container. Returns a typed error (never panics) when a dependency is
+/// missing so `main` can log and exit non-zero.
+fn build_state(
+    container: &dependency_injection::ServiceContainer,
+) -> Result<AppState, DependencyError> {
+    let schema = require_dependency::<graphql::AtomicIpSchema>(container, "graphql_schema")?;
+    let query_client =
+        require_dependency::<Arc<graphql::SorobanQueryClient>>(container, "query_client")?;
+    let rpc_client =
+        require_dependency::<Arc<dyn graphql::SorobanRpcClient>>(container, "rpc_client")?;
+    let ws_broadcaster =
+        require_dependency::<Arc<websocket::EventBroadcaster>>(container, "ws_broadcaster")?;
+    let sse_broadcaster =
+        require_dependency::<Arc<events::EventBroadcaster>>(container, "sse_broadcaster")?;
+    let health_checker =
+        require_dependency::<Arc<health::HealthChecker>>(container, "health_checker")?;
+    let rate_limiter =
+        require_dependency::<Arc<rate_limit::RateLimitMiddleware>>(container, "rate_limiter")?;
+
+    Ok(AppState {
+        schema,
+        query_client,
+        rpc_client,
+        ws_broadcaster,
+        sse_broadcaster,
+        health_checker,
+        rate_limiter,
+    })
+}
+
 #[tokio::main]
 async fn main() {
     // Initialise OpenTelemetry SDK (OTLP exporter) + tracing subscriber.
@@ -269,14 +332,25 @@ async fn main() {
 
     let rate_limiter = Arc::new(rate_limit::RateLimitMiddleware::new(rate_limit::RateLimitConfig::default()));
 
-    let state = AppState {
-        schema,
-        query_client,
-        rpc_client,
-        ws_broadcaster:  Arc::new(websocket::EventBroadcaster::new()),
-        sse_broadcaster: Arc::new(events::create_event_broadcaster().0),
-        health_checker:  Arc::new(health::HealthChecker::new()),
-        rate_limiter: rate_limiter.clone(),
+    // Register every dependency in the container, then resolve the state
+    // through it. A missing dependency yields a typed error rather than a
+    // panic; log it clearly and exit non-zero.
+    let mut container = dependency_injection::ServiceContainer::new();
+    container.register(schema);
+    container.register(query_client);
+    container.register(rpc_client);
+    container.register(Arc::new(websocket::EventBroadcaster::new()));
+    container.register(Arc::new(events::create_event_broadcaster().0));
+    container.register(Arc::new(health::HealthChecker::new()));
+    container.register(rate_limiter.clone());
+
+    let state = match build_state(&container) {
+        Ok(state) => state,
+        Err(e) => {
+            tracing::error!("failed to start API server: {e}");
+            eprintln!("failed to start API server: {e}");
+            std::process::exit(1);
+        }
     };
     let request_queue = Arc::new(request_queue::RequestQueue::new(
         request_queue::QueueConfig::default(),
@@ -411,15 +485,20 @@ fn build_app() -> Router {
     let query_client = Arc::new(graphql::SorobanQueryClient::new(rpc_client.clone()));
     let schema = graphql::build_schema_with_context(rpc_client.clone());
     let health_checker = Arc::new(health::HealthChecker::new());
-    let rate_limiter = rate_limit::RateLimitMiddleware::new(rate_limit::RateLimitConfig::default());
-    let state = AppState {
-        schema,
-        query_client,
-        ws_broadcaster: Arc::new(websocket::EventBroadcaster::new()),
-        sse_broadcaster: Arc::new(events::create_event_broadcaster().0),
-        health_checker,
-        rpc_client,
-    };
+    let rate_limiter = Arc::new(rate_limit::RateLimitMiddleware::new(rate_limit::RateLimitConfig::default()));
+
+    let mut container = dependency_injection::ServiceContainer::new();
+    container.register(schema);
+    container.register(query_client);
+    container.register(rpc_client);
+    container.register(Arc::new(websocket::EventBroadcaster::new()));
+    container.register(Arc::new(events::create_event_broadcaster().0));
+    container.register(health_checker);
+    container.register(rate_limiter.clone());
+
+    // The test router registers every dependency, so resolution cannot fail;
+    // surface any regression as a panic here (tests only).
+    let state = build_state(&container).expect("test container must resolve all dependencies");
 
     // #535: same signing enforcement as the production router, so the test
     // router exercises the identical middleware on the six write endpoints.
@@ -518,17 +597,67 @@ mod tests {
         let query_client = Arc::new(graphql::SorobanQueryClient::new(rpc_client.clone()));
         let schema = graphql::build_schema();
         let health_checker = Arc::new(health::HealthChecker::new());
-        let state = AppState {
-            schema,
-            query_client,
-            rpc_client,
-            ws_broadcaster:  Arc::new(websocket::EventBroadcaster::new()),
-            sse_broadcaster: Arc::new(events::create_event_broadcaster().0),
-            health_checker,
-        };
+        let rate_limiter = Arc::new(rate_limit::RateLimitMiddleware::new(rate_limit::RateLimitConfig::default()));
+
+        let mut container = dependency_injection::ServiceContainer::new();
+        container.register(schema);
+        container.register(query_client);
+        container.register(rpc_client);
+        container.register(Arc::new(websocket::EventBroadcaster::new()));
+        container.register(Arc::new(events::create_event_broadcaster().0));
+        container.register(health_checker);
+        container.register(rate_limiter);
+
+        let state = build_state(&container).expect("test container must resolve all dependencies");
         Router::new()
             .route("/v1/swap/{swap_id}", get(handlers::get_swap))
             .with_state(state)
+    }
+
+    // ── #1220: typed dependency-resolution errors ────────────────────────────
+
+    #[test]
+    fn test_missing_dependency_yields_typed_error_not_panic() {
+        // An empty container has no dependencies registered; resolving must
+        // return the typed error rather than panicking.
+        let container = dependency_injection::ServiceContainer::new();
+        let result = build_state(&container);
+        match result {
+            Err(DependencyError::Missing(name)) => {
+                assert_eq!(name, "graphql_schema");
+            }
+            Ok(_) => panic!("expected a missing-dependency error from an empty container"),
+        }
+    }
+
+    #[test]
+    fn test_missing_dependency_error_message_names_dependency() {
+        let container = dependency_injection::ServiceContainer::new();
+        let err = require_dependency::<graphql::AtomicIpSchema>(&container, "graphql_schema")
+            .expect_err("empty container must not resolve the schema");
+        assert_eq!(err, DependencyError::Missing("graphql_schema"));
+        assert!(err.to_string().contains("graphql_schema"));
+    }
+
+    #[test]
+    fn test_fully_registered_container_resolves_state() {
+        let rpc_client: Arc<dyn graphql::SorobanRpcClient> =
+            Arc::new(graphql::MockSorobanRpcClient::default());
+        let query_client = Arc::new(graphql::SorobanQueryClient::new(rpc_client.clone()));
+        let schema = graphql::build_schema_with_context(rpc_client.clone());
+        let rate_limiter =
+            Arc::new(rate_limit::RateLimitMiddleware::new(rate_limit::RateLimitConfig::default()));
+
+        let mut container = dependency_injection::ServiceContainer::new();
+        container.register(schema);
+        container.register(query_client);
+        container.register(rpc_client);
+        container.register(Arc::new(websocket::EventBroadcaster::new()));
+        container.register(Arc::new(events::create_event_broadcaster().0));
+        container.register(Arc::new(health::HealthChecker::new()));
+        container.register(rate_limiter);
+
+        assert!(build_state(&container).is_ok());
     }
 
     #[tokio::test]
