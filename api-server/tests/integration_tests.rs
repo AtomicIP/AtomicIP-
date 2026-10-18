@@ -989,3 +989,245 @@ mod load_balancer_multi_instance_tests {
         }
     }
 }
+
+// ── #1204–#1207: API hardening integration tests ─────────────────────────────
+//
+// Covers:
+//   #1204 — CORS allowlist (no wildcard, public read routes only)
+//   #1205 — GraphQL depth / complexity limits
+//   #1206 — GraphQL introspection disabled outside development
+//   #1207 — /metrics requires authentication
+
+#[cfg(test)]
+mod api_hardening_tests {
+    use api_server::middleware_pipeline::{
+        cors_headers_for, is_public_read_route, CorsConfig,
+    };
+    use api_server::graphql::{build_schema, GraphQlLimits, GraphQlMode};
+    use api_server::metrics_auth::authorize_metrics_scrape;
+    use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+
+    // ── #1204: CORS allowlist ────────────────────────────────────────────────
+
+    fn test_cors_config() -> CorsConfig {
+        CorsConfig::new(vec![
+            "https://app.atomicip.example".to_string(),
+            "https://explorer.atomicip.example".to_string(),
+        ])
+    }
+
+    #[test]
+    fn test_unlisted_origin_receives_no_allow_origin_header() {
+        let config = test_cors_config();
+        let headers = cors_headers_for(&config, Some("https://evil.example"), "/ip/123");
+
+        assert!(
+            headers.get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none(),
+            "unlisted origin must not receive Access-Control-Allow-Origin"
+        );
+        assert!(
+            headers.get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS).is_none(),
+            "unlisted origin must not receive Access-Control-Allow-Credentials"
+        );
+    }
+
+    #[test]
+    fn test_allowlisted_origin_on_public_read_route_gets_allow_origin() {
+        let config = test_cors_config();
+        let headers = cors_headers_for(
+            &config,
+            Some("https://app.atomicip.example"),
+            "/ip/123",
+        );
+
+        assert_eq!(
+            headers
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|v| v.to_str().ok()),
+            Some("https://app.atomicip.example"),
+            "allowlisted origin on a public read route must be echoed back"
+        );
+        assert!(
+            headers
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|v| v.to_str().ok())
+                != Some("*"),
+            "wildcard CORS must never be emitted"
+        );
+    }
+
+    #[test]
+    fn test_allowlisted_origin_on_admin_route_gets_no_cors_headers() {
+        let config = test_cors_config();
+        for path in ["/admin/stats", "/admin/instances", "/recovery/state"] {
+            let headers = cors_headers_for(&config, Some("https://app.atomicip.example"), path);
+            assert!(
+                headers.get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none(),
+                "{path}: admin/recovery routes must never receive CORS headers"
+            );
+        }
+    }
+
+    #[test]
+    fn test_public_read_route_classification() {
+        assert!(is_public_read_route("/ip/123"), "/ip/:id is a public read route");
+        assert!(is_public_read_route("/swap/456"), "/swap/:id is a public read route");
+        assert!(is_public_read_route("/reputation/GABC"), "/reputation/:owner is a public read route");
+        assert!(!is_public_read_route("/admin/stats"), "/admin/* is not public");
+        assert!(!is_public_read_route("/recovery/state"), "/recovery/* is not public");
+        assert!(!is_public_read_route("/metrics"), "/metrics is not public");
+        assert!(!is_public_read_route("/graphql"), "/graphql is not a public read route");
+    }
+
+    #[test]
+    fn test_request_without_origin_gets_no_cors_headers() {
+        let config = test_cors_config();
+        let headers = cors_headers_for(&config, None, "/ip/123");
+        assert!(
+            headers.get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none(),
+            "requests without an Origin header must not receive CORS headers"
+        );
+    }
+
+    // ── #1205: GraphQL depth / complexity limits ─────────────────────────────
+
+    fn nested_query(depth: usize) -> String {
+        // Build a deeply nested selection set: swap { ip { owner { ... } } }
+        let mut q = String::from("{ swap(id: 1) { id ");
+        for _ in 0..depth {
+            q.push_str("ip { id ");
+        }
+        for _ in 0..depth {
+            q.push_str("} ");
+        }
+        q.push_str("} }");
+        q
+    }
+
+    #[test]
+    fn test_graphql_query_within_depth_limit_is_accepted() {
+        let schema = build_schema(GraphQlLimits::default(), GraphQlMode::Development);
+        let query = "{ ip(id: 1) { id owner } }";
+        assert!(
+            schema.validate_query(query).is_ok(),
+            "a shallow query must pass depth/complexity validation"
+        );
+    }
+
+    #[test]
+    fn test_graphql_query_exceeding_depth_limit_is_rejected() {
+        let limits = GraphQlLimits::default();
+        let schema = build_schema(limits.clone(), GraphQlMode::Development);
+        let query = nested_query(limits.max_depth + 5);
+
+        let err = schema
+            .validate_query(&query)
+            .expect_err("query exceeding the depth limit must be rejected");
+        assert!(
+            err.to_string().to_lowercase().contains("depth"),
+            "rejection must mention the depth limit, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_graphql_query_exceeding_complexity_limit_is_rejected() {
+        let limits = GraphQlLimits::default();
+        let schema = build_schema(limits.clone(), GraphQlMode::Development);
+
+        // A wide query with many sibling fields blows the complexity budget.
+        let mut query = String::from("{ ");
+        for i in 0..(limits.max_complexity + 50) {
+            query.push_str(&format!("ip{}(id: {}) {{ id owner }} ", i, i));
+        }
+        query.push('}');
+
+        let err = schema
+            .validate_query(&query)
+            .expect_err("query exceeding the complexity limit must be rejected");
+        assert!(
+            err.to_string().to_lowercase().contains("complexity"),
+            "rejection must mention the complexity limit, got: {err}"
+        );
+    }
+
+    // ── #1206: GraphQL introspection ─────────────────────────────────────────
+
+    #[test]
+    fn test_introspection_rejected_in_production_mode() {
+        let schema = build_schema(GraphQlLimits::default(), GraphQlMode::Production);
+        let query = "{ __schema { types { name } } }";
+
+        let err = schema
+            .validate_query(query)
+            .expect_err("introspection must be rejected in production mode");
+        assert!(
+            err.to_string().to_lowercase().contains("introspection"),
+            "rejection must mention introspection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_introspection_allowed_in_development_mode() {
+        let schema = build_schema(GraphQlLimits::default(), GraphQlMode::Development);
+        let query = "{ __schema { types { name } } }";
+        assert!(
+            schema.validate_query(query).is_ok(),
+            "introspection must remain available in development mode"
+        );
+    }
+
+    #[test]
+    fn test_graphql_mode_is_explicitly_configured() {
+        // The mode must be an explicit environment option, not a default.
+        assert_eq!(GraphQlMode::from_env_value("production"), GraphQlMode::Production);
+        assert_eq!(GraphQlMode::from_env_value("development"), GraphQlMode::Development);
+        assert_eq!(GraphQlMode::from_env_value("staging"), GraphQlMode::Production);
+    }
+
+    // ── #1207: /metrics authentication ───────────────────────────────────────
+
+    fn metrics_token() -> &'static str {
+        "test-metrics-token"
+    }
+
+    #[test]
+    fn test_unauthenticated_metrics_scrape_is_refused() {
+        let headers = HeaderMap::new();
+        let status = authorize_metrics_scrape(&headers, metrics_token());
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "unauthenticated scrape of /metrics must be refused with 401"
+        );
+    }
+
+    #[test]
+    fn test_metrics_scrape_with_wrong_token_is_refused() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer wrong-token"),
+        );
+        let status = authorize_metrics_scrape(&headers, metrics_token());
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "scrape with an incorrect token must be refused with 401"
+        );
+    }
+
+    #[test]
+    fn test_authenticated_metrics_scrape_succeeds() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer test-metrics-token"),
+        );
+        let status = authorize_metrics_scrape(&headers, metrics_token());
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "scrape with the configured token must succeed"
+        );
+    }
+}

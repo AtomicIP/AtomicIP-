@@ -1130,6 +1130,91 @@ match combined.validate() {
 
 GraphQL requests validate input at the resolver level. All scalar inputs use the same validation rules as REST endpoints.
 
+### GraphQL Depth and Complexity Limits
+
+The GraphQL endpoint enforces a maximum query depth and a maximum query
+complexity so that a deeply nested or wide query cannot consume unbounded CPU
+and memory. Both limits are applied before execution; a query that exceeds
+either one is rejected without running any resolver.
+
+| Setting | Environment variable | Default |
+|---|---|---|
+| Maximum query depth | `GRAPHQL_MAX_DEPTH` | `10` |
+| Maximum query complexity | `GRAPHQL_MAX_COMPLEXITY` | `1000` |
+
+Depth counts nested selection sets from the root query or mutation. Complexity
+is the sum of the estimated cost of every selected field, so a wide query with
+many sibling fields is bounded as well as a deeply nested one.
+
+A rejected query returns HTTP `400 Bad Request` with a GraphQL error body whose
+message identifies which limit was exceeded:
+
+```json
+{
+  "errors": [
+    {
+      "message": "Query is nested too deep: depth 12 exceeds the maximum of 10",
+      "locations": [{ "line": 1, "column": 1 }]
+    }
+  ]
+}
+```
+
+```json
+{
+  "errors": [
+    {
+      "message": "Query is too complex: complexity 1500 exceeds the maximum of 1000",
+      "locations": [{ "line": 1, "column": 1 }]
+    }
+  ]
+}
+```
+
+Clients should request only the fields they need and split large queries into
+several smaller ones. Operators can raise the limits through the environment
+variables above, but should keep them as low as their clients allow.
+
+### GraphQL Introspection
+
+Introspection is **disabled by default outside development**. In production the
+schema cannot be enumerated through `__schema` or `__type` queries; such a query
+is rejected with a GraphQL error and no schema data is returned.
+
+| Environment variable | Values | Default |
+|---|---|---|
+| `GRAPHQL_INTROSPECTION` | `true`, `false` | `true` when the server runs in development mode, `false` otherwise |
+
+Set `GRAPHQL_INTROSPECTION=true` explicitly to enable introspection in a
+non-development environment (for example, a staging deployment used to generate
+client code). Leaving it unset in production keeps introspection off.
+
+### Metrics Endpoint
+
+`/metrics` is **not** part of the public API surface. It exposes request counts,
+error rates, and internal labels, so it is protected in two ways:
+
+- **Separate internal port** — metrics are served on the internal metrics
+  listener rather than the public API port, so they are only reachable from the
+  internal network.
+- **Bearer token** — when the metrics listener is exposed, scrapes must send
+  `Authorization: Bearer <token>`. Requests without a valid token are refused
+  with `401 Unauthorized` and no metrics are returned.
+
+The Prometheus scrape configuration must therefore target the internal metrics
+port and include the bearer token:
+
+```yaml
+scrape_configs:
+  - job_name: ip-registry-api
+    metrics_path: /metrics
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/ip-registry-metrics-token
+    static_configs:
+      - targets: ["ip-registry-api-internal:9090"]
+```
+
 Example mutation with validation:
 
 ```graphql
