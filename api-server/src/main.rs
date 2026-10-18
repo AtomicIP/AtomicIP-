@@ -249,6 +249,47 @@ async fn init_subscription_broadcaster() -> Arc<graphql::SubscriptionBroadcaster
     }
 }
 
+/// Default bind address used when `API_BIND_ADDR` is unset.
+const DEFAULT_BIND_ADDR: &str = "0.0.0.0";
+/// Default bind port used when `API_BIND_PORT` is unset.
+const DEFAULT_BIND_PORT: u16 = 8080;
+
+/// Resolves the address the server should bind to from the environment.
+///
+/// `API_BIND_ADDR` (default `0.0.0.0`) and `API_BIND_PORT` (default `8080`)
+/// allow the listen address to be changed without a rebuild. An invalid
+/// address or port is logged and falls back to the default so the server
+/// still starts with a usable configuration.
+fn resolve_bind_addr() -> std::net::SocketAddr {
+    let host = std::env::var("API_BIND_ADDR")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_BIND_ADDR.to_string());
+
+    let port = match std::env::var("API_BIND_PORT") {
+        Ok(raw) if !raw.trim().is_empty() => match raw.trim().parse::<u16>() {
+            Ok(port) => port,
+            Err(e) => {
+                tracing::error!(
+                    "invalid API_BIND_PORT {raw:?} ({e}); falling back to {DEFAULT_BIND_PORT}"
+                );
+                DEFAULT_BIND_PORT
+            }
+        },
+        _ => DEFAULT_BIND_PORT,
+    };
+
+    match format!("{host}:{port}").parse::<std::net::SocketAddr>() {
+        Ok(addr) => addr,
+        Err(e) => {
+            tracing::error!(
+                "invalid API_BIND_ADDR {host:?} ({e}); falling back to {DEFAULT_BIND_ADDR}:{port}"
+            );
+            std::net::SocketAddr::from(([0, 0, 0, 0], port))
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // Initialise OpenTelemetry SDK (OTLP exporter) + tracing subscriber.
@@ -359,16 +400,32 @@ async fn main() {
         .layer(middleware::from_fn(middleware_pipeline::cors_middleware))
         .layer(middleware::from_fn(require_json_content_type));
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
-    println!("OpenAPI JSON    -> http://localhost:8080/openapi.json");
-    println!("Health Check    -> http://localhost:8080/health");
-    println!("Metrics         -> http://localhost:8080/metrics");
-    println!("WebSocket (raw) -> ws://localhost:8080/ws");
-    println!("GraphQL WS      -> ws://localhost:8080/graphql/ws");
-    println!("Events SSE      -> http://localhost:8080/events");
-    println!("Batch API       -> http://localhost:8080/batch");
-    println!("GraphQL         -> http://localhost:8080/graphql");
-    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap();
+    let bind_addr = resolve_bind_addr();
+    let listener = match tokio::net::TcpListener::bind(bind_addr).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            tracing::error!("failed to bind to {bind_addr}: {e}");
+            std::process::exit(1);
+        }
+    };
+    let display_host = if bind_addr.ip().is_unspecified() {
+        "localhost".to_string()
+    } else {
+        bind_addr.ip().to_string()
+    };
+    let base = format!("http://{display_host}:{}", bind_addr.port());
+    println!("OpenAPI JSON    -> {base}/openapi.json");
+    println!("Health Check    -> {base}/health");
+    println!("Metrics         -> {base}/metrics");
+    println!("WebSocket (raw) -> ws://{display_host}:{}/ws", bind_addr.port());
+    println!("GraphQL WS      -> ws://{display_host}:{}/graphql/ws", bind_addr.port());
+    println!("Events SSE      -> {base}/events");
+    println!("Batch API       -> {base}/batch");
+    println!("GraphQL         -> {base}/graphql");
+    if let Err(e) = axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await {
+        tracing::error!("server error: {e}");
+        std::process::exit(1);
+    }
 
     // Flush and shut down the OTel tracer so all pending spans are exported.
     if let Some(provider) = tracer_provider {
@@ -511,6 +568,18 @@ mod tests {
         http::{Request, StatusCode},
     };
     use tower::ServiceExt;
+
+    #[test]
+    fn test_default_bind_addr_is_0_0_0_0_8080() {
+        // Ensure the environment does not override the defaults for this test.
+        // SAFETY: tests in this module do not rely on these variables elsewhere.
+        std::env::remove_var("API_BIND_ADDR");
+        std::env::remove_var("API_BIND_PORT");
+        let addr = resolve_bind_addr();
+        assert_eq!(addr, "0.0.0.0:8080".parse::<std::net::SocketAddr>().unwrap());
+        assert_eq!(addr.ip().to_string(), DEFAULT_BIND_ADDR);
+        assert_eq!(addr.port(), DEFAULT_BIND_PORT);
+    }
 
     /// Test router with an injectable RPC client, used by the swap read-path
     /// tests to exercise `GET /v1/swap/{id}` against a stub client.

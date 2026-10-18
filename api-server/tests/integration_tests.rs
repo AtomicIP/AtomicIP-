@@ -989,3 +989,162 @@ mod load_balancer_multi_instance_tests {
         }
     }
 }
+
+// ── Security hardening integration tests (#1208, #1209, #1210, #1211) ────────
+
+#[cfg(test)]
+mod security_hardening_tests {
+    use api_server::health::{detailed_health_access, HealthAccessDecision};
+    use api_server::audit::{create_audit_store_with_fallback, AuditStoreKind};
+    use api_server::config::{default_bind_addr, resolve_bind_addr};
+    use api_server::sync_util::lock_or_recover;
+    use std::sync::{Arc, Mutex};
+
+    // ── #1208: /health/detailed must not be public ────────────────────────────
+
+    #[test]
+    fn test_health_detailed_rejects_unauthenticated_request() {
+        // No credentials, no internal-network marker → must be denied.
+        let decision = detailed_health_access(None, false);
+        assert_eq!(
+            decision,
+            HealthAccessDecision::Denied,
+            "/health/detailed must not be reachable without authentication"
+        );
+    }
+
+    #[test]
+    fn test_health_detailed_rejects_external_request_without_auth() {
+        // Request originates from outside the internal network and carries no token.
+        let decision = detailed_health_access(None, false);
+        assert!(
+            !decision.is_allowed(),
+            "external unauthenticated request must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_health_detailed_allows_authenticated_request() {
+        let decision = detailed_health_access(Some("valid-token"), false);
+        assert!(
+            decision.is_allowed(),
+            "authenticated request must be allowed to see detailed health"
+        );
+    }
+
+    #[test]
+    fn test_health_detailed_allows_internal_network_request() {
+        let decision = detailed_health_access(None, true);
+        assert!(
+            decision.is_allowed(),
+            "internal-network request must be allowed to see detailed health"
+        );
+    }
+
+    #[test]
+    fn test_health_basic_route_remains_public() {
+        // The minimal /health endpoint must stay public and require no auth.
+        assert!(
+            api_server::health::basic_health_is_public(),
+            "/health must remain public and minimal"
+        );
+    }
+
+    // ── #1209: fallback audit store must not panic ────────────────────────────
+
+    #[test]
+    fn test_fallback_audit_store_degrades_without_panic() {
+        // Force the primary store creation to fail; the helper must return an
+        // in-memory fallback instead of panicking.
+        let store = create_audit_store_with_fallback(|| {
+            Err("primary audit store unavailable".to_string())
+        });
+        assert_eq!(
+            store.kind(),
+            AuditStoreKind::InMemoryFallback,
+            "failed primary store must degrade to the in-memory fallback sink"
+        );
+    }
+
+    #[test]
+    fn test_fallback_audit_store_emits_metric() {
+        let store = create_audit_store_with_fallback(|| {
+            Err("primary audit store unavailable".to_string())
+        });
+        assert!(
+            store.fallback_metric_emitted(),
+            "a metric must be emitted when the fallback audit store is active"
+        );
+    }
+
+    #[test]
+    fn test_primary_audit_store_used_when_available() {
+        let store = create_audit_store_with_fallback(|| Ok(()));
+        assert_eq!(
+            store.kind(),
+            AuditStoreKind::Primary,
+            "a healthy primary store must be used directly"
+        );
+        assert!(
+            !store.fallback_metric_emitted(),
+            "no fallback metric should be emitted when the primary store works"
+        );
+    }
+
+    // ── #1210: configurable bind address ──────────────────────────────────────
+
+    #[test]
+    fn test_default_bind_addr_is_0_0_0_0_8080() {
+        assert_eq!(
+            default_bind_addr().to_string(),
+            "0.0.0.0:8080",
+            "default bind address must remain 0.0.0.0:8080"
+        );
+    }
+
+    #[test]
+    fn test_bind_addr_resolves_from_env_overrides() {
+        let addr = resolve_bind_addr(Some("127.0.0.1"), Some("9090"));
+        assert_eq!(
+            addr.to_string(),
+            "127.0.0.1:9090",
+            "bind address must be configurable via environment variables"
+        );
+    }
+
+    #[test]
+    fn test_bind_addr_falls_back_to_defaults_when_env_absent() {
+        let addr = resolve_bind_addr(None, None);
+        assert_eq!(addr.to_string(), "0.0.0.0:8080");
+    }
+
+    // ── #1211: poisoned mutex must not panic the next request ─────────────────
+
+    #[test]
+    fn test_poisoned_lock_does_not_panic_next_request() {
+        let shared = Arc::new(Mutex::new(0u32));
+
+        // Poison the mutex by panicking while holding the guard.
+        let poisoner = shared.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("intentional panic to poison the mutex");
+        })
+        .join();
+
+        assert!(shared.is_poisoned(), "mutex should be poisoned by the panic");
+
+        // The next request must recover the guard rather than panic.
+        let mut guard = lock_or_recover(&shared);
+        *guard += 1;
+        assert_eq!(*guard, 1, "poison-tolerant lock must still allow progress");
+    }
+
+    #[test]
+    fn test_lock_or_recover_works_on_unpoisoned_mutex() {
+        let shared = Mutex::new(41u32);
+        let mut guard = lock_or_recover(&shared);
+        *guard += 1;
+        assert_eq!(*guard, 42);
+    }
+}

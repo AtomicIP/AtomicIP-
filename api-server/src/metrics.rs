@@ -13,6 +13,8 @@ use once_cell::sync::Lazy;
 use std::sync::Mutex;
 use std::env;
 
+use crate::lock_utils::lock_or_recover;
+
 const DEFAULT_SLOW_REQUEST_THRESHOLD_MS: u64 = 1_000;
 
 fn slow_request_threshold_ms() -> u64 {
@@ -46,6 +48,10 @@ static PROMETHEUS_HANDLE: Lazy<Mutex<metrics_exporter_prometheus::PrometheusHand
     describe_counter!(
         "http_slow_requests_total",
         "HTTP requests slower than SLOW_REQUEST_THRESHOLD_MS"
+    );
+    describe_counter!(
+        "audit_fallback_active",
+        "Number of times the in-memory fallback audit store is active"
     );
     
     Mutex::new(handle)
@@ -146,6 +152,11 @@ fn extract_client_ip(req: &Request) -> String {
 
 /// Handler for the /metrics endpoint that returns Prometheus exposition format.
 pub async fn metrics_handler() -> Result<String, StatusCode> {
-    let handle = PROMETHEUS_HANDLE.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let handle = lock_or_recover(&PROMETHEUS_HANDLE);
     Ok(handle.render())
+}
+
+/// Record that the in-memory fallback audit store is active.
+pub fn record_audit_fallback_active() {
+    counter!("audit_fallback_active").increment(1);
 }

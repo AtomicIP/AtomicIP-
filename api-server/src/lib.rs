@@ -69,3 +69,45 @@ pub mod fallback;
 pub mod response;
 pub mod validation;
 pub mod validation_middleware;
+
+use std::sync::{Mutex, MutexGuard};
+
+/// Error returned when a mutex cannot be locked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LockError {
+    /// The mutex was poisoned by a panic in another thread.
+    Poisoned,
+}
+
+impl std::fmt::Display for LockError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LockError::Poisoned => write!(f, "mutex was poisoned by a previous panic"),
+        }
+    }
+}
+
+impl std::error::Error for LockError {}
+
+/// Acquire a lock, recovering the guard if the mutex was poisoned.
+///
+/// A poisoned mutex means a thread panicked while holding the lock. Rather than
+/// propagating that panic into every later request, we log a warning and keep
+/// using the (possibly inconsistent) data. See `docs/SECURITY_HARDENING.md`.
+pub fn lock_or_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    match m.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            tracing::warn!("recovered poisoned mutex; continuing with possibly inconsistent data");
+            poisoned.into_inner()
+        }
+    }
+}
+
+/// Acquire a lock, returning a structured [`LockError`] if the mutex is poisoned.
+///
+/// Use this when callers should surface the poisoning as an error instead of
+/// silently recovering.
+pub fn try_lock_or_error<T>(m: &Mutex<T>) -> Result<MutexGuard<'_, T>, LockError> {
+    m.lock().map_err(|_| LockError::Poisoned)
+}

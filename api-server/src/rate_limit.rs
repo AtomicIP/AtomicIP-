@@ -199,7 +199,7 @@ impl RateLimitStore for InProcessStore {
         now: Instant,
         idle_ttl: Duration,
     ) -> RefillResult {
-        let mut store = self.buckets.lock().unwrap();
+        let mut store = crate::lock_recover(&self.buckets);
         store.checks += 1;
         if store.checks % 1024 == 0 {
             store
@@ -442,9 +442,7 @@ impl RateLimitMiddleware {
 
     /// Assign a verified user to a billing tier. Unknown users use the free tier.
     pub fn set_user_tier(&self, user_id: impl Into<String>, tier: RateLimitTier) {
-        self.local
-            .lock()
-            .unwrap()
+        crate::lock_recover(&self.local)
             .user_tiers
             .insert(user_id.into(), tier);
     }
@@ -485,7 +483,7 @@ impl RateLimitMiddleware {
 
     async fn check(&self, ip: &str, user: Option<&str>, now: Instant) -> Decision {
         let (tier, violation_key, bucket_keys, early_denial) = {
-            let mut local = self.local.lock().unwrap();
+            let mut local = crate::lock_recover(&self.local);
             local.checks += 1;
             if local.checks % 1024 == 0 {
                 let ttl = self.config.idle_ttl;
@@ -622,7 +620,7 @@ impl RateLimitMiddleware {
                 .max_by_key(|(_, _, wait)| *wait)
                 .expect("store reported denial without an exhausted bucket");
 
-            let mut local = self.local.lock().unwrap();
+            let mut local = crate::lock_recover(&self.local);
             let violation = local.violations.entry(violation_key).or_default();
             violation.count = violation.count.saturating_add(1).min(31);
             violation.last_seen = Some(now);
@@ -647,7 +645,9 @@ impl RateLimitMiddleware {
             };
         }
 
-        self.local.lock().unwrap().violations.remove(&violation_key);
+        crate::lock_recover(&self.local)
+            .violations
+            .remove(&violation_key);
         let remaining = tokens.floor().max(1.0) as u32 - 1;
         let reset_after = Duration::from_secs_f64(
             ((quota.burst as f64 - (tokens - 1.0)) / quota.refill_per_second()).max(0.0),
@@ -853,7 +853,7 @@ mod tests {
         assert!(limiter.check("b", Some("b"), now).await.allowed);
         assert!(limiter.check("c", Some("c"), now).await.allowed);
         assert!(!limiter.check("d", Some("d"), now).await.allowed);
-        let local = limiter.local.lock().unwrap();
+        let local = crate::lock_recover(&limiter.local);
         assert_eq!(local.cardinality_ips.len(), 1);
         assert_eq!(local.cardinality_users.len(), 1);
     }
