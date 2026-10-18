@@ -52,6 +52,8 @@ pub mod handlers;
 pub mod health;
 pub mod invariants;
 pub mod load_balancer;
+#[cfg(test)]
+pub mod load_testing;
 pub mod metrics;
 pub mod middleware_pipeline;
 pub mod request_queue;

@@ -6,7 +6,7 @@ use axum::{
     middleware::Next,
     response::Response,
 };
-use metrics::{counter, histogram, describe_counter, describe_histogram};
+use metrics::{counter, gauge, histogram, describe_counter, describe_gauge, describe_histogram};
 use tracing::info;
 
 use once_cell::sync::Lazy;
@@ -47,9 +47,27 @@ static PROMETHEUS_HANDLE: Lazy<Mutex<metrics_exporter_prometheus::PrometheusHand
         "http_slow_requests_total",
         "HTTP requests slower than SLOW_REQUEST_THRESHOLD_MS"
     );
+    describe_gauge!(
+        "open_connections",
+        "Currently open WebSocket/SSE connections"
+    );
     
     Mutex::new(handle)
 });
+
+/// Record the current number of open WebSocket/SSE connections.
+///
+/// Called by the connection limiter in `websocket.rs`/`events.rs` whenever a
+/// connection is acquired or released so the gauge reflects the live count.
+pub fn set_open_connections(count: u64) {
+    gauge!("open_connections").set(count as f64);
+}
+
+/// Record the current number of open connections for a specific protocol
+/// (e.g. "websocket" or "sse").
+pub fn set_open_connections_for(protocol: &'static str, count: u64) {
+    gauge!("open_connections", "protocol" => protocol).set(count as f64);
+}
 
 /// Initialize the Prometheus metrics recorder and JSON logging subscriber.
 pub fn init() {

@@ -76,6 +76,7 @@ mod request_queue;
 mod rate_limit;
 mod validation;
 mod validation_middleware;
+mod docs;
 #[cfg(test)]
 mod validation_fuzz_tests;
 #[cfg(test)]
@@ -346,6 +347,8 @@ async fn main() {
         .route("/swap/{swap_id}/cancel-expired",  post(handlers::cancel_expired_swap))
         .route("/swap/{swap_id}",                 get(handlers::get_swap))
         .route("/openapi.json", get(openapi_handler))
+        .route("/docs", get(docs::docs_handler))
+        .route("/docs/markdown", get(docs::docs_markdown_handler))
         .with_state(state)
         .layer(middleware::from_fn_with_state(
             request_queue,
@@ -361,6 +364,7 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
     println!("OpenAPI JSON    -> http://localhost:8080/openapi.json");
+    println!("Docs            -> http://localhost:8080/docs");
     println!("Health Check    -> http://localhost:8080/health");
     println!("Metrics         -> http://localhost:8080/metrics");
     println!("WebSocket (raw) -> ws://localhost:8080/ws");
@@ -494,6 +498,8 @@ fn build_app() -> Router {
         .route("/auth/session/status", post(handlers::check_session))
         .route("/auth/extend-session", post(handlers::extend_session))
         .route("/openapi.json", get(openapi_handler))
+        .route("/docs", get(docs::docs_handler))
+        .route("/docs/markdown", get(docs::docs_markdown_handler))
         .with_state(state)
         .layer(middleware::from_fn_with_state(rate_limiter, rate_limit::rate_limit_middleware))
         .layer(middleware::from_fn(tracing_middleware::trace_requests))
@@ -596,6 +602,43 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    #[tokio::test]
+    async fn test_docs_route_returns_200() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/docs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.is_object());
+    }
+
+    #[tokio::test]
+    async fn test_docs_markdown_route_returns_200() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/docs/markdown")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert!(!body.is_empty());
     }
 
     #[tokio::test]

@@ -711,6 +711,49 @@ mod commit_ip_handler_tests {
     }
 }
 
+// ── #1219: docs.rs route is mounted and served ───────────────────────────────
+
+#[cfg(test)]
+mod docs_route_tests {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    /// The docs route must be reachable and return 200 with the API title.
+    /// This guards against `docs.rs` silently becoming unreferenced again.
+    #[tokio::test]
+    async fn test_docs_route_returns_200_with_api_title() {
+        let app = api_server::docs::docs_router();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(api_server::docs::DOCS_PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("docs request must not fail");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "docs route must return 200 OK"
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("docs body must be readable");
+        let html = String::from_utf8(body.to_vec()).expect("docs body must be UTF-8");
+
+        assert!(
+            html.contains(api_server::docs::API_TITLE),
+            "docs body must contain the API title '{}'",
+            api_server::docs::API_TITLE
+        );
+    }
+}
+
 // ── #926: Multi-Instance Load Balancer Integration Tests ─────────────────────
 
 #[cfg(test)]

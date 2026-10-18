@@ -101,6 +101,13 @@ jobs:
         env:
           REDIS_URL: redis://localhost:6379
 
+      - name: Load tests (api-server)
+        # Exercises api-server/src/load_testing.rs (#1218). Runs in mock mode
+        # (LOAD_TEST_BASE_URL unset) so no live server is required.
+        run: cargo test -p api-server load_ -- --nocapture
+        env:
+          REDIS_URL: redis://localhost:6379
+
       - name: Test (JS)
         run: npm test -- --coverage
 
