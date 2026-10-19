@@ -64,6 +64,12 @@ pub enum ContractError {
     CommitmentAlreadyRegistered = 3,
     IpAlreadyRevoked = 4,
     UnauthorizedUpgrade = 5,
+    /// #1161: Batch exceeds `MAX_BATCH_COMMIT` hashes.
+    BatchTooLarge = 60,
+    /// #1160: Anonymous commit rate limit for the current ledger exceeded.
+    AnonRateLimitExceeded = 61,
+    /// #1162: Stake amount must be strictly positive.
+    InvalidStakeAmount = 62,
     Unauthorized = 6,
     IpExpired = 7,
     MetadataTooLarge = 8,
@@ -197,6 +203,15 @@ const SHARD_MIGRATION_BATCH: u32 = 64;
 /// Supports paths like "Software/Cryptography/ZK-Proofs/DLV/AXIOM" (depth 5).
 pub const MAX_CATEGORY_DEPTH: u32 = 10;
 
+/// #1161: Maximum commitment hashes accepted by one `batch_commit_ip` call.
+pub const MAX_BATCH_COMMIT: u32 = 100;
+
+/// #1160: Maximum commitment hashes accepted by one `batch_commit_ip_anonymous` call.
+pub const MAX_ANON_BATCH_COMMIT: u32 = MAX_BATCH_COMMIT;
+
+/// #1160: Maximum anonymous commitments accepted per ledger across all callers.
+pub const MAX_ANON_COMMITS_PER_LEDGER: u32 = 500;
+
 fn commitment_hash(
     env: &Env,
     secret: &BytesN<32>,
@@ -236,6 +251,8 @@ pub enum DataKey {
     AnonymousOwner(BytesN<32>),
     /// #464: Tracks blinded_owner values that have already been used for replay protection
     UsedBlindedOwner(BytesN<32>),
+    /// #1160: Count of anonymous commitments accepted in a given ledger sequence (temporary storage)
+    AnonLedgerCommits(u32),
     Admin,
     PartialDisclosure(u64), // stores partial_hash for a given ip_id after reveal
     IpLicenses(u64),        // stores license entries for a given ip_id
@@ -399,6 +416,9 @@ const CURRENT_STORAGE_KEYS: &[&str] = &[
 /// Used as the compatibility baseline in `validate_upgrade`.
 const CURRENT_ERROR_CODES: &[(&str, u32)] = &[
     ("IpNotFound", 1),
+    ("BatchTooLarge", 60),
+    ("AnonRateLimitExceeded", 61),
+    ("InvalidStakeAmount", 62),
     ("ZeroCommitmentHash", 2),
     ("CommitmentAlreadyRegistered", 3),
     ("IpAlreadyRevoked", 4),
@@ -1202,6 +1222,11 @@ impl IpRegistry {
     ) -> Vec<u64> {
         owner.require_auth();
 
+        // #1161: Cap batch size to stay within Soroban compute and ledger-entry limits.
+        if commitment_hashes.len() > MAX_BATCH_COMMIT {
+            panic_with_error!(&env, ContractError::BatchTooLarge);
+        }
+
         let mut ids = Vec::new(&env);
         let timestamp = env.ledger().timestamp();
 
@@ -1340,6 +1365,20 @@ impl IpRegistry {
                 ContractError::ZeroCommitmentHash as u32,
             ));
         }
+
+        // #1160: Per-call cap on anonymous batch size.
+        if commitment_hashes.len() > MAX_ANON_BATCH_COMMIT {
+            panic_with_error!(&env, ContractError::BatchTooLarge);
+        }
+
+        // #1160: Rate limit anonymous commits per ledger, across all callers.
+        let rl_key = DataKey::AnonLedgerCommits(env.ledger().sequence());
+        let used: u32 = env.storage().temporary().get(&rl_key).unwrap_or(0);
+        let total = used.saturating_add(commitment_hashes.len());
+        if total > MAX_ANON_COMMITS_PER_LEDGER {
+            panic_with_error!(&env, ContractError::AnonRateLimitExceeded);
+        }
+        env.storage().temporary().set(&rl_key, &total);
 
         // #464: Replay protection — reject if this blinded_owner has already been used.
         // A blinded_owner is sha256(real_owner || nonce); reusing it would link
@@ -5070,6 +5109,10 @@ impl IpRegistry {
     /// Stake XLM (represented as an i128 amount) against an IP commitment.
     /// Only the IP owner may stake. One active stake per IP.
     pub fn stake_commitment(env: Env, ip_id: u64, amount: i128) {
+        // #1162: Reject non-positive stakes.
+        if amount <= 0 {
+            panic_with_error!(&env, ContractError::InvalidStakeAmount);
+        }
         let record = require_ip_exists(&env, ip_id);
         record.owner.require_auth();
 
@@ -5107,6 +5150,10 @@ impl IpRegistry {
         for i in 0..ip_ids.len() {
             let ip_id = ip_ids.get(i).unwrap();
             let amount = amounts.get(i).unwrap();
+            // #1162: Reject non-positive stakes.
+            if amount <= 0 {
+                panic_with_error!(&env, ContractError::InvalidStakeAmount);
+            }
             let record = require_ip_exists(&env, ip_id);
             record.owner.require_auth();
 
