@@ -130,13 +130,15 @@ impl ResponseFormatter {
         message: impl Into<String>,
         code: impl Into<String>,
     ) -> ApiResponse<()> {
+        let message = message.into();
+        let code = code.into();
         ApiResponse {
             status: 400,
-            message: message.into(),
+            message: message.clone(),
             data: None,
             error: Some(ErrorDetails {
-                code: code.into(),
-                message: message.into(),
+                code,
+                message,
                 details: None,
             }),
             meta: Self::create_meta(),
@@ -149,13 +151,15 @@ impl ResponseFormatter {
         code: impl Into<String>,
         details: HashMap<String, Vec<String>>,
     ) -> ApiResponse<()> {
+        let message = message.into();
+        let code = code.into();
         ApiResponse {
             status: 400,
-            message: message.into(),
+            message: message.clone(),
             data: None,
             error: Some(ErrorDetails {
-                code: code.into(),
-                message: message.into(),
+                code,
+                message,
                 details: Some(details),
             }),
             meta: Self::create_meta(),
@@ -164,13 +168,14 @@ impl ResponseFormatter {
 
     /// Create an unauthorized error response (401)
     pub fn unauthorized(message: impl Into<String>) -> ApiResponse<()> {
+        let message = message.into();
         ApiResponse {
             status: 401,
-            message: message.into(),
+            message: message.clone(),
             data: None,
             error: Some(ErrorDetails {
                 code: "UNAUTHORIZED".to_string(),
-                message: message.into(),
+                message,
                 details: None,
             }),
             meta: Self::create_meta(),
@@ -179,13 +184,14 @@ impl ResponseFormatter {
 
     /// Create a forbidden error response (403)
     pub fn forbidden(message: impl Into<String>) -> ApiResponse<()> {
+        let message = message.into();
         ApiResponse {
             status: 403,
-            message: message.into(),
+            message: message.clone(),
             data: None,
             error: Some(ErrorDetails {
                 code: "FORBIDDEN".to_string(),
-                message: message.into(),
+                message,
                 details: None,
             }),
             meta: Self::create_meta(),
@@ -194,13 +200,14 @@ impl ResponseFormatter {
 
     /// Create a not found error response (404)
     pub fn not_found(message: impl Into<String>) -> ApiResponse<()> {
+        let message = message.into();
         ApiResponse {
             status: 404,
-            message: message.into(),
+            message: message.clone(),
             data: None,
             error: Some(ErrorDetails {
                 code: "NOT_FOUND".to_string(),
-                message: message.into(),
+                message,
                 details: None,
             }),
             meta: Self::create_meta(),
@@ -209,13 +216,14 @@ impl ResponseFormatter {
 
     /// Create a conflict error response (409)
     pub fn conflict(message: impl Into<String>) -> ApiResponse<()> {
+        let message = message.into();
         ApiResponse {
             status: 409,
-            message: message.into(),
+            message: message.clone(),
             data: None,
             error: Some(ErrorDetails {
                 code: "CONFLICT".to_string(),
-                message: message.into(),
+                message,
                 details: None,
             }),
             meta: Self::create_meta(),
@@ -224,13 +232,14 @@ impl ResponseFormatter {
 
     /// Create an internal server error response (500)
     pub fn internal_error(message: impl Into<String>) -> ApiResponse<()> {
+        let message = message.into();
         ApiResponse {
             status: 500,
-            message: message.into(),
+            message: message.clone(),
             data: None,
             error: Some(ErrorDetails {
                 code: "INTERNAL_ERROR".to_string(),
-                message: message.into(),
+                message,
                 details: None,
             }),
             meta: Self::create_meta(),

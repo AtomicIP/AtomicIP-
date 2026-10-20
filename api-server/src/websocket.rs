@@ -141,16 +141,20 @@ impl EventBroadcaster {
             crate::events::ContractEvent::SwapAccepted { swap_id, .. } => {
                 self.trigger_swap_status_changed(*swap_id, Some("Pending".to_string()), "Accepted".to_string());
             }
-            crate::events::ContractEvent::SwapCompleted { swap_id, .. } => {
+            crate::events::ContractEvent::KeyRevealed { swap_id, .. } => {
                 self.trigger_swap_status_changed(*swap_id, Some("Accepted".to_string()), "Completed".to_string());
             }
-            crate::events::ContractEvent::IpCommitted { ip_id, owner, .. } => {
+            crate::events::ContractEvent::IpRevoked { ip_id, owner, .. } => {
                 self.broadcast_ip_event(IpEvent {
-                    event_type: "ip_committed".to_string(),
+                    event_type: "ip_revoked".to_string(),
                     ip_id: *ip_id,
                     owner: owner.clone(),
                     timestamp,
                 });
+            }
+            _ => {
+                // Other contract events (IpTransferred, BatchVerified, etc.)
+                // do not trigger WebSocket notifications in the current implementation.
             }
         }
     }

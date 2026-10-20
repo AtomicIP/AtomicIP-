@@ -190,7 +190,7 @@ pub fn create_redis_pool(
     metrics.record_connection_created();
 
     let pool = Pool::builder()
-        .min_size(config.min_size)
+        .min_idle(Some(config.min_size))
         .max_size(config.max_size)
         .connection_timeout(config.connection_timeout)
         .build(client)?;

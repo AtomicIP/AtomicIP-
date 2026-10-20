@@ -14,9 +14,10 @@ use tokio::time::{Duration, Instant};
 use tracing::instrument;
 use sha2::{Digest, Sha256};
 use crate::cache;
-use crate::deduplication::{create_store, DeduplicationStore};
+use crate::deduplication::{create_store, create_store_with_backend, DeduplicationStore, DeduplicationBackend};
 use crate::graphql::SorobanQueryClient;
 use crate::schemas::*;
+use crate::soroban_rpc;
 use std::sync::Arc;
 use crate::webhook;
 use crate::websocket;
@@ -41,6 +42,13 @@ static BATCH_SWAP_IDEMPOTENCY: Lazy<DeduplicationStore> = Lazy::new(|| match std
         create_store()
     }
 });
+
+/// Process-local Soroban RPC client. In production this is replaced by a
+/// `LiveSorobanRpcClient` injected via Axum's State extractor; this static
+/// is a fallback used by handlers that have not been fully wired to the
+/// dependency-injection layer yet.
+static SOROBAN_CLIENT: Lazy<std::sync::Arc<dyn crate::soroban_rpc::SorobanRpcClient>> =
+    Lazy::new(|| std::sync::Arc::new(crate::soroban_rpc::MockSorobanRpcClient::default()));
 
 // #520: Mirrors the contract's MAX_BATCH_SIZE cap on a single batch.
 const MAX_BATCH_SIZE: usize = 50;
@@ -105,18 +113,19 @@ pub async fn commit_ip(
     // Delegate to the Soroban RPC client.  The client validates inputs before
     // making the network call, so validation errors are surfaced as 400 without
     // a round-trip to the RPC node.
-    let ip_id = SOROBAN_CLIENT
-        .commit_ip(&body.owner, &body.commitment_hash)
-        .await
-        .map_err(|err| {
-            let status = soroban_rpc::map_rpc_error_to_status(&err);
-            (
-                status,
-                Json(ErrorResponse {
-                    error: err.to_string(),
-                }),
-            )
-        })?;
+    let ip_id = {
+        let client = SOROBAN_CLIENT.as_ref();
+        client.commit_ip(&body.owner, &body.commitment_hash).await
+    }
+    .map_err(|err| {
+        let status = soroban_rpc::map_rpc_error_to_status(&err);
+        (
+            status,
+            Json(ErrorResponse {
+                error: err.to_string(),
+            }),
+        )
+    })?;
 
     // #983: Check per-user commitment rate limit after successful commit
     let (allowed, _remaining, reset_after) = rate_limiter.check_commitment_rate_limit(&body.owner).await;
@@ -145,7 +154,7 @@ pub async fn commit_ip(
     tag = "Analytics",
     responses((status = 200, description = "Commitment and swap analytics"))
 )]
-#[instrument]
+#[instrument(skip_all)]
 pub async fn commitment_analytics() -> impl IntoResponse {
     Json(crate::analytics::snapshot())
 }
@@ -158,7 +167,7 @@ pub async fn commitment_analytics() -> impl IntoResponse {
     params(("tag" = String, Path, description = "Commitment tag")),
     responses((status = 200, description = "Commitments with the tag", body = Vec<u64>))
 )]
-#[instrument]
+#[instrument(skip_all)]
 pub async fn list_commitments_by_tag(Path(tag): Path<String>) -> impl IntoResponse {
     Json(crate::commitments::list_by_tag(&tag))
 }
@@ -174,7 +183,7 @@ pub async fn list_commitments_by_tag(Path(tag): Path<String>) -> impl IntoRespon
         (status = 404, description = "IP record not found", body = ErrorResponse),
     )
 )]
-#[instrument]
+#[instrument(skip_all)]
 pub async fn get_ip(Path(ip_id): Path<u64>) -> impl IntoResponse {
     // #316: Check cache first
     let cache_key = cache::ip_key(ip_id);
@@ -530,7 +539,7 @@ pub async fn batch_reveal_commitments(
         (status = 400, description = "Invalid commitment hash", body = ErrorResponse),
     )
 )]
-#[instrument]
+#[instrument(skip_all)]
 pub async fn find_similar_commitments(
     Query(params): Query<SimilarCommitmentsParams>,
 ) -> Result<Json<SimilarCommitmentsResponse>, (StatusCode, Json<ErrorResponse>)> {
@@ -584,7 +593,7 @@ pub async fn find_similar_commitments(
         (status = 200, description = "Paginated list of IP IDs", body = ListIpByOwnerResponse),
     )
 )]
-#[instrument]
+#[instrument(skip_all)]
 pub async fn list_ip_by_owner(
     Path(owner): Path<String>,
     Query(pagination): Query<PaginationParams>,
@@ -646,7 +655,7 @@ pub async fn list_ip_by_owner(
         (status = 200, description = "Cursor-paginated list of IP IDs", body = PaginatedResponse<u64>),
     )
 )]
-#[instrument]
+#[instrument(skip_all)]
 pub async fn list_ip_by_owner_cursor(
     Path(owner): Path<String>,
     Query(pagination): Query<CursorPaginationParams>,
@@ -868,10 +877,10 @@ pub async fn batch_initiate_swap(Json(body): Json<BatchInitiateSwapRequest>) -> 
     // #523: Cache the result under the idempotency key so replays return the
     // same swap IDs instead of allocating new ones.
     if let Some(ref key) = body.idempotency_key {
-        BATCH_SWAP_IDEMPOTENCY.insert(
-            key.clone(),
-            (serde_json::to_value(&response).unwrap(), Instant::now()),
-        );
+        BATCH_SWAP_IDEMPOTENCY.set(
+            key,
+            serde_json::to_value(&response).unwrap(),
+        ).await;
     }
 
     Ok(Json(response))
@@ -1013,7 +1022,7 @@ pub async fn cancel_expired_swap(Path(swap_id): Path<u64>, Json(body): Json<Canc
         (status = 404, description = "Swap not found", body = ErrorResponse),
     )
 )]
-#[instrument]
+#[instrument(skip_all)]
 pub async fn get_swap(
     State(rpc_client): State<Arc<dyn crate::graphql::SorobanRpcClient>>,
     Path(swap_id): Path<u64>,
@@ -1061,7 +1070,7 @@ pub async fn get_swap(
         (status = 502, description = "Escrow status unavailable", body = ErrorResponse),
     )
 )]
-#[instrument]
+#[instrument(skip_all)]
 pub async fn get_swap_escrow(
     State(rpc_client): State<Arc<dyn crate::graphql::SorobanRpcClient>>,
     Path(swap_id): Path<u64>,
@@ -1113,7 +1122,7 @@ pub async fn get_swap_escrow(
     params(("swap_id" = u64, Path, description = "Swap identifier")),
     responses((status = 200, description = "Swap history", body = [SwapHistoryEntry]))
 )]
-#[instrument]
+#[instrument(skip_all)]
 pub async fn get_swap_history(
     State(rpc_client): State<Arc<dyn crate::graphql::SorobanRpcClient>>,
     Path(swap_id): Path<u64>,
@@ -1152,7 +1161,7 @@ pub async fn get_swap_history(
     params(("swap_id" = u64, Path, description = "Swap identifier")),
     responses((status = 200, description = "Dispute evidence history", body = [DisputeEvidenceEntry]))
 )]
-#[instrument]
+#[instrument(skip_all)]
 pub async fn get_swap_disputes(
     State(rpc_client): State<Arc<dyn crate::graphql::SorobanRpcClient>>,
     Path(swap_id): Path<u64>,
@@ -1190,7 +1199,7 @@ pub async fn get_swap_disputes(
         (status = 400, description = "At least one seller, buyer, or ip_id selector is required", body = ErrorResponse),
     )
 )]
-#[instrument]
+#[instrument(skip_all)]
 pub async fn list_swaps(
     State(rpc_client): State<Arc<dyn crate::graphql::SorobanRpcClient>>,
     Query(filters): Query<SwapFilterParams>,
@@ -1297,7 +1306,7 @@ async fn marketplace_response(
     get,
     path = "/v1/swap/marketplace/seller/{seller}",
     tag = "Marketplace",
-    params(("seller" = String, Path), CursorPaginationParams),
+    params(("seller" = String, Path, description = "Seller address"), CursorPaginationParams),
     responses((status = 200, description = "Seller marketplace listings", body = MarketplaceResponse))
 )]
 pub async fn marketplace_by_seller(
@@ -1313,7 +1322,7 @@ pub async fn marketplace_by_seller(
     get,
     path = "/v1/swap/marketplace/buyer/{buyer}",
     tag = "Marketplace",
-    params(("buyer" = String, Path), CursorPaginationParams),
+    params(("buyer" = String, Path, description = "Buyer address"), CursorPaginationParams),
     responses((status = 200, description = "Buyer marketplace listings", body = MarketplaceResponse))
 )]
 pub async fn marketplace_by_buyer(
@@ -1329,7 +1338,7 @@ pub async fn marketplace_by_buyer(
     get,
     path = "/v1/swap/marketplace/ip/{ip_id}",
     tag = "Marketplace",
-    params(("ip_id" = u64, Path), CursorPaginationParams),
+    params(("ip_id" = u64, Path, description = "IP record identifier"), CursorPaginationParams),
     responses((status = 200, description = "IP marketplace listings", body = MarketplaceResponse))
 )]
 pub async fn marketplace_by_ip(

@@ -283,6 +283,7 @@ mod fuzz_tests {
         let req = CommitIpRequest {
             owner: valid_address.to_string(),
             commitment_hash: valid_hash.clone(),
+            tags: vec![],
         };
         assert!(RequestValidator::validate_stellar_address(&req.owner, "owner").is_ok());
         assert!(RequestValidator::validate_hex_string(&req.commitment_hash, 32, "commitment_hash").is_ok());
