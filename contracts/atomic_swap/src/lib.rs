@@ -1458,6 +1458,9 @@ impl AtomicSwap {
 
         Self::release_dispute_bonds_uncontested(&env, swap_id, &swap);
 
+        // #1174: Release insurance reservation
+        Self::release_insurance_reservation(&env, swap_id, &swap.token);
+
         // #1172: Record history on timeout resolution
         Self::append_history(&env, swap_id, SwapStatus::Cancelled);
 
@@ -2379,6 +2382,9 @@ impl AtomicSwap {
             .persistent()
             .remove(&DataKey::ActiveSwap(swap.ip_id));
 
+        // #1174: Release insurance reservation
+        Self::release_insurance_reservation(&env, swap_id, &swap.token);
+
         // #253: Log history entry
         Self::append_history(&env, swap_id, SwapStatus::Cancelled);
 
@@ -2443,6 +2449,9 @@ impl AtomicSwap {
                 );
             }
         }
+
+        // #1174: Release insurance reservation
+        Self::release_insurance_reservation(&env, swap_id, &swap.token);
 
         // #253: Log history entry
         Self::append_history(&env, swap_id, SwapStatus::Cancelled);
@@ -5005,16 +5014,22 @@ impl AtomicSwap {
         env.storage()
             .persistent()
             .remove(&DataKey::EscrowDeposit(swap_id));
-        Self::append_history(&env, swap_id, SwapStatus::Cancelled);
 
-        // Refund buyer
+        let token_client = token::Client::new(&env, &swap.token);
+
+        // Refund buyer's escrow deposit
         if deposit > 0 {
-            token::Client::new(&env, &swap.token).transfer(
+            token_client.transfer(
                 &env.current_contract_address(),
                 &swap.buyer,
                 &deposit,
             );
         }
+
+        // #1174: Release insurance reservation
+        Self::release_insurance_reservation(&env, swap_id, &swap.token);
+
+        Self::append_history(&env, swap_id, SwapStatus::Cancelled);
 
         env.events().publish(
             (soroban_sdk::symbol_short!("esc_wdr"),),
