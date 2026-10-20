@@ -1428,10 +1428,18 @@ impl AtomicSwap {
             .remove(&DataKey::ActiveSwap(swap.ip_id));
 
         let token_client = token::Client::new(&env, &swap.token);
+
+        // #1175: Refund installment swaps by amount actually paid
+        let refund_amount = if swap.is_installment && swap.paid_amount < swap.price {
+            swap.paid_amount
+        } else {
+            swap.price
+        };
+
         token_client.transfer(
             &env.current_contract_address(),
             &swap.buyer,
-            &swap.price,
+            &refund_amount,
         );
 
         // #1173: Settle collateral and dispute bonds on timeout
@@ -2404,8 +2412,14 @@ impl AtomicSwap {
 
         let token_client = token::Client::new(&env, &swap.token);
 
-        // Refund buyer's escrowed payment (Issue #35)
-        token_client.transfer(&env.current_contract_address(), &swap.buyer, &swap.price);
+        // #1175: Refund installment swaps by amount actually paid
+        let refund_amount = if swap.is_installment && swap.paid_amount < swap.price {
+            swap.paid_amount
+        } else {
+            swap.price
+        };
+
+        token_client.transfer(&env.current_contract_address(), &swap.buyer, &refund_amount);
 
         // #350: Refund collateral on cancellation
         if swap.collateral_amount > 0 {
