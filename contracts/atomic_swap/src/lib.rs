@@ -125,6 +125,8 @@ pub enum ContractError {
     /// #906: Treasury address validation - rejects zero or placeholder addresses
     InvalidTreasuryAddress = 68,
     BatchDependencyNotMet = 69,
+    /// #1169: buyer and seller must be different addresses (no self-trades).
+    SelfTradeNotAllowed = 70,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -531,6 +533,13 @@ impl AtomicSwap {
 
         // Guard: price must be positive.
         require_positive_price(&env, price);
+
+        // #1169: reject self-trades (buyer == seller).
+        if buyer == seller {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::SelfTradeNotAllowed as u32,
+            ));
+        }
 
         // Verify seller owns the IP and it's not revoked
         registry::ensure_seller_owns_active_ip(&env, ip_id, &seller);
@@ -2903,6 +2912,13 @@ impl AtomicSwap {
     ) -> Vec<u64> {
         require_not_paused(&env);
         seller.require_auth();
+
+        // #1169: reject self-trades (buyer == seller).
+        if buyer == seller {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::SelfTradeNotAllowed as u32,
+            ));
+        }
 
         let len = ip_ids.len();
 
