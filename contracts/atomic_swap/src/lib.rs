@@ -127,6 +127,8 @@ pub enum ContractError {
     BatchDependencyNotMet = 69,
     /// #1169: buyer and seller must be different addresses (no self-trades).
     SelfTradeNotAllowed = 70,
+    /// #1170: an ID counter would overflow u64 on increment.
+    IdCounterOverflow = 71,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -625,7 +627,7 @@ impl AtomicSwap {
         // #253: Log initial history entry
         Self::append_history(&env, id, SwapStatus::Pending);
 
-        env.storage().instance().set(&DataKey::NextId, &(id + 1));
+        env.storage().instance().set(&DataKey::NextId, &Self::checked_next_id(&env, id));
 
         env.events().publish(
             (soroban_sdk::symbol_short!("swap_init"),),
@@ -2613,6 +2615,17 @@ impl AtomicSwap {
     // get_protocol_config removed - ProtocolConfig can't be returned from contract functions
     // Use individual getters instead if needed
 
+    /// #1170: `id + 1`, panicking with a structured error on overflow instead
+    /// of silently wrapping. Used for every monotonic ID counter in the
+    /// contract (NextId, NextAuctionId).
+    fn checked_next_id(env: &Env, id: u64) -> u64 {
+        id.checked_add(1).unwrap_or_else(|| {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::IdCounterOverflow as u32,
+            ))
+        })
+    }
+
     /// List all swap IDs initiated by a seller. Returns `None` if the seller has no swaps.
     pub fn get_swaps_by_seller(env: Env, seller: Address) -> Option<Vec<u64>> {
         env.storage()
@@ -3066,7 +3079,7 @@ impl AtomicSwap {
                 .extend_ttl(&DataKey::IpSwaps(ip_id), 50000, 50000);
 
             Self::append_history(&env, id, SwapStatus::Pending);
-            env.storage().instance().set(&DataKey::NextId, &(id + 1));
+            env.storage().instance().set(&DataKey::NextId, &Self::checked_next_id(&env, id));
 
             env.events().publish(
                 (soroban_sdk::symbol_short!("swap_init"),),
@@ -3164,7 +3177,7 @@ impl AtomicSwap {
 
         env.storage()
             .persistent()
-            .set(&DataKey::NextAuctionId, &(auction_id + 1));
+            .set(&DataKey::NextAuctionId, &Self::checked_next_id(&env, auction_id));
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::NextAuctionId, LEDGER_BUMP, LEDGER_BUMP);
@@ -3362,7 +3375,7 @@ impl AtomicSwap {
             Self::append_history(&env, swap_id, SwapStatus::Accepted);
             env.storage()
                 .instance()
-                .set(&DataKey::NextId, &(swap_id + 1));
+                .set(&DataKey::NextId, &Self::checked_next_id(&env, swap_id));
 
             env.events().publish(
                 (soroban_sdk::symbol_short!("swap_init"),),
@@ -3496,7 +3509,7 @@ impl AtomicSwap {
             .extend_ttl(&DataKey::IpSwaps(ip_id), LEDGER_BUMP, LEDGER_BUMP);
 
         Self::append_history(&env, id, SwapStatus::Pending);
-        env.storage().instance().set(&DataKey::NextId, &(id + 1));
+        env.storage().instance().set(&DataKey::NextId, &Self::checked_next_id(&env, id));
 
         env.events().publish(
             (soroban_sdk::symbol_short!("swap_init"),),
@@ -3704,7 +3717,7 @@ impl AtomicSwap {
             .extend_ttl(&DataKey::IpSwaps(ip_id), 50000, 50000);
 
         Self::append_history(&env, id, SwapStatus::Pending);
-        env.storage().instance().set(&DataKey::NextId, &(id + 1));
+        env.storage().instance().set(&DataKey::NextId, &Self::checked_next_id(&env, id));
 
         env.events().publish(
             (symbol_short!("swap_init"),),
@@ -4641,7 +4654,7 @@ impl AtomicSwap {
                 .extend_ttl(&DataKey::IpSwaps(ip_id), 50000, 50000);
 
             Self::append_history(&env, id, SwapStatus::Pending);
-            env.storage().instance().set(&DataKey::NextId, &(id + 1));
+            env.storage().instance().set(&DataKey::NextId, &Self::checked_next_id(&env, id));
 
             env.events().publish(
                 (soroban_sdk::symbol_short!("swap_init"),),
@@ -4754,7 +4767,7 @@ impl AtomicSwap {
 
         swap::append_swap_for_party(&env, &seller, &buyer, id);
         Self::append_history(&env, id, SwapStatus::Pending);
-        env.storage().instance().set(&DataKey::NextId, &(id + 1));
+        env.storage().instance().set(&DataKey::NextId, &Self::checked_next_id(&env, id));
 
         env.events().publish(
             (soroban_sdk::symbol_short!("esc_ini"),),
@@ -4864,7 +4877,7 @@ impl AtomicSwap {
                 .extend_ttl(&DataKey::IpSwaps(ip_id), 50000, 50000);
 
             Self::append_history(&env, id, SwapStatus::Pending);
-            env.storage().instance().set(&DataKey::NextId, &(id + 1));
+            env.storage().instance().set(&DataKey::NextId, &Self::checked_next_id(&env, id));
 
             env.events().publish(
                 (soroban_sdk::symbol_short!("esc_ini"),),
@@ -5222,7 +5235,7 @@ impl AtomicSwap {
             .extend_ttl(&DataKey::IpSwaps(ip_id), LEDGER_BUMP, LEDGER_BUMP);
 
         Self::append_history(&env, id, SwapStatus::Pending);
-        env.storage().instance().set(&DataKey::NextId, &(id + 1));
+        env.storage().instance().set(&DataKey::NextId, &Self::checked_next_id(&env, id));
 
         env.events().publish(
             (soroban_sdk::symbol_short!("swap_init"),),
