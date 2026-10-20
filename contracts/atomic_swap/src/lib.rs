@@ -27,7 +27,7 @@ mod contingency_tests;
 use soroban_sdk::xdr::{FromXdr, ToXdr};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Bytes,
-    BytesN, Env, Error, IntoVal, String, Val, Vec,
+    BytesN, Env, Error, IntoVal, Map, String, Val, Vec,
 };
 
 pub use upgrade::{build_v1_schema, ContractSchema, ErrorEntry, FunctionEntry};
@@ -2931,20 +2931,21 @@ impl AtomicSwap {
         }
 
         // #522: Pre-validation pass — no mutations; ensures full atomicity
+        // #1177: duplicate IP IDs are detected with a map keyed by IP ID
+        // (O(n)) instead of a nested loop (O(n^2)).
+        let mut seen_ip_ids: Map<u64, ()> = Map::new(&env);
         for i in 0..len {
             let ip_id = ip_ids.get(i).unwrap();
             let price = prices.get(i).unwrap();
             require_positive_price(&env, price);
             registry::ensure_seller_owns_active_ip(&env, ip_id, &seller);
             require_no_active_swap(&env, ip_id);
-            // Detect duplicate IP IDs within the batch
-            for j in (i + 1)..len {
-                if ip_ids.get(j).unwrap() == ip_id {
-                    env.panic_with_error(Error::from_contract_error(
-                        ContractError::SwapExists as u32,
-                    ));
-                }
+            if seen_ip_ids.contains_key(ip_id) {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::SwapExists as u32,
+                ));
             }
+            seen_ip_ids.set(ip_id, ());
         }
 
         // Execution pass — all validations passed, safe to mutate
