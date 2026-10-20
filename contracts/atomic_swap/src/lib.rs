@@ -993,17 +993,10 @@ impl AtomicSwap {
 
         let valid = registry::verify_commitment(&env, swap.ip_id, &secret, &blinding_factor);
         if !valid {
-            // #354: If insurance is enabled, mark swap as claimable before panicking.
-            if swap.insurance_enabled {
-                env.storage()
-                    .persistent()
-                    .set(&DataKey::InsuranceClaimable(swap_id), &true);
-                env.storage().persistent().extend_ttl(
-                    &DataKey::InsuranceClaimable(swap_id),
-                    LEDGER_BUMP,
-                    LEDGER_BUMP,
-                );
-            }
+            // #1171: Soroban rolls back all state changes in a failed invocation, so a
+            // storage write here would never persist. Callers must follow up with
+            // mark_invalid_key_insurance_claimable (a separate, successfully-returning
+            // entry point) to actually record the claimable flag. See #354.
             env.panic_with_error(Error::from_contract_error(ContractError::InvalidKey as u32));
         }
 
@@ -1131,6 +1124,51 @@ impl AtomicSwap {
                 fee_amount,
             },
         );
+    }
+
+    /// #1171: Companion to `reveal_key` for the invalid-key insurance path (#354).
+    /// `reveal_key` panics (and therefore rolls back) on an invalid key, so it can
+    /// never itself persist the `InsuranceClaimable` flag. This entry point re-runs
+    /// the same commitment check in a call that returns successfully instead of
+    /// panicking, so a genuinely invalid reveal attempt can be recorded on-chain.
+    /// Returns `true` if the claimable flag was set, `false` if the commitment was
+    /// actually valid (nothing to claim) or insurance was not enabled.
+    pub fn mark_invalid_key_insurance_claimable(
+        env: Env,
+        swap_id: u64,
+        caller: Address,
+        secret: BytesN<32>,
+        blinding_factor: BytesN<32>,
+    ) -> bool {
+        let swap = require_swap_exists(&env, swap_id);
+        require_seller(&env, &caller, &swap);
+        caller.require_auth();
+        require_swap_status(
+            &env,
+            &swap,
+            SwapStatus::Accepted,
+            ContractError::NotAccepted,
+        );
+
+        if !swap.insurance_enabled {
+            return false;
+        }
+
+        let valid = registry::verify_commitment(&env, swap.ip_id, &secret, &blinding_factor);
+        if valid {
+            return false;
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::InsuranceClaimable(swap_id), &true);
+        env.storage().persistent().extend_ttl(
+            &DataKey::InsuranceClaimable(swap_id),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        true
     }
 
     /// Buyer raises a dispute on an Accepted swap within the dispute window.
