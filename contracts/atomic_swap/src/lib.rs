@@ -1427,11 +1427,28 @@ impl AtomicSwap {
             .persistent()
             .remove(&DataKey::ActiveSwap(swap.ip_id));
 
-        token::Client::new(&env, &swap.token).transfer(
+        let token_client = token::Client::new(&env, &swap.token);
+        token_client.transfer(
             &env.current_contract_address(),
             &swap.buyer,
             &swap.price,
         );
+
+        // #1173: Settle collateral and dispute bonds on timeout
+        if swap.collateral_amount > 0 {
+            if let Some(collateral) = env
+                .storage()
+                .persistent()
+                .get::<_, i128>(&DataKey::SwapCollateral(swap_id))
+            {
+                token_client.transfer(&env.current_contract_address(), &swap.buyer, &collateral);
+                env.storage()
+                    .persistent()
+                    .remove(&DataKey::SwapCollateral(swap_id));
+            }
+        }
+
+        Self::release_dispute_bonds_uncontested(&env, swap_id, &swap);
 
         // #1172: Record history on timeout resolution
         Self::append_history(&env, swap_id, SwapStatus::Cancelled);
