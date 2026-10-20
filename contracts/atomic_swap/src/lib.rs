@@ -370,10 +370,10 @@ impl AtomicSwap {
             .instance()
             .set(&DataKey::IpRegistry, &ip_registry);
 
-        // Seed the on-chain interface manifest so future upgrades can validate
-        // backward compatibility against the v1 schema.
-        // let schema = upgrade::build_v1_schema(&env);
-        // upgrade::store_schema(&env, &schema);
+        // #1179: Seed the on-chain interface manifest so future upgrades can
+        // validate backward compatibility against the v1 schema.
+        let schema = upgrade::build_v1_schema(&env);
+        upgrade::store_schema(&env, &schema);
     }
 
     // ── #470: Price Oracle ────────────────────────────────────────────────────
