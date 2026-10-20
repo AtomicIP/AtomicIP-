@@ -300,6 +300,9 @@ pub struct ProtocolConfig {
     /// field cannot actually be reconfigured at runtime today — see its
     /// definition below.
     pub arbitration_ruling_delay_secs: u64,
+    /// #1167: How long (seconds) before a pending swap expires.
+    /// Default: 7 days = 604_800 seconds.
+    pub swap_expiry_seconds: u64,
 }
 
 #[contracttype]
@@ -358,9 +361,12 @@ pub struct AtomicSwap;
 
 #[contractimpl]
 impl AtomicSwap {
-    /// One-time initialization: store the IpRegistry contract address.
-    /// Panics if called more than once.
-    pub fn initialize(env: Env, ip_registry: Address) {
+    /// One-time initialization: store the IpRegistry contract address and admin.
+    /// Panics if called more than once or if deployer is not authorized.
+    pub fn initialize(env: Env, deployer: Address, ip_registry: Address) {
+        // Require authorization from the deployer to prevent front-running
+        deployer.require_auth();
+
         if env.storage().instance().has(&DataKey::IpRegistry) {
             env.panic_with_error(Error::from_contract_error(
                 ContractError::AlreadyInit as u32,
@@ -369,6 +375,14 @@ impl AtomicSwap {
         env.storage()
             .instance()
             .set(&DataKey::IpRegistry, &ip_registry);
+
+        // Store deployer as the admin
+        env.storage()
+            .persistent()
+            .set(&DataKey::Admin, &deployer);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Admin, 50000, 50000);
 
         // Seed the on-chain interface manifest so future upgrades can validate
         // backward compatibility against the v1 schema.
@@ -521,14 +535,6 @@ impl AtomicSwap {
 
         seller.require_auth();
 
-        // Initialize admin on first call if not set
-        if !env.storage().persistent().has(&DataKey::Admin) {
-            env.storage().persistent().set(&DataKey::Admin, &seller);
-            env.storage()
-                .persistent()
-                .extend_ttl(&DataKey::Admin, 50000, 50000);
-        }
-
         // Guard: price must be positive.
         require_positive_price(&env, price);
 
@@ -537,6 +543,7 @@ impl AtomicSwap {
 
         require_no_active_swap(&env, ip_id);
 
+        let config = Self::protocol_config(&env);
         let id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(0);
 
         let swap = SwapRecord {
@@ -546,7 +553,7 @@ impl AtomicSwap {
             price,
             token: token.clone(),
             status: SwapStatus::Pending,
-            expiry: env.ledger().timestamp() + 604800u64,
+            expiry: env.ledger().timestamp() + config.swap_expiry_seconds,
             accept_timestamp: 0,
             required_approvals,
             dispute_timestamp: 0,
@@ -2523,6 +2530,7 @@ impl AtomicSwap {
                 referral_fee_bps,
                 arbitration_timeout_seconds: 1_209_600,
                 arbitration_ruling_delay_secs: DEFAULT_ARBITRATION_RULING_DELAY_SECONDS,
+                swap_expiry_seconds: 604800, // 7 days
             },
         );
     }
@@ -2546,6 +2554,7 @@ impl AtomicSwap {
             referral_fee_bps: 100,
             arbitration_timeout_seconds: 1_209_600, // 14 days
             arbitration_ruling_delay_secs: DEFAULT_ARBITRATION_RULING_DELAY_SECONDS,
+            swap_expiry_seconds: 604800, // 7 days
         }
     }
 
@@ -2904,6 +2913,7 @@ impl AtomicSwap {
         require_not_paused(&env);
         seller.require_auth();
 
+        let config = Self::protocol_config(&env);
         let len = ip_ids.len();
 
         // #520: Validate batch parameters upfront
@@ -2953,7 +2963,7 @@ impl AtomicSwap {
                 price,
                 token: token.clone(),
                 status: SwapStatus::Pending,
-                expiry: env.ledger().timestamp() + 604800u64,
+                expiry: env.ledger().timestamp() + config.swap_expiry_seconds,
                 accept_timestamp: 0,
                 required_approvals,
                 dispute_timestamp: 0,
