@@ -1433,6 +1433,9 @@ impl AtomicSwap {
             &swap.price,
         );
 
+        // #1172: Record history on timeout resolution
+        Self::append_history(&env, swap_id, SwapStatus::Cancelled);
+
         env.storage().persistent().set(
             &DataKey::CancelReason(swap_id),
             &Bytes::from_slice(&env, b"dispute_timeout"),
