@@ -302,6 +302,10 @@ pub struct ProtocolConfig {
     /// field cannot actually be reconfigured at runtime today — see its
     /// definition below.
     pub arbitration_ruling_delay_secs: u64,
+    /// #1168: Insurance premium rate in basis points (100 = 1%), applied to
+    /// `price` when insurance is enabled on a swap. Default: 200 (2%),
+    /// matching the previous hardcoded `price * 2 / 100`.
+    pub insurance_premium_bps: u32,
 }
 
 #[contracttype]
@@ -562,7 +566,8 @@ impl AtomicSwap {
             referrer: referrer.clone(),
             collateral_amount,
             insurance_premium: if insurance_enabled {
-                price * 2 / 100
+                // #1168: configurable insurance premium rate (was hardcoded 2%).
+                price * Self::protocol_config(&env).insurance_premium_bps as i128 / 10_000
             } else {
                 0
             },
@@ -2529,6 +2534,7 @@ impl AtomicSwap {
         dispute_window_seconds: u64,
         dispute_timeout_secs: u64,
         referral_fee_bps: u32,
+        insurance_premium_bps: u32,
     ) {
         if protocol_fee_bps > 10_000 {
             env.panic_with_error(Error::from_contract_error(
@@ -2536,6 +2542,12 @@ impl AtomicSwap {
             ));
         }
         if referral_fee_bps > 10_000 {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::InvalidFeeBps as u32,
+            ));
+        }
+        // #1168: 0 bps (no premium) and 10_000 bps (100%, price-equal premium) are both valid.
+        if insurance_premium_bps > 10_000 {
             env.panic_with_error(Error::from_contract_error(
                 ContractError::InvalidFeeBps as u32,
             ));
@@ -2570,6 +2582,7 @@ impl AtomicSwap {
                 referral_fee_bps,
                 arbitration_timeout_seconds: 1_209_600,
                 arbitration_ruling_delay_secs: DEFAULT_ARBITRATION_RULING_DELAY_SECONDS,
+                insurance_premium_bps,
             },
         );
     }
@@ -2593,6 +2606,7 @@ impl AtomicSwap {
             referral_fee_bps: 100,
             arbitration_timeout_seconds: 1_209_600, // 14 days
             arbitration_ruling_delay_secs: DEFAULT_ARBITRATION_RULING_DELAY_SECONDS,
+            insurance_premium_bps: 200, // 2%, matches the previous hardcoded rate
         }
     }
 
@@ -4546,6 +4560,8 @@ impl AtomicSwap {
 
         let len = ip_ids.len();
         let mut swap_ids: Vec<u64> = Vec::new(&env);
+        // #1168: configurable insurance premium rate (was hardcoded 2%).
+        let insurance_premium_bps = Self::protocol_config(&env).insurance_premium_bps;
 
         for i in 0..len {
             let ip_id = ip_ids.get(i).unwrap();
@@ -4557,7 +4573,7 @@ impl AtomicSwap {
 
             let id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(0);
             let insurance_premium = if insurance_enabled {
-                price * 2 / 100
+                price * insurance_premium_bps as i128 / 10_000
             } else {
                 0
             };
