@@ -46,6 +46,14 @@ mod session;
 mod batch;
 mod cache;
 mod commitments;
+mod licensing;
+mod portfolio;
+mod transfers;
+mod valuation;
+mod due_diligence;
+mod marketplace_analytics;
+mod recommendations;
+mod collections;
 mod analytics;
 mod circuit_breaker;
 mod commitment_monitoring;
@@ -55,6 +63,7 @@ mod event_topics;
 mod events;
 mod graphql;
 mod handlers;
+mod ip_search;
 mod metrics;
 mod middleware_pipeline;
 mod schemas;
@@ -106,6 +115,11 @@ mod snapshot_tests;
         handlers::marketplace_by_seller,
         handlers::marketplace_by_buyer,
         handlers::marketplace_by_ip,
+        handlers::search_ip,
+        handlers::put_ip_search_metadata,
+        handlers::save_ip_search,
+        handlers::list_ip_saved_searches,
+        handlers::delete_ip_saved_search,
         handlers::initiate_swap,
         handlers::batch_initiate_swap,
         handlers::accept_swap,
@@ -132,6 +146,13 @@ mod snapshot_tests;
         events::events_handler,
     ),
     components(schemas(
+        ip_search::IpSearchFilters,
+        ip_search::IpSearchMetadata,
+        ip_search::IpSearchResponse,
+        ip_search::FacetCount,
+        ip_search::SearchFacets,
+        ip_search::SaveSearchRequest,
+        ip_search::SavedSearch,
         schemas::CommitIpRequest,
         schemas::CommitmentTagsResponse,
         schemas::MarketplaceResponse,
@@ -367,6 +388,15 @@ async fn main() {
         .route("/swap/{swap_id}/reveal",          post(handlers::reveal_key))
         .route("/swap/{swap_id}/cancel",          post(handlers::cancel_swap))
         .route("/swap/{swap_id}/cancel-expired",  post(handlers::cancel_expired_swap))
+        // #1098: collections identify the caller by the verified X-Public-Key header,
+        // so every collection route, reads included, must be signed.
+        .route("/collections",                          post(collections::create_collection).get(collections::list_collections))
+        .route("/collections/{id}",                     get(collections::get_collection).delete(collections::delete_collection))
+        .route("/collections/{id}/ips",                 post(collections::add_collection_ips))
+        .route("/collections/{id}/ips/{ip_id}",         axum::routing::delete(collections::remove_collection_ip))
+        .route("/collections/{id}/shares",              post(collections::share_collection))
+        .route("/collections/{id}/shares/{user}",       axum::routing::delete(collections::unshare_collection))
+        .route("/collections/{id}/summary",             get(collections::collection_summary))
         .route_layer(middleware::from_fn(request_signing::verify_request_signature));
 
     let app = Router::new()
@@ -379,6 +409,7 @@ async fn main() {
         .route("/ws",              get(ws_handler))
         .route("/events",          get(events_handler))
         .route("/batch",           post(batch::batch_handler))
+        .route("/audit-logs",                        get(handlers::get_audit_logs))
         .route("/v1/admin/audit/logs",               get(handlers::get_audit_logs))
         .route("/v1/admin/audit/suspicious-patterns", get(handlers::get_suspicious_patterns))
         .route("/v1/admin/commitments/lifecycle", get(commitment_monitoring::lifecycle_handler))
@@ -407,6 +438,9 @@ async fn main() {
         .route("/ip/owner/{owner}/cursor",        get(handlers::list_ip_by_owner_cursor))
         .route("/ip/tag/{tag}",                   get(handlers::list_commitments_by_tag))
         .route("/analytics/commitments",          get(handlers::commitment_analytics))
+        .route("/analytics/marketplace",          get(marketplace_analytics::marketplace_analytics_handler))
+        .route("/ip/{ip_id}/due-diligence",       get(due_diligence::get_due_diligence))
+        .route("/recommendations",                get(recommendations::get_recommendations))
         .route("/webhooks",                       post(handlers::register_webhook).get(handlers::list_webhooks))
         .route("/webhooks/{id}",                  axum::routing::delete(handlers::unregister_webhook))
         .route("/swap/marketplace/seller/{seller}", get(handlers::marketplace_by_seller))
@@ -513,6 +547,7 @@ fn build_app() -> Router {
         .route("/ws", get(ws_handler))
         .route("/events", get(events_handler))
         .route("/batch", post(batch::batch_handler))
+        .route("/audit-logs", get(handlers::get_audit_logs))
         .route("/v1/admin/audit/logs", get(handlers::get_audit_logs))
         .route("/v1/admin/audit/suspicious-patterns", get(handlers::get_suspicious_patterns))
         .route("/v1/admin/commitments/lifecycle", get(commitment_monitoring::lifecycle_handler))
@@ -549,6 +584,10 @@ fn build_app() -> Router {
         .route("/v1/swap/marketplace/seller/{seller}", get(handlers::marketplace_by_seller))
         .route("/v1/swap/marketplace/buyer/{buyer}",  get(handlers::marketplace_by_buyer))
         .route("/v1/swap/marketplace/ip/{ip_id}",     get(handlers::marketplace_by_ip))
+        .route("/v1/ip/search", get(handlers::search_ip))
+        .route("/v1/ip/{ip_id}/metadata", axum::routing::put(handlers::put_ip_search_metadata))
+        .route("/v1/ip/search/saved/{owner}", get(handlers::list_ip_saved_searches).post(handlers::save_ip_search))
+        .route("/v1/ip/search/saved/{owner}/{id}", axum::routing::delete(handlers::delete_ip_saved_search))
         .route("/v1/ip/owner/{owner}/cursor", get(handlers::list_ip_by_owner_cursor))
         .route("/v1/swap/initiate", post(handlers::initiate_swap))
         .route("/v1/swap/batch-initiate", post(handlers::batch_initiate_swap))
@@ -567,6 +606,19 @@ fn build_app() -> Router {
         .route("/v1/bulk/commit-ip", post(handlers::bulk_commit_ip))
         .route("/v1/bulk/initiate-swap", post(handlers::bulk_initiate_swap))
         .route("/v1/swaps/execute-batch", post(handlers::execute_batch_swaps))
+        .route("/v1/portfolio/{owner}", get(portfolio::get_portfolio))
+        .route("/v1/portfolio/{owner}/holdings", post(portfolio::put_holdings))
+        .route("/v1/valuation/sales", post(valuation::post_sale))
+        .route("/v1/valuation/{commitment_id}", get(valuation::get_valuation))
+        .route("/v1/transfers", post(transfers::create_transfer).layer(signed.clone()))
+        .route("/v1/transfers/{id}", get(transfers::get_transfer))
+        .route("/v1/transfers/{id}/validate", post(transfers::validate_transfer))
+        .route("/v1/transfers/{id}/escrow", post(transfers::fund_transfer_escrow))
+        .route("/v1/transfers/{id}/cancel", post(transfers::cancel_transfer))
+        .route("/v1/licenses", post(licensing::create_license))
+        .route("/v1/licenses/{id}", get(licensing::get_license))
+        .route("/v1/licenses/{id}/terms", post(licensing::update_license_terms))
+        .route("/v1/licenses/{id}/royalties", post(licensing::record_license_royalty))
         .route("/auth/2fa/enable", post(handlers::enable_2fa))
         .route("/auth/2fa/verify", post(handlers::verify_2fa))
         .route("/auth/2fa/backup-code", post(handlers::use_backup_code))

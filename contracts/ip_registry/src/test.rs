@@ -2796,6 +2796,8 @@ mod expiry_tests {
     #[test]
     fn test_cleanup_removes_ip_past_grace_period() {
         let (env, client, _owner, ip_id) = setup();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
         let now = env.ledger().timestamp();
         client.set_ip_expiry(&ip_id, &(now + 100), &50);
 
@@ -2813,6 +2815,8 @@ mod expiry_tests {
     #[test]
     fn test_cleanup_skips_ip_within_grace_period() {
         let (env, client, _owner, ip_id) = setup();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
         let now = env.ledger().timestamp();
         client.set_ip_expiry(&ip_id, &(now + 100), &200);
 
@@ -2830,6 +2834,8 @@ mod expiry_tests {
     #[test]
     fn test_cleanup_skips_ip_with_no_expiry() {
         let (env, client, _owner, ip_id) = setup();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
         // No expiry set (expiry_timestamp == 0)
         env.ledger().with_mut(|l| l.timestamp = 9_999_999);
 
@@ -2857,6 +2863,8 @@ mod expiry_tests {
     #[test]
     fn test_cleanup_emits_event() {
         let (env, client, _owner, ip_id) = setup();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
         let now = env.ledger().timestamp();
         client.set_ip_expiry(&ip_id, &(now + 100), &0);
         env.ledger().with_mut(|l| l.timestamp = now + 200);
@@ -2868,6 +2876,72 @@ mod expiry_tests {
         // Verify at least one event was emitted (set_ip_expiry + cleanup_expired_ips).
         let events = env.events().all();
         assert!(events.events().len() >= 1, "ip_clean event must be emitted");
+    }
+
+    /// #1159: only the admin may trigger cleanup; a random caller is rejected.
+    #[test]
+    fn test_cleanup_rejects_non_admin() {
+        let (env, client, _owner, ip_id) = setup();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+        let attacker = Address::generate(&env);
+
+        let now = env.ledger().timestamp();
+        client.set_ip_expiry(&ip_id, &(now + 100), &50);
+        env.ledger().with_mut(|l| l.timestamp = now + 200);
+
+        let mut ids = Vec::new(&env);
+        ids.push_back(ip_id);
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &attacker,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "cleanup_expired_ips",
+                args: (ids.clone(),).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        assert!(client.try_cleanup_expired_ips(&ids).is_err());
+
+        // Record survives the rejected call.
+        env.mock_auths(&[]);
+        assert_eq!(client.get_ip(&ip_id).ip_id, ip_id);
+    }
+
+    /// #1159: cleanup removes the owner index and commitment index entries in the
+    /// same call, so no dangling references remain and the hash can be re-committed.
+    #[test]
+    fn test_cleanup_removes_owner_and_commitment_index_entries() {
+        let (env, client, owner, ip_id) = setup();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        // A second, non-expiring IP for the same owner must be kept in the index.
+        let keep_hash = BytesN::from_array(&env, &[0x61u8; 32]);
+        let keep_id = client.commit_ip(&owner, &keep_hash, &0u32);
+
+        let now = env.ledger().timestamp();
+        client.set_ip_expiry(&ip_id, &(now + 100), &50);
+        env.ledger().with_mut(|l| l.timestamp = now + 200);
+
+        let mut ids = Vec::new(&env);
+        ids.push_back(ip_id);
+        client.cleanup_expired_ips(&ids);
+
+        // Owner index no longer references the removed IP, but keeps the other one.
+        let owner_ips = client.list_ip_by_owner(&owner);
+        assert_eq!(owner_ips.len(), 1);
+        assert_eq!(owner_ips.get(0).unwrap(), keep_id);
+
+        // Commitment index for the removed hash is gone.
+        assert!(client
+            .find_duplicate_commitment(&BytesN::from_array(&env, &[0xAAu8; 32]))
+            .is_none());
+
+        // The freed hash can be committed again by a different owner.
+        let other = Address::generate(&env);
+        let new_id = client.commit_ip(&other, &BytesN::from_array(&env, &[0xAAu8; 32]), &0u32);
+        assert!(new_id > keep_id);
     }
 
     #[test]
@@ -4307,6 +4381,69 @@ mod batch_escrow_tests {
             client.create_time_locked_commitment(&owner, &hash, &unlock_time);
         });
         assert!(result.is_err(), "creation with past unlock time should fail");
+    }
+
+    /// #1158: the owner cannot reveal a time-locked commitment before unlock_time.
+    #[test]
+    fn test_unlock_commitment_before_unlock_time_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[0x51u8; 32]);
+        let now = env.ledger().timestamp();
+        let ip_id = client.create_time_locked_commitment(&owner, &hash, &(now + 3600));
+
+        // Owner is authorized, but the time lock has not expired.
+        assert!(client.try_unlock_commitment(&ip_id).is_err());
+    }
+
+    /// #1158: the owner can reveal once unlock_time has passed.
+    #[test]
+    fn test_unlock_commitment_after_unlock_time_by_owner_succeeds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[0x52u8; 32]);
+        let now = env.ledger().timestamp();
+        let unlock_time = now + 3600;
+        let ip_id = client.create_time_locked_commitment(&owner, &hash, &unlock_time);
+
+        env.ledger().with_mut(|l| l.timestamp = unlock_time);
+        assert!(client.unlock_commitment(&ip_id));
+    }
+
+    /// #1158: a non-owner cannot reveal the commitment, even after unlock_time.
+    #[test]
+    fn test_unlock_commitment_rejects_non_owner_after_unlock_time() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let attacker = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[0x53u8; 32]);
+        let now = env.ledger().timestamp();
+        let unlock_time = now + 3600;
+        let ip_id = client.create_time_locked_commitment(&owner, &hash, &unlock_time);
+
+        env.ledger().with_mut(|l| l.timestamp = unlock_time);
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &attacker,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "unlock_commitment",
+                args: (ip_id,).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        assert!(client.try_unlock_commitment(&ip_id).is_err());
     }
 
     // ── Tests for Issue #976: Commitment Amendment ────────────────────────

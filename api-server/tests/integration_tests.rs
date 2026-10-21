@@ -1079,3 +1079,380 @@ mod load_balancer_multi_instance_tests {
         }
     }
 }
+
+// ── #1200: WATCHLISTS global store bounds ────────────────────────────────────
+
+#[cfg(test)]
+mod watchlists_bounds_tests {
+    use api_server::handlers::{
+        watchlists_insert, watchlists_len, watchlists_clear_for_tests,
+        WatchlistError, MAX_WATCHLIST_ENTRIES_PER_USER, MAX_WATCHLIST_USERS,
+    };
+
+    fn reset() {
+        watchlists_clear_for_tests();
+    }
+
+    /// A single user cannot exceed the per-user entry cap; the structured error
+    /// is returned and the set is left unchanged.
+    #[test]
+    fn test_watchlist_per_user_cap_returns_structured_error() {
+        reset();
+        let user = "GUSERPERCAP";
+
+        for i in 0..MAX_WATCHLIST_ENTRIES_PER_USER as u64 {
+            watchlists_insert(user, i).expect("inserts below the cap must succeed");
+        }
+        assert_eq!(
+            watchlists_len(user),
+            MAX_WATCHLIST_ENTRIES_PER_USER,
+            "user should hold exactly the cap"
+        );
+
+        let err = watchlists_insert(user, 999_999).unwrap_err();
+        match err {
+            WatchlistError::PerUserCapExceeded { user: u, limit } => {
+                assert_eq!(u, user);
+                assert_eq!(limit, MAX_WATCHLIST_ENTRIES_PER_USER);
+            }
+            other => panic!("expected PerUserCapExceeded, got {:?}", other),
+        }
+
+        // State must be unchanged after the rejected insert.
+        assert_eq!(
+            watchlists_len(user),
+            MAX_WATCHLIST_ENTRIES_PER_USER,
+            "rejected insert must not grow the set"
+        );
+        reset();
+    }
+
+    /// The total number of tracked users is bounded; once the cap is reached a
+    /// new user is rejected with a structured error and no new entry is created.
+    #[test]
+    fn test_watchlist_total_users_cap_returns_structured_error() {
+        reset();
+
+        for i in 0..MAX_WATCHLIST_USERS {
+            let user = format!("GUSER{i:04}");
+            watchlists_insert(&user, 1).expect("inserts below the total cap must succeed");
+        }
+
+        let overflow_user = "GUSEROVERFLOW";
+        let err = watchlists_insert(overflow_user, 1).unwrap_err();
+        match err {
+            WatchlistError::TotalUsersCapExceeded { limit } => {
+                assert_eq!(limit, MAX_WATCHLIST_USERS);
+            }
+            other => panic!("expected TotalUsersCapExceeded, got {:?}", other),
+        }
+
+        // The overflowing user must not have been created.
+        assert_eq!(
+            watchlists_len(overflow_user),
+            0,
+            "rejected user must not be added to the global map"
+        );
+        reset();
+    }
+
+    /// Re-inserting an existing user at the total cap is still allowed (the user
+    /// already exists, so no new map entry is created).
+    #[test]
+    fn test_watchlist_existing_user_allowed_at_total_cap() {
+        reset();
+        for i in 0..MAX_WATCHLIST_USERS {
+            let user = format!("GUSER{i:04}");
+            watchlists_insert(&user, 1).expect("fill to total cap");
+        }
+        // Existing user, new entry — must succeed.
+        watchlists_insert("GUSER0000", 2).expect("existing user may still add entries");
+        assert_eq!(watchlists_len("GUSER0000"), 2);
+        reset();
+    }
+}
+
+// ── #1201: list_webhooks owner scoping & redaction ──────────────────────────
+
+#[cfg(test)]
+mod list_webhooks_scoping_tests {
+    use api_server::handlers::{
+        register_webhook_for_tests, list_webhooks_for_tests, webhooks_clear_for_tests,
+        redact_webhook_url,
+    };
+
+    fn reset() {
+        webhooks_clear_for_tests();
+    }
+
+    /// One owner must not see another owner's hooks.
+    #[test]
+    fn test_list_webhooks_isolated_per_owner() {
+        reset();
+        register_webhook_for_tests("GOWNER_A", "https://a.example.com/hook").unwrap();
+        register_webhook_for_tests("GOWNER_B", "https://b.example.com/hook").unwrap();
+
+        let a = list_webhooks_for_tests("GOWNER_A");
+        let b = list_webhooks_for_tests("GOWNER_B");
+
+        assert_eq!(a.len(), 1, "owner A should see exactly their own hook");
+        assert_eq!(b.len(), 1, "owner B should see exactly their own hook");
+        assert!(a[0].url.contains("a.example.com"));
+        assert!(b[0].url.contains("b.example.com"));
+        assert!(
+            a.iter().all(|h| !h.url.contains("b.example.com")),
+            "owner A must not see owner B's hooks"
+        );
+        assert!(
+            b.iter().all(|h| !h.url.contains("a.example.com")),
+            "owner B must not see owner A's hooks"
+        );
+        reset();
+    }
+
+    /// URL query strings and userinfo credentials are stripped from the listing.
+    #[test]
+    fn test_list_webhooks_redacts_query_and_credentials() {
+        reset();
+        register_webhook_for_tests(
+            "GOWNER_C",
+            "https://user:secret@c.example.com/hook?token=abc123&x=1",
+        )
+        .unwrap();
+
+        let listed = list_webhooks_for_tests("GOWNER_C");
+        assert_eq!(listed.len(), 1);
+        let url = &listed[0].url;
+        assert!(!url.contains("token=abc123"), "query string must be stripped: {url}");
+        assert!(!url.contains("secret"), "userinfo password must be stripped: {url}");
+        assert!(!url.contains("user:"), "userinfo must be stripped: {url}");
+        assert!(url.contains("c.example.com"), "host must be preserved: {url}");
+        reset();
+    }
+
+    /// The redaction helper itself behaves as documented.
+    #[test]
+    fn test_redact_webhook_url_helper() {
+        assert_eq!(
+            redact_webhook_url("https://user:pass@example.com/path?q=1#frag"),
+            "https://example.com/path"
+        );
+        assert_eq!(
+            redact_webhook_url("https://example.com/path"),
+            "https://example.com/path"
+        );
+    }
+}
+
+// ── #1202: SSRF guard on webhook registration ───────────────────────────────
+
+#[cfg(test)]
+mod webhook_ssrf_tests {
+    use api_server::handlers::{
+        register_webhook_for_tests, webhooks_clear_for_tests, WebhookError,
+        is_blocked_ip, validate_webhook_url,
+    };
+    use std::net::IpAddr;
+
+    fn reset() {
+        webhooks_clear_for_tests();
+    }
+
+    fn assert_blocked(ip: &str) {
+        let addr: IpAddr = ip.parse().expect("valid ip literal");
+        assert!(is_blocked_ip(&addr), "address {ip} must be blocked by the SSRF guard");
+    }
+
+    #[test]
+    fn test_ssrf_blocks_loopback_v4() {
+        assert_blocked("127.0.0.1");
+        assert_blocked("127.255.255.254");
+    }
+
+    #[test]
+    fn test_ssrf_blocks_loopback_v6() {
+        assert_blocked("::1");
+    }
+
+    #[test]
+    fn test_ssrf_blocks_rfc1918_10_slash_8() {
+        assert_blocked("10.0.0.1");
+        assert_blocked("10.255.255.254");
+    }
+
+    #[test]
+    fn test_ssrf_blocks_rfc1918_172_16_slash_12() {
+        assert_blocked("172.16.0.1");
+        assert_blocked("172.31.255.254");
+        // 172.32.x is public and must not be blocked by the private-range rule.
+        let public: IpAddr = "172.32.0.1".parse().unwrap();
+        assert!(!is_blocked_ip(&public), "172.32.0.1 is outside 172.16/12");
+    }
+
+    #[test]
+    fn test_ssrf_blocks_rfc1918_192_168_slash_16() {
+        assert_blocked("192.168.0.1");
+        assert_blocked("192.168.255.254");
+    }
+
+    #[test]
+    fn test_ssrf_blocks_link_local_metadata_endpoint() {
+        assert_blocked("169.254.169.254");
+    }
+
+    #[test]
+    fn test_ssrf_blocks_ipv6_unique_local_fc00_slash_7() {
+        assert_blocked("fc00::1");
+        assert_blocked("fd12:3456:789a::1");
+    }
+
+    #[test]
+    fn test_ssrf_blocks_ipv6_link_local_fe80_slash_10() {
+        assert_blocked("fe80::1");
+        assert_blocked("febf::1");
+    }
+
+    #[test]
+    fn test_ssrf_allows_public_addresses() {
+        let public: IpAddr = "93.184.216.34".parse().unwrap();
+        assert!(!is_blocked_ip(&public), "public address must be allowed");
+    }
+
+    /// Registering a webhook pointing at a blocked literal address is rejected.
+    #[test]
+    fn test_register_webhook_rejects_blocked_literal() {
+        reset();
+        for url in [
+            "http://127.0.0.1/hook",
+            "http://[::1]/hook",
+            "http://10.1.2.3/hook",
+            "http://172.16.5.5/hook",
+            "http://192.168.1.1/hook",
+            "http://169.254.169.254/latest/meta-data",
+            "http://[fc00::1]/hook",
+            "http://[fe80::1]/hook",
+        ] {
+            let err = register_webhook_for_tests("GOWNER_SSRF", url)
+                .expect_err(&format!("{url} must be rejected"));
+            match err {
+                WebhookError::BlockedAddress { .. } => {}
+                other => panic!("expected BlockedAddress for {url}, got {:?}", other),
+            }
+        }
+        reset();
+    }
+
+    /// `validate_webhook_url` rejects non-http(s) schemes with a structured error.
+    #[test]
+    fn test_validate_webhook_url_rejects_bad_scheme() {
+        let err = validate_webhook_url("ftp://example.com/hook").unwrap_err();
+        match err {
+            WebhookError::InvalidScheme { .. } => {}
+            other => panic!("expected InvalidScheme, got {:?}", other),
+        }
+    }
+}
+
+// ── #1202: DNS rebinding re-check at delivery time ──────────────────────────
+
+#[cfg(test)]
+mod webhook_dns_rebinding_tests {
+    use api_server::handlers::{
+        register_webhook_for_tests, webhooks_clear_for_tests,
+        deliver_webhook_with_resolver_for_tests, WebhookError,
+    };
+    use std::net::IpAddr;
+
+    /// Simulate a host that resolves to a public address at registration time
+    /// but to a private address at delivery time (DNS rebinding).  The
+    /// delivery-time re-check must block the request.
+    #[tokio::test]
+    async fn test_delivery_time_recheck_blocks_rebinding() {
+        webhooks_clear_for_tests();
+
+        // Registration-time resolver: public address.
+        let public: IpAddr = "93.184.216.34".parse().unwrap();
+        let hook = register_webhook_for_tests_with_resolver(
+            "GOWNER_REBIND",
+            "https://rebind.example.com/hook",
+            move |_host: &str| Ok(vec![public]),
+        )
+        .expect("registration with a public resolution must succeed");
+
+        // Delivery-time resolver: private address (rebound).
+        let private: IpAddr = "10.0.0.5".parse().unwrap();
+        let result = deliver_webhook_with_resolver_for_tests(
+            &hook,
+            move |_host: &str| Ok(vec![private]),
+        )
+        .await;
+
+        let err = result.expect_err("delivery must be blocked after rebinding");
+        match err {
+            WebhookError::BlockedAddress { .. } => {}
+            other => panic!("expected BlockedAddress at delivery, got {:?}", other),
+        }
+
+        webhooks_clear_for_tests();
+    }
+
+    /// Helper mirroring `register_webhook_for_tests` but with an injected resolver.
+    fn register_webhook_for_tests_with_resolver<F>(
+        owner: &str,
+        url: &str,
+        resolver: F,
+    ) -> Result<api_server::handlers::RegisteredWebhook, WebhookError>
+    where
+        F: Fn(&str) -> Result<Vec<IpAddr>, WebhookError> + Send + Sync + 'static,
+    {
+        api_server::handlers::register_webhook_with_resolver_for_tests(owner, url, resolver)
+    }
+}
+
+// ── #1203: redirects are not followed by the webhook client ─────────────────
+
+#[cfg(test)]
+mod webhook_redirect_tests {
+    use api_server::webhook::{WebhookClient, DeliveryOutcome};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    /// Spin up a tiny HTTP server that answers every request with a 302 to an
+    /// internal address.  The webhook client must NOT follow it; it must record
+    /// a delivery failure instead.
+    #[tokio::test]
+    async fn test_redirect_is_not_followed() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().unwrap();
+
+        // Serve exactly one request then exit.
+        let server = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let response = "HTTP/1.1 302 Found\r\n\
+                                Location: http://169.254.169.254/latest/meta-data\r\n\
+                                Content-Length: 0\r\n\
+                                Connection: close\r\n\r\n";
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        let client = WebhookClient::for_tests_allow_loopback();
+        let url = format!("http://{}/hook", addr);
+        let outcome = client.deliver_for_tests(&url, b"{}").await;
+
+        match outcome {
+            DeliveryOutcome::Failure { reason } => {
+                assert!(
+                    reason.to_lowercase().contains("redirect"),
+                    "failure reason should mention the redirect: {reason}"
+                );
+            }
+            other => panic!("redirect must be recorded as a failure, got {:?}", other),
+        }
+
+        let _ = server.join();
+    }
+}

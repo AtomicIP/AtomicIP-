@@ -254,6 +254,133 @@ mod refund_distribution_tests {
         assert_eq!(client.get_swap_status(&swap_id), SwapStatus::Cancelled);
     }
 
+    // ── Item 34: installment refund math ──────────────────────────────────────
+    //
+    // Backlog item 34 requires that when an installment swap is cancelled or
+    // times out, the buyer is refunded only the amount actually paid so far
+    // (0, partial, or full price), never the full price unconditionally.
+
+    fn setup_installment_swap(
+        env: &Env,
+        seller: &Address,
+        buyer: &Address,
+        price: i128,
+        installments: u32,
+    ) -> (Address, u64, Address) {
+        let (registry_id, ip_id, _, _) = setup_registry(env, seller);
+        let token_id = setup_token(env, seller, buyer, 1_000_000);
+        let contract_id = setup_swap_contract(env, &registry_id);
+        let client = AtomicSwapClient::new(env, &contract_id);
+
+        let swap_id = client.initiate_swap(
+            &token_id, &ip_id, seller, &price, buyer,
+            &installments, &None, &0i128, &false,
+        );
+
+        client.accept_swap(&swap_id);
+        (token_id, swap_id, contract_id)
+    }
+
+    fn token_balance(env: &Env, token_id: &Address, who: &Address) -> i128 {
+        soroban_sdk::token::Client::new(env, token_id).balance(who)
+    }
+
+    #[test]
+    fn test_installment_refund_cancel_after_zero_installments() {
+        // Item 34: cancelling before any installment is paid refunds 0.
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let (token_id, swap_id, contract_id) =
+            setup_installment_swap(&env, &seller, &buyer, 1000i128, 4u32);
+        let client = AtomicSwapClient::new(&env, &contract_id);
+
+        let buyer_before = token_balance(&env, &token_id, &buyer);
+
+        client.cancel_swap(&swap_id, &seller);
+
+        assert_eq!(client.get_swap_status(&swap_id), SwapStatus::Cancelled);
+        assert_eq!(token_balance(&env, &token_id, &buyer), buyer_before);
+    }
+
+    #[test]
+    fn test_installment_refund_cancel_after_partial_installments() {
+        // Item 34: cancelling after a partial payment refunds only what was paid.
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let (token_id, swap_id, contract_id) =
+            setup_installment_swap(&env, &seller, &buyer, 1000i128, 4u32);
+        let client = AtomicSwapClient::new(&env, &contract_id);
+
+        let buyer_before = token_balance(&env, &token_id, &buyer);
+
+        client.submit_installment_payment(&swap_id, &buyer, &250i128);
+        let paid = buyer_before - token_balance(&env, &token_id, &buyer);
+        assert_eq!(paid, 250i128);
+
+        client.cancel_swap(&swap_id, &seller);
+
+        assert_eq!(client.get_swap_status(&swap_id), SwapStatus::Cancelled);
+        assert_eq!(token_balance(&env, &token_id, &buyer), buyer_before);
+    }
+
+    #[test]
+    fn test_installment_refund_cancel_after_full_installments() {
+        // Item 34: cancelling after the full price is paid refunds the full price.
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let (token_id, swap_id, contract_id) =
+            setup_installment_swap(&env, &seller, &buyer, 1000i128, 4u32);
+        let client = AtomicSwapClient::new(&env, &contract_id);
+
+        let buyer_before = token_balance(&env, &token_id, &buyer);
+
+        client.submit_installment_payment(&swap_id, &buyer, &250i128);
+        client.submit_installment_payment(&swap_id, &buyer, &250i128);
+        client.submit_installment_payment(&swap_id, &buyer, &250i128);
+        client.submit_installment_payment(&swap_id, &buyer, &250i128);
+        let paid = buyer_before - token_balance(&env, &token_id, &buyer);
+        assert_eq!(paid, 1000i128);
+
+        client.cancel_swap(&swap_id, &seller);
+
+        assert_eq!(client.get_swap_status(&swap_id), SwapStatus::Cancelled);
+        assert_eq!(token_balance(&env, &token_id, &buyer), buyer_before);
+    }
+
+    #[test]
+    fn test_installment_refund_timeout_after_partial_installments() {
+        // Item 34: a timeout refunds only the amount actually paid.
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let (token_id, swap_id, contract_id) =
+            setup_installment_swap(&env, &seller, &buyer, 1000i128, 4u32);
+        let client = AtomicSwapClient::new(&env, &contract_id);
+
+        let buyer_before = token_balance(&env, &token_id, &buyer);
+
+        client.submit_installment_payment(&swap_id, &buyer, &250i128);
+        let paid = buyer_before - token_balance(&env, &token_id, &buyer);
+        assert_eq!(paid, 250i128);
+
+        env.ledger().with_mut(|l| l.timestamp += 604800);
+        client.cancel_expired_swap(&swap_id, &buyer);
+
+        assert_eq!(client.get_swap_status(&swap_id), SwapStatus::Cancelled);
+        assert_eq!(token_balance(&env, &token_id, &buyer), buyer_before);
+    }
+
     #[test]
     fn test_refund_distribution_zero_recipients() {
         let env = Env::default();
