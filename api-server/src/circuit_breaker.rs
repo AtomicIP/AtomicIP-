@@ -88,13 +88,37 @@ impl CircuitBreaker {
         }
     }
 
+    /// Acquire the state lock, tolerating poisoning.
+    ///
+    /// If the mutex is poisoned, the breaker cannot trust its state, so it
+    /// fails closed: the state is forced to `Open`, the transition is emitted
+    /// and logged, and the recovered guard is returned.
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, CircuitState> {
+        match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::error!(
+                    service = %self.name,
+                    "circuit breaker state mutex poisoned; failing closed"
+                );
+                let mut guard = poisoned.into_inner();
+                let prev = *guard;
+                *guard = CircuitState::Open;
+                if prev != CircuitState::Open {
+                    self.emit_transition(prev, CircuitState::Open);
+                }
+                guard
+            }
+        }
+    }
+
     pub fn get_state(&self) -> CircuitState {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.lock_state();
 
         if *state == CircuitState::Open {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_millis() as u64;
             let last_failure = self.last_failure_time.load(Ordering::SeqCst);
             let timeout_ms = if self.config.timeout_secs == 0 {
@@ -125,7 +149,7 @@ impl CircuitBreaker {
             CircuitState::HalfOpen => {
                 let success = self.success_count.fetch_add(1, Ordering::SeqCst) + 1;
                 if success >= self.config.success_threshold {
-                    let mut s = self.state.lock().unwrap();
+                    let mut s = self.lock_state();
                     *s = CircuitState::Closed;
                     drop(s);
                     self.failure_count.store(0, Ordering::SeqCst);
@@ -141,7 +165,7 @@ impl CircuitBreaker {
     pub fn record_failure(&self) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_millis() as u64;
         self.last_failure_time.store(now, Ordering::SeqCst);
 
@@ -151,14 +175,14 @@ impl CircuitBreaker {
             CircuitState::Closed => {
                 let failures = self.failure_count.fetch_add(1, Ordering::SeqCst) + 1;
                 if failures >= self.config.failure_threshold {
-                    let mut s = self.state.lock().unwrap();
+                    let mut s = self.lock_state();
                     *s = CircuitState::Open;
                     drop(s);
                     self.emit_transition(CircuitState::Closed, CircuitState::Open);
                 }
             }
             CircuitState::HalfOpen => {
-                let mut s = self.state.lock().unwrap();
+                let mut s = self.lock_state();
                 *s = CircuitState::Open;
                 drop(s);
                 self.failure_count.store(0, Ordering::SeqCst);
@@ -231,7 +255,7 @@ impl CircuitBreaker {
 
     pub fn reset(&self) {
         let prev = self.get_state();
-        *self.state.lock().unwrap() = CircuitState::Closed;
+        *self.lock_state() = CircuitState::Closed;
         self.failure_count.store(0, Ordering::SeqCst);
         self.success_count.store(0, Ordering::SeqCst);
         self.half_open_calls.store(0, Ordering::SeqCst);
@@ -531,6 +555,30 @@ mod tests {
         // Phase 6 — normal operation resumes
         let r: Result<i32, CallError<()>> = cb.call(|| Ok(99));
         assert_eq!(r, Ok(99));
+    }
+
+    // ── Poisoned state fails closed ───────────────────────────────────────────
+
+    #[test]
+    fn test_poisoned_state_fails_closed() {
+        let cb = make_cb(5, 2, 30);
+        assert_eq!(cb.get_state(), CircuitState::Closed);
+
+        // Poison the internal mutex by panicking while holding the lock.
+        let state = Arc::clone(&cb.state);
+        let handle = std::thread::spawn(move || {
+            let _guard = state.lock().unwrap();
+            panic!("poison the circuit breaker state");
+        });
+        assert!(handle.join().is_err(), "spawned thread should have panicked");
+        assert!(cb.state.is_poisoned(), "state mutex should be poisoned");
+
+        // The breaker must not panic and must fail closed.
+        assert_eq!(cb.get_state(), CircuitState::Open);
+        assert!(!cb.can_execute(), "poisoned breaker must reject calls");
+
+        let result: Result<(), CallError<()>> = cb.call(|| Ok(()));
+        assert_eq!(result, Err(CallError::CircuitOpen));
     }
 
     // ── End-to-end: database outage + failed recovery ─────────────────────────

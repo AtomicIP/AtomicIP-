@@ -13,11 +13,11 @@
 /// the `cache_backend_degraded_transitions_total` counter. A background
 /// thread pings Redis every [`HEALTH_CHECK_INTERVAL`] and flips the cache
 /// back to shared mode automatically once Redis is reachable again.
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
-use metrics::{counter, describe_counter};
+use metrics::{counter, describe_counter, describe_gauge, gauge};
 use once_cell::sync::Lazy;
 use r2d2::Pool;
 use redis::Commands;
@@ -28,6 +28,10 @@ const IP_TTL_SECS: u64 = 60;
 const SWAP_TTL_SECS: u64 = 30;
 const REPUTATION_TTL_SECS: u64 = 300;
 
+/// Default cap on the number of entries held by the in-process fallback
+/// store. Overridable via the `CACHE_MAX_ENTRIES` environment variable.
+const DEFAULT_MAX_ENTRIES: usize = 10_000;
+
 /// How often the background thread pings Redis to detect recovery from a
 /// degraded state. Cache operations do not retry Redis on every call while
 /// degraded — they defer to this thread — so this interval is also the
@@ -37,9 +41,52 @@ const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 struct Entry {
     value: String,
     expires_at: Instant,
+    /// Monotonic access stamp used for LRU eviction. Bumped on every read
+    /// and write of the entry.
+    last_used: u64,
 }
 
 static STORE: Lazy<DashMap<String, Entry>> = Lazy::new(DashMap::new);
+
+/// Monotonic counter backing [`Entry::last_used`].
+static ACCESS_CLOCK: AtomicU64 = AtomicU64::new(0);
+
+/// Maximum number of entries the in-process store may hold before the
+/// least-recently-used entries are evicted on insert.
+static MAX_ENTRIES: Lazy<usize> = Lazy::new(|| {
+    describe_gauge!(
+        "cache_entries",
+        "Number of entries currently held by the in-process response cache"
+    );
+    std::env::var("CACHE_MAX_ENTRIES")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_MAX_ENTRIES)
+});
+
+fn next_access_stamp() -> u64 {
+    ACCESS_CLOCK.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Evict least-recently-used entries until the store is within its cap.
+/// Called after every insert into the in-process store.
+fn enforce_capacity() {
+    let max = *MAX_ENTRIES;
+    while STORE.len() > max {
+        let victim = STORE
+            .iter()
+            .min_by_key(|entry| entry.value().last_used)
+            .map(|entry| entry.key().clone());
+        match victim {
+            Some(key) => {
+                STORE.remove(&key);
+            }
+            None => break,
+        }
+    }
+    gauge!("cache_entries").set(STORE.len() as f64);
+}
 
 /// `true` when the cache is serving from the in-process `DashMap` fallback
 /// instead of the shared Redis store — either because `REDIS_URL` isn't
@@ -231,8 +278,10 @@ pub fn set_with_ttl<T: Serialize>(key: &str, value: &T, ttl_secs: u64) {
         Entry {
             value: json,
             expires_at: Instant::now() + Duration::from_secs(ttl_secs),
+            last_used: next_access_stamp(),
         },
     );
+    enforce_capacity();
 }
 
 /// Read a cached value. Returns `None` on miss or expiry.
@@ -245,12 +294,14 @@ pub fn get<T: DeserializeOwned>(key: &str) -> Option<T> {
         }
     }
 
-    let entry = STORE.get(key)?;
+    let stamp = next_access_stamp();
+    let mut entry = STORE.get_mut(key)?;
     if entry.expires_at < Instant::now() {
         drop(entry);
         STORE.remove(key);
         return None;
     }
+    entry.last_used = stamp;
     serde_json::from_str(&entry.value).ok()
 }
 
@@ -279,12 +330,14 @@ pub fn ttl_remaining(key: &str) -> Option<u64> {
         }
     }
 
-    let entry = STORE.get(key)?;
+    let stamp = next_access_stamp();
+    let mut entry = STORE.get_mut(key)?;
     if entry.expires_at < Instant::now() {
         drop(entry);
         STORE.remove(key);
         return None;
     }
+    entry.last_used = stamp;
     let remaining = entry.expires_at.duration_since(Instant::now()).as_secs();
     Some(remaining)
 }
@@ -689,6 +742,36 @@ mod tests {
         // In the test binary REDIS_URL is unset, so the cache runs
         // in-process only and reports itself as degraded — not silently.
         assert!(is_degraded());
+    }
+
+    #[test]
+    fn test_capacity_cap_evicts_least_recently_used() {
+        clear();
+        let max = *MAX_ENTRIES;
+
+        // Insert exactly the cap, then touch the first key so it becomes
+        // the most-recently-used entry.
+        for i in 0..max {
+            set(&format!("cap:{i}"), &Dummy { val: i as u64 });
+        }
+        assert_eq!(STORE.len(), max);
+        assert!(get::<Dummy>("cap:0").is_some());
+
+        // Inserting beyond the cap must evict down to the cap.
+        for i in max..(max + 10) {
+            set(&format!("cap:{i}"), &Dummy { val: i as u64 });
+        }
+        assert!(STORE.len() <= max, "store grew past cap: {}", STORE.len());
+
+        // The touched key survives; the oldest untouched keys are gone.
+        assert!(get::<Dummy>("cap:0").is_some());
+        assert!(get::<Dummy>("cap:1").is_none());
+        assert!(get::<Dummy>("cap:2").is_none());
+
+        // The most recently inserted keys are present.
+        assert!(get::<Dummy>(&format!("cap:{}", max + 9)).is_some());
+
+        clear();
     }
 }
 
