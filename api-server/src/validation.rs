@@ -475,6 +475,39 @@ impl RequestValidator {
         Ok(())
     }
 
+    /// Validate a webhook URL against SSRF: requires http/https and rejects
+    /// hosts that are literal IPs in loopback, private, link-local,
+    /// unique-local, unspecified, or multicast ranges.
+    pub fn validate_webhook_url(url: &str) -> ValidationResult {
+        Self::validate_url(url)?;
+
+        let host = match extract_url_host(url) {
+            Some(host) => host,
+            None => {
+                return Err(vec![ValidationError {
+                    field: "url".to_string(),
+                    message: "URL is missing a valid host".to_string(),
+                    severity: ErrorSeverity::High,
+                }]);
+            }
+        };
+
+        // Strip IPv6 brackets if present.
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+
+        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            if is_blocked_ip(&ip) {
+                return Err(vec![ValidationError {
+                    field: "url".to_string(),
+                    message: format!("URL host {} is not allowed (internal address)", ip),
+                    severity: ErrorSeverity::High,
+                }]);
+            }
+        }
+
+        Ok(())
+    }
+
     /// Validate UUID format
     pub fn validate_uuid(uuid_str: &str) -> ValidationResult {
         Self::check_null_bytes(uuid_str, "uuid")?;
@@ -511,6 +544,91 @@ impl RequestValidator {
             .filter(|e| e.severity == ErrorSeverity::High)
             .cloned()
             .collect()
+    }
+}
+
+/// Extract the host portion of an http/https URL without external crates.
+fn extract_url_host(url: &str) -> Option<String> {
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))?;
+
+    // Authority ends at the first '/', '?' or '#'.
+    let authority = rest
+        .split(|c| c == '/' || c == '?' || c == '#')
+        .next()
+        .unwrap_or("");
+
+    if authority.is_empty() {
+        return None;
+    }
+
+    // Strip userinfo.
+    let host_port = match authority.rsplit_once('@') {
+        Some((_, hp)) => hp,
+        None => authority,
+    };
+
+    // IPv6 literal: [::1]:8080
+    if let Some(stripped) = host_port.strip_prefix('[') {
+        let end = stripped.find(']')?;
+        return Some(format!("[{}]", &stripped[..end]));
+    }
+
+    // Strip port for hostnames / IPv4.
+    let host = match host_port.rsplit_once(':') {
+        Some((h, port)) if port.chars().all(|c| c.is_ascii_digit()) => h,
+        _ => host_port,
+    };
+
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
+}
+
+/// Returns true if the IP is in a range that must not be reachable via webhooks.
+fn is_blocked_ip(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || v4.is_documentation()
+                // 0.0.0.0/8
+                || v4.octets()[0] == 0
+                // 100.64.0.0/10 (carrier-grade NAT)
+                || (v4.octets()[0] == 100 && (64..=127).contains(&v4.octets()[1]))
+                // 192.0.0.0/24
+                || (v4.octets()[0] == 192 && v4.octets()[1] == 0 && v4.octets()[2] == 0)
+                // 198.18.0.0/15 (benchmarking)
+                || (v4.octets()[0] == 198 && (v4.octets()[1] == 18 || v4.octets()[1] == 19))
+                // 240.0.0.0/4 (reserved)
+                || v4.octets()[0] >= 240
+        }
+        std::net::IpAddr::V6(v6) => {
+            if v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() {
+                return true;
+            }
+            let segments = v6.segments();
+            // Unique local fc00::/7
+            if (segments[0] & 0xfe00) == 0xfc00 {
+                return true;
+            }
+            // Link-local fe80::/10
+            if (segments[0] & 0xffc0) == 0xfe80 {
+                return true;
+            }
+            // IPv4-mapped ::ffff:0:0/96
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_blocked_ip(&std::net::IpAddr::V4(v4));
+            }
+            false
+        }
     }
 }
 
@@ -606,6 +724,49 @@ mod tests {
         assert!(RequestValidator::validate_url("http://example.com").is_ok());
         assert!(RequestValidator::validate_url("ftp://example.com").is_err());
         assert!(RequestValidator::validate_url("").is_err());
+    }
+
+    #[test]
+    fn test_validate_webhook_url_allows_public() {
+        assert!(RequestValidator::validate_webhook_url("https://example.com/hook").is_ok());
+        assert!(RequestValidator::validate_webhook_url("http://8.8.8.8/hook").is_ok());
+        assert!(RequestValidator::validate_webhook_url("https://[2001:4860:4860::8888]/hook").is_ok());
+    }
+
+    #[test]
+    fn test_validate_webhook_url_rejects_loopback() {
+        assert!(RequestValidator::validate_webhook_url("http://127.0.0.1/hook").is_err());
+        assert!(RequestValidator::validate_webhook_url("http://127.1.2.3:8080/hook").is_err());
+        assert!(RequestValidator::validate_webhook_url("http://[::1]/hook").is_err());
+    }
+
+    #[test]
+    fn test_validate_webhook_url_rejects_private() {
+        assert!(RequestValidator::validate_webhook_url("http://10.0.0.1/hook").is_err());
+        assert!(RequestValidator::validate_webhook_url("http://172.16.0.1/hook").is_err());
+        assert!(RequestValidator::validate_webhook_url("http://192.168.1.1/hook").is_err());
+        assert!(RequestValidator::validate_webhook_url("http://[fc00::1]/hook").is_err());
+        assert!(RequestValidator::validate_webhook_url("http://[fd12:3456::1]/hook").is_err());
+    }
+
+    #[test]
+    fn test_validate_webhook_url_rejects_link_local() {
+        assert!(RequestValidator::validate_webhook_url("http://169.254.169.254/latest").is_err());
+        assert!(RequestValidator::validate_webhook_url("http://[fe80::1]/hook").is_err());
+    }
+
+    #[test]
+    fn test_validate_webhook_url_rejects_unspecified_and_multicast() {
+        assert!(RequestValidator::validate_webhook_url("http://0.0.0.0/hook").is_err());
+        assert!(RequestValidator::validate_webhook_url("http://224.0.0.1/hook").is_err());
+        assert!(RequestValidator::validate_webhook_url("http://[::]/hook").is_err());
+        assert!(RequestValidator::validate_webhook_url("http://[ff02::1]/hook").is_err());
+    }
+
+    #[test]
+    fn test_validate_webhook_url_rejects_bad_scheme() {
+        assert!(RequestValidator::validate_webhook_url("ftp://example.com").is_err());
+        assert!(RequestValidator::validate_webhook_url("").is_err());
     }
 
     #[test]

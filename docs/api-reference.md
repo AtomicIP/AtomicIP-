@@ -1260,6 +1260,37 @@ When migrating between major versions:
 4. **Monitor deprecation headers**: Watch for `Deprecation` and `Sunset` headers
 5. **Migrate before sunset**: Complete migration before the sunset date
 
+## Documentation endpoint
+
+The API server serves its generated API documentation directly, so the
+reference is always available alongside the running service.
+
+| Property | Value |
+|---|---|
+| Path | `GET /docs` |
+| Response format | `text/html` (rendered documentation page) |
+| Auth | None — publicly readable |
+
+The handler is mounted in the main router and returns `200 OK` with the
+rendered documentation body. Any other method on `/docs` is rejected by the
+router.
+
+## Connection limits (WebSocket and SSE)
+
+Streaming endpoints (`websocket.rs` and `events.rs`) enforce connection caps so
+that a single client cannot exhaust file descriptors or memory.
+
+| Limit | Scope | Behavior when exceeded |
+|---|---|---|
+| Global connection cap | All streaming connections on the process | New connection is rejected (closed immediately) |
+| Per-IP connection cap | Connections from one source IP | New connection from that IP is rejected; other IPs are unaffected |
+| Idle timeout | Per connection | Connection is closed after the configured idle period with no traffic |
+
+The TCP peer address is used for per-IP accounting, consistent with rate
+limiting (see [Proxy deployment](#proxy-deployment)). The number of currently
+open streaming connections is exported as a metric so operators can alert on
+saturation before the caps are hit.
+
 ## Rate limiting
 
 The HTTP API uses token buckets to allow short bursts while recovering quota

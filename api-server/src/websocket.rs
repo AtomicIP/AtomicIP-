@@ -25,13 +25,165 @@
 //! ```
 
 use axum::extract::ws::WebSocket;
+use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use tokio::sync::broadcast;
+
+/// Default global cap on concurrent streaming (WebSocket + SSE) connections.
+const DEFAULT_MAX_CONNECTIONS: usize = 1024;
+/// Default per-IP cap on concurrent streaming connections.
+const DEFAULT_MAX_CONNECTIONS_PER_IP: usize = 16;
+/// Default idle timeout for streaming connections.
+const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 120;
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
+}
+
+fn env_duration_secs(name: &str, default: u64) -> Duration {
+    let secs = std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default);
+    Duration::from_secs(secs)
+}
+
+/// Reason a connection slot could not be acquired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LimitError {
+    /// Global connection cap reached.
+    GlobalLimit,
+    /// Per-IP connection cap reached.
+    PerIpLimit,
+}
+
+/// Tracks open streaming connections with a global cap and a per-IP cap.
+///
+/// A slot is acquired before upgrading a connection and released when the
+/// connection ends (via [`ConnectionGuard`]'s `Drop` implementation).
+pub struct ConnectionLimiter {
+    max_connections: usize,
+    max_connections_per_ip: usize,
+    idle_timeout: Duration,
+    total: AtomicUsize,
+    per_ip: DashMap<String, usize>,
+}
+
+impl ConnectionLimiter {
+    pub fn new(max_connections: usize, max_connections_per_ip: usize, idle_timeout: Duration) -> Self {
+        Self {
+            max_connections,
+            max_connections_per_ip,
+            idle_timeout,
+            total: AtomicUsize::new(0),
+            per_ip: DashMap::new(),
+        }
+    }
+
+    /// Build a limiter from environment variables:
+    /// `WS_MAX_CONNECTIONS`, `WS_MAX_CONNECTIONS_PER_IP`, `WS_IDLE_TIMEOUT_SECS`.
+    pub fn from_env() -> Self {
+        Self::new(
+            env_usize("WS_MAX_CONNECTIONS", DEFAULT_MAX_CONNECTIONS),
+            env_usize("WS_MAX_CONNECTIONS_PER_IP", DEFAULT_MAX_CONNECTIONS_PER_IP),
+            env_duration_secs("WS_IDLE_TIMEOUT_SECS", DEFAULT_IDLE_TIMEOUT_SECS),
+        )
+    }
+
+    pub fn max_connections(&self) -> usize {
+        self.max_connections
+    }
+
+    pub fn max_connections_per_ip(&self) -> usize {
+        self.max_connections_per_ip
+    }
+
+    pub fn idle_timeout(&self) -> Duration {
+        self.idle_timeout
+    }
+
+    /// Number of currently open connections (exposed as a metric).
+    pub fn open_connections(&self) -> usize {
+        self.total.load(Ordering::Relaxed)
+    }
+
+    /// Number of currently open connections for a given IP.
+    pub fn open_connections_for_ip(&self, ip: &str) -> usize {
+        self.per_ip.get(ip).map(|v| *v).unwrap_or(0)
+    }
+
+    /// Try to reserve a slot for `ip`. Returns a guard that releases the slot
+    /// on drop, or an error if a cap is exceeded.
+    pub fn try_acquire(self: &Arc<Self>, ip: &str) -> Result<ConnectionGuard, LimitError> {
+        // Reserve the global slot first; roll back if the per-IP cap is hit.
+        let prev_total = self.total.fetch_add(1, Ordering::AcqRel);
+        if prev_total >= self.max_connections {
+            self.total.fetch_sub(1, Ordering::AcqRel);
+            return Err(LimitError::GlobalLimit);
+        }
+
+        let mut entry = self.per_ip.entry(ip.to_string()).or_insert(0);
+        if *entry >= self.max_connections_per_ip {
+            drop(entry);
+            self.total.fetch_sub(1, Ordering::AcqRel);
+            return Err(LimitError::PerIpLimit);
+        }
+        *entry += 1;
+        drop(entry);
+
+        Ok(ConnectionGuard {
+            limiter: self.clone(),
+            ip: ip.to_string(),
+        })
+    }
+}
+
+/// RAII guard that releases a connection slot when dropped.
+pub struct ConnectionGuard {
+    limiter: Arc<ConnectionLimiter>,
+    ip: String,
+}
+
+impl ConnectionGuard {
+    pub fn idle_timeout(&self) -> Duration {
+        self.limiter.idle_timeout
+    }
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.limiter.total.fetch_sub(1, Ordering::AcqRel);
+        if let Some(mut entry) = self.limiter.per_ip.get_mut(&self.ip) {
+            if *entry > 0 {
+                *entry -= 1;
+            }
+            if *entry == 0 {
+                drop(entry);
+                self.limiter.per_ip.remove(&self.ip);
+            }
+        }
+    }
+}
+
+/// Shared limiter used by both the WebSocket and SSE endpoints.
+static CONNECTION_LIMITER: Lazy<Arc<ConnectionLimiter>> =
+    Lazy::new(|| Arc::new(ConnectionLimiter::from_env()));
+
+/// Get the process-wide streaming connection limiter.
+pub fn get_connection_limiter() -> Arc<ConnectionLimiter> {
+    CONNECTION_LIMITER.clone()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IpEvent {
@@ -152,6 +304,7 @@ impl EventBroadcaster {
                     timestamp,
                 });
             }
+            _ => {}
         }
     }
 
@@ -176,6 +329,22 @@ pub struct SubscriptionMessage {
 }
 
 pub async fn handle_socket(socket: WebSocket, broadcaster: Arc<EventBroadcaster>) {
+    handle_socket_limited(socket, broadcaster, None).await
+}
+
+/// Handle a raw `/ws` connection, enforcing the idle timeout from the shared
+/// limiter. The caller is expected to have acquired a slot via
+/// [`ConnectionLimiter::try_acquire`] before upgrading.
+pub async fn handle_socket_limited(
+    socket: WebSocket,
+    broadcaster: Arc<EventBroadcaster>,
+    guard: Option<ConnectionGuard>,
+) {
+    let idle_timeout = guard
+        .as_ref()
+        .map(|g| g.idle_timeout())
+        .unwrap_or_else(|| get_connection_limiter().idle_timeout());
+
     let (mut sender, mut receiver) = socket.split();
 
     let mut ip_rx = broadcaster.subscribe_ip();
@@ -188,7 +357,8 @@ pub async fn handle_socket(socket: WebSocket, broadcaster: Arc<EventBroadcaster>
     let mut subscribed_swap_ids: HashSet<u64> = HashSet::new();
 
     loop {
-        tokio::select! {
+        let next = tokio::time::timeout(idle_timeout, async {
+            tokio::select! {
             msg = receiver.next() => {
                 match msg {
                     Some(Ok(axum::extract::ws::Message::Text(text))) => {
@@ -269,8 +439,25 @@ pub async fn handle_socket(socket: WebSocket, broadcaster: Arc<EventBroadcaster>
                     }
                 }
             }
+            }
+        }).await;
+
+        if next.is_err() {
+            // Idle timeout elapsed: close the stale connection.
+            let _ = sender
+                .send(axum::extract::ws::Message::Close(Some(
+                    axum::extract::ws::CloseFrame {
+                        code: axum::extract::ws::close_code::AWAY,
+                        reason: "idle timeout".into(),
+                    },
+                )))
+                .await;
+            break;
         }
     }
+
+    // Release the connection slot (if any) once the loop exits.
+    drop(guard);
 }
 
 #[cfg(test)]
@@ -335,6 +522,31 @@ mod tests {
 
         assert_eq!(swap_event.swap_id, 200);
         assert_eq!(swap_event.seller, "GSELLER");
+    }
+
+    #[test]
+    fn test_connection_limiter_global_cap() {
+        let limiter = Arc::new(ConnectionLimiter::new(2, 10, Duration::from_secs(60)));
+        let g1 = limiter.try_acquire("1.1.1.1").expect("first slot");
+        let _g2 = limiter.try_acquire("2.2.2.2").expect("second slot");
+        assert_eq!(limiter.open_connections(), 2);
+        assert_eq!(limiter.try_acquire("3.3.3.3").unwrap_err(), LimitError::GlobalLimit);
+        drop(g1);
+        assert_eq!(limiter.open_connections(), 1);
+        let _g3 = limiter.try_acquire("3.3.3.3").expect("slot freed");
+    }
+
+    #[test]
+    fn test_connection_limiter_per_ip_cap() {
+        let limiter = Arc::new(ConnectionLimiter::new(10, 2, Duration::from_secs(60)));
+        let g1 = limiter.try_acquire("1.1.1.1").expect("first slot");
+        let _g2 = limiter.try_acquire("1.1.1.1").expect("second slot");
+        assert_eq!(limiter.open_connections_for_ip("1.1.1.1"), 2);
+        assert_eq!(limiter.try_acquire("1.1.1.1").unwrap_err(), LimitError::PerIpLimit);
+        // Other IPs are unaffected.
+        let _g3 = limiter.try_acquire("2.2.2.2").expect("other ip slot");
+        drop(g1);
+        assert_eq!(limiter.open_connections_for_ip("1.1.1.1"), 1);
     }
 
     #[tokio::test]

@@ -19,6 +19,12 @@ use types::*;
 
 mod zk_commitment;
 
+/// #1100: verification-result cache for hiding proofs.
+mod zk_cache;
+
+/// #1102: commitment randomness verification and weak-entropy alerts.
+mod commitment_randomness;
+
 /// Issue #973: Commitment metadata storage and search.
 mod metadata;
 
@@ -51,10 +57,19 @@ mod commitment_property_tests;
 mod commitment_sybil_resistance_tests;
 
 #[cfg(test)]
+mod commitment_challenge_tests;
+
+#[cfg(test)]
+mod metadata_encryption_tests;
+
+#[cfg(test)]
+mod audit_trail_tests;
+
+#[cfg(test)]
 mod validator_network_tests;
 
 #[cfg(test)]
-mod notary_access_tests;
+mod revocation_property_tests;
 
 // ── Error Codes ────────────────────────────────────────────────────────────
 
@@ -67,6 +82,12 @@ pub enum ContractError {
     CommitmentAlreadyRegistered = 3,
     IpAlreadyRevoked = 4,
     UnauthorizedUpgrade = 5,
+    /// #1161: Batch exceeds `MAX_BATCH_COMMIT` hashes.
+    BatchTooLarge = 60,
+    /// #1160: Anonymous commit rate limit for the current ledger exceeded.
+    AnonRateLimitExceeded = 61,
+    /// #1162: Stake amount must be strictly positive.
+    InvalidStakeAmount = 62,
     Unauthorized = 6,
     IpExpired = 7,
     MetadataTooLarge = 8,
@@ -162,12 +183,20 @@ pub enum ContractError {
     InsuranceDisputeMismatch = 58,
     /// #1073: Dispute must be resolved before the claim can be verified.
     InsuranceDisputeUnresolved = 59,
-    /// #1148: The IP already has a notary signature. Notarization is write-once.
-    AlreadyNotarized = 60,
-    /// #1150: Access level is outside the accepted range `1..=3`.
-    InvalidAccessLevel = 61,
-    /// #1151: The owner cannot grant access to their own address.
-    SelfGrantNotAllowed = 62,
+    /// Issue #811 / #1104: Ownership challenge TTL has elapsed.
+    ChallengeExpired = 60,
+    /// Issue #811 / #1104: Ownership challenge has already been answered.
+    ChallengeAlreadyAnswered = 61,
+    /// Issue #1104: No open ownership challenge exists for this commitment.
+    CommitmentChallengeNotFound = 62,
+    /// Issue #1105: Encrypted metadata is empty, has too many fields, or is too large.
+    EncryptedMetadataInvalid = 63,
+    /// Issue #1105: No metadata key is registered, or none is active for writes.
+    MetadataKeyNotFound = 64,
+    /// Issue #1105: A metadata key with this ID is already registered.
+    MetadataKeyAlreadyRegistered = 65,
+    /// Issue #1105: The metadata key has been retired and cannot be used for writes.
+    MetadataKeyRetired = 66,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -182,6 +211,9 @@ pub const DEFAULT_CHALLENGE_TTL_SECONDS: u64 = 86_400;
 
 /// Maximum metadata size: 1 KB
 pub const MAX_METADATA_BYTES: u32 = 1024;
+
+/// Issue #1105: Minimum `grant_ip_access` level that may read an encrypted metadata field.
+pub const METADATA_FIELD_ACCESS_LEVEL: u32 = 1;
 
 /// Trusted notary public key for timestamp notarization (Issue #345)
 /// This is a placeholder - should be set during contract initialization
@@ -233,6 +265,15 @@ const SHARD_MIGRATION_BATCH: u32 = 64;
 /// Supports paths like "Software/Cryptography/ZK-Proofs/DLV/AXIOM" (depth 5).
 pub const MAX_CATEGORY_DEPTH: u32 = 10;
 
+/// #1161: Maximum commitment hashes accepted by one `batch_commit_ip` call.
+pub const MAX_BATCH_COMMIT: u32 = 100;
+
+/// #1160: Maximum commitment hashes accepted by one `batch_commit_ip_anonymous` call.
+pub const MAX_ANON_BATCH_COMMIT: u32 = MAX_BATCH_COMMIT;
+
+/// #1160: Maximum anonymous commitments accepted per ledger across all callers.
+pub const MAX_ANON_COMMITS_PER_LEDGER: u32 = 500;
+
 fn commitment_hash(
     env: &Env,
     secret: &BytesN<32>,
@@ -272,6 +313,8 @@ pub enum DataKey {
     AnonymousOwner(BytesN<32>),
     /// #464: Tracks blinded_owner values that have already been used for replay protection
     UsedBlindedOwner(BytesN<32>),
+    /// #1160: Count of anonymous commitments accepted in a given ledger sequence (temporary storage)
+    AnonLedgerCommits(u32),
     Admin,
     PartialDisclosure(u64), // stores partial_hash for a given ip_id after reveal
     IpLicenses(u64),        // stores license entries for a given ip_id
@@ -309,6 +352,12 @@ pub enum DataKey {
     CompressedCommitment(u64), // Issue #438: stores compressed commitment bytes for a given ip_id
     // Issue #458: Batch verification result cache
     BatchVerifyResult(BytesN<32>), // maps batch_proof_id -> BatchVerifyResult
+    // #1100: ZK proof verification cache
+    ZkCacheEntry(BytesN<32>), // maps cache key -> cached verdict (bool)
+    ZkCacheEpoch(BytesN<32>), // maps commitment -> invalidation epoch (u32)
+    ZkCacheSlot(u32),         // maps FIFO slot -> cache key occupying it
+    ZkCacheCursor,            // next slot to evict once the cache is full (u32)
+    ZkCacheStats,             // ZkCacheStats hit/miss/eviction counters
     // Issue #456: Compression algorithm selection
     CompressionSelection(u64), // maps ip_id -> CompressionSelection
     // Issue #459: Hierarchical storage
@@ -354,6 +403,12 @@ pub enum DataKey {
     NextClaimId,                  // monotonic claim ID counter
     IpInsurancePolicy(u64),       // maps ip_id -> policy_id (one policy per IP)
     PolicyClaim(u64),             // maps policy_id -> claim_id (one claim per policy)
+    // Issue #1104: Random-nonce ownership challenge and its outcome counters
+    CommitmentChallenge(u64),     // maps commitment_id -> open CommitmentChallenge
+    ChallengeStats(u64),          // maps commitment_id -> ChallengeStats
+    // Issue #1105: Encrypted metadata key management and field-level records
+    MetadataKey(u32),             // maps key_id -> MetadataKeyRecord
+    ActiveMetadataKey,            // the key_id used for new encrypted metadata writes
 }
 
 // ── Upgrade Compatibility Manifest (#791) ───────────────────────────────────
@@ -429,12 +484,16 @@ const CURRENT_STORAGE_KEYS: &[&str] = &[
     "CompressedCommitment", "BatchVerifyResult", "CompressionSelection", "HierarchyNode",
     "OwnerCategories", "CategoryDepth", "ThresholdConfig", "ThresholdSignatures", "BatchMetadata",
     "EncryptedCommitment", "BatchEscrow", "MerkleProof", "CommitmentAlgorithm", "CommitmentLinks", "LinkedCommitments",
+    "ZkCacheEntry", "ZkCacheEpoch", "ZkCacheSlot", "ZkCacheCursor", "ZkCacheStats",
 ];
 
 /// (error name, error code) pairs defined by the currently deployed contract.
 /// Used as the compatibility baseline in `validate_upgrade`.
 const CURRENT_ERROR_CODES: &[(&str, u32)] = &[
     ("IpNotFound", 1),
+    ("BatchTooLarge", 60),
+    ("AnonRateLimitExceeded", 61),
+    ("InvalidStakeAmount", 62),
     ("ZeroCommitmentHash", 2),
     ("CommitmentAlreadyRegistered", 3),
     ("IpAlreadyRevoked", 4),
@@ -1160,8 +1219,8 @@ impl IpRegistry {
             .set(&DataKey::CommitmentOwner(commitment_hash.clone()), &owner);
         env.storage().persistent().extend_ttl(
             &DataKey::CommitmentOwner(commitment_hash.clone()),
-            50000,
-            50000,
+            LEDGER_BUMP,
+            LEDGER_BUMP,
         );
 
         env.storage().persistent().set(&DataKey::NextId, &(id + 1));
@@ -1238,6 +1297,11 @@ impl IpRegistry {
     ) -> Vec<u64> {
         owner.require_auth();
 
+        // #1161: Cap batch size to stay within Soroban compute and ledger-entry limits.
+        if commitment_hashes.len() > MAX_BATCH_COMMIT {
+            panic_with_error!(&env, ContractError::BatchTooLarge);
+        }
+
         let mut ids = Vec::new(&env);
         let timestamp = env.ledger().timestamp();
 
@@ -1299,8 +1363,8 @@ impl IpRegistry {
                 .set(&DataKey::CommitmentOwner(commitment_hash.clone()), &owner);
             env.storage().persistent().extend_ttl(
                 &DataKey::CommitmentOwner(commitment_hash.clone()),
-                50000,
-                50000,
+                LEDGER_BUMP,
+                LEDGER_BUMP,
             );
 
             env.events()
@@ -1377,6 +1441,20 @@ impl IpRegistry {
             ));
         }
 
+        // #1160: Per-call cap on anonymous batch size.
+        if commitment_hashes.len() > MAX_ANON_BATCH_COMMIT {
+            panic_with_error!(&env, ContractError::BatchTooLarge);
+        }
+
+        // #1160: Rate limit anonymous commits per ledger, across all callers.
+        let rl_key = DataKey::AnonLedgerCommits(env.ledger().sequence());
+        let used: u32 = env.storage().temporary().get(&rl_key).unwrap_or(0);
+        let total = used.saturating_add(commitment_hashes.len());
+        if total > MAX_ANON_COMMITS_PER_LEDGER {
+            panic_with_error!(&env, ContractError::AnonRateLimitExceeded);
+        }
+        env.storage().temporary().set(&rl_key, &total);
+
         // #464: Replay protection — reject if this blinded_owner has already been used.
         // A blinded_owner is sha256(real_owner || nonce); reusing it would link
         // multiple batches to the same blinded identity, undermining anonymity.
@@ -1447,8 +1525,8 @@ impl IpRegistry {
             );
             env.storage().persistent().extend_ttl(
                 &DataKey::CommitmentOwner(commitment_hash.clone()),
-                50000,
-                50000,
+                LEDGER_BUMP,
+                LEDGER_BUMP,
             );
 
             // Record blinded owner mapping for later on-chain/off-chain proof if needed.
@@ -1545,10 +1623,9 @@ impl IpRegistry {
     ) -> u64 {
         owner.require_auth();
 
-        require!(
-            commitment_hashes.len() > 0,
-            ContractError::BatchSizeMismatch
-        );
+        if commitment_hashes.len() == 0 {
+            panic_with_error!(&env, ContractError::BatchSizeMismatch);
+        }
 
         let root_hash = Self::compute_merkle_root(&env, &commitment_hashes);
         let timestamp = env.ledger().timestamp();
@@ -1575,7 +1652,7 @@ impl IpRegistry {
             .extend_ttl(&DataKey::MerkleRootRecord(root_id), LEDGER_BUMP, LEDGER_BUMP);
 
         env.events()
-            .publish((symbol_short!("merkle_root"),), (root_id, timestamp, root_hash));
+            .publish((Symbol::new(&env, "merkle_root"),), (root_id, timestamp, root_hash));
 
         root_id
     }
@@ -1677,7 +1754,9 @@ impl IpRegistry {
         owner.require_auth();
 
         let current_time = env.ledger().timestamp();
-        require!(unlock_time > current_time, ContractError::InvalidTimeLock);
+        if unlock_time <= current_time {
+            panic_with_error!(&env, ContractError::InvalidTimeLock);
+        }
         require_non_zero_commitment(&env, &commitment_hash);
         require_unique_commitment(&env, &commitment_hash);
 
@@ -1733,7 +1812,7 @@ impl IpRegistry {
             .extend_ttl(&DataKey::NextId, LEDGER_BUMP, LEDGER_BUMP);
 
         env.events().publish(
-            (symbol_short!("timelock_crt"),),
+            (Symbol::new(&env, "timelock_crt"),),
             (id, unlock_time, current_time),
         );
 
@@ -1742,7 +1821,10 @@ impl IpRegistry {
 
     /// Unlock and reveal a time-locked commitment.
     ///
-    /// Only callable after unlock_time has passed.
+    /// Authorization: only the IP owner may reveal the commitment, matching the
+    /// owner-signature model used by `amend_commitment`. The time lock itself
+    /// decides *when* the reveal is allowed: the owner may call this only once
+    /// `unlock_time` has passed.
     ///
     /// # Arguments
     ///
@@ -1762,6 +1844,9 @@ impl IpRegistry {
             return false;
         }
 
+        let record = require_ip_exists(&env, commitment_id);
+        record.owner.require_auth();
+
         let mut lock = timelock.unwrap();
         let current_time = env.ledger().timestamp();
 
@@ -1775,7 +1860,7 @@ impl IpRegistry {
             .set(&DataKey::TimeLockRecord(commitment_id), &lock);
 
         env.events()
-            .publish((symbol_short!("timelock_unlock"),), (commitment_id, current_time));
+            .publish((Symbol::new(&env, "timelock_unlock"),), (commitment_id, current_time));
 
         true
     }
@@ -1842,6 +1927,9 @@ impl IpRegistry {
                 LEDGER_BUMP,
             );
 
+        // #1100: verdicts cached against either commitment value are now stale.
+        zk_cache::invalidate(&env, &ip_record.commitment_hash);
+        zk_cache::invalidate(&env, &new_hash);
         ip_record.commitment_hash = new_hash.clone();
         env.storage()
             .persistent()
@@ -1857,6 +1945,12 @@ impl IpRegistry {
             .persistent()
             .set(&DataKey::CommitmentOwner(new_hash), &ip_record.owner);
 
+        Self::append_audit_entry(
+            &env,
+            commitment_id,
+            symbol_short!("amended"),
+            ip_record.owner.clone(),
+        );
         env.events().publish(
             (symbol_short!("amend_cmt"),),
             (commitment_id, amendment_id),
@@ -1885,10 +1979,9 @@ impl IpRegistry {
         privacy_level: u32,
         allowed_addresses: Vec<Address>,
     ) -> bool {
-        require!(
-            privacy_level <= 3,
-            ContractError::InvalidPrivacyLevel
-        );
+        if privacy_level > 3 {
+            panic_with_error!(&env, ContractError::InvalidPrivacyLevel);
+        }
 
         let mut record: Option<IpRecord> = env
             .storage()
@@ -1927,8 +2020,14 @@ impl IpRegistry {
                 LEDGER_BUMP,
             );
 
+        Self::append_audit_entry(
+            &env,
+            commitment_id,
+            symbol_short!("privacy"),
+            ip_record.owner.clone(),
+        );
         env.events()
-            .publish((symbol_short!("privacy_set"),), (commitment_id, privacy_level));
+            .publish((Symbol::new(&env, "privacy_set"),), (commitment_id, privacy_level));
 
         true
     }
@@ -2189,7 +2288,7 @@ impl IpRegistry {
             .set(&DataKey::OwnerIps(old_owner.clone()), &old_ids);
         env.storage()
             .persistent()
-            .extend_ttl(&DataKey::OwnerIps(old_owner.clone()), 50000, 50000);
+            .extend_ttl(&DataKey::OwnerIps(old_owner.clone()), LEDGER_BUMP, LEDGER_BUMP);
 
         // Add to new owner's index
         let mut new_ids: Vec<u64> = env
@@ -2203,7 +2302,7 @@ impl IpRegistry {
             .set(&DataKey::OwnerIps(new_owner.clone()), &new_ids);
         env.storage()
             .persistent()
-            .extend_ttl(&DataKey::OwnerIps(new_owner.clone()), 50000, 50000);
+            .extend_ttl(&DataKey::OwnerIps(new_owner.clone()), LEDGER_BUMP, LEDGER_BUMP);
 
         // Update commitment index
         env.storage().persistent().set(
@@ -2215,6 +2314,11 @@ impl IpRegistry {
             LEDGER_BUMP,
             LEDGER_BUMP,
         );
+
+        // #1146: authority state belongs to the outgoing owner, so clear it.
+        // The new owner starts with a single-owner cap table and no grants.
+        validation::clear_owner_scoped_state(&env, ip_id);
+        record.co_owners = Vec::new(&env);
 
         record.owner = new_owner.clone();
         env.storage()
@@ -2270,7 +2374,7 @@ impl IpRegistry {
             .set(&DataKey::IpRecord(ip_id), &record);
         env.storage()
             .persistent()
-            .extend_ttl(&DataKey::IpRecord(ip_id), 50000, 50000);
+            .extend_ttl(&DataKey::IpRecord(ip_id), LEDGER_BUMP, LEDGER_BUMP);
 
         env.events().publish(
             (REVOKE_TOPIC, record.owner.clone()),
@@ -2537,7 +2641,9 @@ impl IpRegistry {
 
     // ── Issue #455: Batch Metadata ──────────────────────────────────────────
     pub fn set_batch_metadata(env: Env, ip_id: u64, batch_id: BytesN<32>, description: Bytes) {
-        require_ip_exists(&env, ip_id);
+        // Only the IP owner may describe its batch; reads remain public.
+        let record = require_ip_exists(&env, ip_id);
+        record.owner.require_auth();
         if description.len() > MAX_METADATA_BYTES {
             panic_with_error!(&env, ContractError::BatchMetadataTooLarge);
         }
@@ -2577,7 +2683,9 @@ impl IpRegistry {
     }
 
     pub fn set_commitment_compression(env: Env, ip_id: u64, algorithm: CompressionAlgo) {
-        require_ip_exists(&env, ip_id);
+        // Only the IP owner may change how its commitment is stored and read back.
+        let record = require_ip_exists(&env, ip_id);
+        record.owner.require_auth();
         let selection = CompressionSelection { ip_id, algorithm };
         env.storage()
             .persistent()
@@ -2684,6 +2792,9 @@ impl IpRegistry {
         blinding_factor: BytesN<32>,
     ) -> bool {
         let record = require_ip_exists(&env, ip_id);
+        if record.revoked {
+            return false;
+        }
         if env
             .storage()
             .persistent()
@@ -2693,23 +2804,16 @@ impl IpRegistry {
             return false;
         }
 
-        // Emit EXPIRY_TOPIC exactly once per expiry transition so off-chain
-        // indexers can cheaply detect an IP crossing into its grace period.
-        if record.expiry_timestamp != 0 && env.ledger().timestamp() >= record.expiry_timestamp {
-            let already_notified: bool = env
-                .storage()
-                .persistent()
-                .get(&DataKey::ExpiryNotified(ip_id))
-                .unwrap_or(false);
-            if !already_notified {
-                env.events().publish(
-                    (EXPIRY_TOPIC, ip_id),
-                    (record.owner.clone(), record.expiry_timestamp),
-                );
-                env.storage()
-                    .persistent()
-                    .set(&DataKey::ExpiryNotified(ip_id), &true);
-            }
+        // Expired past the grace period: the commitment is no longer verifiable.
+        // Inside the grace period (expiry..expiry+grace) verification still succeeds.
+        // Read-only: expiry transition events are emitted by `notify_ip_expiry`.
+        if record.expiry_timestamp != 0
+            && env.ledger().timestamp()
+                >= record
+                    .expiry_timestamp
+                    .saturating_add(record.grace_period_seconds)
+        {
+            return false;
         }
 
         let algorithm: CommitmentAlgorithm = env
@@ -2899,7 +3003,17 @@ impl IpRegistry {
         }
 
         record.owner.require_auth();
-        Self::reveal_partial_authorized(&env, &record, ip_id, partial_hash, blinding_factor)
+        let revealed =
+            Self::reveal_partial_authorized(&env, &record, ip_id, partial_hash, blinding_factor);
+        if revealed {
+            Self::append_audit_entry(
+                &env,
+                ip_id,
+                symbol_short!("revealed"),
+                record.owner.clone(),
+            );
+        }
+        revealed
     }
 
     /// Reveal a commitment through an authority delegated by its owner.
@@ -2955,7 +3069,7 @@ impl IpRegistry {
         );
 
         env.events().publish(
-            (symbol_short!("partial"), record.owner),
+            (symbol_short!("partial"), record.owner.clone()),
             (ip_id, partial_hash),
         );
 
@@ -2984,6 +3098,12 @@ impl IpRegistry {
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::Archived(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+        Self::append_audit_entry(
+            &env,
+            ip_id,
+            symbol_short!("archived"),
+            record.owner.clone(),
+        );
         env.events()
             .publish((symbol_short!("archived"),), (ip_id, record.owner));
     }
@@ -3081,6 +3201,12 @@ impl IpRegistry {
                 terms_hash,
             });
         }
+        Self::append_audit_entry(
+            &env,
+            ip_id,
+            symbol_short!("lic_grnt"),
+            record.owner.clone(),
+        );
 
         env.storage()
             .persistent()
@@ -3105,6 +3231,12 @@ impl IpRegistry {
 
         if let Some(pos) = licenses.iter().position(|e| e.licensee == licensee) {
             licenses.remove(pos as u32);
+            Self::append_audit_entry(
+                &env,
+                ip_id,
+                symbol_short!("lic_rvk"),
+                record.owner.clone(),
+            );
         } else {
             env.panic_with_error(Error::from_contract_error(
                 ContractError::LicenseeNotFound as u32,
@@ -3710,7 +3842,7 @@ impl IpRegistry {
             }
         }
 
-        Self::verify_merkle_proof(&env, &record.commitment_hash, &proof, &hashes)
+        Self::verify_merkle_leaf_path(&env, &record.commitment_hash, &proof, &hashes)
     }
 
     // ── Issue #435: Generate Merkle Proof ─────────────────────────────────────
@@ -3861,7 +3993,7 @@ impl IpRegistry {
         current_level.get(0).unwrap()
     }
 
-    fn verify_merkle_proof(
+    fn verify_merkle_leaf_path(
         env: &Env,
         leaf: &BytesN<32>,
         proof: &Vec<BytesN<32>>,
@@ -3990,6 +4122,12 @@ impl IpRegistry {
             LEDGER_BUMP,
         );
 
+        Self::append_audit_entry(
+            &env,
+            ip_id,
+            symbol_short!("acc_grnt"),
+            record.owner.clone(),
+        );
         env.events()
             .publish((symbol_short!("ac_grant"), ip_id), (grantee, access_level));
     }
@@ -4017,6 +4155,12 @@ impl IpRegistry {
                 LEDGER_BUMP,
             );
 
+            Self::append_audit_entry(
+                &env,
+                ip_id,
+                symbol_short!("acc_rvk"),
+                record.owner.clone(),
+            );
             env.events()
                 .publish((symbol_short!("ac_revoke"), ip_id), grantee);
         }
@@ -4899,6 +5043,152 @@ impl IpRegistry {
         );
     }
 
+    // ── Issue #1104: Random-nonce ownership challenge ──────────────────────────
+
+    /// Issue a random ownership challenge for a commitment.
+    ///
+    /// Generates 32 random bytes on-chain and stores them as the open challenge
+    /// for `commitment_id`. Issuing a new challenge replaces any earlier challenge
+    /// that is still unanswered. The holder proves control by calling
+    /// `respond_to_commitment_challenge` before the challenge expires.
+    ///
+    /// Returns the challenge bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the commitment does not exist or has been revoked.
+    pub fn challenge_ownership(env: Env, commitment_id: u64) -> Bytes {
+        let record = require_ip_exists(&env, commitment_id);
+        if record.revoked {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::IpAlreadyRevoked as u32,
+            ));
+        }
+
+        let challenge: Bytes = env.prng().gen_len(32);
+        let now = env.ledger().timestamp();
+        let ttl_seconds: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ChallengeTtl)
+            .unwrap_or(DEFAULT_CHALLENGE_TTL_SECONDS);
+
+        let record_key = DataKey::CommitmentChallenge(commitment_id);
+        let open = CommitmentChallenge {
+            challenge: challenge.clone(),
+            issued_at: now,
+            expires_at: now + ttl_seconds,
+            answered: false,
+        };
+        env.storage().persistent().set(&record_key, &open);
+        env.storage()
+            .persistent()
+            .extend_ttl(&record_key, LEDGER_BUMP, LEDGER_BUMP);
+
+        let mut stats = Self::load_challenge_stats(&env, commitment_id);
+        stats.issued += 1;
+        Self::save_challenge_stats(&env, commitment_id, &stats);
+
+        challenge
+    }
+
+    /// Answer the open ownership challenge for a commitment.
+    ///
+    /// Only the commitment owner can answer, enforced with `require_auth`. That
+    /// signature is the proof of control. The response must equal
+    /// `sha256(commitment_hash || challenge)`.
+    ///
+    /// The challenge is single-use. A wrong response is recorded as a failure and
+    /// returns `false` without reverting, so the failure counter persists. A
+    /// correct response returns `true` and is recorded as a success.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the caller is not the owner, no challenge is open, the challenge
+    /// was already answered, or it has expired.
+    pub fn respond_to_commitment_challenge(env: Env, commitment_id: u64, response: BytesN<32>) -> bool {
+        let record = require_ip_exists(&env, commitment_id);
+        record.owner.require_auth();
+
+        let record_key = DataKey::CommitmentChallenge(commitment_id);
+        let mut open: CommitmentChallenge = env
+            .storage()
+            .persistent()
+            .get(&record_key)
+            .unwrap_or_else(|| {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::CommitmentChallengeNotFound as u32,
+                ))
+            });
+
+        if open.answered {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::ChallengeAlreadyAnswered as u32,
+            ));
+        }
+        if env.ledger().timestamp() > open.expires_at {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::ChallengeExpired as u32,
+            ));
+        }
+
+        let mut preimage = Bytes::new(&env);
+        preimage.append(&record.commitment_hash.into());
+        preimage.append(&open.challenge);
+        let expected: BytesN<32> = env.crypto().sha256(&preimage).into();
+        let matched = response == expected;
+
+        open.answered = true;
+        env.storage().persistent().set(&record_key, &open);
+        env.storage()
+            .persistent()
+            .extend_ttl(&record_key, LEDGER_BUMP, LEDGER_BUMP);
+
+        let mut stats = Self::load_challenge_stats(&env, commitment_id);
+        if matched {
+            stats.succeeded += 1;
+        } else {
+            stats.failed += 1;
+        }
+        Self::save_challenge_stats(&env, commitment_id, &stats);
+
+        env.events().publish(
+            (symbol_short!("ch_ans"), record.owner),
+            (commitment_id, matched),
+        );
+
+        matched
+    }
+
+    /// Outcome counters for a commitment's ownership challenges.
+    pub fn get_challenge_stats(env: Env, commitment_id: u64) -> ChallengeStats {
+        Self::load_challenge_stats(&env, commitment_id)
+    }
+
+    /// Success rate of answered ownership challenges, in basis points
+    /// (0–10_000). Returns 0 when no challenge has been answered yet.
+    pub fn get_challenge_success_rate_bps(env: Env, commitment_id: u64) -> u32 {
+        let stats = Self::load_challenge_stats(&env, commitment_id);
+        let answered = stats.succeeded + stats.failed;
+        if answered == 0 {
+            return 0;
+        }
+        ((stats.succeeded * 10_000) / answered) as u32
+    }
+
+    fn load_challenge_stats(env: &Env, commitment_id: u64) -> ChallengeStats {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ChallengeStats(commitment_id))
+            .unwrap_or_default()
+    }
+
+    fn save_challenge_stats(env: &Env, commitment_id: u64, stats: &ChallengeStats) {
+        let key = DataKey::ChallengeStats(commitment_id);
+        env.storage().persistent().set(&key, stats);
+        env.storage().persistent().extend_ttl(&key, LEDGER_BUMP, LEDGER_BUMP);
+    }
+
     // ── Issue #434: Encryption Key Rotation ───────────────────────────────────
 
     /// Rotate the commitment key for an IP.
@@ -4969,6 +5259,10 @@ impl IpRegistry {
             LEDGER_BUMP,
         );
 
+        // #1100: verdicts cached against either commitment value are now stale.
+        zk_cache::invalidate(&env, &record.commitment_hash);
+        zk_cache::invalidate(&env, &new_commitment_hash);
+
         // Update the record
         record.commitment_hash = new_commitment_hash.clone();
         env.storage()
@@ -4978,6 +5272,12 @@ impl IpRegistry {
             .persistent()
             .extend_ttl(&DataKey::IpRecord(ip_id), LEDGER_BUMP, LEDGER_BUMP);
 
+        Self::append_audit_entry(
+            &env,
+            ip_id,
+            symbol_short!("key_rot"),
+            record.owner.clone(),
+        );
         env.events().publish(
             (symbol_short!("key_rot"), record.owner.clone()),
             (ip_id, new_commitment_hash),
@@ -5170,6 +5470,10 @@ impl IpRegistry {
     /// Stake XLM (represented as an i128 amount) against an IP commitment.
     /// Only the IP owner may stake. One active stake per IP.
     pub fn stake_commitment(env: Env, ip_id: u64, amount: i128) {
+        // #1162: Reject non-positive stakes.
+        if amount <= 0 {
+            panic_with_error!(&env, ContractError::InvalidStakeAmount);
+        }
         let record = require_ip_exists(&env, ip_id);
         record.owner.require_auth();
 
@@ -5207,6 +5511,10 @@ impl IpRegistry {
         for i in 0..ip_ids.len() {
             let ip_id = ip_ids.get(i).unwrap();
             let amount = amounts.get(i).unwrap();
+            // #1162: Reject non-positive stakes.
+            if amount <= 0 {
+                panic_with_error!(&env, ContractError::InvalidStakeAmount);
+            }
             let record = require_ip_exists(&env, ip_id);
             record.owner.require_auth();
 
@@ -6027,8 +6335,30 @@ impl IpRegistry {
         for req in requests.iter() {
             let record = require_ip_exists(&env, req.ip_id);
 
+            // #1101: audit commitment parameter problems. The verdict below is
+            // already false for these, the event records why.
+            if let Err(err) = zk_commitment::validate_commitment_point(&record.commitment_hash) {
+                env.events().publish(
+                    (symbol_short!("param_aud"),),
+                    (req.ip_id, err.audit_code()),
+                );
+            }
+
+            // #1102: alert on commitments showing weak-randomness signatures.
+            // The commitment is still verified; the alert is advisory.
+            let assessment =
+                commitment_randomness::assess(&record.commitment_hash.to_array());
+            if assessment.is_suspicious() {
+                let code = assessment.pattern.map_or(0, |p| p.alert_code());
+                env.events().publish(
+                    (Symbol::new(&env, "rand_alert"),),
+                    (req.ip_id, code, assessment.distinct_bytes),
+                );
+            }
+
+            // #1100: reuse a cached verdict when this exact proof was checked before.
             let valid =
-                zk_commitment::verify_hiding_proof(&env, &record.commitment_hash, &req.proof);
+                zk_cache::verify_cached(&env, &record.commitment_hash, &req.proof);
             results.push_back(VerifyResult {
                 ip_id: req.ip_id,
                 valid,
@@ -6038,6 +6368,12 @@ impl IpRegistry {
                 valid_hashes.push_back(record.commitment_hash);
             }
         }
+
+        let cache = zk_cache::stats(&env);
+        env.events().publish(
+            (symbol_short!("zk_cache"),),
+            (cache.hits, cache.misses, cache.hit_rate_bps()),
+        );
 
         let valid_count = valid_hashes.len();
         let aggregate_proof = aggregate_batch_proof(&env, &valid_hashes);
@@ -6618,6 +6954,40 @@ impl IpRegistry {
             .remove(&DataKey::ExpiryNotified(ip_id));
     }
 
+    /// Emit `EXPIRY_TOPIC` once for an IP's expiry transition. Anyone can call.
+    ///
+    /// Expiry notifications used to be emitted from `verify_commitment`, which made a
+    /// read path write state and emit events. This state-changing entry point owns
+    /// that transition instead. Indexers should call it, or watch for the event.
+    ///
+    /// Returns `true` only when this call emitted the event. It returns `false` if
+    /// the IP has no expiry, has not reached it yet, or was already notified for the
+    /// current expiry. `set_ip_expiry` and `renew_ip_commitment` reset the flag.
+    pub fn notify_ip_expiry(env: Env, ip_id: u64) -> bool {
+        let record = require_ip_exists(&env, ip_id);
+        if record.expiry_timestamp == 0 || env.ledger().timestamp() < record.expiry_timestamp {
+            return false;
+        }
+
+        let already_notified: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ExpiryNotified(ip_id))
+            .unwrap_or(false);
+        if already_notified {
+            return false;
+        }
+
+        env.events().publish(
+            (EXPIRY_TOPIC, ip_id),
+            (record.owner.clone(), record.expiry_timestamp),
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::ExpiryNotified(ip_id), &true);
+        true
+    }
+
     /// Renew an IP commitment's expiry. Owner-only.
     /// new_expiry must be strictly greater than the current expiry_timestamp.
     pub fn renew_ip_commitment(env: Env, ip_id: u64, new_expiry: u64) -> bool {
@@ -6650,9 +7020,13 @@ impl IpRegistry {
         true
     }
 
-    /// Remove expired IPs that are past their grace period. Anyone can call.
+    /// Remove expired IPs that are past their grace period. Admin-only.
     /// Skips IPs with expiry_timestamp == 0 (no expiry set).
+    /// Removes the record plus its `OwnerIps` and `CommitmentOwner` index entries.
     pub fn cleanup_expired_ips(env: Env, ip_ids: Vec<u64>) {
+        // Admin-only: deleting records must not be open to arbitrary callers.
+        Self::require_admin(&env).require_auth();
+
         let now = env.ledger().timestamp();
         for ip_id in ip_ids.iter() {
             let record: Option<IpRecord> =
@@ -6666,6 +7040,28 @@ impl IpRegistry {
                         .expiry_timestamp
                         .saturating_add(rec.grace_period_seconds)
                 {
+                    // Drop index entries in the same call so no dangling references remain.
+                    let owner_ids: Option<Vec<u64>> = env
+                        .storage()
+                        .persistent()
+                        .get(&DataKey::OwnerIps(rec.owner.clone()));
+                    if let Some(owner_ids) = owner_ids {
+                        if owner_ids.iter().any(|id| id == ip_id) {
+                            let mut kept: Vec<u64> = Vec::new(&env);
+                            for id in owner_ids.iter() {
+                                if id != ip_id {
+                                    kept.push_back(id);
+                                }
+                            }
+                            env.storage()
+                                .persistent()
+                                .set(&DataKey::OwnerIps(rec.owner.clone()), &kept);
+                        }
+                    }
+                    env.storage()
+                        .persistent()
+                        .remove(&DataKey::CommitmentOwner(rec.commitment_hash.clone()));
+
                     env.storage().persistent().remove(&DataKey::IpRecord(ip_id));
                     env.events()
                         .publish((symbol_short!("ip_clean"),), (ip_id, now));
@@ -6734,6 +7130,199 @@ impl IpRegistry {
     /// Option<IpMetadata> containing the encrypted metadata if it exists
     pub fn get_commitment_metadata(env: Env, ip_id: u64) -> Option<types::IpMetadata> {
         metadata::get_metadata(&env, ip_id)
+    }
+
+    // ── Issue #1105: Encrypted metadata key management ────────────────────────
+
+    /// Register a metadata encryption key (admin only).
+    ///
+    /// Only the key's fingerprint (e.g. its SHA-256) is stored on-chain, never the
+    /// key itself. A registered key is not used for writes until
+    /// `rotate_metadata_key` makes it active.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the caller is not the admin or `key_id` is already registered.
+    pub fn register_metadata_key(env: Env, key_id: u32, fingerprint: BytesN<32>) {
+        Self::require_admin(&env).require_auth();
+
+        let key = DataKey::MetadataKey(key_id);
+        if env.storage().persistent().has(&key) {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::MetadataKeyAlreadyRegistered as u32,
+            ));
+        }
+
+        let record = MetadataKeyRecord {
+            key_id,
+            fingerprint,
+            registered_at: env.ledger().timestamp(),
+            retired: false,
+        };
+        env.storage().persistent().set(&key, &record);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, LEDGER_BUMP, LEDGER_BUMP);
+    }
+
+    /// Make a registered key the active key for new encrypted metadata writes (admin only).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the caller is not the admin, the key is not registered, or the key is retired.
+    pub fn rotate_metadata_key(env: Env, key_id: u32) {
+        Self::require_admin(&env).require_auth();
+
+        let record = Self::load_metadata_key(&env, key_id);
+        if record.retired {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::MetadataKeyRetired as u32,
+            ));
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ActiveMetadataKey, &key_id);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::ActiveMetadataKey, LEDGER_BUMP, LEDGER_BUMP);
+    }
+
+    /// Retire a metadata key (admin only). A retired key can no longer be used for
+    /// writes but its existing ciphertext stays readable. Retiring the active key
+    /// clears it, so writes fail until another key is activated.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the caller is not the admin or the key is not registered.
+    pub fn retire_metadata_key(env: Env, key_id: u32) {
+        Self::require_admin(&env).require_auth();
+
+        let mut record = Self::load_metadata_key(&env, key_id);
+        record.retired = true;
+        let key = DataKey::MetadataKey(key_id);
+        env.storage().persistent().set(&key, &record);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, LEDGER_BUMP, LEDGER_BUMP);
+
+        let active: Option<u32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActiveMetadataKey);
+        if active == Some(key_id) {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::ActiveMetadataKey);
+        }
+    }
+
+    /// Look up a registered metadata key by ID.
+    pub fn get_metadata_key(env: Env, key_id: u32) -> Option<MetadataKeyRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MetadataKey(key_id))
+    }
+
+    /// The key ID currently used for new encrypted metadata writes, if any.
+    pub fn get_active_metadata_key(env: Env) -> Option<u32> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ActiveMetadataKey)
+    }
+
+    fn load_metadata_key(env: &Env, key_id: u32) -> MetadataKeyRecord {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MetadataKey(key_id))
+            .unwrap_or_else(|| {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::MetadataKeyNotFound as u32,
+                ))
+            })
+    }
+
+    // ── Issue #1105: Field-level encrypted metadata ───────────────────────────
+
+    /// Store field-level encrypted metadata for a commitment (owner only).
+    ///
+    /// The owner encrypts each field client-side under the active metadata key and
+    /// passes the ciphertexts here. `tag_hashes` are blinded search tags, indexed
+    /// for `search_commitment_metadata`, so search still works without plaintext.
+    /// A new record replaces the previous one, and its tags are re-indexed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the IP does not exist or is revoked, the caller is not the owner,
+    /// no metadata key is active, or the fields or tags fail validation.
+    pub fn store_encrypted_metadata(
+        env: Env,
+        ip_id: u64,
+        fields: soroban_sdk::Map<soroban_sdk::Symbol, EncryptedField>,
+        tag_hashes: soroban_sdk::Vec<BytesN<32>>,
+    ) {
+        let record = require_ip_exists(&env, ip_id);
+        if record.revoked {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::IpAlreadyRevoked as u32,
+            ));
+        }
+        record.owner.require_auth();
+
+        let key_id: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActiveMetadataKey)
+            .unwrap_or_else(|| {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::MetadataKeyNotFound as u32,
+                ))
+            });
+
+        metadata::store_encrypted_fields(&env, ip_id, key_id, fields, tag_hashes);
+        Self::append_audit_entry(
+            &env,
+            ip_id,
+            symbol_short!("md_store"),
+            record.owner.clone(),
+        );
+    }
+
+    /// Public summary of an IP's encrypted metadata: key ID, field names and
+    /// timestamp. Ciphertexts are not included. Use `get_encrypted_metadata_field`.
+    pub fn get_encrypted_metadata_info(env: Env, ip_id: u64) -> Option<EncryptedMetadataInfo> {
+        metadata::get_encrypted_info(&env, ip_id)
+    }
+
+    /// Ciphertext of one field, released only to an authorized requester.
+    ///
+    /// The requester must authenticate and must be the owner or hold any grant from
+    /// `grant_ip_access` (levels 1–3). Other fields stay encrypted. Returns `None`
+    /// if the field does not exist.
+    ///
+    /// # Panics
+    ///
+    /// Panics with `AccessDenied` if the requester is not authorized.
+    pub fn get_encrypted_metadata_field(
+        env: Env,
+        ip_id: u64,
+        field: soroban_sdk::Symbol,
+        requester: Address,
+    ) -> Option<EncryptedField> {
+        requester.require_auth();
+        if !Self::check_ip_access(
+            env.clone(),
+            ip_id,
+            requester.clone(),
+            METADATA_FIELD_ACCESS_LEVEL,
+        ) {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::AccessDenied as u32,
+            ));
+        }
+        // Track who read which field, and when, in the immutable audit trail.
+        Self::append_audit_entry(&env, ip_id, symbol_short!("md_read"), requester);
+        metadata::get_encrypted_field(&env, ip_id, field)
     }
 
     // ── Issue #1070: Verifiable Commitment Timestamps with Notary ─────────────
@@ -8568,6 +9157,71 @@ mod tests {
         );
     }
 
+    /// #1156: a non-owner must not be able to rewrite an IP's batch metadata.
+    #[test]
+    fn test_set_batch_metadata_rejects_non_owner() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+        let attacker = Address::generate(&env);
+
+        let hash = BytesN::from_array(&env, &[0x15u8; 32]);
+        let ip_id = client.commit_ip(&owner, &hash, &0u32);
+
+        let batch_id = BytesN::from_array(&env, &[0xCAu8; 32]);
+        let description = soroban_sdk::Bytes::from_array(&env, b"forged");
+
+        // Only the attacker's auth is mocked; the owner's auth is absent.
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &attacker,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "set_batch_metadata",
+                args: (ip_id, batch_id.clone(), description.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        assert!(client
+            .try_set_batch_metadata(&ip_id, &batch_id, &description)
+            .is_err());
+
+        // Nothing was written.
+        assert!(client.get_batch_metadata(&ip_id).is_none());
+    }
+
+    /// #1156: the owner can still write, and reads stay public without auth.
+    #[test]
+    fn test_set_batch_metadata_owner_writes_and_reads_are_public() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+
+        let hash = BytesN::from_array(&env, &[0x16u8; 32]);
+        let ip_id = client.commit_ip(&owner, &hash, &0u32);
+
+        let batch_id = BytesN::from_array(&env, &[0xDAu8; 32]);
+        let description = soroban_sdk::Bytes::from_array(&env, b"owner");
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &owner,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "set_batch_metadata",
+                args: (ip_id, batch_id.clone(), description.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.set_batch_metadata(&ip_id, &batch_id, &description);
+
+        // Read with no auth mocked at all.
+        env.mock_auths(&[]);
+        let meta = client.get_batch_metadata(&ip_id).unwrap();
+        assert_eq!(meta.description, description);
+    }
+
     // ── Issue #456: Compression Algorithm Selection Tests ────────────────────
 
     #[test]
@@ -8666,6 +9320,77 @@ mod tests {
 
         client.set_commitment_compression(&ip_id, &CompressionAlgo::None);
         assert_eq!(client.get_compressed_bytes(&ip_id).len(), 32);
+    }
+
+    /// #1157: a non-owner must not be able to change an IP's compression algorithm.
+    #[test]
+    fn test_set_compression_rejects_non_owner() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+        let attacker = Address::generate(&env);
+
+        let hash = BytesN::from_array(&env, &[0x27u8; 32]);
+        let ip_id = client.commit_ip(&owner, &hash, &0u32);
+
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &attacker,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "set_commitment_compression",
+                args: (ip_id, CompressionAlgo::None).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        assert!(client
+            .try_set_commitment_compression(&ip_id, &CompressionAlgo::None)
+            .is_err());
+
+        // The default algorithm is untouched.
+        env.mock_auths(&[]);
+        assert_eq!(
+            client.get_commitment_compression(&ip_id),
+            CompressionAlgo::Truncate16
+        );
+    }
+
+    /// #1157 regression: compressed bytes round-trip correctly for every algorithm
+    /// on a non-uniform hash, so byte-order or fold mistakes are caught.
+    #[test]
+    fn test_compressed_bytes_round_trip_regression() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+
+        let mut raw = [0u8; 32];
+        for (i, b) in raw.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(7).wrapping_add(3);
+        }
+        let hash = BytesN::from_array(&env, &raw);
+        let ip_id = client.commit_ip(&owner, &hash, &0u32);
+
+        client.set_commitment_compression(&ip_id, &CompressionAlgo::None);
+        assert_eq!(
+            client.get_compressed_bytes(&ip_id),
+            soroban_sdk::Bytes::from_slice(&env, &raw)
+        );
+
+        client.set_commitment_compression(&ip_id, &CompressionAlgo::Truncate16);
+        assert_eq!(
+            client.get_compressed_bytes(&ip_id),
+            soroban_sdk::Bytes::from_slice(&env, &raw[..16])
+        );
+
+        let fold = raw.iter().fold(0u8, |acc, b| acc ^ b);
+        client.set_commitment_compression(&ip_id, &CompressionAlgo::Xor8);
+        assert_eq!(
+            client.get_compressed_bytes(&ip_id),
+            soroban_sdk::Bytes::from_slice(&env, &[fold; 8])
+        );
     }
 
     // ── Issue #457: Commitment Encryption Tests ───────────────────────────────
@@ -9619,5 +10344,166 @@ mod tests {
 
         // id2 must appear in cat_into.
         assert!(in_into.contains(&id2));
+    }
+}
+
+// ── Issue #1232: Revocation property tests ────────────────────────────────
+//
+// Property: once an IP has been revoked, no subsequent operation may
+// transfer it or successfully verify its commitment. Random sequences of
+// revoke / transfer / verify operations are generated and, after every
+// revoke, the invariant is asserted directly.
+#[cfg(test)]
+mod revocation_property_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use proptest::test_runner::{Config as ProptestConfig, RngAlgorithm, TestRng};
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    /// Fixed seed so CI runs are reproducible.
+    const FIXED_SEED: [u8; 32] = [0x12u8; 32];
+
+    /// A single operation in a random sequence.
+    #[derive(Clone, Copy, Debug)]
+    enum Op {
+        Revoke,
+        Transfer,
+        Verify,
+    }
+
+    fn op_strategy() -> impl Strategy<Value = Op> {
+        prop_oneof![
+            Just(Op::Revoke),
+            Just(Op::Transfer),
+            Just(Op::Verify),
+        ]
+    }
+
+    fn sequence_strategy() -> impl Strategy<Value = std::vec::Vec<Op>> {
+        prop::collection::vec(op_strategy(), 1..12)
+    }
+
+    fn fixed_config() -> ProptestConfig {
+        let mut config = ProptestConfig::default();
+        config.cases = 32;
+        config.rng_algorithm = RngAlgorithm::ChaCha;
+        config.rng_seed = TestRng::from_seed(RngAlgorithm::ChaCha, &FIXED_SEED);
+        config
+    }
+
+    /// Runs one random sequence against a fresh contract instance and
+    /// asserts the revocation invariant after every revoke.
+    fn run_sequence(ops: &[Op]) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let secret = BytesN::from_array(&env, &[0x5Au8; 32]);
+        let blinding = BytesN::from_array(&env, &[0xA5u8; 32]);
+        let mut preimage = Bytes::new(&env);
+        preimage.append(&secret.clone().into());
+        preimage.append(&blinding.clone().into());
+        let commitment: BytesN<32> = env.crypto().sha256(&preimage).into();
+
+        let ip_id = client.commit_ip(&owner, &commitment, &0u32);
+
+        let mut revoked = false;
+
+        for op in ops {
+            match op {
+                Op::Revoke => {
+                    if revoked {
+                        // Double revoke must fail; invariant already holds.
+                        let result = catch_unwind(AssertUnwindSafe(|| {
+                            client.revoke_ip(&ip_id);
+                        }));
+                        assert!(result.is_err(), "double revoke must fail");
+                        continue;
+                    }
+                    client.revoke_ip(&ip_id);
+                    revoked = true;
+
+                    // Invariant: the record is marked revoked.
+                    assert!(
+                        client.get_ip(&ip_id).revoked,
+                        "record must be marked revoked"
+                    );
+
+                    // Invariant: transfer after revoke must fail.
+                    let transfer_result = catch_unwind(AssertUnwindSafe(|| {
+                        client.transfer_ip(&ip_id, &owner, &recipient);
+                    }));
+                    assert!(
+                        transfer_result.is_err(),
+                        "transfer of a revoked IP must fail"
+                    );
+
+                    // Invariant: verification after revoke must not succeed.
+                    let verify_result = catch_unwind(AssertUnwindSafe(|| {
+                        client.verify_commitment(&ip_id, &secret, &blinding)
+                    }));
+                    match verify_result {
+                        Ok(valid) => assert!(
+                            !valid,
+                            "verification of a revoked IP must not succeed"
+                        ),
+                        Err(_) => { /* erroring out is also acceptable */ }
+                    }
+
+                    // Ownership must be unchanged by the failed transfer.
+                    assert_eq!(
+                        client.get_ip(&ip_id).owner,
+                        owner,
+                        "owner must not change after a failed transfer"
+                    );
+                }
+                Op::Transfer => {
+                    let result = catch_unwind(AssertUnwindSafe(|| {
+                        client.transfer_ip(&ip_id, &owner, &recipient);
+                    }));
+                    if revoked {
+                        assert!(result.is_err(), "transfer of a revoked IP must fail");
+                    }
+                }
+                Op::Verify => {
+                    let result = catch_unwind(AssertUnwindSafe(|| {
+                        client.verify_commitment(&ip_id, &secret, &blinding)
+                    }));
+                    if revoked {
+                        match result {
+                            Ok(valid) => assert!(
+                                !valid,
+                                "verification of a revoked IP must not succeed"
+                            ),
+                            Err(_) => { /* erroring out is also acceptable */ }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(fixed_config())]
+
+        /// Issue #1232: random revoke/transfer/verify sequences never allow a
+        /// revoked IP to be transferred or successfully verified.
+        #[test]
+        fn prop_revoked_ip_cannot_be_transferred_or_verified(
+            ops in sequence_strategy()
+        ) {
+            run_sequence(&ops);
+        }
+    }
+
+    /// Sanity check that the invariant is actually exercised: a sequence that
+    /// revokes first must leave the IP revoked and untransferable.
+    #[test]
+    fn test_revocation_invariant_smoke() {
+        run_sequence(&[Op::Revoke, Op::Transfer, Op::Verify]);
     }
 }
