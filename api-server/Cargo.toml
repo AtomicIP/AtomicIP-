@@ -3,11 +3,6 @@ name = "api-server"
 version = "0.1.0"
 edition = "2021"
 
-# Stand-alone workspace declaration so this crate can be built independently
-# without being added to the root workspace (which has a separate Soroban
-# contract dependency graph).
-[workspace]
-
 [[bin]]
 name = "api-server"
 path = "src/main.rs"
@@ -38,19 +33,22 @@ dashmap = "5"
 tokio-tungstenite = "0.21"
 futures = "0.3"
 uuid = { version = "1", features = ["v4", "serde"] }
-async-graphql = "7"
-async-graphql-axum = "7"
+async-graphql = "7.0.7"
+async-graphql-axum = "7.0.7"
 sha2 = "0.10"
 hex = "0.4"
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 ed25519-dalek = "2"
+base32 = "0.4"
 hmac = "0.12"
+sha1 = "0.10"
 jsonwebtoken = "9"
 stellar-strkey = "0.0.8"
 rand = "0.8.6"
 regex = "1"
 base64 = "0.22"
+base32 = "0.4"
 flate2 = "1.0"
 brotli = "7.0"
 redis = { version = "0.27", features = ["r2d2", "tokio-comp", "aio", "connection-manager"] }

@@ -4,8 +4,11 @@
 /// without compromising privacy. Metadata is AES-GCM encrypted and indexed by tags
 /// for efficient searching.
 
-use crate::types::{DataKey, IpMetadata, MetadataSearchResult};
-use soroban_sdk::{Bytes, BytesN, Env, Vec};
+use crate::types::{
+    DataKey, EncryptedField, EncryptedMetadataInfo, EncryptedMetadataRecord, IpMetadata,
+    MetadataSearchResult,
+};
+use soroban_sdk::{Bytes, BytesN, Env, Map, Symbol, Vec};
 
 /// Maximum number of results per search page
 pub const MAX_SEARCH_RESULTS: u32 = 100;
@@ -43,7 +46,7 @@ pub fn store_metadata(
     env.storage().persistent().set(&key, &metadata);
     env.storage()
         .persistent()
-        .extend_ttl(&key, 6_307_200, 6_307_200);
+        .extend_ttl(&key, LEDGER_BUMP, LEDGER_BUMP);
 
     // Index by each tag for search
     for i in 0..tag_hashes.len() {
@@ -70,7 +73,7 @@ fn index_metadata_by_tag(env: &Env, tag_hash: &BytesN<32>, ip_id: u64) {
     env.storage().persistent().set(&key, &ip_ids);
     env.storage()
         .persistent()
-        .extend_ttl(&key, 6_307_200, 6_307_200);
+        .extend_ttl(&key, LEDGER_BUMP, LEDGER_BUMP);
 }
 
 /// Search for commitments by tag with pagination.
@@ -97,7 +100,7 @@ pub fn search_by_metadata(
         limit
     };
 
-    let key = DataKey::MetadataTagIndex(tag_hash);
+    let key = DataKey::MetadataTagIndex(tag_hash.clone());
     let ip_ids: Vec<u64> = env
         .storage()
         .persistent()
@@ -108,11 +111,11 @@ pub fn search_by_metadata(
 
     // Calculate pagination
     let start = offset as usize;
-    let end = ((offset + limit) as usize).min(ip_ids.len());
+    let end = ((offset + limit) as usize).min(ip_ids.len() as usize);
 
     let mut result_ids = Vec::new(env);
 
-    if start < ip_ids.len() {
+    if start < ip_ids.len() as usize {
         for i in start..end {
             if let Some(ip_id) = ip_ids.get(i as u32) {
                 result_ids.push_back(ip_id);
@@ -121,7 +124,7 @@ pub fn search_by_metadata(
     }
 
     // Determine if there are more results
-    let next_cursor = if end < ip_ids.len() {
+    let next_cursor = if end < ip_ids.len() as usize {
         // Store cursor as hash of (tag_hash || offset)
         let mut cursor_bytes = Bytes::new(env);
         cursor_bytes.append(&Bytes::from(tag_hash.clone()));
@@ -163,35 +166,131 @@ pub fn get_metadata(env: &Env, ip_id: u64) -> Option<IpMetadata> {
 /// * `ip_id` - The IP ID whose metadata should be deleted
 pub fn delete_metadata(env: &Env, ip_id: u64) {
     if let Some(metadata) = get_metadata(env, ip_id) {
-        // Remove from tag indices
-        for i in 0..metadata.tag_hashes.len() {
-            if let Some(tag_hash) = metadata.tag_hashes.get(i) {
-                let key = DataKey::MetadataTagIndex(tag_hash);
-                if let Some(mut ip_ids) = env.storage().persistent().get::<_, Vec<u64>>(&key) {
-                    // Remove this IP from the index
-                    let mut new_ids = Vec::new(env);
-                    for j in 0..ip_ids.len() {
-                        if let Some(id) = ip_ids.get(j) {
-                            if id != ip_id {
-                                new_ids.push_back(id);
-                            }
-                        }
-                    }
-
-                    if new_ids.is_empty() {
-                        env.storage().persistent().remove(&key);
-                    } else {
-                        env.storage().persistent().set(&key, &new_ids);
-                    }
-                }
-            }
-        }
+        remove_tag_indices(env, ip_id, &metadata.tag_hashes);
     }
 
     // Remove the metadata itself
     env.storage()
         .persistent()
         .remove(&DataKey::IpMetadata(ip_id));
+
+    // Issue #1105: field-level encrypted metadata is removed the same way.
+    if let Some(encrypted) = get_encrypted_record(env, ip_id) {
+        remove_tag_indices(env, ip_id, &encrypted.tag_hashes);
+    }
+    env.storage()
+        .persistent()
+        .remove(&DataKey::EncryptedMetadata(ip_id));
+}
+
+/// Remove `ip_id` from the search index of each tag, dropping index entries left empty.
+fn remove_tag_indices(env: &Env, ip_id: u64, tag_hashes: &Vec<BytesN<32>>) {
+    for i in 0..tag_hashes.len() {
+        if let Some(tag_hash) = tag_hashes.get(i) {
+            let key = DataKey::MetadataTagIndex(tag_hash);
+            if let Some(ip_ids) = env.storage().persistent().get::<_, Vec<u64>>(&key) {
+                let mut new_ids = Vec::new(env);
+                for j in 0..ip_ids.len() {
+                    if let Some(id) = ip_ids.get(j) {
+                        if id != ip_id {
+                            new_ids.push_back(id);
+                        }
+                    }
+                }
+
+                if new_ids.is_empty() {
+                    env.storage().persistent().remove(&key);
+                } else {
+                    env.storage().persistent().set(&key, &new_ids);
+                }
+            }
+        }
+    }
+}
+
+// ── Issue #1105: Field-level encrypted metadata ─────────────────────────────
+
+/// Maximum number of independently encrypted fields per commitment.
+pub const MAX_ENCRYPTED_FIELDS: u32 = 16;
+
+/// Maximum number of search tags per commitment.
+pub const MAX_METADATA_TAGS: u32 = 32;
+
+fn get_encrypted_record(env: &Env, ip_id: u64) -> Option<EncryptedMetadataRecord> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::EncryptedMetadata(ip_id))
+}
+
+/// Validate and store field-level encrypted metadata, then index its tags.
+///
+/// The ciphertext is produced client-side under the key identified by `key_id`.
+/// Replacing an existing record drops its old tags from the search index first,
+/// so search only reflects the current tags.
+///
+/// # Panics
+///
+/// Panics with `EncryptedMetadataInvalid` if there are no fields, too many fields,
+/// too many tags, or more total ciphertext than `MAX_METADATA_BYTES`.
+pub fn store_encrypted_fields(
+    env: &Env,
+    ip_id: u64,
+    key_id: u32,
+    fields: Map<Symbol, EncryptedField>,
+    tag_hashes: Vec<BytesN<32>>,
+) {
+    if fields.is_empty() || fields.len() > MAX_ENCRYPTED_FIELDS {
+        env.panic_with_error(crate::ContractError::EncryptedMetadataInvalid);
+    }
+    if tag_hashes.len() > MAX_METADATA_TAGS {
+        env.panic_with_error(crate::ContractError::EncryptedMetadataInvalid);
+    }
+    let mut total_bytes: u32 = 0;
+    for (_, field) in fields.iter() {
+        total_bytes = total_bytes.saturating_add(field.ciphertext.len());
+    }
+    if total_bytes > crate::MAX_METADATA_BYTES {
+        env.panic_with_error(crate::ContractError::EncryptedMetadataInvalid);
+    }
+
+    if let Some(previous) = get_encrypted_record(env, ip_id) {
+        remove_tag_indices(env, ip_id, &previous.tag_hashes);
+    }
+
+    let record = EncryptedMetadataRecord {
+        ip_id,
+        key_id,
+        fields,
+        timestamp: env.ledger().timestamp(),
+        tag_hashes: tag_hashes.clone(),
+    };
+    let key = DataKey::EncryptedMetadata(ip_id);
+    env.storage().persistent().set(&key, &record);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, 6_307_200, 6_307_200);
+
+    for i in 0..tag_hashes.len() {
+        if let Some(tag_hash) = tag_hashes.get(i) {
+            index_metadata_by_tag(env, &tag_hash, ip_id);
+        }
+    }
+}
+
+/// Public summary of an IP's encrypted metadata: key ID, field names, timestamp.
+/// Field ciphertexts are not included.
+pub fn get_encrypted_info(env: &Env, ip_id: u64) -> Option<EncryptedMetadataInfo> {
+    let record = get_encrypted_record(env, ip_id)?;
+    Some(EncryptedMetadataInfo {
+        key_id: record.key_id,
+        field_names: record.fields.keys(),
+        timestamp: record.timestamp,
+    })
+}
+
+/// Ciphertext of a single field. The caller is responsible for the access check.
+pub fn get_encrypted_field(env: &Env, ip_id: u64, field: Symbol) -> Option<EncryptedField> {
+    get_encrypted_record(env, ip_id)?.fields.get(field)
 }
 
 #[cfg(test)]

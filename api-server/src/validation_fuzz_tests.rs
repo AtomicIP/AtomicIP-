@@ -650,4 +650,302 @@ mod fuzz_tests {
             RequestValidator::validate_string_length(&ok_cursor, 1, 512, "cursor").is_ok()
         );
     }
+
+    // ── Handler-level fuzz tests (#1221) ──────────────────────────────────────
+    //
+    // These cases feed malformed inputs through the same validation paths that
+    // the HTTP handlers in handlers.rs use.  Each must return an error (which
+    // the handler maps to a 4xx response) rather than panicking.
+
+    /// Handler: commit_ip — malformed owner / commitment_hash
+    #[test]
+    fn fuzz_handler_commit_ip_malformed_inputs() {
+        let bad_owners = [
+            "",
+            " ",
+            "not_an_address",
+            "0AHJJJKMOKYE4RVPZEWZTKH5FVI4PA3VL7GK2LFNUBSGBZE5HAHD8X",
+            "GAHJJJKMOKYE4RVPZEWZTKH5FVI4PA3VL7GK2LFNUBSGBZE5HAHD8X\n",
+            "GAHJJJKMOKYE4RVPZEWZTKH5FVI4PA3VL7GK2LFNUBSGBZE5HAHD8",
+        ];
+        for owner in &bad_owners {
+            assert!(
+                RequestValidator::validate_stellar_address(owner, "owner").is_err(),
+                "commit_ip must reject owner: {owner:?}"
+            );
+        }
+
+        let bad_hashes = [
+            String::new(),
+            "zz".to_string(),
+            "a".repeat(63),
+            "a".repeat(65),
+            "a".repeat(10_000),
+            format!("{}\0", "a".repeat(63)),
+        ];
+        for hash in &bad_hashes {
+            assert!(
+                RequestValidator::validate_hex_string(hash, 32, "commitment_hash").is_err(),
+                "commit_ip must reject commitment_hash of len {}",
+                hash.len()
+            );
+        }
+    }
+
+    /// Handler: transfer_ip — non-positive ip_id and bad new_owner
+    #[test]
+    fn fuzz_handler_transfer_ip_malformed_inputs() {
+        for ip_id in [0_i128, -1, i128::MIN] {
+            assert!(
+                RequestValidator::validate_positive_integer(ip_id, "ip_id").is_err(),
+                "transfer_ip must reject ip_id: {ip_id}"
+            );
+        }
+        for owner in ["", "\0", "G", &"G".repeat(1000)] {
+            assert!(
+                RequestValidator::validate_stellar_address(owner, "new_owner").is_err(),
+                "transfer_ip must reject new_owner of len {}",
+                owner.len()
+            );
+        }
+    }
+
+    /// Handler: verify_commitment — bad secret / blinding_factor hex
+    #[test]
+    fn fuzz_handler_verify_commitment_malformed_inputs() {
+        let bad_hexes = [
+            String::new(),
+            "0".to_string(),
+            "g".repeat(64),
+            "b".repeat(62),
+            "b".repeat(66),
+            "b".repeat(1_000_000),
+        ];
+        for bad in &bad_hexes {
+            assert!(
+                RequestValidator::validate_hex_string(bad, 32, "secret").is_err(),
+                "verify_commitment must reject secret of len {}",
+                bad.len()
+            );
+            assert!(
+                RequestValidator::validate_hex_string(bad, 32, "blinding_factor").is_err(),
+                "verify_commitment must reject blinding_factor of len {}",
+                bad.len()
+            );
+        }
+        assert!(RequestValidator::check_null_bytes("ab\0cd", "secret").is_err());
+    }
+
+    /// Handler: initiate_swap — bad addresses, price, oversized registry id
+    #[test]
+    fn fuzz_handler_initiate_swap_malformed_inputs() {
+        let addr = "GAHJJJKMOKYE4RVPZEWZTKH5FVI4PA3VL7GK2LFNUBSGBZE5HAHD8X";
+        for field in ["seller", "buyer", "token"] {
+            assert!(
+                RequestValidator::validate_stellar_address("bad", field).is_err(),
+                "initiate_swap must reject {field}"
+            );
+        }
+        for price in [0_i128, -1, i128::MIN] {
+            assert!(
+                RequestValidator::validate_positive_integer(price, "price").is_err(),
+                "initiate_swap must reject price: {price}"
+            );
+        }
+        // Oversized / empty registry id
+        assert!(RequestValidator::validate_string_length("", 1, 512, "ip_registry_id").is_err());
+        let huge_id = "r".repeat(10_000);
+        assert!(RequestValidator::validate_string_length(&huge_id, 1, 512, "ip_registry_id").is_err());
+        // Optional referrer, when present, must be valid
+        assert!(RequestValidator::validate_stellar_address(addr, "referrer").is_ok());
+        assert!(RequestValidator::validate_stellar_address("nope", "referrer").is_err());
+    }
+
+    /// Handler: batch_initiate_swap — empty / oversized / mismatched arrays
+    #[test]
+    fn fuzz_handler_batch_initiate_swap_malformed_inputs() {
+        let empty: Vec<u64> = vec![];
+        assert!(RequestValidator::validate_non_empty_vec(&empty, "ip_ids").is_err());
+
+        let huge: Vec<u64> = (0..1001).collect();
+        assert!(RequestValidator::validate_non_empty_vec(&huge, "ip_ids").is_err());
+
+        // A zero price anywhere in the batch must be rejected
+        assert!(RequestValidator::validate_positive_integer(0_i128, "prices[0]").is_err());
+
+        // Oversized idempotency key
+        let long_key = "k".repeat(513);
+        assert!(RequestValidator::validate_string_length(&long_key, 1, 512, "idempotency_key").is_err());
+        assert!(RequestValidator::check_null_bytes("key\0", "idempotency_key").is_err());
+    }
+
+    /// Handler: accept_swap — malformed buyer
+    #[test]
+    fn fuzz_handler_accept_swap_malformed_inputs() {
+        for buyer in ["", " ", "\t", "\n", "0AAAA", &"G".repeat(60)] {
+            assert!(
+                RequestValidator::validate_stellar_address(buyer, "buyer").is_err(),
+                "accept_swap must reject buyer: {buyer:?}"
+            );
+        }
+    }
+
+    /// Handler: reveal_key — malformed caller / secret / blinding_factor
+    #[test]
+    fn fuzz_handler_reveal_key_malformed_inputs() {
+        assert!(RequestValidator::validate_stellar_address("", "caller").is_err());
+        for bad in ["", "ZZZZ", &"c".repeat(63), &"c".repeat(65)] {
+            assert!(
+                RequestValidator::validate_hex_string(bad, 32, "secret").is_err(),
+                "reveal_key must reject secret of len {}",
+                bad.len()
+            );
+        }
+        assert!(RequestValidator::check_null_bytes("abc\0", "blinding_factor").is_err());
+    }
+
+    /// Handler: cancel_swap / cancel_expired_swap — malformed canceller/caller
+    #[test]
+    fn fuzz_handler_cancel_swap_malformed_inputs() {
+        for bad in ["", " ", "not_valid", &"G".repeat(57)] {
+            assert!(
+                RequestValidator::validate_stellar_address(bad, "canceller").is_err(),
+                "cancel_swap must reject canceller: {bad:?}"
+            );
+            assert!(
+                RequestValidator::validate_stellar_address(bad, "caller").is_err(),
+                "cancel_expired_swap must reject caller: {bad:?}"
+            );
+        }
+    }
+
+    /// Handler: register_webhook — invalid URLs, empty/oversized events
+    #[test]
+    fn fuzz_handler_register_webhook_malformed_inputs() {
+        let bad_urls = [
+            "",
+            "not_a_url",
+            "ftp://example.com",
+            "javascript:alert(1)",
+            "//example.com",
+            "http://example.com\0malicious",
+        ];
+        for url in &bad_urls {
+            assert!(
+                RequestValidator::validate_url(url).is_err(),
+                "register_webhook must reject url: {url:?}"
+            );
+        }
+        let long_url = format!("http://{}", "a".repeat(1000));
+        assert!(RequestValidator::validate_url(&long_url).is_err());
+
+        let empty: Vec<u64> = vec![];
+        assert!(RequestValidator::validate_non_empty_vec(&empty, "events").is_err());
+        let huge: Vec<u64> = (0..1001).collect();
+        assert!(RequestValidator::validate_non_empty_vec(&huge, "events").is_err());
+        assert!(RequestValidator::check_null_bytes("swap\0.completed", "events[0]").is_err());
+    }
+
+    /// Handler: bulk_commit_ip — bad owner / empty / malformed hashes
+    #[test]
+    fn fuzz_handler_bulk_commit_ip_malformed_inputs() {
+        assert!(RequestValidator::validate_stellar_address("bad", "owner").is_err());
+
+        let empty: Vec<u64> = vec![];
+        assert!(RequestValidator::validate_non_empty_vec(&empty, "commitment_hashes").is_err());
+
+        for bad in ["", "notHex!", &"d".repeat(63), &"d".repeat(65)] {
+            assert!(
+                RequestValidator::validate_hex_string(bad, 32, "commitment_hashes[i]").is_err(),
+                "bulk_commit_ip must reject hash of len {}",
+                bad.len()
+            );
+        }
+    }
+
+    /// Handler: bulk_initiate_swap — empty / oversized ip_ids, bad prices
+    #[test]
+    fn fuzz_handler_bulk_initiate_swap_malformed_inputs() {
+        let empty: Vec<u64> = vec![];
+        assert!(RequestValidator::validate_non_empty_vec(&empty, "ip_ids").is_err());
+
+        let huge: Vec<u64> = (0..1001).collect();
+        assert!(RequestValidator::validate_non_empty_vec(&huge, "ip_ids").is_err());
+
+        assert!(RequestValidator::validate_positive_integer(-1_i128, "prices[i]").is_err());
+        assert!(RequestValidator::validate_positive_integer(0_i128, "prices[i]").is_err());
+    }
+
+    /// Handler: pagination — out-of-range limit / negative offset
+    #[test]
+    fn fuzz_handler_pagination_malformed_inputs() {
+        for limit in [0_i128, -1, 201, i128::MAX, i128::MIN] {
+            assert!(
+                RequestValidator::validate_amount_range(limit, 1, 200, "limit").is_err(),
+                "pagination must reject limit: {limit}"
+            );
+        }
+        for offset in [-1_i128, i128::MIN] {
+            assert!(
+                RequestValidator::validate_non_negative_integer(offset, "offset").is_err(),
+                "pagination must reject offset: {offset}"
+            );
+        }
+    }
+
+    /// Handler: cursor pagination — null bytes / oversized cursor
+    #[test]
+    fn fuzz_handler_cursor_pagination_malformed_inputs() {
+        for cursor in ["abc\0def", "\0", "cursor\0"] {
+            assert!(
+                RequestValidator::check_null_bytes(cursor, "cursor").is_err(),
+                "cursor pagination must reject null byte in cursor: {cursor:?}"
+            );
+        }
+        let long_cursor = "c".repeat(513);
+        assert!(RequestValidator::validate_string_length(&long_cursor, 1, 512, "cursor").is_err());
+    }
+
+    /// Handler: bad JSON field types — deserialization must fail, not panic
+    #[test]
+    fn fuzz_handler_bad_json_field_types() {
+        use crate::schemas::{CommitIpRequest, TransferIpRequest, AcceptSwapRequest};
+
+        // owner given as a number instead of a string
+        assert!(serde_json::from_str::<CommitIpRequest>(
+            r#"{"owner": 123, "commitment_hash": "aa"}"#
+        ).is_err());
+        // commitment_hash given as an array
+        assert!(serde_json::from_str::<CommitIpRequest>(
+            r#"{"owner": "G", "commitment_hash": ["aa"]}"#
+        ).is_err());
+        // missing required field
+        assert!(serde_json::from_str::<CommitIpRequest>(r#"{"owner": "G"}"#).is_err());
+        // ip_id given as a string
+        assert!(serde_json::from_str::<TransferIpRequest>(
+            r#"{"ip_id": "1", "new_owner": "G"}"#
+        ).is_err());
+        // buyer given as null
+        assert!(serde_json::from_str::<AcceptSwapRequest>(r#"{"buyer": null}"#).is_err());
+        // completely malformed JSON
+        assert!(serde_json::from_str::<AcceptSwapRequest>("{not json").is_err());
+    }
+
+    /// Handler: invalid header values — must be rejected, not panic
+    #[test]
+    fn fuzz_handler_invalid_headers() {
+        // Header values with control characters / null bytes must be rejected
+        // by the same null-byte / length checks the handlers apply.
+        let bad_headers = ["id\0empotency", "\0", "k".repeat(513).as_str()];
+        for value in &bad_headers {
+            let has_null = RequestValidator::check_null_bytes(value, "header").is_err();
+            let too_long =
+                RequestValidator::validate_string_length(value, 1, 512, "header").is_err();
+            assert!(
+                has_null || too_long,
+                "invalid header value must be rejected: len={}",
+                value.len()
+            );
+        }
+    }
 }
