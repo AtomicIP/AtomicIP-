@@ -6,12 +6,14 @@ use axum::{
     middleware::Next,
     response::Response,
 };
-use metrics::{counter, histogram, describe_counter, describe_histogram};
+use metrics::{counter, gauge, histogram, describe_counter, describe_gauge, describe_histogram};
 use tracing::info;
 
 use once_cell::sync::Lazy;
 use std::sync::Mutex;
 use std::env;
+
+use crate::lock_utils::lock_or_recover;
 
 const DEFAULT_SLOW_REQUEST_THRESHOLD_MS: u64 = 1_000;
 
@@ -47,9 +49,35 @@ static PROMETHEUS_HANDLE: Lazy<Mutex<metrics_exporter_prometheus::PrometheusHand
         "http_slow_requests_total",
         "HTTP requests slower than SLOW_REQUEST_THRESHOLD_MS"
     );
+    describe_counter!(
+        "audit_fallback_active",
+        "Number of times the in-memory fallback audit store is active"
+    );
+    describe_gauge!(
+        "open_connections",
+        "Currently open WebSocket/SSE connections"
+    );
+    describe_gauge!(
+        "cache_entries",
+        "Current number of entries stored in the response cache"
+    );
     
     Mutex::new(handle)
 });
+
+/// Record the current number of open WebSocket/SSE connections.
+///
+/// Called by the connection limiter in `websocket.rs`/`events.rs` whenever a
+/// connection is acquired or released so the gauge reflects the live count.
+pub fn set_open_connections(count: u64) {
+    gauge!("open_connections").set(count as f64);
+}
+
+/// Record the current number of open connections for a specific protocol
+/// (e.g. "websocket" or "sse").
+pub fn set_open_connections_for(protocol: &'static str, count: u64) {
+    gauge!("open_connections", "protocol" => protocol).set(count as f64);
+}
 
 /// Initialize the Prometheus metrics recorder and JSON logging subscriber.
 pub fn init() {
@@ -146,6 +174,11 @@ fn extract_client_ip(req: &Request) -> String {
 
 /// Handler for the /metrics endpoint that returns Prometheus exposition format.
 pub async fn metrics_handler() -> Result<String, StatusCode> {
-    let handle = PROMETHEUS_HANDLE.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let handle = lock_or_recover(&PROMETHEUS_HANDLE);
     Ok(handle.render())
+}
+
+/// Record that the in-memory fallback audit store is active.
+pub fn record_audit_fallback_active() {
+    counter!("audit_fallback_active").increment(1);
 }

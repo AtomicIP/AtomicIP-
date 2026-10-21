@@ -50,9 +50,8 @@ where
         "rpc.duration_ms" = tracing::field::Empty,
         error = tracing::field::Empty,
     );
-    let _entered = span.entered();
     let started = Instant::now();
-    let result = rpc_call().await;
+    let result = tracing::Instrument::instrument(rpc_call(), span.clone()).await;
     span.record("rpc.duration_ms", started.elapsed().as_secs_f64() * 1000.0);
     if let Err(ref error) = result {
         span.record("error", true);

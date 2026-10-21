@@ -712,3 +712,84 @@ pub struct BatchExecutionFailedEvent {
     pub failed_swap_ids: Vec<u64>,
     pub reason: String,
 }
+
+// ── #1087: Buyer Escrow Release Events ────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct EscrowReleasedEvent {
+    pub swap_id: u64,
+    pub seller: Address,
+    pub amount: i128,
+    pub total_released: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct EscrowLockedEvent {
+    pub swap_id: u64,
+    pub caller: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct EscrowDisputeResolvedEvent {
+    pub swap_id: u64,
+    pub released_to_seller: bool,
+    pub amount: i128,
+}
+
+// ── #1088: Liquidity Pool Types ───────────────────────────────────────────────
+
+/// Constant-product (x·y = k) pool for trading one IP commitment against a token.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct LiquidityPool {
+    pub commitment_id: u64,
+    pub token: Address,
+    /// IP units held by the pool.
+    pub ip_reserve: u64,
+    /// Token units held by the pool.
+    pub token_reserve: i128,
+    /// Maximum price impact, in basis points, a single swap may cause.
+    pub max_slippage_bps: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PoolCreatedEvent {
+    pub commitment_id: u64,
+    pub token: Address,
+    pub ip_reserve: u64,
+    pub token_reserve: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PoolSwapEvent {
+    pub commitment_id: u64,
+    pub buyer: Address,
+    pub token_in: i128,
+    pub ip_out: u64,
+    pub ip_reserve: u64,
+    pub token_reserve: i128,
+}
+
+// ── #1089: Settlement Finality Types ──────────────────────────────────────────
+
+/// A contract call executed once a swap's settlement is final. The callee
+/// receives the swap id as its only argument.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct FinalityCallback {
+    pub contract: Address,
+    pub function: soroban_sdk::Symbol,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct FinalityCallbackExecutedEvent {
+    pub swap_id: u64,
+    pub contract: Address,
+    pub function: soroban_sdk::Symbol,
+}

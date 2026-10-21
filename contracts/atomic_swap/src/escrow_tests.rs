@@ -186,6 +186,198 @@ mod tests {
         client.escrow_deposit(&swap_id); // second deposit — must panic
     }
 
+    // ── Insurance reservation release on terminal paths ───────────────────────
+
+    /// Reads the per-swap reserved insurance amount (0 when unset).
+    fn reserved_for(env: &Env, contract_id: &Address, swap_id: u64) -> i128 {
+        env.as_contract(contract_id, || {
+            env.storage()
+                .persistent()
+                .get(&crate::DataKey::InsuranceReserved(swap_id))
+                .unwrap_or(0)
+        })
+    }
+
+    /// Reads the global reserved insurance total (0 when unset).
+    fn reserved_total(env: &Env, contract_id: &Address) -> i128 {
+        env.as_contract(contract_id, || {
+            env.storage()
+                .persistent()
+                .get(&crate::DataKey::InsuranceReservedTotal)
+                .unwrap_or(0)
+        })
+    }
+
+    /// Reserves insurance for a swap and asserts the reservation is recorded.
+    fn reserve_insurance(
+        env: &Env,
+        client: &AtomicSwapClient,
+        contract_id: &Address,
+        swap_id: u64,
+        amount: i128,
+    ) {
+        client.reserve_insurance(&swap_id, &amount);
+        assert_eq!(reserved_for(env, contract_id, swap_id), amount);
+        assert_eq!(reserved_total(env, contract_id), amount);
+    }
+
+    /// `cancel_expired_swap` must release the insurance reservation.
+    #[test]
+    fn test_cancel_expired_swap_releases_insurance() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let admin = Address::generate(&env);
+
+        let (registry_id, ip_id, _, _) = setup_registry(&env, &seller);
+        let token_id = setup_token(&env, &admin, &buyer, 1000);
+        let contract_id = setup_swap_contract(&env, &registry_id);
+        let client = AtomicSwapClient::new(&env, &contract_id);
+
+        let timeout = env.ledger().timestamp() + 100;
+        let swap_id = client.initiate_swap(
+            &token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None, &0_i128, &false,
+        );
+        reserve_insurance(&env, &client, &contract_id, swap_id, 50);
+
+        env.ledger().with_mut(|l| l.timestamp = timeout + 1);
+
+        client.cancel_expired_swap(&swap_id);
+
+        assert_eq!(reserved_for(&env, &contract_id, swap_id), 0);
+        assert_eq!(reserved_total(&env, &contract_id), 0);
+    }
+
+    /// `cancel_swap` must release the insurance reservation.
+    #[test]
+    fn test_cancel_swap_releases_insurance() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let admin = Address::generate(&env);
+
+        let (registry_id, ip_id, _, _) = setup_registry(&env, &seller);
+        let token_id = setup_token(&env, &admin, &buyer, 1000);
+        let contract_id = setup_swap_contract(&env, &registry_id);
+        let client = AtomicSwapClient::new(&env, &contract_id);
+
+        let swap_id = client.initiate_swap(
+            &token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None, &0_i128, &false,
+        );
+        reserve_insurance(&env, &client, &contract_id, swap_id, 50);
+
+        client.cancel_swap(&swap_id, &seller);
+
+        assert_eq!(reserved_for(&env, &contract_id, swap_id), 0);
+        assert_eq!(reserved_total(&env, &contract_id), 0);
+    }
+
+    /// `escrow_withdraw` must release the insurance reservation.
+    #[test]
+    fn test_escrow_withdraw_releases_insurance() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let admin = Address::generate(&env);
+
+        let (registry_id, ip_id, _, _) = setup_registry(&env, &seller);
+        let token_id = setup_token(&env, &admin, &buyer, 1000);
+        let contract_id = setup_swap_contract(&env, &registry_id);
+        let client = AtomicSwapClient::new(&env, &contract_id);
+
+        let timeout = env.ledger().timestamp() + 100;
+        let swap_id =
+            client.initiate_escrow_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &timeout);
+        client.escrow_deposit(&swap_id);
+        reserve_insurance(&env, &client, &contract_id, swap_id, 50);
+
+        env.ledger().with_mut(|l| l.timestamp = timeout + 1);
+
+        client.escrow_withdraw(&swap_id);
+
+        assert_eq!(reserved_for(&env, &contract_id, swap_id), 0);
+        assert_eq!(reserved_total(&env, &contract_id), 0);
+    }
+
+    /// `auto_resolve_dispute` must release the insurance reservation.
+    #[test]
+    fn test_auto_resolve_dispute_releases_insurance() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let admin = Address::generate(&env);
+
+        let (registry_id, ip_id, _, _) = setup_registry(&env, &seller);
+        let token_id = setup_token(&env, &admin, &buyer, 1000);
+        let contract_id = setup_swap_contract(&env, &registry_id);
+        let client = AtomicSwapClient::new(&env, &contract_id);
+
+        let swap_id = client.initiate_swap(
+            &token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None, &0_i128, &false,
+        );
+        client.escrow_deposit(&swap_id);
+        client.raise_dispute(&swap_id, &buyer);
+        reserve_insurance(&env, &client, &contract_id, swap_id, 50);
+
+        client.auto_resolve_dispute(&swap_id);
+
+        assert_eq!(reserved_for(&env, &contract_id, swap_id), 0);
+        assert_eq!(reserved_total(&env, &contract_id), 0);
+    }
+
+    /// Property: the reserved total equals the sum of reservations over all
+    /// active (non-terminal) insured swaps.
+    #[test]
+    fn test_reserved_total_equals_sum_over_active_swaps() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let admin = Address::generate(&env);
+
+        let (registry_id, ip_id, _, _) = setup_registry(&env, &seller);
+        let token_id = setup_token(&env, &admin, &buyer, 10_000);
+        let contract_id = setup_swap_contract(&env, &registry_id);
+        let client = AtomicSwapClient::new(&env, &contract_id);
+
+        let mut active: soroban_sdk::Vec<(u64, i128)> = soroban_sdk::Vec::new(&env);
+        let amounts = [10_i128, 25, 40, 5];
+        for amount in amounts.iter() {
+            let swap_id = client.initiate_swap(
+                &token_id, &ip_id, &seller, &100_i128, &buyer, &0_u32, &None, &0_i128, &false,
+            );
+            client.reserve_insurance(&swap_id, amount);
+            active.push_back((swap_id, *amount));
+        }
+
+        // Cancel one swap — it must drop out of the active set.
+        let (cancelled_id, cancelled_amount) = active.get(0).unwrap();
+        client.cancel_swap(&cancelled_id, &seller);
+        assert_eq!(reserved_for(&env, &contract_id, cancelled_id), 0);
+
+        let mut expected: i128 = 0;
+        for i in 0..active.len() {
+            let (swap_id, amount) = active.get(i).unwrap();
+            if swap_id == cancelled_id {
+                continue;
+            }
+            assert_eq!(reserved_for(&env, &contract_id, swap_id), amount);
+            expected += amount;
+        }
+        assert_eq!(expected, 80);
+        assert_eq!(reserved_total(&env, &contract_id), expected);
+        let _ = cancelled_amount;
+    }
+
     /// SwapMode is stored as Escrow for escrow swaps.
     #[test]
     fn test_escrow_swap_mode_stored() {

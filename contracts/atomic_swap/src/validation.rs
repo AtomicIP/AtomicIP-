@@ -224,7 +224,8 @@ pub fn require_admin(env: &Env, caller: &Address) {
 ///
 /// Panics with `InvalidTreasuryAddress` error if the address is invalid (zero or placeholder).
 pub fn require_valid_treasury_address(env: &Env, treasury: &Address) {
-    let zero_address = Address::from_contract_id(env, &soroban_sdk::BytesN::<32>::new());
+    // The all-zero contract address (strkey form of 32 zero bytes).
+    let zero_address = Address::from_str(env, "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4");
     if treasury == &zero_address {
         env.panic_with_error(Error::from_contract_error(
             ContractError::InvalidTreasuryAddress as u32,
@@ -232,315 +233,245 @@ pub fn require_valid_treasury_address(env: &Env, treasury: &Address) {
     }
 }
 
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-//     use soroban_sdk::{testutils::Address as _, Env};
-// //
-// //     /// Convenience constructor so every test doesn't repeat all fields.
-// //     fn make_swap(env: &Env, status: SwapStatus, expiry: u64) -> SwapRecord {
-// //         SwapRecord {
-// //             ip_id: 1,
-// //             seller: Address::generate(env),
-// //             buyer: Address::generate(env),
-// //             price: 100,
-// //             token: Address::generate(env),
-// //             status,
-// //             expiry,
-// //             accept_timestamp: 0,
-// //             required_approvals: 0,
-// //             dispute_timestamp: 0,
-// //             referrer: None,
-// //             collateral_amount: 0,
-// //             insurance_premium: 0,
-// //             insurance_enabled: false,
-// //             escrow_agent: None,
-// //             quantity: 1,
-// //             conditions: Vec::new(&env),
-// //         }
-// //     }
-// //
-// //     #[test]
-// //     fn test_require_not_paused_succeeds_when_not_paused() {
-// //         let env = Env::default();
-// //         // Should not panic
-// //         require_not_paused(&env);
-// //     }
-// //
-// //     #[test]
-// //     #[should_panic(expected = "ContractPaused")]
-// //     fn test_require_not_paused_panics_when_paused() {
-// //         let env = Env::default();
-// //         env.storage().instance().set(&DataKey::Paused, &true);
-// //         require_not_paused(&env);
-// //     }
-// //
-// //     #[test]
-// //     fn test_require_positive_price_succeeds_for_positive() {
-// //         let env = Env::default();
-// //         // Should not panic
-// //         require_positive_price(&env, 100);
-// //     }
-// //
-// //     #[test]
-// //     #[should_panic(expected = "PriceMustBeGreaterThanZero")]
-// //     fn test_require_positive_price_panics_for_zero() {
-// //         let env = Env::default();
-// //         require_positive_price(&env, 0);
-// //     }
-// //
-// //     #[test]
-// //     #[should_panic(expected = "PriceMustBeGreaterThanZero")]
-// //     fn test_require_positive_price_panics_for_negative() {
-// //         let env = Env::default();
-// //         require_positive_price(&env, -100);
-// //     }
-// //
-// //     #[test]
-// //     fn test_require_swap_status_succeeds_when_matching() {
-// //         let env = Env::default();
-// //         let swap = make_swap(&env, SwapStatus::Pending, 0);
-// //         // Should not panic
-// //         require_swap_status(&env, &swap, SwapStatus::Pending, ContractError::NotPending);
-// //     }
-// //
-// //     #[test]
-// //     #[should_panic(expected = "SwapNotPending")]
-// //     fn test_require_swap_status_panics_when_not_matching() {
-// //         let env = Env::default();
-// //         let swap = make_swap(&env, SwapStatus::Accepted, 0);
-// //         require_swap_status(&env, &swap, SwapStatus::Pending, ContractError::NotPending);
-// //     }
-// //
-// //     #[test]
-// //     fn test_require_seller_succeeds_when_matching() {
-// //         let env = Env::default();
-// //         let seller = Address::generate(&env);
-// //         let swap = SwapRecord {
-// //             ip_id: 1,
-// //             seller: seller.clone(),
-// //             buyer: Address::generate(&env),
-// //             price: 100,
-// //             token: Address::generate(&env),
-// //             status: SwapStatus::Pending,
-// //             expiry: 0,
-// //             accept_timestamp: 0,
-// //             required_approvals: 0,
-// //             dispute_timestamp: 0,
-// //             referrer: None,
-// //             collateral_amount: 0,
-// //             insurance_premium: 0,
-// //             insurance_enabled: false,
-// //             escrow_agent: None,
-// //             quantity: 1,
-// //             conditions: Vec::new(&env),
-// //         };
-// //         // Should not panic
-// //         require_seller(&env, &seller, &swap);
-// //     }
-// //
-// //     #[test]
-// //     #[should_panic(expected = "OnlyTheSellerCanRevealTheKey")]
-// //     fn test_require_seller_panics_when_not_matching() {
-// //         let env = Env::default();
-// //         let seller = Address::generate(&env);
-// //         let not_seller = Address::generate(&env);
-// //         let swap = SwapRecord {
-// //             ip_id: 1,
-// //             seller: seller.clone(),
-// //             buyer: Address::generate(&env),
-// //             price: 100,
-// //             token: Address::generate(&env),
-// //             status: SwapStatus::Pending,
-// //             expiry: 0,
-// //             accept_timestamp: 0,
-// //             required_approvals: 0,
-// //             dispute_timestamp: 0,
-// //             referrer: None,
-// //             collateral_amount: 0,
-// //             insurance_premium: 0,
-// //             insurance_enabled: false,
-// //             escrow_agent: None,
-// //             quantity: 1,
-// //             conditions: Vec::new(&env),
-// //         };
-// //         require_seller(&env, &not_seller, &swap);
-// //     }
-// //
-// //     #[test]
-// //     fn test_require_buyer_succeeds_when_matching() {
-// //         let env = Env::default();
-// //         let buyer = Address::generate(&env);
-// //         let swap = SwapRecord {
-// //             ip_id: 1,
-// //             seller: Address::generate(&env),
-// //             buyer: buyer.clone(),
-// //             price: 100,
-// //             token: Address::generate(&env),
-// //             status: SwapStatus::Pending,
-// //             expiry: 0,
-// //             accept_timestamp: 0,
-// //             required_approvals: 0,
-// //             dispute_timestamp: 0,
-// //             referrer: None,
-// //             collateral_amount: 0,
-// //             insurance_premium: 0,
-// //             insurance_enabled: false,
-// //             escrow_agent: None,
-// //             quantity: 1,
-// //             conditions: Vec::new(&env),
-// //         };
-// //         // Should not panic
-// //         require_buyer(&env, &buyer, &swap);
-// //     }
-// //
-// //     #[test]
-// //     #[should_panic(expected = "OnlyTheBuyerCanCancelAnExpiredSwap")]
-// //     fn test_require_buyer_panics_when_not_matching() {
-// //         let env = Env::default();
-// //         let buyer = Address::generate(&env);
-// //         let not_buyer = Address::generate(&env);
-// //         let swap = SwapRecord {
-// //             ip_id: 1,
-// //             seller: Address::generate(&env),
-// //             buyer: buyer.clone(),
-// //             price: 100,
-// //             token: Address::generate(&env),
-// //             status: SwapStatus::Pending,
-// //             expiry: 0,
-// //             accept_timestamp: 0,
-// //             required_approvals: 0,
-// //             dispute_timestamp: 0,
-// //             referrer: None,
-// //             collateral_amount: 0,
-// //             insurance_premium: 0,
-// //             insurance_enabled: false,
-// //             escrow_agent: None,
-// //             quantity: 1,
-// //             conditions: Vec::new(&env),
-// //         };
-// //         require_buyer(&env, &not_buyer, &swap);
-// //     }
-// //
-// //     #[test]
-// //     fn test_require_seller_or_buyer_succeeds_for_seller() {
-// //         let env = Env::default();
-// //         let seller = Address::generate(&env);
-// //         let swap = SwapRecord {
-// //             ip_id: 1,
-// //             seller: seller.clone(),
-// //             buyer: Address::generate(&env),
-// //             price: 100,
-// //             token: Address::generate(&env),
-// //             status: SwapStatus::Pending,
-// //             expiry: 0,
-// //             accept_timestamp: 0,
-// //             required_approvals: 0,
-// //             dispute_timestamp: 0,
-// //             referrer: None,
-// //             collateral_amount: 0,
-// //             insurance_premium: 0,
-// //             insurance_enabled: false,
-// //             escrow_agent: None,
-// //             quantity: 1,
-// //             conditions: Vec::new(&env),
-// //         };
-// //         // Should not panic
-// //         require_seller_or_buyer(&env, &seller, &swap);
-// //     }
-// //
-// //     #[test]
-// //     fn test_require_seller_or_buyer_succeeds_for_buyer() {
-// //         let env = Env::default();
-// //         let buyer = Address::generate(&env);
-// //         let swap = SwapRecord {
-// //             ip_id: 1,
-// //             seller: Address::generate(&env),
-// //             buyer: buyer.clone(),
-// //             price: 100,
-// //             token: Address::generate(&env),
-// //             status: SwapStatus::Pending,
-// //             expiry: 0,
-// //             accept_timestamp: 0,
-// //             required_approvals: 0,
-// //             dispute_timestamp: 0,
-// //             referrer: None,
-// //             collateral_amount: 0,
-// //             insurance_premium: 0,
-// //             insurance_enabled: false,
-// //             escrow_agent: None,
-// //             quantity: 1,
-// //             conditions: Vec::new(&env),
-// //         };
-// //         // Should not panic
-// //         require_seller_or_buyer(&env, &buyer, &swap);
-// //     }
-// //
-// //     #[test]
-// //     #[should_panic(expected = "OnlyTheSellerOrBuyerCanCancel")]
-// //     fn test_require_seller_or_buyer_panics_for_neither() {
-// //         let env = Env::default();
-// //         let seller = Address::generate(&env);
-// //         let buyer = Address::generate(&env);
-// //         let neither = Address::generate(&env);
-// //         let swap = SwapRecord {
-// //             ip_id: 1,
-// //             seller: seller.clone(),
-// //             buyer: buyer.clone(),
-// //             price: 100,
-// //             token: Address::generate(&env),
-// //             status: SwapStatus::Pending,
-// //             expiry: 0,
-// //             accept_timestamp: 0,
-// //             required_approvals: 0,
-// //             dispute_timestamp: 0,
-// //             referrer: None,
-// //             collateral_amount: 0,
-// //             insurance_premium: 0,
-// //             insurance_enabled: false,
-// //             escrow_agent: None,
-// //             quantity: 1,
-// //             conditions: Vec::new(&env),
-// //         };
-// //         require_seller_or_buyer(&env, &neither, &swap);
-// //     }
-// //
-// //     #[test]
-// //     fn test_require_swap_expired_succeeds_when_expired() {
-// //         let env = Env::default();
-// //         // expiry=0, ledger timestamp starts at 0 but require_swap_expired checks <=
-// //         // so we need expiry strictly less than current timestamp.
-// //         // In the default test env, timestamp is 0; set expiry to 0 means 0 <= 0 → not expired.
-// //         // Use a swap with expiry in the past relative to a bumped ledger.
-// //         let swap = make_swap(&env, SwapStatus::Accepted, 0);
-// //         // Ledger timestamp is 0 and expiry is 0: 0 <= 0 is true so it would panic.
-// //         // Advance ledger time past expiry.
-// //         env.ledger().with_mut(|l| l.timestamp = 1);
-// //         require_swap_expired(&env, &swap);
-// //     }
-// //
-// //     #[test]
-// //     #[should_panic(expected = "SwapHasNotExpiredYet")]
-// //     fn test_require_swap_expired_panics_when_not_expired() {
-// //         let env = Env::default();
-// //         let swap = make_swap(&env, SwapStatus::Accepted, u64::MAX);
-// //         require_swap_expired(&env, &swap);
-// //     }
-// //
-// //     #[test]
-// //     fn test_require_no_active_swap_succeeds_when_no_active_swap() {
-// //         let env = Env::default();
-// //         // Should not panic
-// //         require_no_active_swap(&env, 1);
-//     }
-//
-//     #[test]
-//     #[should_panic(expected = "ActiveSwapAlreadyExistsForThisIpId")]
-//     fn test_require_no_active_swap_panics_when_active_swap_exists() {
-//         let env = Env::default();
-//         env.storage()
-//             .persistent()
-//             .set(&DataKey::ActiveSwap(1), &0u64);
-//         require_no_active_swap(&env, 1);
-//     }
-// }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::{testutils::Address as _, Env, Vec};
+
+    /// Convenience constructor so every test doesn't repeat all fields.
+    fn make_swap(env: &Env, status: SwapStatus, expiry: u64) -> SwapRecord {
+        SwapRecord {
+            ip_id: 1,
+            seller: Address::generate(env),
+            buyer: Address::generate(env),
+            price: 100,
+            token: Address::generate(env),
+            status,
+            expiry,
+            accept_timestamp: 0,
+            required_approvals: 0,
+            dispute_timestamp: 0,
+            referrer: None,
+            collateral_amount: 0,
+            insurance_premium: 0,
+            insurance_enabled: false,
+            escrow_agent: None,
+            quantity: 1,
+            conditions: Vec::new(env),
+        }
+    }
+
+    #[test]
+    fn test_require_not_paused_succeeds_when_not_paused() {
+        let env = Env::default();
+        // Should not panic
+        require_not_paused(&env);
+    }
+
+    #[test]
+    #[should_panic(expected = "ContractPaused")]
+    fn test_require_not_paused_panics_when_paused() {
+        let env = Env::default();
+        env.storage().instance().set(&DataKey::Paused, &true);
+        require_not_paused(&env);
+    }
+
+    #[test]
+    fn test_require_swap_exists_succeeds_when_present() {
+        let env = Env::default();
+        let swap = make_swap(&env, SwapStatus::Pending, 0);
+        env.storage().persistent().set(&DataKey::Swap(1), &swap);
+        let found = require_swap_exists(&env, 1);
+        assert_eq!(found.ip_id, 1);
+        assert_eq!(found.status, SwapStatus::Pending);
+    }
+
+    #[test]
+    #[should_panic(expected = "SwapNotFound")]
+    fn test_require_swap_exists_panics_when_missing() {
+        let env = Env::default();
+        require_swap_exists(&env, 42);
+    }
+
+    #[test]
+    fn test_require_positive_price_succeeds_for_positive() {
+        let env = Env::default();
+        // Should not panic
+        require_positive_price(&env, 100);
+    }
+
+    #[test]
+    #[should_panic(expected = "PriceMustBeGreaterThanZero")]
+    fn test_require_positive_price_panics_for_zero() {
+        let env = Env::default();
+        require_positive_price(&env, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "PriceMustBeGreaterThanZero")]
+    fn test_require_positive_price_panics_for_negative() {
+        let env = Env::default();
+        require_positive_price(&env, -100);
+    }
+
+    #[test]
+    fn test_require_swap_status_succeeds_when_matching() {
+        let env = Env::default();
+        let swap = make_swap(&env, SwapStatus::Pending, 0);
+        // Should not panic
+        require_swap_status(&env, &swap, SwapStatus::Pending, ContractError::NotPending);
+    }
+
+    #[test]
+    #[should_panic(expected = "SwapNotPending")]
+    fn test_require_swap_status_panics_when_not_matching() {
+        let env = Env::default();
+        let swap = make_swap(&env, SwapStatus::Accepted, 0);
+        require_swap_status(&env, &swap, SwapStatus::Pending, ContractError::NotPending);
+    }
+
+    #[test]
+    fn test_require_seller_succeeds_when_matching() {
+        let env = Env::default();
+        let seller = Address::generate(&env);
+        let mut swap = make_swap(&env, SwapStatus::Pending, 0);
+        swap.seller = seller.clone();
+        // Should not panic
+        require_seller(&env, &seller, &swap);
+    }
+
+    #[test]
+    #[should_panic(expected = "OnlyTheSellerCanRevealTheKey")]
+    fn test_require_seller_panics_when_not_matching() {
+        let env = Env::default();
+        let not_seller = Address::generate(&env);
+        let swap = make_swap(&env, SwapStatus::Pending, 0);
+        require_seller(&env, &not_seller, &swap);
+    }
+
+    #[test]
+    fn test_require_buyer_succeeds_when_matching() {
+        let env = Env::default();
+        let buyer = Address::generate(&env);
+        let mut swap = make_swap(&env, SwapStatus::Pending, 0);
+        swap.buyer = buyer.clone();
+        // Should not panic
+        require_buyer(&env, &buyer, &swap);
+    }
+
+    #[test]
+    #[should_panic(expected = "OnlyTheBuyerCanCancelAnExpiredSwap")]
+    fn test_require_buyer_panics_when_not_matching() {
+        let env = Env::default();
+        let not_buyer = Address::generate(&env);
+        let swap = make_swap(&env, SwapStatus::Pending, 0);
+        require_buyer(&env, &not_buyer, &swap);
+    }
+
+    #[test]
+    fn test_require_seller_or_buyer_succeeds_for_seller() {
+        let env = Env::default();
+        let seller = Address::generate(&env);
+        let mut swap = make_swap(&env, SwapStatus::Pending, 0);
+        swap.seller = seller.clone();
+        // Should not panic
+        require_seller_or_buyer(&env, &seller, &swap);
+    }
+
+    #[test]
+    fn test_require_seller_or_buyer_succeeds_for_buyer() {
+        let env = Env::default();
+        let buyer = Address::generate(&env);
+        let mut swap = make_swap(&env, SwapStatus::Pending, 0);
+        swap.buyer = buyer.clone();
+        // Should not panic
+        require_seller_or_buyer(&env, &buyer, &swap);
+    }
+
+    #[test]
+    #[should_panic(expected = "OnlyTheSellerOrBuyerCanCancel")]
+    fn test_require_seller_or_buyer_panics_for_neither() {
+        let env = Env::default();
+        let neither = Address::generate(&env);
+        let swap = make_swap(&env, SwapStatus::Pending, 0);
+        require_seller_or_buyer(&env, &neither, &swap);
+    }
+
+    #[test]
+    fn test_require_swap_expired_succeeds_when_expired() {
+        let env = Env::default();
+        // Advance the ledger past the swap's expiry so the swap counts as expired.
+        let swap = make_swap(&env, SwapStatus::Accepted, 0);
+        env.ledger().with_mut(|l| l.timestamp = 1);
+        // Should not panic
+        require_swap_expired(&env, &swap);
+    }
+
+    #[test]
+    #[should_panic(expected = "SwapHasNotExpiredYet")]
+    fn test_require_swap_expired_panics_when_not_expired() {
+        let env = Env::default();
+        let swap = make_swap(&env, SwapStatus::Accepted, u64::MAX);
+        require_swap_expired(&env, &swap);
+    }
+
+    #[test]
+    fn test_require_no_active_swap_succeeds_when_no_active_swap() {
+        let env = Env::default();
+        // Should not panic
+        require_no_active_swap(&env, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "ActiveSwapAlreadyExistsForThisIpId")]
+    fn test_require_no_active_swap_panics_when_active_swap_exists() {
+        let env = Env::default();
+        env.storage()
+            .persistent()
+            .set(&DataKey::ActiveSwap(1), &0u64);
+        require_no_active_swap(&env, 1);
+    }
+
+    #[test]
+    fn test_require_admin_succeeds_when_matching() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        // Should not panic
+        require_admin(&env, &admin);
+    }
+
+    #[test]
+    #[should_panic(expected = "Unauthorized")]
+    fn test_require_admin_panics_when_not_admin() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let not_admin = Address::generate(&env);
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        require_admin(&env, &not_admin);
+    }
+
+    #[test]
+    #[should_panic(expected = "Unauthorized")]
+    fn test_require_admin_panics_when_not_initialized() {
+        let env = Env::default();
+        let caller = Address::generate(&env);
+        require_admin(&env, &caller);
+    }
+
+    #[test]
+    fn test_require_valid_treasury_address_accepts_valid_address() {
+        let env = Env::default();
+        let treasury = Address::generate(&env);
+        // Should not panic
+        require_valid_treasury_address(&env, &treasury);
+    }
+
+    #[test]
+    #[should_panic(expected = "InvalidTreasuryAddress")]
+    fn test_require_valid_treasury_address_rejects_zero_address() {
+        let env = Env::default();
+        let zero_address = Address::from_contract_id(&env, &soroban_sdk::BytesN::<32>::new());
+        require_valid_treasury_address(&env, &zero_address);
+    }
+}

@@ -187,8 +187,9 @@ Recover → Verify → Communicate → Post-mortem within 5 business days.**
 <a id="playbook-key-compromise"></a>
 ### 5.4 Key compromise (SEV-1)
 
-1. **Contain within 1 h:** rotate the admin with `set_admin` to a fresh key
-   from the cold backup quorum (3-of-5 Shamir). Revoke compromised API
+1. **Contain within 1 h:** rotate the admin with `propose_admin` (from the current
+   admin), then `accept_admin` (signed by the fresh key from the cold backup quorum,
+   3-of-5 Shamir). `cancel_admin_proposal` withdraws a mistaken nomination. Revoke compromised API
    secrets (JWT, request signing, `AUDIT_HMAC_KEY`, webhook secrets) in the
    secret manager and roll the API server.
 2. Review the audit trail (`/v1/admin/audit/logs`,
