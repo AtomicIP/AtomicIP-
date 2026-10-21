@@ -1068,12 +1068,12 @@ mod tests {
 
     #[test]
     fn test_verify_commit_ip_request_valid() {
-        assert!(InvariantChecker::verify_commit_ip_request("GOWNER123", "a".repeat(64)).is_ok());
+        assert!(InvariantChecker::verify_commit_ip_request("GOWNER123", &"a".repeat(64)).is_ok());
     }
 
     #[test]
     fn test_verify_commit_ip_request_fails_on_empty_owner() {
-        let res = InvariantChecker::verify_commit_ip_request("", "a".repeat(64));
+        let res = InvariantChecker::verify_commit_ip_request("", &"a".repeat(64));
         assert!(res.is_err());
         assert_eq!(res.unwrap_err().invariant_id, "H10_COMMIT_OWNER_NOT_EMPTY");
     }
@@ -1084,7 +1084,7 @@ mod tests {
         assert!(res.is_err());
         assert_eq!(res.unwrap_err().invariant_id, "H10_COMMIT_HASH_FORMAT");
 
-        let res2 = InvariantChecker::verify_commit_ip_request("GOWNER", "g".repeat(64)); // Non-hex character
+        let res2 = InvariantChecker::verify_commit_ip_request("GOWNER", &"g".repeat(64)); // Non-hex character
         assert!(res2.is_err());
         assert_eq!(res2.unwrap_err().invariant_id, "H10_COMMIT_HASH_FORMAT");
     }
