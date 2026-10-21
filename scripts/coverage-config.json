@@ -24,5 +24,10 @@
       "src/royalty/royaltyCalculation.js": 80,
       "src/metrics/swapMetrics.js": 75
     }
-  }
+  },
+  "js_modules": [
+    "src/recommendations/swapRecommendations.js",
+    "src/batch/bulkSwapOperations.js",
+    "src/notifications/notificationPreferences.js"
+  ]
 }

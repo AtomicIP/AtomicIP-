@@ -53,6 +53,16 @@ pub enum ContractEvent {
         swap_id: u64,
         buyer: String,
     },
+    #[serde(rename = "swap_completed")]
+    SwapCompleted {
+        swap_id: u64,
+    },
+    #[serde(rename = "ip_committed")]
+    IpCommitted {
+        ip_id: u64,
+        owner: String,
+        timestamp: u64,
+    },
     #[serde(rename = "key_revealed")]
     KeyRevealed {
         swap_id: u64,
