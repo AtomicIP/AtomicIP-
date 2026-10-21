@@ -29,6 +29,9 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Check for disabled test modules
+        # Enforces the tracked checklist of disabled test modules and fails on
+        # any new #[ignore] attribute that does not reference a linked issue
+        # (e.g. `#[ignore = "reason (#1234)"]`). See scripts/check-disabled-tests.sh.
         run: ./scripts/check-disabled-tests.sh
 
       - uses: dtolnay/rust-toolchain@stable
