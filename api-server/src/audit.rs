@@ -308,6 +308,97 @@ pub struct AuditLogStore {
     events: RwLock<Vec<AuditEvent>>,
 }
 
+/// In-memory-only audit sink used as a degraded fallback when the durable
+/// audit log cannot be initialized. Events are kept in process memory only
+/// and are lost on restart, so this is strictly a "keep serving, keep
+/// recording something" mode rather than a substitute for the durable store.
+pub struct InMemoryAuditSink {
+    key: Vec<u8>,
+    events: RwLock<Vec<AuditEvent>>,
+}
+
+impl InMemoryAuditSink {
+    /// Builds an in-memory sink from durable configuration. Mirrors
+    /// [`AuditLogStore::from_env`]'s key requirement so the fallback never
+    /// silently substitutes a random key.
+    pub fn from_env() -> Result<Self, AuditLogError> {
+        let key = std::env::var("AUDIT_HMAC_KEY")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .ok_or(AuditLogError::MissingHmacKey)?;
+
+        Ok(Self::new(key.into_bytes()))
+    }
+
+    pub fn new(key: Vec<u8>) -> Self {
+        Self {
+            key,
+            events: RwLock::new(Vec::new()),
+        }
+    }
+
+    pub fn hash_identifier(&self, identifier: &str) -> String {
+        hmac_sha256_hex(&self.key, &format!("identifier:{identifier}"))
+    }
+
+    pub async fn append(&self, input: AuditEventInput) -> Result<AuditEvent, AuditLogError> {
+        let mut events = self.events.write().await;
+        let sequence = events.len() as u64 + 1;
+        let previous_signature = events
+            .last()
+            .map(|event| event.signature.clone())
+            .unwrap_or_else(|| GENESIS_SIGNATURE.to_string());
+
+        let mut event = input.into_event(sequence, previous_signature);
+        event.signature = compute_signature(&self.key, &event);
+        events.push(event.clone());
+
+        Ok(event)
+    }
+
+    pub async fn query(&self, filter: &AuditLogQuery) -> AuditLogQueryResponse {
+        let events = self.events.read().await;
+        let limit = filter.limit.clamp(1, 200);
+        let offset = filter.offset as usize;
+        let filtered: Vec<AuditEvent> = events
+            .iter()
+            .filter(|event| event_matches_filter(event, filter))
+            .cloned()
+            .collect();
+        let total_count = filtered.len() as u64;
+        let page_end = offset.saturating_add(limit as usize).min(filtered.len());
+        let page = filtered
+            .iter()
+            .skip(offset)
+            .take(limit as usize)
+            .cloned()
+            .collect::<Vec<_>>();
+        let has_more = page_end < filtered.len();
+        let integrity = if events.is_empty() {
+            AuditIntegrityStatus::Empty
+        } else if verify_chain(&self.key, &events) {
+            AuditIntegrityStatus::Valid
+        } else {
+            AuditIntegrityStatus::Invalid
+        };
+
+        AuditLogQueryResponse {
+            events: page,
+            total_count,
+            has_more,
+            integrity,
+        }
+    }
+
+    pub async fn len(&self) -> usize {
+        self.events.read().await.len()
+    }
+
+    pub async fn is_empty(&self) -> bool {
+        self.events.read().await.is_empty()
+    }
+}
+
 impl AuditLogStore {
     /// Opens (or creates) the audit log backed by `path`, replaying any
     /// existing chain into memory so queries reflect history that predates
@@ -610,6 +701,20 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
         .zip(right.iter())
         .fold(0u8, |accumulator, (left, right)| accumulator | (left ^ right))
         == 0
+}
+
+/// #1106: Admin check for the audit log endpoints.
+///
+/// Fails closed. `expected` must be set and non-empty, and `provided` must match
+/// it in constant time. An unset key therefore locks the endpoints rather than
+/// opening them.
+pub fn admin_key_matches(provided: Option<&str>, expected: Option<&str>) -> bool {
+    match (provided, expected) {
+        (Some(provided), Some(expected)) if !expected.is_empty() => {
+            constant_time_eq(provided.as_bytes(), expected.as_bytes())
+        }
+        _ => false,
+    }
 }
 
 fn lock_path_for(base_path: &Path) -> PathBuf {
@@ -1034,6 +1139,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_in_memory_sink_accepts_appends_and_chains() {
+        let sink = InMemoryAuditSink::new(vec![51; 32]);
+
+        let first = sink
+            .append(AuditEventInput::new(AuditEventCategory::Admin, "admin.action"))
+            .await
+            .unwrap();
+        let second = sink
+            .append(AuditEventInput::new(AuditEventCategory::Admin, "admin.action"))
+            .await
+            .unwrap();
+
+        assert_eq!(first.sequence, 1);
+        assert_eq!(first.previous_signature, GENESIS_SIGNATURE);
+        assert_eq!(second.sequence, 2);
+        assert_eq!(second.previous_signature, first.signature);
+        assert_eq!(sink.len().await, 2);
+
+        let response = sink.query(&AuditLogQuery::default()).await;
+        assert_eq!(response.total_count, 2);
+        assert_eq!(response.integrity, AuditIntegrityStatus::Valid);
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_sink_from_env_requires_hmac_key() {
+        // SAFETY: this test owns the AUDIT_HMAC_KEY var for its duration;
+        // no other test reads or writes it.
+        unsafe {
+            std::env::remove_var("AUDIT_HMAC_KEY");
+        }
+        let missing = InMemoryAuditSink::from_env();
+        assert_eq!(missing.err(), Some(AuditLogError::MissingHmacKey));
+
+        unsafe {
+            std::env::set_var("AUDIT_HMAC_KEY", "a-sufficiently-secret-value");
+        }
+        let sink = InMemoryAuditSink::from_env()
+            .expect("in-memory sink should initialize once AUDIT_HMAC_KEY is set");
+        assert!(sink.is_empty().await);
+
+        unsafe {
+            std::env::remove_var("AUDIT_HMAC_KEY");
+        }
+    }
+
+    #[tokio::test]
     async fn test_verify_persisted_chain_detects_on_disk_tampering() {
         let temp = TempStorePath::new("verify-tamper");
         let key = vec![41; 32];
@@ -1131,5 +1282,34 @@ mod tests {
 
         assert_eq!(count, 0);
         assert_eq!(fs::read_to_string(temp.path()).unwrap(), before);
+    }
+}
+
+#[cfg(test)]
+mod admin_key_tests {
+    use super::admin_key_matches;
+
+    #[test]
+    fn matching_key_is_accepted() {
+        assert!(admin_key_matches(Some("s3cret"), Some("s3cret")));
+    }
+
+    #[test]
+    fn wrong_or_missing_key_is_rejected() {
+        assert!(!admin_key_matches(Some("wrong"), Some("s3cret")));
+        assert!(!admin_key_matches(Some("s3cre"), Some("s3cret")));
+        assert!(!admin_key_matches(None, Some("s3cret")));
+    }
+
+    #[test]
+    fn unset_expected_key_locks_endpoint() {
+        assert!(!admin_key_matches(Some("anything"), None));
+        assert!(!admin_key_matches(Some(""), None));
+    }
+
+    #[test]
+    fn empty_expected_key_locks_endpoint() {
+        assert!(!admin_key_matches(Some(""), Some("")));
+        assert!(!admin_key_matches(None, Some("")));
     }
 }

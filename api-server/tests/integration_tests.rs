@@ -711,6 +711,137 @@ mod commit_ip_handler_tests {
     }
 }
 
+// ── #1219: docs.rs route is mounted and served ───────────────────────────────
+
+#[cfg(test)]
+mod docs_route_tests {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    /// The docs route must be reachable and return 200 with the API title.
+    /// This guards against `docs.rs` silently becoming unreferenced again.
+    #[tokio::test]
+    async fn test_docs_route_returns_200_with_api_title() {
+        let app = api_server::docs::docs_router();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(api_server::docs::DOCS_PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("docs request must not fail");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "docs route must return 200 OK"
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("docs body must be readable");
+        let html = String::from_utf8(body.to_vec()).expect("docs body must be UTF-8");
+
+        assert!(
+            html.contains(api_server::docs::API_TITLE),
+            "docs body must contain the API title '{}'",
+            api_server::docs::API_TITLE
+        );
+    }
+// ── #1222: Malformed Alertmanager payload tests for the incidents webhook ────
+//
+// The incidents webhook must reject malformed Alertmanager payloads with a
+// 400 response and a JSON error body instead of panicking (previously caused
+// by `unwrap()` calls in `incidents.rs`).
+
+#[cfg(test)]
+mod incidents_webhook_malformed_payload_tests {
+    use api_server::incidents::parse_alertmanager_payload;
+    use axum::http::StatusCode;
+
+    /// Assert that a payload is rejected with 400 and a JSON error body.
+    fn assert_rejected_with_400(body: &str) {
+        let result = parse_alertmanager_payload(body);
+        let err = result.err().expect("malformed payload must be rejected");
+        assert_eq!(
+            err.status,
+            StatusCode::BAD_REQUEST,
+            "malformed payload must map to 400, got {:?}",
+            err.status
+        );
+        assert!(
+            !err.message.is_empty(),
+            "error response must carry a descriptive message"
+        );
+    }
+
+    #[test]
+    fn test_malformed_json_body_returns_400() {
+        assert_rejected_with_400("{ this is not json ");
+        assert_rejected_with_400("");
+        assert_rejected_with_400("null");
+        assert_rejected_with_400("[]");
+    }
+
+    #[test]
+    fn test_missing_required_fields_returns_400() {
+        // Missing `alerts` entirely.
+        assert_rejected_with_400(r#"{"status": "firing"}"#);
+        // Missing `status`.
+        assert_rejected_with_400(r#"{"alerts": []}"#);
+        // Missing `labels` inside an alert.
+        assert_rejected_with_400(
+            r#"{"status": "firing", "alerts": [{"annotations": {}}]}"#,
+        );
+        // Missing `annotations` inside an alert.
+        assert_rejected_with_400(
+            r#"{"status": "firing", "alerts": [{"labels": {}}]}"#,
+        );
+    }
+
+    #[test]
+    fn test_wrong_json_types_returns_400() {
+        // `alerts` must be an array, not a string.
+        assert_rejected_with_400(r#"{"status": "firing", "alerts": "oops"}"#);
+        // `alerts` must be an array, not an object.
+        assert_rejected_with_400(r#"{"status": "firing", "alerts": {}}"#);
+        // `status` must be a string.
+        assert_rejected_with_400(r#"{"status": 42, "alerts": []}"#);
+        // `labels` must be an object.
+        assert_rejected_with_400(
+            r#"{"status": "firing", "alerts": [{"labels": "bad", "annotations": {}}]}"#,
+        );
+        // `annotations` must be an object.
+        assert_rejected_with_400(
+            r#"{"status": "firing", "alerts": [{"labels": {}, "annotations": 7}]}"#,
+        );
+    }
+
+    #[test]
+    fn test_empty_alerts_array_returns_400() {
+        assert_rejected_with_400(r#"{"status": "firing", "alerts": []}"#);
+    }
+
+    #[test]
+    fn test_valid_payload_is_accepted() {
+        let body = r#"{
+            "status": "firing",
+            "alerts": [
+                {
+                    "labels": {"alertname": "HighErrorRate", "severity": "critical"},
+                    "annotations": {"summary": "error rate above threshold"}
+                }
+            ]
+        }"#;
+        let parsed = parse_alertmanager_payload(body).expect("valid payload must be accepted");
+        assert_eq!(parsed.alerts.len(), 1);
+    }
+}
+
 // ── #926: Multi-Instance Load Balancer Integration Tests ─────────────────────
 
 #[cfg(test)]
@@ -987,5 +1118,538 @@ mod load_balancer_multi_instance_tests {
         for h in health {
             assert_eq!(h.request_count, 10, "concurrent distribution should be even");
         }
+    }
+}
+
+// ── Security hardening integration tests (#1208, #1209, #1210, #1211) ────────
+
+#[cfg(test)]
+mod security_hardening_tests {
+    use api_server::health::{detailed_health_access, HealthAccessDecision};
+    use api_server::audit::{create_audit_store_with_fallback, AuditStoreKind};
+    use api_server::config::{default_bind_addr, resolve_bind_addr};
+    use api_server::sync_util::lock_or_recover;
+    use std::sync::{Arc, Mutex};
+
+    // ── #1208: /health/detailed must not be public ────────────────────────────
+
+    #[test]
+    fn test_health_detailed_rejects_unauthenticated_request() {
+        // No credentials, no internal-network marker → must be denied.
+        let decision = detailed_health_access(None, false);
+        assert_eq!(
+            decision,
+            HealthAccessDecision::Denied,
+            "/health/detailed must not be reachable without authentication"
+        );
+    }
+
+    #[test]
+    fn test_health_detailed_rejects_external_request_without_auth() {
+        // Request originates from outside the internal network and carries no token.
+        let decision = detailed_health_access(None, false);
+        assert!(
+            !decision.is_allowed(),
+            "external unauthenticated request must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_health_detailed_allows_authenticated_request() {
+        let decision = detailed_health_access(Some("valid-token"), false);
+        assert!(
+            decision.is_allowed(),
+            "authenticated request must be allowed to see detailed health"
+        );
+    }
+
+    #[test]
+    fn test_health_detailed_allows_internal_network_request() {
+        let decision = detailed_health_access(None, true);
+        assert!(
+            decision.is_allowed(),
+            "internal-network request must be allowed to see detailed health"
+        );
+    }
+
+    #[test]
+    fn test_health_basic_route_remains_public() {
+        // The minimal /health endpoint must stay public and require no auth.
+        assert!(
+            api_server::health::basic_health_is_public(),
+            "/health must remain public and minimal"
+        );
+    }
+
+    // ── #1209: fallback audit store must not panic ────────────────────────────
+
+    #[test]
+    fn test_fallback_audit_store_degrades_without_panic() {
+        // Force the primary store creation to fail; the helper must return an
+        // in-memory fallback instead of panicking.
+        let store = create_audit_store_with_fallback(|| {
+            Err("primary audit store unavailable".to_string())
+        });
+        assert_eq!(
+            store.kind(),
+            AuditStoreKind::InMemoryFallback,
+            "failed primary store must degrade to the in-memory fallback sink"
+        );
+    }
+
+    #[test]
+    fn test_fallback_audit_store_emits_metric() {
+        let store = create_audit_store_with_fallback(|| {
+            Err("primary audit store unavailable".to_string())
+        });
+        assert!(
+            store.fallback_metric_emitted(),
+            "a metric must be emitted when the fallback audit store is active"
+        );
+    }
+
+    #[test]
+    fn test_primary_audit_store_used_when_available() {
+        let store = create_audit_store_with_fallback(|| Ok(()));
+        assert_eq!(
+            store.kind(),
+            AuditStoreKind::Primary,
+            "a healthy primary store must be used directly"
+        );
+        assert!(
+            !store.fallback_metric_emitted(),
+            "no fallback metric should be emitted when the primary store works"
+        );
+    }
+
+    // ── #1210: configurable bind address ──────────────────────────────────────
+
+    #[test]
+    fn test_default_bind_addr_is_0_0_0_0_8080() {
+        assert_eq!(
+            default_bind_addr().to_string(),
+            "0.0.0.0:8080",
+            "default bind address must remain 0.0.0.0:8080"
+        );
+    }
+
+    #[test]
+    fn test_bind_addr_resolves_from_env_overrides() {
+        let addr = resolve_bind_addr(Some("127.0.0.1"), Some("9090"));
+        assert_eq!(
+            addr.to_string(),
+            "127.0.0.1:9090",
+            "bind address must be configurable via environment variables"
+        );
+    }
+
+    #[test]
+    fn test_bind_addr_falls_back_to_defaults_when_env_absent() {
+        let addr = resolve_bind_addr(None, None);
+        assert_eq!(addr.to_string(), "0.0.0.0:8080");
+    }
+
+    // ── #1211: poisoned mutex must not panic the next request ─────────────────
+
+    #[test]
+    fn test_poisoned_lock_does_not_panic_next_request() {
+        let shared = Arc::new(Mutex::new(0u32));
+
+        // Poison the mutex by panicking while holding the guard.
+        let poisoner = shared.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("intentional panic to poison the mutex");
+        })
+        .join();
+
+        assert!(shared.is_poisoned(), "mutex should be poisoned by the panic");
+
+        // The next request must recover the guard rather than panic.
+        let mut guard = lock_or_recover(&shared);
+        *guard += 1;
+        assert_eq!(*guard, 1, "poison-tolerant lock must still allow progress");
+    }
+
+    #[test]
+    fn test_lock_or_recover_works_on_unpoisoned_mutex() {
+        let shared = Mutex::new(41u32);
+        let mut guard = lock_or_recover(&shared);
+        *guard += 1;
+        assert_eq!(*guard, 42);
+// ── #1200: WATCHLISTS global store bounds ────────────────────────────────────
+
+#[cfg(test)]
+mod watchlists_bounds_tests {
+    use api_server::handlers::{
+        watchlists_insert, watchlists_len, watchlists_clear_for_tests,
+        WatchlistError, MAX_WATCHLIST_ENTRIES_PER_USER, MAX_WATCHLIST_USERS,
+    };
+
+    fn reset() {
+        watchlists_clear_for_tests();
+    }
+
+    /// A single user cannot exceed the per-user entry cap; the structured error
+    /// is returned and the set is left unchanged.
+    #[test]
+    fn test_watchlist_per_user_cap_returns_structured_error() {
+        reset();
+        let user = "GUSERPERCAP";
+
+        for i in 0..MAX_WATCHLIST_ENTRIES_PER_USER as u64 {
+            watchlists_insert(user, i).expect("inserts below the cap must succeed");
+        }
+        assert_eq!(
+            watchlists_len(user),
+            MAX_WATCHLIST_ENTRIES_PER_USER,
+            "user should hold exactly the cap"
+        );
+
+        let err = watchlists_insert(user, 999_999).unwrap_err();
+        match err {
+            WatchlistError::PerUserCapExceeded { user: u, limit } => {
+                assert_eq!(u, user);
+                assert_eq!(limit, MAX_WATCHLIST_ENTRIES_PER_USER);
+            }
+            other => panic!("expected PerUserCapExceeded, got {:?}", other),
+        }
+
+        // State must be unchanged after the rejected insert.
+        assert_eq!(
+            watchlists_len(user),
+            MAX_WATCHLIST_ENTRIES_PER_USER,
+            "rejected insert must not grow the set"
+        );
+        reset();
+    }
+
+    /// The total number of tracked users is bounded; once the cap is reached a
+    /// new user is rejected with a structured error and no new entry is created.
+    #[test]
+    fn test_watchlist_total_users_cap_returns_structured_error() {
+        reset();
+
+        for i in 0..MAX_WATCHLIST_USERS {
+            let user = format!("GUSER{i:04}");
+            watchlists_insert(&user, 1).expect("inserts below the total cap must succeed");
+        }
+
+        let overflow_user = "GUSEROVERFLOW";
+        let err = watchlists_insert(overflow_user, 1).unwrap_err();
+        match err {
+            WatchlistError::TotalUsersCapExceeded { limit } => {
+                assert_eq!(limit, MAX_WATCHLIST_USERS);
+            }
+            other => panic!("expected TotalUsersCapExceeded, got {:?}", other),
+        }
+
+        // The overflowing user must not have been created.
+        assert_eq!(
+            watchlists_len(overflow_user),
+            0,
+            "rejected user must not be added to the global map"
+        );
+        reset();
+    }
+
+    /// Re-inserting an existing user at the total cap is still allowed (the user
+    /// already exists, so no new map entry is created).
+    #[test]
+    fn test_watchlist_existing_user_allowed_at_total_cap() {
+        reset();
+        for i in 0..MAX_WATCHLIST_USERS {
+            let user = format!("GUSER{i:04}");
+            watchlists_insert(&user, 1).expect("fill to total cap");
+        }
+        // Existing user, new entry — must succeed.
+        watchlists_insert("GUSER0000", 2).expect("existing user may still add entries");
+        assert_eq!(watchlists_len("GUSER0000"), 2);
+        reset();
+    }
+}
+
+// ── #1201: list_webhooks owner scoping & redaction ──────────────────────────
+
+#[cfg(test)]
+mod list_webhooks_scoping_tests {
+    use api_server::handlers::{
+        register_webhook_for_tests, list_webhooks_for_tests, webhooks_clear_for_tests,
+        redact_webhook_url,
+    };
+
+    fn reset() {
+        webhooks_clear_for_tests();
+    }
+
+    /// One owner must not see another owner's hooks.
+    #[test]
+    fn test_list_webhooks_isolated_per_owner() {
+        reset();
+        register_webhook_for_tests("GOWNER_A", "https://a.example.com/hook").unwrap();
+        register_webhook_for_tests("GOWNER_B", "https://b.example.com/hook").unwrap();
+
+        let a = list_webhooks_for_tests("GOWNER_A");
+        let b = list_webhooks_for_tests("GOWNER_B");
+
+        assert_eq!(a.len(), 1, "owner A should see exactly their own hook");
+        assert_eq!(b.len(), 1, "owner B should see exactly their own hook");
+        assert!(a[0].url.contains("a.example.com"));
+        assert!(b[0].url.contains("b.example.com"));
+        assert!(
+            a.iter().all(|h| !h.url.contains("b.example.com")),
+            "owner A must not see owner B's hooks"
+        );
+        assert!(
+            b.iter().all(|h| !h.url.contains("a.example.com")),
+            "owner B must not see owner A's hooks"
+        );
+        reset();
+    }
+
+    /// URL query strings and userinfo credentials are stripped from the listing.
+    #[test]
+    fn test_list_webhooks_redacts_query_and_credentials() {
+        reset();
+        register_webhook_for_tests(
+            "GOWNER_C",
+            "https://user:secret@c.example.com/hook?token=abc123&x=1",
+        )
+        .unwrap();
+
+        let listed = list_webhooks_for_tests("GOWNER_C");
+        assert_eq!(listed.len(), 1);
+        let url = &listed[0].url;
+        assert!(!url.contains("token=abc123"), "query string must be stripped: {url}");
+        assert!(!url.contains("secret"), "userinfo password must be stripped: {url}");
+        assert!(!url.contains("user:"), "userinfo must be stripped: {url}");
+        assert!(url.contains("c.example.com"), "host must be preserved: {url}");
+        reset();
+    }
+
+    /// The redaction helper itself behaves as documented.
+    #[test]
+    fn test_redact_webhook_url_helper() {
+        assert_eq!(
+            redact_webhook_url("https://user:pass@example.com/path?q=1#frag"),
+            "https://example.com/path"
+        );
+        assert_eq!(
+            redact_webhook_url("https://example.com/path"),
+            "https://example.com/path"
+        );
+    }
+}
+
+// ── #1202: SSRF guard on webhook registration ───────────────────────────────
+
+#[cfg(test)]
+mod webhook_ssrf_tests {
+    use api_server::handlers::{
+        register_webhook_for_tests, webhooks_clear_for_tests, WebhookError,
+        is_blocked_ip, validate_webhook_url,
+    };
+    use std::net::IpAddr;
+
+    fn reset() {
+        webhooks_clear_for_tests();
+    }
+
+    fn assert_blocked(ip: &str) {
+        let addr: IpAddr = ip.parse().expect("valid ip literal");
+        assert!(is_blocked_ip(&addr), "address {ip} must be blocked by the SSRF guard");
+    }
+
+    #[test]
+    fn test_ssrf_blocks_loopback_v4() {
+        assert_blocked("127.0.0.1");
+        assert_blocked("127.255.255.254");
+    }
+
+    #[test]
+    fn test_ssrf_blocks_loopback_v6() {
+        assert_blocked("::1");
+    }
+
+    #[test]
+    fn test_ssrf_blocks_rfc1918_10_slash_8() {
+        assert_blocked("10.0.0.1");
+        assert_blocked("10.255.255.254");
+    }
+
+    #[test]
+    fn test_ssrf_blocks_rfc1918_172_16_slash_12() {
+        assert_blocked("172.16.0.1");
+        assert_blocked("172.31.255.254");
+        // 172.32.x is public and must not be blocked by the private-range rule.
+        let public: IpAddr = "172.32.0.1".parse().unwrap();
+        assert!(!is_blocked_ip(&public), "172.32.0.1 is outside 172.16/12");
+    }
+
+    #[test]
+    fn test_ssrf_blocks_rfc1918_192_168_slash_16() {
+        assert_blocked("192.168.0.1");
+        assert_blocked("192.168.255.254");
+    }
+
+    #[test]
+    fn test_ssrf_blocks_link_local_metadata_endpoint() {
+        assert_blocked("169.254.169.254");
+    }
+
+    #[test]
+    fn test_ssrf_blocks_ipv6_unique_local_fc00_slash_7() {
+        assert_blocked("fc00::1");
+        assert_blocked("fd12:3456:789a::1");
+    }
+
+    #[test]
+    fn test_ssrf_blocks_ipv6_link_local_fe80_slash_10() {
+        assert_blocked("fe80::1");
+        assert_blocked("febf::1");
+    }
+
+    #[test]
+    fn test_ssrf_allows_public_addresses() {
+        let public: IpAddr = "93.184.216.34".parse().unwrap();
+        assert!(!is_blocked_ip(&public), "public address must be allowed");
+    }
+
+    /// Registering a webhook pointing at a blocked literal address is rejected.
+    #[test]
+    fn test_register_webhook_rejects_blocked_literal() {
+        reset();
+        for url in [
+            "http://127.0.0.1/hook",
+            "http://[::1]/hook",
+            "http://10.1.2.3/hook",
+            "http://172.16.5.5/hook",
+            "http://192.168.1.1/hook",
+            "http://169.254.169.254/latest/meta-data",
+            "http://[fc00::1]/hook",
+            "http://[fe80::1]/hook",
+        ] {
+            let err = register_webhook_for_tests("GOWNER_SSRF", url)
+                .expect_err(&format!("{url} must be rejected"));
+            match err {
+                WebhookError::BlockedAddress { .. } => {}
+                other => panic!("expected BlockedAddress for {url}, got {:?}", other),
+            }
+        }
+        reset();
+    }
+
+    /// `validate_webhook_url` rejects non-http(s) schemes with a structured error.
+    #[test]
+    fn test_validate_webhook_url_rejects_bad_scheme() {
+        let err = validate_webhook_url("ftp://example.com/hook").unwrap_err();
+        match err {
+            WebhookError::InvalidScheme { .. } => {}
+            other => panic!("expected InvalidScheme, got {:?}", other),
+        }
+    }
+}
+
+// ── #1202: DNS rebinding re-check at delivery time ──────────────────────────
+
+#[cfg(test)]
+mod webhook_dns_rebinding_tests {
+    use api_server::handlers::{
+        register_webhook_for_tests, webhooks_clear_for_tests,
+        deliver_webhook_with_resolver_for_tests, WebhookError,
+    };
+    use std::net::IpAddr;
+
+    /// Simulate a host that resolves to a public address at registration time
+    /// but to a private address at delivery time (DNS rebinding).  The
+    /// delivery-time re-check must block the request.
+    #[tokio::test]
+    async fn test_delivery_time_recheck_blocks_rebinding() {
+        webhooks_clear_for_tests();
+
+        // Registration-time resolver: public address.
+        let public: IpAddr = "93.184.216.34".parse().unwrap();
+        let hook = register_webhook_for_tests_with_resolver(
+            "GOWNER_REBIND",
+            "https://rebind.example.com/hook",
+            move |_host: &str| Ok(vec![public]),
+        )
+        .expect("registration with a public resolution must succeed");
+
+        // Delivery-time resolver: private address (rebound).
+        let private: IpAddr = "10.0.0.5".parse().unwrap();
+        let result = deliver_webhook_with_resolver_for_tests(
+            &hook,
+            move |_host: &str| Ok(vec![private]),
+        )
+        .await;
+
+        let err = result.expect_err("delivery must be blocked after rebinding");
+        match err {
+            WebhookError::BlockedAddress { .. } => {}
+            other => panic!("expected BlockedAddress at delivery, got {:?}", other),
+        }
+
+        webhooks_clear_for_tests();
+    }
+
+    /// Helper mirroring `register_webhook_for_tests` but with an injected resolver.
+    fn register_webhook_for_tests_with_resolver<F>(
+        owner: &str,
+        url: &str,
+        resolver: F,
+    ) -> Result<api_server::handlers::RegisteredWebhook, WebhookError>
+    where
+        F: Fn(&str) -> Result<Vec<IpAddr>, WebhookError> + Send + Sync + 'static,
+    {
+        api_server::handlers::register_webhook_with_resolver_for_tests(owner, url, resolver)
+    }
+}
+
+// ── #1203: redirects are not followed by the webhook client ─────────────────
+
+#[cfg(test)]
+mod webhook_redirect_tests {
+    use api_server::webhook::{WebhookClient, DeliveryOutcome};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    /// Spin up a tiny HTTP server that answers every request with a 302 to an
+    /// internal address.  The webhook client must NOT follow it; it must record
+    /// a delivery failure instead.
+    #[tokio::test]
+    async fn test_redirect_is_not_followed() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().unwrap();
+
+        // Serve exactly one request then exit.
+        let server = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let response = "HTTP/1.1 302 Found\r\n\
+                                Location: http://169.254.169.254/latest/meta-data\r\n\
+                                Content-Length: 0\r\n\
+                                Connection: close\r\n\r\n";
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        let client = WebhookClient::for_tests_allow_loopback();
+        let url = format!("http://{}/hook", addr);
+        let outcome = client.deliver_for_tests(&url, b"{}").await;
+
+        match outcome {
+            DeliveryOutcome::Failure { reason } => {
+                assert!(
+                    reason.to_lowercase().contains("redirect"),
+                    "failure reason should mention the redirect: {reason}"
+                );
+            }
+            other => panic!("redirect must be recorded as a failure, got {:?}", other),
+        }
+
+        let _ = server.join();
     }
 }

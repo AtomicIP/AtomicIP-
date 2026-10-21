@@ -8,6 +8,9 @@ use axum::{
 use ed25519_dalek::{Signer, SigningKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SignaturePayload {
@@ -15,6 +18,7 @@ pub struct SignaturePayload {
     pub path: String,
     pub timestamp: u64,
     pub body_hash: String,
+    pub nonce: String,
 }
 
 /// Default window (seconds) within which a request's `X-Timestamp` must fall
@@ -29,10 +33,35 @@ fn timestamp_skew_secs() -> u64 {
 }
 
 /// The canonical bytes signed/verified for a request: binds method, path,
-/// timestamp, and body hash together so a signature cannot be replayed
-/// against a different endpoint, time, or body.
-fn signing_payload(method: &str, path: &str, timestamp: u64, body_hash: &str) -> String {
-    format!("{}||{}||{}||{}", method, path, timestamp, body_hash)
+/// timestamp, body hash, and nonce together so a signature cannot be replayed
+/// against a different endpoint, time, body, or nonce.
+fn signing_payload(method: &str, path: &str, timestamp: u64, body_hash: &str, nonce: &str) -> String {
+    format!("{}||{}||{}||{}||{}", method, path, timestamp, body_hash, nonce)
+}
+
+/// Process-wide store of nonces seen within the current skew window, used to
+/// reject replayed signed requests. Each entry maps the nonce to the instant
+/// it was first observed; entries older than the skew window are evicted.
+fn nonce_store() -> &'static Mutex<HashMap<String, Instant>> {
+    static STORE: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Atomically record `nonce` as seen. Returns `false` if the nonce was already
+/// present (i.e. this is a replay), `true` if it was newly inserted. Expired
+/// entries (older than the skew window) are evicted on each call.
+fn record_nonce(nonce: &str) -> bool {
+    let ttl = std::time::Duration::from_secs(timestamp_skew_secs());
+    let mut store = nonce_store().lock().unwrap_or_else(|e| e.into_inner());
+
+    // Evict entries that have aged out of the skew window.
+    store.retain(|_, seen_at| seen_at.elapsed() < ttl);
+
+    if store.contains_key(nonce) {
+        return false;
+    }
+    store.insert(nonce.to_string(), Instant::now());
+    true
 }
 
 /// Sign a request with an Ed25519 keypair. The signed message is the SHA-256
@@ -43,9 +72,10 @@ pub fn generate_signature(
     path: &str,
     timestamp: u64,
     body_hash: &str,
+    nonce: &str,
     signing_key: &SigningKey,
 ) -> String {
-    let payload = signing_payload(method, path, timestamp, body_hash);
+    let payload = signing_payload(method, path, timestamp, body_hash, nonce);
     let mut hasher = Sha256::new();
     hasher.update(payload.as_bytes());
     let message_hash = hasher.finalize();
@@ -71,10 +101,11 @@ pub fn verify_signature(
     path: &str,
     timestamp: u64,
     body_hash: &str,
+    nonce: &str,
     signature: &str,
     public_key: &str,
 ) -> bool {
-    let payload = signing_payload(method, path, timestamp, body_hash);
+    let payload = signing_payload(method, path, timestamp, body_hash, nonce);
     auth::verify_stellar_signature(public_key, &payload, signature).unwrap_or(false)
 }
 
@@ -104,6 +135,15 @@ pub async fn verify_request_signature(
 
     let timestamp: u64 = timestamp_str.parse()
         .map_err(|_| axum::http::StatusCode::UNAUTHORIZED)?;
+
+    // Extract nonce header — required and must be non-empty.
+    let nonce = headers
+        .get("X-Nonce")
+        .and_then(|v| v.to_str().ok())
+        .ok_or(axum::http::StatusCode::UNAUTHORIZED)?;
+    if nonce.is_empty() {
+        return Err(axum::http::StatusCode::UNAUTHORIZED);
+    }
 
     // Check timestamp is within the configured skew window (replay protection).
     let now = std::time::SystemTime::now()
@@ -137,7 +177,12 @@ pub async fn verify_request_signature(
     let body_hash = hash_body(&body_bytes);
 
     // Verify signature
-    if !verify_signature(&method, &path, timestamp, &body_hash, signature, public_key) {
+    if !verify_signature(&method, &path, timestamp, &body_hash, nonce, signature, public_key) {
+        return Err(axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    // Reject replays: the nonce must not have been seen within the skew window.
+    if !record_nonce(nonce) {
         return Err(axum::http::StatusCode::UNAUTHORIZED);
     }
 
@@ -164,20 +209,21 @@ mod tests {
     #[test]
     fn test_signature_generation() {
         let (signing_key, _) = test_keypair(1);
-        let signature = generate_signature("POST", "/ip/commit", 1234567890, "body_hash", &signing_key);
+        let signature = generate_signature("POST", "/ip/commit", 1234567890, "body_hash", "nonce-1", &signing_key);
         assert!(!signature.is_empty());
     }
 
     #[test]
     fn test_signature_verification() {
         let (signing_key, public_key) = test_keypair(2);
-        let signature = generate_signature("POST", "/ip/commit", 1234567890, "body_hash", &signing_key);
+        let signature = generate_signature("POST", "/ip/commit", 1234567890, "body_hash", "nonce-2", &signing_key);
 
         assert!(verify_signature(
             "POST",
             "/ip/commit",
             1234567890,
             "body_hash",
+            "nonce-2",
             &signature,
             &public_key,
         ));
@@ -191,13 +237,14 @@ mod tests {
         let (wrong_signing_key, _) = test_keypair(3);
         let (_, real_public_key) = test_keypair(4);
 
-        let forged = generate_signature("POST", "/ip/commit", 1234567890, "body_hash", &wrong_signing_key);
+        let forged = generate_signature("POST", "/ip/commit", 1234567890, "body_hash", "nonce-3", &wrong_signing_key);
 
         assert!(!verify_signature(
             "POST",
             "/ip/commit",
             1234567890,
             "body_hash",
+            "nonce-3",
             &forged,
             &real_public_key,
         ));
@@ -209,13 +256,14 @@ mod tests {
     #[test]
     fn test_signature_rejected_when_path_tampered() {
         let (signing_key, public_key) = test_keypair(5);
-        let signature = generate_signature("POST", "/ip/commit", 1234567890, "body_hash", &signing_key);
+        let signature = generate_signature("POST", "/ip/commit", 1234567890, "body_hash", "nonce-5", &signing_key);
 
         assert!(!verify_signature(
             "POST",
             "/ip/transfer",
             1234567890,
             "body_hash",
+            "nonce-5",
             &signature,
             &public_key,
         ));
@@ -224,13 +272,32 @@ mod tests {
     #[test]
     fn test_signature_rejected_when_body_tampered() {
         let (signing_key, public_key) = test_keypair(6);
-        let signature = generate_signature("POST", "/ip/commit", 1234567890, "body_hash", &signing_key);
+        let signature = generate_signature("POST", "/ip/commit", 1234567890, "body_hash", "nonce-6", &signing_key);
 
         assert!(!verify_signature(
             "POST",
             "/ip/commit",
             1234567890,
             "tampered_body_hash",
+            "nonce-6",
+            &signature,
+            &public_key,
+        ));
+    }
+
+    /// Issue #1216: the nonce is part of the signed payload, so a signature
+    /// computed over one nonce cannot be replayed under a different nonce.
+    #[test]
+    fn test_signature_rejected_when_nonce_tampered() {
+        let (signing_key, public_key) = test_keypair(7);
+        let signature = generate_signature("POST", "/ip/commit", 1234567890, "body_hash", "nonce-a", &signing_key);
+
+        assert!(!verify_signature(
+            "POST",
+            "/ip/commit",
+            1234567890,
+            "body_hash",
+            "nonce-b",
             &signature,
             &public_key,
         ));
@@ -287,13 +354,14 @@ mod tests {
         let timestamp = now_secs();
         let body_hash = hash_body(&body);
         let signature =
-            generate_signature("POST", "/protected", timestamp, &body_hash, &signing_key);
+            generate_signature("POST", "/protected", timestamp, &body_hash, "nonce-valid", &signing_key);
 
         let req = axum::http::Request::builder()
             .method("POST")
             .uri("/protected")
             .header("X-Signature", signature)
             .header("X-Timestamp", timestamp.to_string())
+            .header("X-Nonce", "nonce-valid")
             .header("X-Public-Key", public_key)
             .body(axum::body::Body::from(body))
             .unwrap();
@@ -317,13 +385,14 @@ mod tests {
         let timestamp = now_secs();
         let body_hash = hash_body(&body);
         let forged =
-            generate_signature("POST", "/protected", timestamp, &body_hash, &wrong_signing_key);
+            generate_signature("POST", "/protected", timestamp, &body_hash, "nonce-wrong-key", &wrong_signing_key);
 
         let req = axum::http::Request::builder()
             .method("POST")
             .uri("/protected")
             .header("X-Signature", forged)
             .header("X-Timestamp", timestamp.to_string())
+            .header("X-Nonce", "nonce-wrong-key")
             .header("X-Public-Key", real_public_key)
             .body(axum::body::Body::from(body))
             .unwrap();
@@ -341,7 +410,7 @@ mod tests {
         let timestamp = now_secs();
         let body_hash = hash_body(&signed_body);
         let signature =
-            generate_signature("POST", "/protected", timestamp, &body_hash, &signing_key);
+            generate_signature("POST", "/protected", timestamp, &body_hash, "nonce-tampered-body", &signing_key);
 
         // Send a different body than the one that was signed.
         let req = axum::http::Request::builder()
@@ -349,6 +418,7 @@ mod tests {
             .uri("/protected")
             .header("X-Signature", signature)
             .header("X-Timestamp", timestamp.to_string())
+            .header("X-Nonce", "nonce-tampered-body")
             .header("X-Public-Key", public_key)
             .body(axum::body::Body::from(b"{\"tampered\":true}".to_vec()))
             .unwrap();
@@ -365,6 +435,66 @@ mod tests {
             .method("POST")
             .uri("/protected")
             .body(axum::body::Body::from(b"{}".to_vec()))
+            .unwrap();
+
+        let resp = signed_app().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    /// Issue #1216: replaying the exact same valid signed request a second
+    /// time must be rejected because its nonce has already been seen.
+    #[tokio::test]
+    async fn test_replayed_request_is_rejected() {
+        use tower::ServiceExt;
+
+        let (signing_key, public_key) = test_keypair(14);
+        let body = b"{}".to_vec();
+        let timestamp = now_secs();
+        let body_hash = hash_body(&body);
+        let nonce = "replay-nonce-1216";
+        let signature =
+            generate_signature("POST", "/protected", timestamp, &body_hash, nonce, &signing_key);
+
+        let build_req = || {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/protected")
+                .header("X-Signature", signature.clone())
+                .header("X-Timestamp", timestamp.to_string())
+                .header("X-Nonce", nonce)
+                .header("X-Public-Key", public_key.clone())
+                .body(axum::body::Body::from(body.clone()))
+                .unwrap()
+        };
+
+        // First submission succeeds.
+        let resp = signed_app().oneshot(build_req()).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        // Replaying the identical request is rejected.
+        let resp = signed_app().oneshot(build_req()).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    /// Issue #1216: a signed request without an `X-Nonce` header is rejected.
+    #[tokio::test]
+    async fn test_request_missing_nonce_is_rejected() {
+        use tower::ServiceExt;
+
+        let (signing_key, public_key) = test_keypair(15);
+        let body = b"{}".to_vec();
+        let timestamp = now_secs();
+        let body_hash = hash_body(&body);
+        let signature =
+            generate_signature("POST", "/protected", timestamp, &body_hash, "nonce-missing", &signing_key);
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/protected")
+            .header("X-Signature", signature)
+            .header("X-Timestamp", timestamp.to_string())
+            .header("X-Public-Key", public_key)
+            .body(axum::body::Body::from(body))
             .unwrap();
 
         let resp = signed_app().oneshot(req).await.unwrap();

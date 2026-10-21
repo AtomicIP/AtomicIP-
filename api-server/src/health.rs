@@ -1,9 +1,11 @@
 use axum::{
-    http::StatusCode,
+    extract::ConnectInfo,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
 use serde::{Deserialize, Serialize};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -148,7 +150,7 @@ impl HealthChecker {
     pub fn new() -> Self {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
 
         Self {
@@ -189,9 +191,6 @@ impl HealthChecker {
         *self.rpc_endpoint.write().await = endpoint;
     }
 
-    /// Check Soroban RPC reachability and contract connectivity
-    pub async fn check_contract_connectivity(&self) -> ComponentStatus {
-        let start = std::time::Instant::now();
     /// Probes the configured Soroban RPC endpoint with a lightweight
     /// `getHealth` JSON-RPC call. When `SOROBAN_RPC_URL` isn't set there is
     /// no contract dependency wired into this deployment, so it is reported
@@ -226,7 +225,7 @@ impl HealthChecker {
         let latency_ms = start.elapsed().as_millis() as u64;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
 
         let status = if latency_ms >= 2000 {
@@ -264,7 +263,7 @@ impl HealthChecker {
     ) -> ComponentStatus {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
 
         let (status, message) = if !is_reachable {
@@ -360,7 +359,7 @@ impl HealthChecker {
         let latency_ms = start.elapsed().as_millis() as u64;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
 
         let component = ComponentStatus {
@@ -391,7 +390,7 @@ impl HealthChecker {
         let latency_ms = start.elapsed().as_millis() as u64;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
 
         let component = ComponentStatus {
@@ -424,7 +423,7 @@ impl HealthChecker {
         let latency_ms = start.elapsed().as_millis() as u64;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
 
         let component = ComponentStatus {
@@ -456,7 +455,7 @@ impl HealthChecker {
         let latency_ms = start.elapsed().as_millis() as u64;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
 
         let component = ComponentStatus {
@@ -513,7 +512,7 @@ impl HealthChecker {
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
 
         let checks = vec![
@@ -588,9 +587,150 @@ pub async fn health_handler(
     (status_code, Json(health)).into_response()
 }
 
-pub async fn detailed_health_handler(
+/// Returns the configured internal CIDR allow-list for `/health/detailed`.
+///
+/// Parsed from `HEALTH_DETAILED_ALLOWED_CIDRS` (comma-separated, e.g.
+/// `10.0.0.0/8,192.168.0.0/16,127.0.0.1/32`). When unset, only loopback
+/// addresses are considered internal.
+fn detailed_health_allowed_cidrs() -> Vec<(IpAddr, u8)> {
+    let raw = std::env::var("HEALTH_DETAILED_ALLOWED_CIDRS")
+        .unwrap_or_else(|_| "127.0.0.0/8,::1/128".to_string());
+
+    raw.split(',')
+        .filter_map(|entry| {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                return None;
+            }
+            let (addr, prefix) = entry.split_once('/')?;
+            let addr: IpAddr = addr.trim().parse().ok()?;
+            let prefix: u8 = prefix.trim().parse().ok()?;
+            let max_prefix = match addr {
+                IpAddr::V4(_) => 32,
+                IpAddr::V6(_) => 128,
+            };
+            if prefix > max_prefix {
+                return None;
+            }
+            Some((addr, prefix))
+        })
+        .collect()
+}
+
+fn ip_in_cidr(ip: IpAddr, network: IpAddr, prefix: u8) -> bool {
+    match (ip, network) {
+        (IpAddr::V4(ip), IpAddr::V4(net)) => {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix)
+            };
+            (u32::from(ip) & mask) == (u32::from(net) & mask)
+        }
+        (IpAddr::V6(ip), IpAddr::V6(net)) => {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix)
+            };
+            (u128::from(ip) & mask) == (u128::from(net) & mask)
+        }
+        _ => false,
+    }
+}
+
+/// Returns the expected bearer token for `/health/detailed`, if configured.
+fn detailed_health_token() -> Option<String> {
+    std::env::var("HEALTH_DETAILED_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty())
+}
+
+fn has_valid_bearer_token(headers: &HeaderMap) -> bool {
+    let Some(expected) = detailed_health_token() else {
+        return false;
+    };
+    let Some(value) = headers.get(axum::http::header::AUTHORIZATION) else {
+        return false;
+    };
+    let Ok(value) = value.to_str() else {
+        return false;
+    };
+    let Some(token) = value.strip_prefix("Bearer ") else {
+        return false;
+    };
+    // Constant-time-ish comparison to avoid trivial timing leaks.
+    let token = token.as_bytes();
+    let expected = expected.as_bytes();
+    if token.len() != expected.len() {
+        return false;
+    }
+    token
+        .iter()
+        .zip(expected.iter())
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+        == 0
+}
+
+/// Returns `true` when the caller may access `/health/detailed`.
+///
+/// Access is granted when either:
+/// - a valid `Authorization: Bearer <HEALTH_DETAILED_TOKEN>` header is present, or
+/// - the client IP falls inside `HEALTH_DETAILED_ALLOWED_CIDRS`.
+fn detailed_health_access_allowed(headers: &HeaderMap, client_ip: Option<IpAddr>) -> bool {
+    if has_valid_bearer_token(headers) {
+        return true;
+    }
+    match client_ip {
+        Some(ip) => detailed_health_allowed_cidrs()
+            .into_iter()
+            .any(|(net, prefix)| ip_in_cidr(ip, net, prefix)),
+        None => false,
+    }
+}
+
+/// Public, minimal health endpoint. Never exposes dependency details.
+pub async fn health_handler(
     axum::extract::State(checker): axum::extract::State<Arc<HealthChecker>>,
 ) -> Response {
+    checker.check_contract_connectivity().await;
+    checker.check_database().await;
+    checker.check_cache().await;
+    checker.check_memory().await;
+    checker.check_disk().await;
+
+    let health = checker.get_health().await;
+
+    let status_code = match health.status.as_str() {
+        "healthy" | "degraded" => StatusCode::OK,
+        _ => StatusCode::SERVICE_UNAVAILABLE,
+    };
+
+    // Minimal payload: no component/dependency details leak publicly.
+    let body = serde_json::json!({
+        "status": health.status,
+        "timestamp": health.timestamp,
+        "uptime_seconds": health.uptime_seconds,
+    });
+
+    (status_code, Json(body)).into_response()
+}
+
+pub async fn detailed_health_handler(
+    axum::extract::State(checker): axum::extract::State<Arc<HealthChecker>>,
+    headers: HeaderMap,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+) -> Response {
+    let client_ip = connect_info.map(|ConnectInfo(addr)| addr.ip());
+    if !detailed_health_access_allowed(&headers, client_ip) {
+        // Do not leak dependency details to unauthorized callers.
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "unauthorized" })),
+        )
+            .into_response();
+    }
+
     checker.check_contract_connectivity().await;
     checker.check_database().await;
     checker.check_cache().await;
@@ -865,6 +1005,114 @@ mod tests {
 
         let health = checker.get_health().await;
         assert_eq!(health.status, "down");
+    }
+
+    #[test]
+    fn test_detailed_health_rejects_unauthenticated_external_caller() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("HEALTH_DETAILED_TOKEN");
+        std::env::set_var("HEALTH_DETAILED_ALLOWED_CIDRS", "10.0.0.0/8");
+
+        let headers = HeaderMap::new();
+        let external_ip: IpAddr = "203.0.113.5".parse().unwrap();
+        assert!(!detailed_health_access_allowed(&headers, Some(external_ip)));
+
+        std::env::remove_var("HEALTH_DETAILED_ALLOWED_CIDRS");
+    }
+
+    #[test]
+    fn test_detailed_health_allows_internal_cidr() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("HEALTH_DETAILED_TOKEN");
+        std::env::set_var("HEALTH_DETAILED_ALLOWED_CIDRS", "10.0.0.0/8,192.168.0.0/16");
+
+        let headers = HeaderMap::new();
+        let internal_ip: IpAddr = "10.1.2.3".parse().unwrap();
+        assert!(detailed_health_access_allowed(&headers, Some(internal_ip)));
+
+        std::env::remove_var("HEALTH_DETAILED_ALLOWED_CIDRS");
+    }
+
+    #[test]
+    fn test_detailed_health_allows_valid_bearer_token() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("HEALTH_DETAILED_TOKEN", "secret-token");
+        std::env::set_var("HEALTH_DETAILED_ALLOWED_CIDRS", "10.0.0.0/8");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer secret-token".parse().unwrap(),
+        );
+        let external_ip: IpAddr = "203.0.113.5".parse().unwrap();
+        assert!(detailed_health_access_allowed(&headers, Some(external_ip)));
+
+        let mut bad_headers = HeaderMap::new();
+        bad_headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer wrong-token".parse().unwrap(),
+        );
+        assert!(!detailed_health_access_allowed(&bad_headers, Some(external_ip)));
+
+        std::env::remove_var("HEALTH_DETAILED_TOKEN");
+        std::env::remove_var("HEALTH_DETAILED_ALLOWED_CIDRS");
+    }
+
+    #[tokio::test]
+    async fn test_detailed_health_handler_returns_401_for_public_caller() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("HEALTH_DETAILED_TOKEN");
+        std::env::set_var("HEALTH_DETAILED_ALLOWED_CIDRS", "10.0.0.0/8");
+
+        let checker = Arc::new(HealthChecker::new());
+        let response = detailed_health_handler(
+            axum::extract::State(checker),
+            HeaderMap::new(),
+            Some(ConnectInfo(SocketAddr::from(([203, 0, 113, 5], 12345)))),
+        )
+        .await;
+
+        std::env::remove_var("HEALTH_DETAILED_ALLOWED_CIDRS");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_public_health_handler_is_accessible() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("SOROBAN_RPC_URL");
+        std::env::remove_var("DATABASE_URL");
+
+        let checker = Arc::new(HealthChecker::new());
+        let response = health_handler(axum::extract::State(checker)).await;
+
+        // Public endpoint must not require auth; status reflects health only.
+        assert!(matches!(
+            response.status(),
+            StatusCode::OK | StatusCode::SERVICE_UNAVAILABLE
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_failing_probe_reports_degraded_not_panic() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // An unreachable dependency must surface as a degraded overall
+        // status, never as a panic from the probe itself.
+        std::env::set_var("SOROBAN_RPC_URL", "http://127.0.0.1:1");
+        std::env::remove_var("DATABASE_URL");
+
+        let checker = HealthChecker::new();
+        checker.check_contract_connectivity().await;
+        checker.check_database().await;
+        checker.check_cache().await;
+        checker.check_memory().await;
+        checker.check_disk().await;
+
+        let health = checker.get_health().await;
+        std::env::remove_var("SOROBAN_RPC_URL");
+
+        assert_eq!(health.status, "degraded");
+        assert_ne!(health.status, "down");
     }
 
     #[tokio::test]

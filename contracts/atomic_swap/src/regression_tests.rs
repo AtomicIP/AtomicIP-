@@ -327,6 +327,54 @@ mod regression_tests {
         );
     }
 
+    // ── Bug: Item 30 — Insurance claimable after invalid-key reveal ───────────
+    //
+    // Regression test for item 30 (tracked by issue #1230).
+    //
+    // After an invalid-key reveal, the swap must remain Accepted and the buyer
+    // must still be able to claim insurance. This test is kept red (via
+    // `#[ignore]`) until item 30 is fixed; once fixed, remove the `#[ignore]`
+    // attribute so it runs as a normal regression test on every CI build.
+    #[test]
+    #[ignore = "item 30: claim_insurance fails after invalid-key reveal (issue #1230)"]
+    fn regression_1230_insurance_claimable_after_invalid_key_reveal() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let admin = Address::generate(&env);
+
+        let (registry_id, ip_id, _correct_secret, _blinding) = setup_registry(&env, &seller);
+        let token_id = setup_token(&env, &admin, &buyer, 1000);
+        let contract_id = setup_swap(&env, &registry_id);
+        let client = AtomicSwapClient::new(&env, &contract_id);
+
+        let swap_id = client.initiate_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None, &false);
+        client.accept_swap(&swap_id, &buyer);
+
+        // Perform an invalid-key reveal: must be rejected and leave the swap Accepted.
+        let wrong_key = BytesN::from_array(&env, &[0xFFu8; 32]);
+        let result = client.try_reveal_key(&swap_id, &seller, &wrong_key);
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            ContractError::InvalidKey,
+            "wrong key must be rejected"
+        );
+        assert_eq!(
+            client.get_swap(&swap_id).unwrap().status,
+            SwapStatus::Accepted,
+            "swap must remain Accepted after an invalid-key reveal"
+        );
+
+        // The buyer must still be able to claim insurance after the failed reveal.
+        let claim_result = client.try_claim_insurance(&swap_id, &buyer);
+        assert!(
+            claim_result.is_ok(),
+            "buyer must be able to claim insurance after an invalid-key reveal (item 30)"
+        );
+    }
+
     // ── Bug: #781 Dispute-Arbitration Hardening ───────────────────────────────
     //
     // Regression test for the #781 dispute-arbitration hardening fix.
