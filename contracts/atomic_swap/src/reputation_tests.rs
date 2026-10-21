@@ -129,6 +129,31 @@ mod reputation_tests {
     }
 
     #[test]
+    fn test_admin_can_configure_expired_swap_reputation_penalty() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let (registry_id, ip_id, _, _) = setup_registry(&env, &seller);
+        let token_id = setup_token(&env, &seller, &buyer, 1_000_000);
+        let contract_id = setup_swap_contract(&env, &registry_id);
+        let client = AtomicSwapClient::new(&env, &contract_id);
+
+        let swap_id = client.initiate_swap(
+            &token_id, &ip_id, &seller, &1000i128, &buyer,
+            &0u32, &None, &0i128, &false,
+        );
+        client.set_expired_swap_reputation_penalty(&seller, &7);
+        client.accept_swap(&swap_id);
+        env.ledger().with_mut(|l| l.timestamp += 604801);
+        client.cancel_expired_swap(&swap_id, &buyer);
+
+        assert_eq!(client.get_expired_swap_reputation_penalty(), 7);
+        assert_eq!(client.get_reputation(&seller), 43);
+    }
+
+    #[test]
     fn test_reputation_clamped_at_zero() {
         let env = Env::default();
         env.mock_all_auths();

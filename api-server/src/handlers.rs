@@ -2350,12 +2350,14 @@ pub(crate) static TWO_FACTOR_STORE: once_cell::sync::Lazy<crate::auth_2fa::TwoFa
     request_body = Enable2faRequest,
     responses(
         (status = 200, description = "2FA enabled successfully, returns secret and backup codes", body = Enable2faResponse),
-        (status = 400, description = "Invalid user ID", body = ErrorResponse),
-        (status = 500, description = "Internal server error", body = ErrorResponse),
+    (status = 409, description = "2FA is already configured for this user", body = ErrorResponse),
+    (status = 400, description = "Invalid user ID", body = ErrorResponse),
+    (status = 500, description = "Internal server error", body = ErrorResponse),
     )
 )]
-#[instrument(skip(body))]
+#[instrument(skip(body, claims))]
 pub async fn enable_2fa(
+    crate::auth::AuthExtension(claims): crate::auth::AuthExtension,
     Json(body): Json<Enable2faRequest>,
 ) -> Result<Json<Enable2faResponse>, (StatusCode, Json<ErrorResponse>)> {
     if body.user_id.is_empty() {
@@ -2363,6 +2365,15 @@ pub async fn enable_2fa(
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
                 error: "user_id must not be empty".to_string(),
+            }),
+        ));
+    }
+
+    if claims.sub != body.user_id {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                error: "Cannot manage 2FA for another user".to_string(),
             }),
         ));
     }
@@ -2379,6 +2390,7 @@ pub async fn enable_2fa(
             secret: secret.clone(),
             enabled_at: chrono::Utc::now().timestamp(),
             verified: false,
+            last_totp_step: None,
         }),
         backup_codes: backup_codes
             .iter()
@@ -2392,12 +2404,22 @@ pub async fn enable_2fa(
         last_verified: None,
     };
 
-    TWO_FACTOR_STORE.store_config(config).map_err(|err| {
+    match TWO_FACTOR_STORE.create_config(config).map_err(|err| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse { error: err }),
         )
-    })?;
+    })? {
+        true => {}
+        false => {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(ErrorResponse {
+                    error: "2FA is already configured for this user".to_string(),
+                }),
+            ));
+        }
+    }
 
     Ok(Json(Enable2faResponse {
         secret,
@@ -2420,8 +2442,9 @@ pub async fn enable_2fa(
         (status = 404, description = "2FA not configured for user", body = ErrorResponse),
     )
 )]
-#[instrument(skip(body))]
+#[instrument(skip(body, claims))]
 pub async fn verify_2fa(
+    crate::auth::AuthExtension(claims): crate::auth::AuthExtension,
     Json(body): Json<Verify2faRequest>,
 ) -> Result<Json<Verify2faResponse>, (StatusCode, Json<ErrorResponse>)> {
     if body.user_id.is_empty() {
@@ -2429,6 +2452,15 @@ pub async fn verify_2fa(
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
                 error: "user_id must not be empty".to_string(),
+            }),
+        ));
+    }
+
+    if claims.sub != body.user_id {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                error: "Cannot manage 2FA for another user".to_string(),
             }),
         ));
     }
@@ -2442,70 +2474,31 @@ pub async fn verify_2fa(
         ));
     }
 
-    // Get user's 2FA config
-    let mut config = match TWO_FACTOR_STORE
-        .get_config(&body.user_id)
+    match TWO_FACTOR_STORE
+        .verify_totp_code(&body.user_id, &body.totp_code, chrono::Utc::now().timestamp())
         .map_err(|err| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse { error: err }),
             )
-        })?
-    {
-        Some(cfg) => cfg,
-        None => {
-            return Err((
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse {
-                    error: "2FA not configured for this user".to_string(),
-                }),
-            ))
-        }
-    };
-
-    // Get TOTP secret
-    let secret = match &config.totp {
-        Some(totp) => &totp.secret,
-        None => {
-            return Err((
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse {
-                    error: "2FA not configured for this user".to_string(),
-                }),
-            ))
-        }
-    };
-
-    // Verify TOTP code
-    match crate::auth_2fa::verify_totp_code(secret, &body.totp_code) {
-        Ok(true) => {
-            // Mark 2FA as verified
-            if let Some(ref mut totp) = config.totp {
-                totp.verified = true;
-            }
-            config.last_verified = Some(chrono::Utc::now().timestamp());
-
-            TWO_FACTOR_STORE.store_config(config).map_err(|err| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse { error: err }),
-                )
-            })?;
-
+        })? {
+        Some(true) => {
             Ok(Json(Verify2faResponse {
                 success: true,
                 message: "2FA verified successfully".to_string(),
             }))
         }
-        Ok(false) => Err((
+        Some(false) => Err((
             StatusCode::UNAUTHORIZED,
             Json(ErrorResponse {
                 error: "Invalid TOTP code".to_string(),
             }),
         )),
-        Err(err) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error: err }),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "2FA not configured for this user".to_string(),
+            }),
         )),
     }
 }
@@ -2523,8 +2516,9 @@ pub async fn verify_2fa(
         (status = 404, description = "User not found", body = ErrorResponse),
     )
 )]
-#[instrument(skip(body))]
+#[instrument(skip(body, claims))]
 pub async fn use_backup_code(
+    crate::auth::AuthExtension(claims): crate::auth::AuthExtension,
     Json(body): Json<UseBackupCodeRequest>,
 ) -> Result<Json<Verify2faResponse>, (StatusCode, Json<ErrorResponse>)> {
     if body.user_id.is_empty() || body.backup_code.is_empty() {
@@ -2532,6 +2526,15 @@ pub async fn use_backup_code(
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
                 error: "user_id and backup_code must not be empty".to_string(),
+            }),
+        ));
+    }
+
+    if claims.sub != body.user_id {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                error: "Cannot manage 2FA for another user".to_string(),
             }),
         ));
     }

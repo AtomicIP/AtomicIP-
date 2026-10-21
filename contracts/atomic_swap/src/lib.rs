@@ -260,6 +260,8 @@ pub enum DataKey {
     EscrowDeposit(u64),
     /// Maps address → reputation score (0–100).
     UserReputation(Address),
+    /// Reputation points deducted from sellers when an accepted swap expires unrevealed.
+    ExpiredSwapReputationPenalty,
     /// Maps ip_id → minimum buyer reputation required (set by seller per swap).
     ReputationMultiplier(u64),
     /// Maps swap_id → timestamp when arbitration was requested.
@@ -2568,8 +2570,13 @@ impl AtomicSwap {
         // #253: Log history entry
         Self::append_history(&env, swap_id, SwapStatus::Cancelled);
 
-        // Seller defaulted (expired without revealing key): seller loses 10 points
-        Self::update_reputation(&env, &swap.seller, -10);
+        // Seller defaulted (expired without revealing key).
+        let penalty: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ExpiredSwapReputationPenalty)
+            .unwrap_or(10);
+        Self::update_reputation(&env, &swap.seller, -(penalty as i32));
 
         env.events().publish(
             (soroban_sdk::symbol_short!("s_cancel"),),
@@ -6029,6 +6036,28 @@ impl AtomicSwap {
     }
 
     // ── Reputation ────────────────────────────────────────────────────────────
+
+    /// Returns the configured seller reputation penalty for expired swaps. Defaults to 10.
+    pub fn get_expired_swap_reputation_penalty(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ExpiredSwapReputationPenalty)
+            .unwrap_or(10)
+    }
+
+    /// Set the seller reputation penalty for expired swaps. Only the admin may call this.
+    pub fn set_expired_swap_reputation_penalty(env: Env, caller: Address, penalty: u32) {
+        caller.require_auth();
+        require_admin(&env, &caller);
+        if penalty > 100 {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::InvalidReputationPenalty as u32,
+            ));
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::ExpiredSwapReputationPenalty, &penalty);
+    }
 
     /// Returns the reputation score (0–100) for an address. Defaults to 50.
     pub fn get_reputation(env: Env, address: Address) -> u32 {

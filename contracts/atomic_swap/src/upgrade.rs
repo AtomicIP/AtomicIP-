@@ -246,6 +246,8 @@ pub fn build_v1_schema(env: &Env) -> ContractSchema {
 
     f!("initialize",               "initialize(ip_registry:Address)->()");
     f!("set_admin",                "set_admin(new_admin:Address)->()");
+    f!("get_expired_swap_reputation_penalty", "get_expired_swap_reputation_penalty()->u32");
+    f!("set_expired_swap_reputation_penalty", "set_expired_swap_reputation_penalty(caller:Address,penalty:u32)->()");
     f!("pause",                    "pause(caller:Address)->()");
     f!("unpause",                  "unpause(caller:Address)->()");
     f!("upgrade",                  "upgrade(new_wasm_hash:BytesN<32>)->()");
@@ -332,6 +334,7 @@ pub fn build_v1_schema(env: &Env) -> ContractSchema {
     e!("InsuranceNotClaimable",                 60);
     e!("HashlockNotMet",                        69);
     e!("TimelockExpired",                       70);
+    e!("InvalidReputationPenalty",               71);
 
     let mut storage_keys: Vec<String> = Vec::new(env);
 
@@ -363,6 +366,7 @@ pub fn build_v1_schema(env: &Env) -> ContractSchema {
     k!("InsuranceReserved");
     k!("InsuranceReservedTotal");
     k!("SwapContingencies");
+    k!("ExpiredSwapReputationPenalty");
 
     ContractSchema {
         version: 1,
