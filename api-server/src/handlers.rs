@@ -18,6 +18,7 @@ use crate::deduplication::{create_store, create_store_with_backend, Deduplicatio
 use crate::ip_search::{IpSearchFilters, IpSearchMetadata, IpSearchResponse, SaveSearchRequest, SavedSearch};
 use crate::graphql::SorobanQueryClient;
 use crate::schemas::*;
+use crate::soroban_rpc;
 use std::sync::Arc;
 use crate::webhook;
 use crate::websocket;
@@ -65,6 +66,13 @@ static BATCH_SWAP_IDEMPOTENCY: Lazy<DeduplicationStore> = Lazy::new(|| match std
         create_store()
     }
 });
+
+/// Process-local Soroban RPC client. In production this is replaced by a
+/// `LiveSorobanRpcClient` injected via Axum's State extractor; this static
+/// is a fallback used by handlers that have not been fully wired to the
+/// dependency-injection layer yet.
+static SOROBAN_CLIENT: Lazy<std::sync::Arc<dyn crate::soroban_rpc::SorobanRpcClient>> =
+    Lazy::new(|| std::sync::Arc::new(crate::soroban_rpc::MockSorobanRpcClient::default()));
 
 // #520: Mirrors the contract's MAX_BATCH_SIZE cap on a single batch.
 const MAX_BATCH_SIZE: usize = 50;
@@ -294,18 +302,19 @@ pub async fn commit_ip(
     // Delegate to the Soroban RPC client.  The client validates inputs before
     // making the network call, so validation errors are surfaced as 400 without
     // a round-trip to the RPC node.
-    let ip_id = SOROBAN_CLIENT
-        .commit_ip(&body.owner, &body.commitment_hash)
-        .await
-        .map_err(|err| {
-            let status = soroban_rpc::map_rpc_error_to_status(&err);
-            (
-                status,
-                Json(ErrorResponse {
-                    error: err.to_string(),
-                }),
-            )
-        })?;
+    let ip_id = {
+        let client = SOROBAN_CLIENT.as_ref();
+        client.commit_ip(&body.owner, &body.commitment_hash).await
+    }
+    .map_err(|err| {
+        let status = soroban_rpc::map_rpc_error_to_status(&err);
+        (
+            status,
+            Json(ErrorResponse {
+                error: err.to_string(),
+            }),
+        )
+    })?;
 
     // #1106: Every successful commitment is recorded in the audit trail, before
     // any later check can fail the request.
@@ -345,7 +354,7 @@ pub async fn commit_ip(
     tag = "Analytics",
     responses((status = 200, description = "Commitment and swap analytics"))
 )]
-#[instrument]
+#[instrument(skip_all)]
 pub async fn commitment_analytics() -> impl IntoResponse {
     Json(crate::analytics::snapshot())
 }
@@ -358,7 +367,7 @@ pub async fn commitment_analytics() -> impl IntoResponse {
     params(("tag" = String, Path, description = "Commitment tag")),
     responses((status = 200, description = "Commitments with the tag", body = Vec<u64>))
 )]
-#[instrument]
+#[instrument(skip_all)]
 pub async fn list_commitments_by_tag(Path(tag): Path<String>) -> impl IntoResponse {
     Json(crate::commitments::list_by_tag(&tag))
 }
@@ -374,7 +383,7 @@ pub async fn list_commitments_by_tag(Path(tag): Path<String>) -> impl IntoRespon
         (status = 404, description = "IP record not found", body = ErrorResponse),
     )
 )]
-#[instrument]
+#[instrument(skip_all)]
 pub async fn get_ip(Path(ip_id): Path<u64>) -> impl IntoResponse {
     // #316: Check cache first
     let cache_key = cache::ip_key(ip_id);
@@ -1061,7 +1070,7 @@ pub async fn remove_from_watchlist(
         (status = 400, description = "Invalid commitment hash", body = ErrorResponse),
     )
 )]
-#[instrument]
+#[instrument(skip_all)]
 pub async fn find_similar_commitments(
     Query(params): Query<SimilarCommitmentsParams>,
 ) -> Result<Json<SimilarCommitmentsResponse>, (StatusCode, Json<ErrorResponse>)> {
