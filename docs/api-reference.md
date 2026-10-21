@@ -643,7 +643,7 @@ Emitted when a new IP is committed.
 | `OwnerIps(Address)` | Persistent | Maps owner → Vec of IP IDs |
 | `NextId` | Persistent | Next available IP ID (monotonic counter) |
 | `CommitmentOwner(BytesN<32>)` | Persistent | Maps commitment hash → owner (duplicate detection) |
-| `Admin` | Persistent | Admin address gating admin-only functions; set once via `initialize(admin)` (never auto-derived), rotatable via `set_admin(new_admin)` |
+| `Admin` | Persistent | Admin address gating admin-only functions; set once via `initialize(admin)` (never auto-derived), rotatable in two steps via `propose_admin(new_admin)` then `accept_admin()` (signed by the nominee); `cancel_admin_proposal()` withdraws a nomination |
 
 ---
 
