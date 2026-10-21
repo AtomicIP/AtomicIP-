@@ -16,5 +16,18 @@
     "ip_registry",
     "atomic_swap"
   ],
-  "ratchet_increment": 2
+  "ratchet_increment": 2,
+  "javascript": {
+    "coverage_tool": "jest",
+    "coverage_floor": 75,
+    "thresholds": {
+      "src/royalty/royaltyCalculation.js": 80,
+      "src/metrics/swapMetrics.js": 75
+    }
+  },
+  "js_modules": [
+    "src/recommendations/swapRecommendations.js",
+    "src/batch/bulkSwapOperations.js",
+    "src/notifications/notificationPreferences.js"
+  ]
 }

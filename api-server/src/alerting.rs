@@ -27,6 +27,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use metrics::counter;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
+use tracing::error;
 
 /// Alert severity. Ordered so `Critical > Warning > Info`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -271,6 +272,21 @@ impl AlertManager {
         Self { config, inner: Mutex::new(Inner::default()) }
     }
 
+    /// Acquire the inner state lock, recovering from a poisoned mutex.
+    ///
+    /// A panic in another thread while holding the lock poisons it; the
+    /// manager state is still structurally valid, so we log the poison and
+    /// continue using it rather than propagating the panic.
+    fn lock_inner(&self) -> std::sync::MutexGuard<'_, Inner> {
+        self.inner.lock().unwrap_or_else(|e| {
+            error!(
+                target: "alerting",
+                "alert manager mutex was poisoned; recovering inner state: {e}"
+            );
+            e.into_inner()
+        })
+    }
+
     /// Manager pre-loaded with the project's default correlation rules.
     pub fn with_default_rules() -> Self {
         let mgr = Self::new(AlertManagerConfig::default());
@@ -281,25 +297,23 @@ impl AlertManager {
     }
 
     pub fn add_correlation_rule(&self, rule: CorrelationRule) {
-        self.inner.lock().unwrap().rules.push(rule);
+        self.lock_inner().rules.push(rule);
     }
 
     pub fn add_silence(&self, silence: Silence) {
-        self.inner.lock().unwrap().silences.push(silence);
+        self.lock_inner().silences.push(silence);
     }
 
     /// Expire a silence early. Returns true if it existed.
     pub fn remove_silence(&self, id: &str) -> bool {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock_inner();
         let before = inner.silences.len();
         inner.silences.retain(|s| s.id != id);
         inner.silences.len() != before
     }
 
     pub fn active_silences(&self, now: u64) -> Vec<Silence> {
-        self.inner
-            .lock()
-            .unwrap()
+        self.lock_inner()
             .silences
             .iter()
             .filter(|s| s.is_active(now))
@@ -314,7 +328,7 @@ impl AlertManager {
 
     /// Submit an alert at an explicit timestamp (seconds since epoch).
     pub fn submit_at(&self, alert: Alert, now: u64) -> Disposition {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self.lock_inner();
         // Reborrow so disjoint fields (alerts / outbox) can be borrowed together.
         let inner = &mut *guard;
         inner.silences.retain(|s| now < s.ends_at);
@@ -396,8 +410,23 @@ impl AlertManager {
 
         // 4. Initial notification (escalation step 0)
         let first_channel = self.first_channel();
-        let n = notification_for(&inner.alerts[&fp], &first_channel);
-        inner.outbox.push(n);
+        match inner.alerts.get(&fp) {
+            Some(tracked) => {
+                let n = notification_for(tracked, &first_channel);
+                inner.outbox.push(n);
+            }
+            None => {
+                // Should be unreachable: we just inserted `fp` above. If it is
+                // missing, log and skip enqueueing rather than panicking.
+                error!(
+                    target: "alerting",
+                    alertname = %alert.name,
+                    fingerprint = fp,
+                    "tracked alert missing after insert; skipping notification"
+                );
+                return Disposition::Notified(fp);
+            }
+        }
         counter!(
             "alerts_notified_total",
             "alertname" => alert.name.clone(),
@@ -421,7 +450,7 @@ impl AlertManager {
     pub fn tick(&self, now: u64) {
         let steps = &self.config.escalation.steps;
         let retention = self.config.retention.as_secs();
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self.lock_inner();
         let inner = &mut *guard;
         let mut pending = Vec::new();
 
@@ -462,7 +491,7 @@ impl AlertManager {
     }
 
     fn set_state(&self, fingerprint: u64, state: AlertState) -> bool {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock_inner();
         let children = match inner.alerts.get_mut(&fingerprint) {
             Some(a) => {
                 a.state = state;
@@ -480,14 +509,12 @@ impl AlertManager {
 
     /// Drain notifications produced since the last call.
     pub fn drain_notifications(&self) -> Vec<Notification> {
-        std::mem::take(&mut self.inner.lock().unwrap().outbox)
+        std::mem::take(&mut self.lock_inner().outbox)
     }
 
     /// Snapshot of alerts that are not resolved.
     pub fn open_alerts(&self) -> Vec<TrackedAlert> {
-        self.inner
-            .lock()
-            .unwrap()
+        self.lock_inner()
             .alerts
             .values()
             .filter(|a| a.state != AlertState::Resolved)
@@ -543,3 +570,77 @@ pub fn default_correlation_rules() -> Vec<CorrelationRule> {
 
 /// Process-wide alert manager.
 pub static ALERT_MANAGER: Lazy<AlertManager> = Lazy::new(AlertManager::with_default_rules);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn alert(name: &str) -> Alert {
+        Alert::new(name, Severity::Warning, format!("{name} fired"))
+    }
+
+    #[test]
+    fn bad_rule_does_not_stop_evaluation_of_others() {
+        let mgr = AlertManager::new(AlertManagerConfig::default());
+
+        // A malformed rule: empty source, empty targets, and a group_by key
+        // that no alert carries. It must never match and must not panic.
+        mgr.add_correlation_rule(CorrelationRule {
+            name: "broken-rule".into(),
+            source: String::new(),
+            targets: Vec::new(),
+            group_by: vec!["nonexistent".into()],
+            window: Duration::from_secs(0),
+        });
+
+        // A valid rule that should still be evaluated.
+        mgr.add_correlation_rule(CorrelationRule {
+            name: "valid-rule".into(),
+            source: "RootCause".into(),
+            targets: vec!["Symptom".into()],
+            group_by: vec!["network".into()],
+            window: Duration::from_secs(600),
+        });
+
+        let now = 1_000;
+
+        // Malformed / edge-case alerts alongside valid ones.
+        let empty = Alert::new("", Severity::Info, "");
+        assert!(matches!(mgr.submit_at(empty, now), Disposition::Notified(_)));
+
+        let root = alert("RootCause").with_label("network", "mainnet");
+        let root_fp = match mgr.submit_at(root, now) {
+            Disposition::Notified(fp) => fp,
+            other => panic!("expected Notified for root, got {other:?}"),
+        };
+
+        let symptom = alert("Symptom").with_label("network", "mainnet");
+        match mgr.submit_at(symptom, now + 1) {
+            Disposition::Correlated { parent } => assert_eq!(parent, root_fp),
+            other => panic!("expected Correlated for symptom, got {other:?}"),
+        }
+
+        // The valid alert was still evaluated and tracked.
+        assert!(mgr.open_alerts().iter().any(|a| a.alert.name == "Symptom"));
+    }
+
+    #[test]
+    fn poisoned_mutex_is_recovered() {
+        let mgr = std::sync::Arc::new(AlertManager::new(AlertManagerConfig::default()));
+
+        let poisoner = mgr.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.inner.lock().unwrap();
+            panic!("intentional panic to poison the mutex");
+        })
+        .join();
+
+        // Lock is poisoned, but the manager must still be usable.
+        let fp = match mgr.submit_at(alert("AfterPoison"), 1) {
+            Disposition::Notified(fp) => fp,
+            other => panic!("expected Notified, got {other:?}"),
+        };
+        assert!(mgr.acknowledge(fp));
+        assert!(mgr.drain_notifications().iter().any(|n| n.alert_name == "AfterPoison"));
+    }
+}
