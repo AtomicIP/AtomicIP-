@@ -1751,7 +1751,10 @@ impl IpRegistry {
 
     /// Unlock and reveal a time-locked commitment.
     ///
-    /// Only callable after unlock_time has passed.
+    /// Authorization: only the IP owner may reveal the commitment, matching the
+    /// owner-signature model used by `amend_commitment`. The time lock itself
+    /// decides *when* the reveal is allowed: the owner may call this only once
+    /// `unlock_time` has passed.
     ///
     /// # Arguments
     ///
@@ -1770,6 +1773,9 @@ impl IpRegistry {
         if timelock.is_none() {
             return false;
         }
+
+        let record = require_ip_exists(&env, commitment_id);
+        record.owner.require_auth();
 
         let mut lock = timelock.unwrap();
         let current_time = env.ledger().timestamp();
@@ -2561,7 +2567,9 @@ impl IpRegistry {
 
     // ── Issue #455: Batch Metadata ──────────────────────────────────────────
     pub fn set_batch_metadata(env: Env, ip_id: u64, batch_id: BytesN<32>, description: Bytes) {
-        require_ip_exists(&env, ip_id);
+        // Only the IP owner may describe its batch; reads remain public.
+        let record = require_ip_exists(&env, ip_id);
+        record.owner.require_auth();
         if description.len() > MAX_METADATA_BYTES {
             panic_with_error!(&env, ContractError::BatchMetadataTooLarge);
         }
@@ -2601,7 +2609,9 @@ impl IpRegistry {
     }
 
     pub fn set_commitment_compression(env: Env, ip_id: u64, algorithm: CompressionAlgo) {
-        require_ip_exists(&env, ip_id);
+        // Only the IP owner may change how its commitment is stored and read back.
+        let record = require_ip_exists(&env, ip_id);
+        record.owner.require_auth();
         let selection = CompressionSelection { ip_id, algorithm };
         env.storage()
             .persistent()
@@ -6834,9 +6844,13 @@ impl IpRegistry {
         true
     }
 
-    /// Remove expired IPs that are past their grace period. Anyone can call.
+    /// Remove expired IPs that are past their grace period. Admin-only.
     /// Skips IPs with expiry_timestamp == 0 (no expiry set).
+    /// Removes the record plus its `OwnerIps` and `CommitmentOwner` index entries.
     pub fn cleanup_expired_ips(env: Env, ip_ids: Vec<u64>) {
+        // Admin-only: deleting records must not be open to arbitrary callers.
+        Self::require_admin(&env).require_auth();
+
         let now = env.ledger().timestamp();
         for ip_id in ip_ids.iter() {
             let record: Option<IpRecord> =
@@ -6850,6 +6864,28 @@ impl IpRegistry {
                         .expiry_timestamp
                         .saturating_add(rec.grace_period_seconds)
                 {
+                    // Drop index entries in the same call so no dangling references remain.
+                    let owner_ids: Option<Vec<u64>> = env
+                        .storage()
+                        .persistent()
+                        .get(&DataKey::OwnerIps(rec.owner.clone()));
+                    if let Some(owner_ids) = owner_ids {
+                        if owner_ids.iter().any(|id| id == ip_id) {
+                            let mut kept: Vec<u64> = Vec::new(&env);
+                            for id in owner_ids.iter() {
+                                if id != ip_id {
+                                    kept.push_back(id);
+                                }
+                            }
+                            env.storage()
+                                .persistent()
+                                .set(&DataKey::OwnerIps(rec.owner.clone()), &kept);
+                        }
+                    }
+                    env.storage()
+                        .persistent()
+                        .remove(&DataKey::CommitmentOwner(rec.commitment_hash.clone()));
+
                     env.storage().persistent().remove(&DataKey::IpRecord(ip_id));
                     env.events()
                         .publish((symbol_short!("ip_clean"),), (ip_id, now));
@@ -8945,6 +8981,71 @@ mod tests {
         );
     }
 
+    /// #1156: a non-owner must not be able to rewrite an IP's batch metadata.
+    #[test]
+    fn test_set_batch_metadata_rejects_non_owner() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+        let attacker = Address::generate(&env);
+
+        let hash = BytesN::from_array(&env, &[0x15u8; 32]);
+        let ip_id = client.commit_ip(&owner, &hash, &0u32);
+
+        let batch_id = BytesN::from_array(&env, &[0xCAu8; 32]);
+        let description = soroban_sdk::Bytes::from_array(&env, b"forged");
+
+        // Only the attacker's auth is mocked; the owner's auth is absent.
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &attacker,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "set_batch_metadata",
+                args: (ip_id, batch_id.clone(), description.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        assert!(client
+            .try_set_batch_metadata(&ip_id, &batch_id, &description)
+            .is_err());
+
+        // Nothing was written.
+        assert!(client.get_batch_metadata(&ip_id).is_none());
+    }
+
+    /// #1156: the owner can still write, and reads stay public without auth.
+    #[test]
+    fn test_set_batch_metadata_owner_writes_and_reads_are_public() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+
+        let hash = BytesN::from_array(&env, &[0x16u8; 32]);
+        let ip_id = client.commit_ip(&owner, &hash, &0u32);
+
+        let batch_id = BytesN::from_array(&env, &[0xDAu8; 32]);
+        let description = soroban_sdk::Bytes::from_array(&env, b"owner");
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &owner,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "set_batch_metadata",
+                args: (ip_id, batch_id.clone(), description.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.set_batch_metadata(&ip_id, &batch_id, &description);
+
+        // Read with no auth mocked at all.
+        env.mock_auths(&[]);
+        let meta = client.get_batch_metadata(&ip_id).unwrap();
+        assert_eq!(meta.description, description);
+    }
+
     // ── Issue #456: Compression Algorithm Selection Tests ────────────────────
 
     #[test]
@@ -9043,6 +9144,77 @@ mod tests {
 
         client.set_commitment_compression(&ip_id, &CompressionAlgo::None);
         assert_eq!(client.get_compressed_bytes(&ip_id).len(), 32);
+    }
+
+    /// #1157: a non-owner must not be able to change an IP's compression algorithm.
+    #[test]
+    fn test_set_compression_rejects_non_owner() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+        let attacker = Address::generate(&env);
+
+        let hash = BytesN::from_array(&env, &[0x27u8; 32]);
+        let ip_id = client.commit_ip(&owner, &hash, &0u32);
+
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &attacker,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "set_commitment_compression",
+                args: (ip_id, CompressionAlgo::None).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        assert!(client
+            .try_set_commitment_compression(&ip_id, &CompressionAlgo::None)
+            .is_err());
+
+        // The default algorithm is untouched.
+        env.mock_auths(&[]);
+        assert_eq!(
+            client.get_commitment_compression(&ip_id),
+            CompressionAlgo::Truncate16
+        );
+    }
+
+    /// #1157 regression: compressed bytes round-trip correctly for every algorithm
+    /// on a non-uniform hash, so byte-order or fold mistakes are caught.
+    #[test]
+    fn test_compressed_bytes_round_trip_regression() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+
+        let mut raw = [0u8; 32];
+        for (i, b) in raw.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(7).wrapping_add(3);
+        }
+        let hash = BytesN::from_array(&env, &raw);
+        let ip_id = client.commit_ip(&owner, &hash, &0u32);
+
+        client.set_commitment_compression(&ip_id, &CompressionAlgo::None);
+        assert_eq!(
+            client.get_compressed_bytes(&ip_id),
+            soroban_sdk::Bytes::from_slice(&env, &raw)
+        );
+
+        client.set_commitment_compression(&ip_id, &CompressionAlgo::Truncate16);
+        assert_eq!(
+            client.get_compressed_bytes(&ip_id),
+            soroban_sdk::Bytes::from_slice(&env, &raw[..16])
+        );
+
+        let fold = raw.iter().fold(0u8, |acc, b| acc ^ b);
+        client.set_commitment_compression(&ip_id, &CompressionAlgo::Xor8);
+        assert_eq!(
+            client.get_compressed_bytes(&ip_id),
+            soroban_sdk::Bytes::from_slice(&env, &[fold; 8])
+        );
     }
 
     // ── Issue #457: Commitment Encryption Tests ───────────────────────────────
