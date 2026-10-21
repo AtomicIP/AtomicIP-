@@ -171,6 +171,38 @@ fn verify_commitment(
 }
 ```
 
+### On-chain behavior of `verify_commitment`
+
+The on-chain `verify_commitment` is stricter than the hash comparison above. It returns
+`false` without comparing hashes when the IP is no longer valid for verification:
+
+- **Revoked IPs (#1144).** If the IP record has `revoked = true`, verification returns `false`
+  even when the secret and blinding factor are correct. Revocation is terminal, so downstream
+  swap logic cannot accept a revoked commitment.
+- **Archived commitments.** If the commitment has been archived, verification returns `false`.
+- **Expired commitments (#1145).** If the IP has an `expiry_timestamp` and the ledger time is at
+  or past `expiry_timestamp + grace_period_seconds`, verification returns `false`. Between expiry
+  and the end of the grace period, verification still succeeds.
+
+`verify_commitment` is read-only. It does not emit events or write state. To record an expiry
+transition, call `notify_ip_expiry(ip_id)`. Anyone can call it. It emits `ip_expiry` once per
+expiry, and returns `true` only on the call that emitted it. `set_ip_expiry` and
+`renew_ip_commitment` reset the notification so the next transition can emit again.
+
+### Ownership transfer (#1146)
+
+`transfer_ip` moves the IP and its commitment index to the new owner. It also clears the
+state that grants authority to the outgoing owner:
+
+- access grants (`grant_ip_access`) and licenses (`grant_license`)
+- access delegations
+- co-owners and the ownership cap table. The new owner starts as sole owner at 100%.
+- threshold signer configuration and collected threshold signatures
+
+History and attestations stay with the IP, including the audit trail, version chain,
+notary signature, stake, dispute records and insurance policy link. The full per-key policy
+is documented next to `clear_owner_scoped_state` in `contracts/ip_registry/src/validation.rs`.
+
 ## Commitment Strength Scoring
 
 Every IP commitment is assigned a **strength score** (0–100) that reflects the entropy and complexity of the commitment hash. Weak commitments (e.g. all-same-byte hashes or zero PoW) score low; strong, high-entropy commitments with meaningful PoW score near 100.

@@ -1,5 +1,6 @@
 use axum::{
     extract::State,
+    http::{HeaderMap, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse,
@@ -11,6 +12,7 @@ use std::{convert::Infallible, sync::Arc, time::Duration};
 use tokio::sync::broadcast;
 use tokio_stream::StreamExt as _;
 use crate::event_topics;
+use crate::websocket::{ConnectionGuard, ConnectionLimiter};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -52,6 +54,16 @@ pub enum ContractEvent {
     SwapAccepted {
         swap_id: u64,
         buyer: String,
+    },
+    #[serde(rename = "swap_completed")]
+    SwapCompleted {
+        swap_id: u64,
+    },
+    #[serde(rename = "ip_committed")]
+    IpCommitted {
+        ip_id: u64,
+        owner: String,
+        timestamp: u64,
     },
     #[serde(rename = "key_revealed")]
     KeyRevealed {
@@ -200,6 +212,21 @@ pub fn parse_event_by_topic(topic: &str, data: String) -> ContractEvent {
     }
 }
 
+/// Maximum time an SSE connection may remain idle (no events sent) before it is closed.
+const SSE_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Extracts the client IP from `X-Forwarded-For` (first hop) or falls back to a
+/// generic key when the header is absent.
+fn client_ip_from_headers(headers: &HeaderMap) -> String {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(|ip| ip.trim().to_string())
+        .filter(|ip| !ip.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 /// Server-Sent Events endpoint for real-time contract events
 #[utoipa::path(
     get,
@@ -207,17 +234,45 @@ pub fn parse_event_by_topic(topic: &str, data: String) -> ContractEvent {
     tag = "Events",
     responses(
         (status = 200, description = "Event stream established", content_type = "text/event-stream"),
+        (status = 429, description = "Too many connections"),
+        (status = 503, description = "Connection limit reached"),
     )
 )]
 pub async fn events_handler(
     State(broadcaster): State<Arc<EventBroadcaster>>,
+    State(limiter): State<Arc<ConnectionLimiter>>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
+    let client_ip = client_ip_from_headers(&headers);
+
+    // Acquire a connection slot before establishing the stream. The guard is
+    // moved into the stream so the slot is released when the stream is dropped.
+    let guard = match limiter.try_acquire(&client_ip) {
+        Ok(guard) => guard,
+        Err(reason) => {
+            let status = match reason {
+                crate::websocket::LimitError::PerIp => StatusCode::TOO_MANY_REQUESTS,
+                crate::websocket::LimitError::Global => StatusCode::SERVICE_UNAVAILABLE,
+            };
+            return (status, "connection limit reached").into_response();
+        }
+    };
+
     let receiver = broadcaster.subscribe();
-    
+
     let stream = tokio_stream::wrappers::BroadcastStream::new(receiver)
         .filter_map(|result| match result {
             Ok(event) => Some(Ok::<axum::response::sse::Event, std::convert::Infallible>(Event::default().json_data(event).unwrap())),
             Err(_) => None, // Skip lagged messages
+        })
+        // Close the connection after the idle timeout so stale streams are
+        // not kept open indefinitely.
+        .take_until(tokio::time::sleep(SSE_IDLE_TIMEOUT))
+        // Hold the guard for the lifetime of the stream so the slot is
+        // released when the client disconnects.
+        .map(move |item| {
+            let _guard = &guard;
+            item
         });
 
     Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(30)))
@@ -344,6 +399,16 @@ mod tests {
                 expected, actual
             );
         }
+    }
+
+    #[test]
+    fn test_client_ip_from_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.7, 10.0.0.1".parse().unwrap());
+        assert_eq!(client_ip_from_headers(&headers), "203.0.113.7");
+
+        let empty = HeaderMap::new();
+        assert_eq!(client_ip_from_headers(&empty), "unknown");
     }
 
     #[test]
