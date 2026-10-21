@@ -43,6 +43,19 @@ This document details the Soroban ledger resource limits relevant to AtomicIP's 
 - Ed25519 signature: 64 bytes + overhead
 - Full batch of 50 IPs with signatures: ~15-20 KB
 
+## Persistent Storage TTL Policy (#1147)
+
+Every persistent write extends its entry's TTL through `extend_ttl(key, threshold, extend_to)`.
+The contract uses one policy for all of them:
+
+- Both arguments are the `LEDGER_BUMP` constant (`contracts/ip_registry/src/lib.rs`), which is
+  `6_307_200` ledgers, about one year at 5 seconds per ledger.
+- Numeric literals are not allowed. `transfer_ip`, `revoke_ip` and `grant_ip_access` used to pass
+  `50000`, which made the lifetime of a record depend on which function last touched it.
+- The `ip_registry` test `extend_ttl_uses_ledger_bump_policy` enforces this. It scans every file in
+  `contracts/ip_registry/src` and fails on any `extend_ttl` call whose last two arguments are
+  numeric literals.
+
 ## Project Batch Size Constants
 
 ### API Server (`api-server/src/handlers.rs`)
@@ -58,6 +71,9 @@ const MAX_BATCH_SIZE: usize = 50;  // Issue #520
 ### Contract Level (`contracts/ip_registry/src/lib.rs`, `contracts/atomic_swap/src/lib.rs`)
 
 - **Batch Commit**: Mirrors MAX_BATCH_SIZE from API server
+- **`MAX_BATCH_COMMIT = 100`** (#1161): `batch_commit_ip` rejects any call with more than 100 hashes using `ContractError::BatchTooLarge` (code 60). The cap bounds CPU and ledger-entry use per transaction (about 3 writes per hash, so about 300 writes at the cap, under the 1,000 limit).
+- **`MAX_ANON_BATCH_COMMIT = MAX_BATCH_COMMIT`** (#1160): per-call cap for `batch_commit_ip_anonymous`, also returning `BatchTooLarge`.
+- **`MAX_ANON_COMMITS_PER_LEDGER = 500`** (#1160): anonymous commits are rate limited per ledger sequence across all callers, using temporary storage keyed by `DataKey::AnonLedgerCommits(sequence)`. Exceeding it returns `AnonRateLimitExceeded` (code 61).
 - **Batch Verify**: Typically 50-100 entries
 - **Batch Transfer**: Typically 10-20 (due to co-owner set complexity)
 

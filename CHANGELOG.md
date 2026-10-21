@@ -70,12 +70,18 @@ Each entry below references an issue number from our GitHub repository. When rev
 - **#66-67** — Error code definitions and security validations
 - **#781** — Arbitrator committee mechanism with M-of-N signatures and time-locked ruling enforcement
 - **#906** — Treasury address validation: guard against hardcoded placeholder addresses
+- **#1216** — Nonce store for signed requests: each signed request must carry a unique nonce, nonces are retained for the 300-second skew window, and repeats are rejected to prevent replay (see #793)
+- **#1217** — Connection caps for WebSocket and SSE endpoints: global and per-IP limits, idle-connection timeout, and open-connection count exposed as a metric
 
 ### Operations & Reliability
 - **#1066** — Automated backup verification: daily/weekly restore tests, integrity checks, RTO measurement, failure alerts (`scripts/ops/backup-verify.sh`, `docs/backup-strategy.md`)
 - **#1067** — Cost optimization automation: api-server HPA, orphaned data cleanup, compression/tiering, savings ledger and reports (`scripts/ops/cost-optimize.sh`, `docs/cost-optimization.md`)
 - **#1068** — Incident management: PagerDuty/Opsgenie integration, incidents from alerts, acknowledgment, postmortems (`api-server/src/incidents.rs`, `docs/incident-response.md`)
 - **#1069** — GitOps deployment pipeline: Argo CD + Kustomize, PR-based promotion, rollback via `git revert` (`deploy/`, `docs/gitops.md`)
+
+### API Server Modules
+- **#1218** — `api-server/src/load_testing.rs` kept and wired in: now referenced by the test target and included in the CI load-test job (see #862)
+- **#1219** — `api-server/src/docs.rs` kept and mounted: docs handler is served by the router, covered by an integration test asserting the docs route returns 200, and `docs/api-reference.md` updated to match (see #860)
 
 ## Contributing
 

@@ -137,10 +137,18 @@ impl StoreBackend for InProcessBackend {
 /// open on a Redis error or timeout — deduplication degrades to "treat as
 /// new request" rather than making the API unavailable when Redis is down,
 /// mirroring the fallback philosophy in `cache.rs` and `rate_limit.rs`.
-#[derive(Debug)]
 struct RedisBackend {
     client: redis::Client,
     conn: tokio::sync::OnceCell<redis::aio::ConnectionManager>,
+}
+
+impl std::fmt::Debug for RedisBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `ConnectionManager` is not `Debug`; the live connection is omitted.
+        f.debug_struct("RedisBackend")
+            .field("client", &self.client)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RedisBackend {

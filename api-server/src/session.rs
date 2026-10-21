@@ -1,3 +1,4 @@
+use crate::lock_or_recover;
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -98,7 +99,7 @@ impl SessionStore {
             grace_period_expires_at: None,
         };
 
-        let mut store = self.sessions.lock().map_err(|e| e.to_string())?;
+        let mut store = lock_or_recover(&self.sessions);
         store.insert(token.to_string(), session.clone());
 
         Ok(session)
@@ -106,13 +107,13 @@ impl SessionStore {
 
     /// Get session information
     pub fn get_session(&self, token: &str) -> Result<Option<SessionInfo>, String> {
-        let store = self.sessions.lock().map_err(|e| e.to_string())?;
+        let store = lock_or_recover(&self.sessions);
         Ok(store.get(token).cloned())
     }
 
     /// Update last activity timestamp
     pub fn update_activity(&self, token: &str) -> Result<(), String> {
-        let mut store = self.sessions.lock().map_err(|e| e.to_string())?;
+        let mut store = lock_or_recover(&self.sessions);
         if let Some(session) = store.get_mut(token) {
             let now = Utc::now().timestamp();
             session.last_activity = now;
@@ -123,7 +124,7 @@ impl SessionStore {
 
     /// Extend session expiration
     pub fn extend_session(&self, token: &str) -> Result<i64, String> {
-        let mut store = self.sessions.lock().map_err(|e| e.to_string())?;
+        let mut store = lock_or_recover(&self.sessions);
         if let Some(session) = store.get_mut(token) {
             let now = Utc::now().timestamp();
             session.last_activity = now;
@@ -137,7 +138,7 @@ impl SessionStore {
 
     /// Check session status
     pub fn check_session_status(&self, token: &str) -> Result<SessionStatus, String> {
-        let store = self.sessions.lock().map_err(|e| e.to_string())?;
+        let store = lock_or_recover(&self.sessions);
 
         match store.get(token) {
             Some(session) => {
@@ -159,7 +160,7 @@ impl SessionStore {
                         }
                     } else {
                         // Set grace period
-                        let mut store = self.sessions.lock().map_err(|e| e.to_string())?;
+                        let mut store = lock_or_recover(&self.sessions);
                         if let Some(session_mut) = store.get_mut(token) {
                             let grace_expires = now + (self.config.grace_period_minutes * 60);
                             session_mut.grace_period_expires_at = Some(grace_expires);
@@ -209,14 +210,28 @@ impl SessionStore {
 
     /// Invalidate a session
     pub fn invalidate_session(&self, token: &str) -> Result<(), String> {
-        let mut store = self.sessions.lock().map_err(|e| e.to_string())?;
+        let mut store = lock_or_recover(&self.sessions);
         store.remove(token);
         Ok(())
     }
 
+    /// Remove every session belonging to `user_id` (#1107). Returns the count removed.
+    pub fn remove_user_sessions(&self, user_id: &str) -> Result<usize, String> {
+        let mut store = self.sessions.lock().map_err(|e| e.to_string())?;
+        let before = store.len();
+        store.retain(|_, session| session.user_id != user_id);
+        Ok(before - store.len())
+    }
+
+    /// Count sessions still held for `user_id`.
+    pub fn count_user_sessions(&self, user_id: &str) -> Result<usize, String> {
+        let store = self.sessions.lock().map_err(|e| e.to_string())?;
+        Ok(store.values().filter(|session| session.user_id == user_id).count())
+    }
+
     /// Clean up expired sessions
     pub fn cleanup_expired_sessions(&self) -> Result<usize, String> {
-        let mut store = self.sessions.lock().map_err(|e| e.to_string())?;
+        let mut store = lock_or_recover(&self.sessions);
         let now = Utc::now().timestamp();
         let before = store.len();
 
@@ -287,5 +302,35 @@ mod tests {
             .expect("Failed to extend session");
 
         assert!(new_expiry > original_expiry);
+    }
+
+    #[test]
+    fn test_poisoned_lock_does_not_panic() {
+        let store = SessionStore::new(SessionConfig::default());
+        store
+            .create_session("user123", "token123")
+            .expect("Failed to create session");
+
+        // Poison the mutex by panicking while holding the lock.
+        let sessions = store.sessions.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = sessions.lock().expect("Failed to lock");
+            panic!("intentional panic to poison the mutex");
+        })
+        .join();
+
+        // Subsequent requests must recover the guard instead of panicking.
+        let retrieved = store
+            .get_session("token123")
+            .expect("Failed to get session after poisoning")
+            .expect("Session not found");
+        assert_eq!(retrieved.user_id, "user123");
+
+        store
+            .update_activity("token123")
+            .expect("Failed to update activity after poisoning");
+        store
+            .invalidate_session("token123")
+            .expect("Failed to invalidate session after poisoning");
     }
 }
