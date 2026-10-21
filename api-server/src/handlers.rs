@@ -157,35 +157,14 @@ impl CommitmentIndex {
 static COMMITMENT_INDEX: Lazy<CommitmentIndex> =
     Lazy::new(|| CommitmentIndex::new(commitment_index_capacity()));
 
-/// Fetch an IP record from the Soroban RPC layer, falling back to the cache.
-///
-/// #1213: Used when `COMMITMENT_INDEX` misses (e.g. after LRU eviction) so the
-/// index can be repopulated from the authoritative on-chain state.
-async fn fetch_ip_record(ip_id: u64) -> Option<IpRecord> {
-    if let Some(cached) = cache::get::<IpRecord>(&cache::ip_key(ip_id)) {
-        return Some(cached);
-    }
-    match SOROBAN_CLIENT.get_ip(ip_id).await {
-        Ok(Some(record)) => {
-            cache::set(&cache::ip_key(ip_id), &record);
-            Some(record)
-        }
-        Ok(None) => None,
-        Err(error) => {
-            tracing::warn!(%error, ip_id, "failed to fetch IP record from Soroban RPC");
-            None
-        }
-    }
-}
-
 /// Look up one indexed commitment by ID, for read-side features (#1095).
 pub(crate) fn indexed_record(ip_id: u64) -> Option<IpRecord> {
-    COMMITMENT_INDEX.get(&ip_id).map(|entry| entry.value().clone())
+    COMMITMENT_INDEX.get(ip_id)
 }
 
 /// Snapshot of every indexed commitment, for read-side features (#1095, #1097).
 pub(crate) fn indexed_records() -> Vec<IpRecord> {
-    COMMITMENT_INDEX.iter().map(|entry| entry.value().clone()).collect()
+    COMMITMENT_INDEX.entries.iter().map(|entry| entry.value().0.clone()).collect()
 }
 
 /// Copy of every user's watchlist, for the recommendation engine (#1097).
