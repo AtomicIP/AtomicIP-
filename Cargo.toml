@@ -2,13 +2,17 @@
 members = [
     "contracts/ip_registry",
     "contracts/atomic_swap",
-    # "api-server",  # temporarily excluded: async-graphql version conflict
+    "api-server",
 ]
 resolver = "2"
 
 [workspace.dependencies]
 # Security: Force rand 0.8.6+ to avoid RUSTSEC-2026-0097 (unsound with custom logger)
 rand = "0.8.6"
+# Shared async-graphql pins so api-server and its dependents resolve to a single
+# compatible version (resolves the prior version conflict that excluded api-server).
+async-graphql = "7"
+async-graphql-axum = "7"
 
 [workspace.lints.clippy]
 # Pre-existing lint suppressions — these fire on code predating this PR.
