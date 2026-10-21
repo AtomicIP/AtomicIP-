@@ -58,6 +58,8 @@ pub mod health;
 pub mod invariants;
 pub mod load_balancer;
 pub mod metrics;
+/// #1099: activity feed, price notifications and marketplace trends.
+pub mod news_feed;
 pub mod middleware_pipeline;
 pub mod request_queue;
 pub mod request_signing;
