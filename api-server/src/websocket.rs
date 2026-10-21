@@ -152,6 +152,7 @@ impl EventBroadcaster {
                     timestamp,
                 });
             }
+            _ => {}
         }
     }
 

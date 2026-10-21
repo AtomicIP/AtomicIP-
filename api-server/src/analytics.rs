@@ -27,10 +27,41 @@ pub struct SwapAnalytics {
     pub cancelled: u64,
 }
 
+/// Maximum number of distinct tags tracked individually. Any tag beyond this
+/// limit is aggregated into the `OTHER_TAG` bucket to keep cardinality bounded.
+pub const MAX_DISTINCT_TAGS: usize = 100;
+/// Maximum allowed length (in bytes) for a single tag.
+pub const MAX_TAG_LENGTH: usize = 64;
+/// Bucket used for tags that exceed the distinct-tag limit.
+pub const OTHER_TAG: &str = "other";
+
 static TOTAL_COMMITMENTS: AtomicU64 = AtomicU64::new(0);
 static TAGGED_COMMITMENTS: AtomicU64 = AtomicU64::new(0);
 static TAG_COUNTS: Lazy<DashMap<String, AtomicU64>> = Lazy::new(DashMap::new);
 static SWAP_ANALYTICS: Lazy<DashMap<&'static str, AtomicU64>> = Lazy::new(DashMap::new);
+
+/// Validate a user-supplied tag against the length and character policy.
+///
+/// Returns `Some(normalized)` when the tag is acceptable, or `None` when it
+/// should be rejected. Accepted tags are lowercased and trimmed; only ASCII
+/// alphanumerics, `-`, `_`, `.` and `:` are permitted.
+pub fn validate_tag(tag: &str) -> Option<String> {
+    let normalized = tag.trim().to_ascii_lowercase();
+    if normalized.is_empty() || normalized.len() > MAX_TAG_LENGTH {
+        return None;
+    }
+    if !normalized
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+    {
+        return None;
+    }
+    Some(normalized)
+}
+
+fn increment_tag(tag: &str) {
+    TAG_COUNTS.entry(tag.to_string()).or_default().fetch_add(1, Ordering::Relaxed);
+}
 
 pub fn record_commitment(tags: &[String]) {
     TOTAL_COMMITMENTS.fetch_add(1, Ordering::Relaxed);
@@ -38,7 +69,20 @@ pub fn record_commitment(tags: &[String]) {
         TAGGED_COMMITMENTS.fetch_add(1, Ordering::Relaxed);
     }
     for tag in tags {
-        TAG_COUNTS.entry(tag.clone()).or_default().fetch_add(1, Ordering::Relaxed);
+        let Some(normalized) = validate_tag(tag) else {
+            continue;
+        };
+        // Fast path: tag already tracked.
+        if TAG_COUNTS.contains_key(&normalized) {
+            increment_tag(&normalized);
+            continue;
+        }
+        // Reserve a slot for a new distinct tag, or fall back to the "other" bucket.
+        if TAG_COUNTS.len() < MAX_DISTINCT_TAGS {
+            increment_tag(&normalized);
+        } else {
+            increment_tag(OTHER_TAG);
+        }
     }
 }
 
@@ -70,5 +114,48 @@ pub fn snapshot() -> CommitmentAnalytics {
             disputed: count("Disputed"),
             cancelled: count("Cancelled"),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_tag_enforces_policy() {
+        assert_eq!(validate_tag("  Alpha "), Some("alpha".to_string()));
+        assert_eq!(validate_tag("swap-1_a.b:c"), Some("swap-1_a.b:c".to_string()));
+        assert_eq!(validate_tag(""), None);
+        assert_eq!(validate_tag("   "), None);
+        assert_eq!(validate_tag("bad tag"), None);
+        assert_eq!(validate_tag("bad<script>"), None);
+        assert_eq!(validate_tag(&"x".repeat(MAX_TAG_LENGTH + 1)), None);
+    }
+
+    #[test]
+    fn overflow_tags_are_bucketed_as_other() {
+        // Use a unique prefix so this test is isolated from other tests sharing
+        // the global TAG_COUNTS map.
+        let prefix = "overflowtest";
+        let total = MAX_DISTINCT_TAGS + 25;
+        let tags: Vec<String> = (0..total).map(|i| format!("{prefix}-{i}")).collect();
+
+        record_commitment(&tags);
+
+        // The map must stay bounded by the limit (plus the "other" bucket).
+        assert!(TAG_COUNTS.len() <= MAX_DISTINCT_TAGS + 1);
+
+        let other = TAG_COUNTS
+            .get(OTHER_TAG)
+            .map(|v| v.load(Ordering::Relaxed))
+            .unwrap_or(0);
+        assert!(other >= 25, "expected overflow tags in 'other', got {other}");
+
+        // No overflow tag should have created its own series.
+        let tracked = TAG_COUNTS
+            .iter()
+            .filter(|e| e.key().starts_with(prefix))
+            .count();
+        assert!(tracked <= MAX_DISTINCT_TAGS);
     }
 }

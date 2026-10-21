@@ -140,6 +140,15 @@ fn generate_recovery_token() -> String {
         .collect()
 }
 
+fn is_recovery_token_valid(store: &RecoveryStore, email: &str, token: &str, now: i64) -> bool {
+    store.tokens.get(token).is_some_and(|recovery_token| {
+        recovery_token.email == email
+            && recovery_token.token == token
+            && !recovery_token.used
+            && recovery_token.expires_at > now
+    })
+}
+
 /// Initiate account recovery via email
 /// Sends a recovery email with a secure token
 #[utoipa::path(
@@ -157,7 +166,7 @@ pub async fn initiate_recovery(
     axum::Json(req): axum::Json<InitiateRecoveryRequest>,
 ) -> Result<axum::Json<InitiateRecoveryResponse>, (axum::http::StatusCode, axum::Json<crate::schemas::ErrorResponse>)> {
     let config = RecoveryConfig::default();
-    let store = RECOVERY_STORE.write().await;
+    let mut store = RECOVERY_STORE.write().await;
 
     // Check lockout status
     if let Some(lockout_until) = store.lockouts.get(&req.email) {
@@ -189,6 +198,7 @@ pub async fn initiate_recovery(
     // 1. Send an email with the recovery link containing the token
     // 2. Store the token in a database
     // 3. Log the recovery attempt
+    store.tokens.insert(token, recovery_token);
 
     Ok(axum::Json(InitiateRecoveryResponse {
         message: format!("Recovery email sent to {}. Check your inbox for recovery instructions.", req.email),
@@ -212,9 +222,7 @@ pub async fn verify_recovery_token(
 ) -> Result<axum::Json<VerifyRecoveryTokenResponse>, (axum::http::StatusCode, axum::Json<crate::schemas::ErrorResponse>)> {
     let store = RECOVERY_STORE.read().await;
 
-    // TODO: In production, verify the token against the database
-    // For now, return success for valid token format
-    if req.token.len() < 20 {
+    if !is_recovery_token_valid(&store, &req.email, &req.token, Utc::now().timestamp()) {
         return Err((
             axum::http::StatusCode::BAD_REQUEST,
             axum::Json(crate::schemas::ErrorResponse {
@@ -337,6 +345,42 @@ mod tests {
 
         assert_eq!(token.email, "test@example.com");
         assert!(!token.used);
+    }
+
+    #[test]
+    fn test_recovery_token_validation_checks_email_expiration_and_usage() {
+        let token = RecoveryToken {
+            email: "test@example.com".to_string(),
+            token: "known-token".to_string(),
+            created_at: 100,
+            expires_at: 200,
+            used: false,
+        };
+        let store = RecoveryStore {
+            tokens: HashMap::from([("known-token".to_string(), token.clone())]),
+            lockouts: HashMap::new(),
+            security_answers: HashMap::new(),
+        };
+
+        assert!(is_recovery_token_valid(&store, "test@example.com", "known-token", 199));
+        assert!(!is_recovery_token_valid(&store, "other@example.com", "known-token", 199));
+        assert!(!is_recovery_token_valid(&store, "test@example.com", "unknown-token", 199));
+        assert!(!is_recovery_token_valid(&store, "test@example.com", "known-token", 200));
+
+        let used_store = RecoveryStore {
+            tokens: HashMap::from([(
+                "known-token".to_string(),
+                RecoveryToken { used: true, ..token },
+            )]),
+            lockouts: HashMap::new(),
+            security_answers: HashMap::new(),
+        };
+        assert!(!is_recovery_token_valid(
+            &used_store,
+            "test@example.com",
+            "known-token",
+            199
+        ));
     }
 
     #[test]

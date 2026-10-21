@@ -282,6 +282,99 @@ mod rate_limit_bypass_tests {
         );
     }
 
+    // ── #1215: X-Forwarded-For trust tests ────────────────────────────────────
+
+    /// Resolves the client identity used for rate-limit bucketing.
+    /// The `x-forwarded-for` header is only honored when the peer (socket)
+    /// address is in the configured proxy allowlist; otherwise the socket
+    /// address is used, preventing spoofed headers from minting fresh buckets.
+    fn resolve_client_ip(
+        peer_addr: &str,
+        forwarded_for: Option<&str>,
+        trusted_proxies: &[&str],
+    ) -> String {
+        if trusted_proxies.contains(&peer_addr) {
+            if let Some(header) = forwarded_for {
+                // Use the left-most (original client) entry
+                if let Some(client_ip) = header.split(',').next() {
+                    let client_ip = client_ip.trim();
+                    if !client_ip.is_empty() {
+                        return client_ip.to_string();
+                    }
+                }
+            }
+        }
+        peer_addr.to_string()
+    }
+
+    #[test]
+    fn test_spoofed_xff_from_untrusted_peer_is_ignored() {
+        let trusted_proxies = ["10.0.0.1"];
+        let peer_addr = "203.0.113.7"; // Not a trusted proxy
+
+        // Attacker rotates spoofed headers to try to get a fresh bucket each time
+        let spoofed_a = resolve_client_ip(peer_addr, Some("1.1.1.1"), &trusted_proxies);
+        let spoofed_b = resolve_client_ip(peer_addr, Some("2.2.2.2"), &trusted_proxies);
+        let spoofed_c = resolve_client_ip(peer_addr, Some("3.3.3.3"), &trusted_proxies);
+
+        assert_eq!(spoofed_a, peer_addr, "Spoofed XFF must not be trusted");
+        assert_eq!(spoofed_b, peer_addr, "Spoofed XFF must not be trusted");
+        assert_eq!(spoofed_c, peer_addr, "Spoofed XFF must not be trusted");
+
+        // All requests collapse into the same bucket keyed by the socket address
+        assert_eq!(
+            spoofed_a, spoofed_b,
+            "Rotating spoofed XFF must not yield fresh buckets"
+        );
+        assert_eq!(
+            spoofed_b, spoofed_c,
+            "Rotating spoofed XFF must not yield fresh buckets"
+        );
+    }
+
+    #[test]
+    fn test_xff_from_trusted_proxy_is_honored() {
+        let trusted_proxies = ["10.0.0.1"];
+        let peer_addr = "10.0.0.1"; // Allowlisted proxy
+
+        let client_ip = resolve_client_ip(peer_addr, Some("198.51.100.42"), &trusted_proxies);
+
+        assert_eq!(
+            client_ip, "198.51.100.42",
+            "XFF from an allowlisted proxy must be used for bucketing"
+        );
+    }
+
+    #[test]
+    fn test_xff_from_trusted_proxy_uses_leftmost_entry() {
+        let trusted_proxies = ["10.0.0.1"];
+        let peer_addr = "10.0.0.1";
+
+        let client_ip = resolve_client_ip(
+            peer_addr,
+            Some("198.51.100.42, 10.0.0.2, 10.0.0.1"),
+            &trusted_proxies,
+        );
+
+        assert_eq!(
+            client_ip, "198.51.100.42",
+            "The original client IP (left-most XFF entry) must be used"
+        );
+    }
+
+    #[test]
+    fn test_trusted_proxy_without_xff_falls_back_to_socket_addr() {
+        let trusted_proxies = ["10.0.0.1"];
+        let peer_addr = "10.0.0.1";
+
+        let client_ip = resolve_client_ip(peer_addr, None, &trusted_proxies);
+
+        assert_eq!(
+            client_ip, peer_addr,
+            "Without XFF the socket address must be used even for trusted proxies"
+        );
+    }
+
     #[test]
     fn test_admin_cannot_bypass_rate_limits_through_batch_operations() {
         let checker = RateLimitChecker::new();
