@@ -26,12 +26,13 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use axum::extract::Path;
-use axum::http::StatusCode;
+use axum::http::{header::AUTHORIZATION, HeaderMap, StatusCode};
 use axum::Json;
 use metrics::{counter, histogram};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use crate::alerting::{self, Notification, Severity};
 
@@ -120,6 +121,7 @@ pub struct ActionItem {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Postmortem {
+    #[serde(default)]
     pub author: String,
     pub summary: String,
     pub impact: String,
@@ -524,6 +526,9 @@ impl IncidentManager {
         if inc.status != IncidentStatus::Resolved {
             return Err(IncidentError::InvalidState("postmortem can only be attached to a resolved incident"));
         }
+        if inc.postmortem.is_some() {
+            return Err(IncidentError::InvalidState("postmortem has already been submitted"));
+        }
         pm.submitted_at = now;
         let author = pm.author.clone();
         inc.postmortem = Some(pm);
@@ -711,7 +716,12 @@ pub async fn note_handler(Path(id): Path<String>, Json(req): Json<NoteRequest>) 
 }
 
 /// `POST /v1/admin/incidents/{id}/postmortem`
-pub async fn postmortem_handler(Path(id): Path<String>, Json(pm): Json<Postmortem>) -> ApiResult<Incident> {
+pub async fn postmortem_handler(
+    Path(id): Path<String>,
+    crate::auth::AuthExtension(claims): crate::auth::AuthExtension,
+    Json(mut pm): Json<Postmortem>,
+) -> ApiResult<Incident> {
+    pm.author = claims.sub;
     INCIDENTS.submit_postmortem(&id, pm, alerting::now_secs()).map(Json).map_err(map_err)
 }
 
@@ -721,9 +731,16 @@ pub struct AlertmanagerWebhook {
     pub alerts: Vec<AlertmanagerAlert>,
 }
 
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AlertmanagerStatus {
+    Firing,
+    Resolved,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct AlertmanagerAlert {
-    pub status: String,
+    pub status: AlertmanagerStatus,
     #[serde(default)]
     pub labels: HashMap<String, String>,
     #[serde(default)]
@@ -762,8 +779,8 @@ pub async fn alertmanager_webhook_handler(
     let (mut opened, mut resolved) = (Vec::new(), Vec::new());
     for a in hook.alerts {
         let name = a.labels.get("alertname").cloned().unwrap_or_else(|| "UnknownAlert".into());
-        let dedup_key = format!("am-{}", if a.fingerprint.is_empty() { &name } else { &a.fingerprint });
-        if a.status == "resolved" {
+        let dedup_key = format!("am-{}", a.fingerprint);
+        if a.status == AlertmanagerStatus::Resolved {
             if let Some(inc) = INCIDENTS.resolve_by_key(&dedup_key, "alertmanager", now) {
                 resolved.push(inc.id);
             }

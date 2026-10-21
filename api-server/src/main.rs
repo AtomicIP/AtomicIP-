@@ -394,7 +394,7 @@ async fn main() {
         subscription_broadcaster.clone(),
     );
 
-    let rate_limiter = Arc::new(rate_limit::RateLimitMiddleware::new(rate_limit::RateLimitConfig::default()));
+    let rate_limiter = rate_limit::RateLimitMiddleware::new(rate_limit::RateLimitConfig::default());
 
     // Register every dependency in the container, then resolve the state
     // through it. A missing dependency yields a typed error rather than a
@@ -419,6 +419,11 @@ async fn main() {
     let request_queue = Arc::new(request_queue::RequestQueue::new(
         request_queue::QueueConfig::default(),
     ));
+    let signed = middleware::from_fn(request_signing::verify_request_signature);
+    let signed_ip_routes = Router::new()
+        .route("/ip/commit", post(handlers::commit_ip))
+        .route("/ip/transfer", post(handlers::transfer_ip))
+        .route_layer(middleware::from_fn(request_signing::verify_request_signature));
 
     // Mutating endpoints that move or commit IP/swap state require a signed
     // request (see request_signing.rs) on top of the layers applied below.
@@ -443,7 +448,7 @@ async fn main() {
         .route_layer(middleware::from_fn(request_signing::verify_request_signature));
 
     let app = Router::new()
-        .merge(signed_routes)
+        .merge(signed_ip_routes)
         .route("/health",          get(health::health_handler))
         .route("/health/detailed", get(health::detailed_health_handler))
         .route("/metrics",         get(metrics::metrics_handler))
@@ -457,15 +462,8 @@ async fn main() {
         .route("/v1/admin/audit/suspicious-patterns", get(handlers::get_suspicious_patterns))
         .route("/v1/admin/commitments/lifecycle", get(commitment_monitoring::lifecycle_handler))
         .route("/v1/admin/alerts", get(commitment_monitoring::open_alerts_handler))
-        // #1068: incident management (PagerDuty / Opsgenie).
-        .route("/v1/admin/incidents",                  get(incidents::list_handler).post(incidents::create_handler))
-        .route("/v1/admin/incidents/stats",            get(incidents::stats_handler))
-        .route("/v1/admin/incidents/alertmanager",     post(incidents::alertmanager_webhook_handler))
-        .route("/v1/admin/incidents/{id}",             get(incidents::get_handler))
-        .route("/v1/admin/incidents/{id}/acknowledge", post(incidents::acknowledge_handler))
-        .route("/v1/admin/incidents/{id}/resolve",     post(incidents::resolve_handler))
-        .route("/v1/admin/incidents/{id}/notes",       post(incidents::note_handler))
-        .route("/v1/admin/incidents/{id}/postmortem",  post(incidents::postmortem_handler))
+        .merge(incident_routes())
+        .route("/v1/admin/incidents/alertmanager", post(incidents::alertmanager_webhook_handler))
         .route("/v1/auth/recovery/initiate",      post(account_recovery::initiate_recovery))
         .route("/v1/auth/recovery/verify-token",  post(account_recovery::verify_recovery_token))
         .route("/v1/auth/recovery/questions",     get(account_recovery::get_security_questions))
@@ -613,15 +611,8 @@ fn build_app() -> Router {
         .route("/v1/admin/audit/suspicious-patterns", get(handlers::get_suspicious_patterns))
         .route("/v1/admin/commitments/lifecycle", get(commitment_monitoring::lifecycle_handler))
         .route("/v1/admin/alerts", get(commitment_monitoring::open_alerts_handler))
-        // #1068: incident management (PagerDuty / Opsgenie).
-        .route("/v1/admin/incidents",                  get(incidents::list_handler).post(incidents::create_handler))
-        .route("/v1/admin/incidents/stats",            get(incidents::stats_handler))
-        .route("/v1/admin/incidents/alertmanager",     post(incidents::alertmanager_webhook_handler))
-        .route("/v1/admin/incidents/{id}",             get(incidents::get_handler))
-        .route("/v1/admin/incidents/{id}/acknowledge", post(incidents::acknowledge_handler))
-        .route("/v1/admin/incidents/{id}/resolve",     post(incidents::resolve_handler))
-        .route("/v1/admin/incidents/{id}/notes",       post(incidents::note_handler))
-        .route("/v1/admin/incidents/{id}/postmortem",  post(incidents::postmortem_handler))
+        .merge(incident_routes())
+        .route("/v1/admin/incidents/alertmanager", post(incidents::alertmanager_webhook_handler))
         .route("/v1/auth/recovery/initiate", post(account_recovery::initiate_recovery))
         .route("/v1/auth/recovery/verify-token", post(account_recovery::verify_recovery_token))
         .route("/v1/auth/recovery/questions", get(account_recovery::get_security_questions))
@@ -650,13 +641,13 @@ fn build_app() -> Router {
         .route("/v1/ip/search/saved/{owner}", get(handlers::list_ip_saved_searches).post(handlers::save_ip_search))
         .route("/v1/ip/search/saved/{owner}/{id}", axum::routing::delete(handlers::delete_ip_saved_search))
         .route("/v1/ip/owner/{owner}/cursor", get(handlers::list_ip_by_owner_cursor))
-        .route("/v1/swap/initiate", post(handlers::initiate_swap))
-        .route("/v1/swap/batch-initiate", post(handlers::batch_initiate_swap))
-        .route("/v1/swap/bulk/initiate", post(handlers::batch_initiate_swap))
+        .route("/v1/swap/initiate", post(handlers::initiate_swap).layer(signed.clone()))
+        .route("/v1/swap/batch-initiate", post(handlers::batch_initiate_swap).layer(signed.clone()))
+        .route("/v1/swap/bulk/initiate", post(handlers::batch_initiate_swap).layer(signed.clone()))
         .route("/v1/swap/{swap_id}/accept", post(handlers::accept_swap).layer(signed.clone()))
         .route("/v1/swap/{swap_id}/reveal", post(handlers::reveal_key).layer(signed.clone()))
         .route("/v1/swap/{swap_id}/cancel", post(handlers::cancel_swap).layer(signed.clone()))
-        .route("/v1/swap/{swap_id}/cancel-expired", post(handlers::cancel_expired_swap))
+        .route("/v1/swap/{swap_id}/cancel-expired", post(handlers::cancel_expired_swap).layer(signed.clone()))
         .route("/v1/swap/{swap_id}", get(handlers::get_swap))
         .route("/v1/swap/{swap_id}/escrow", get(handlers::get_swap_escrow))
         .route("/v1/swap/{swap_id}/history", get(handlers::get_swap_history))
@@ -693,6 +684,18 @@ fn build_app() -> Router {
         .layer(middleware::from_fn(compression::compression_middleware))
         .layer(middleware::from_fn(validation_middleware::validation_logging_middleware))
         .layer(middleware::from_fn(require_json_content_type))
+}
+
+fn incident_routes() -> Router {
+    Router::new()
+        .route("/v1/admin/incidents", get(incidents::list_handler).post(incidents::create_handler))
+        .route("/v1/admin/incidents/stats", get(incidents::stats_handler))
+        .route("/v1/admin/incidents/{id}", get(incidents::get_handler))
+        .route("/v1/admin/incidents/{id}/acknowledge", post(incidents::acknowledge_handler))
+        .route("/v1/admin/incidents/{id}/resolve", post(incidents::resolve_handler))
+        .route("/v1/admin/incidents/{id}/notes", post(incidents::note_handler))
+        .route("/v1/admin/incidents/{id}/postmortem", post(incidents::postmortem_handler))
+        .route_layer(middleware::from_fn(auth::require_auth))
 }
 
 #[cfg(test)]
