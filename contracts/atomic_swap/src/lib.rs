@@ -1479,11 +1479,42 @@ impl AtomicSwap {
             .persistent()
             .remove(&DataKey::ActiveSwap(swap.ip_id));
 
-        token::Client::new(&env, &swap.token).transfer(
+        let token_client = token::Client::new(&env, &swap.token);
+
+        // #1175: Refund installment swaps by amount actually paid
+        let refund_amount = if swap.is_installment && swap.paid_amount < swap.price {
+            swap.paid_amount
+        } else {
+            swap.price
+        };
+
+        token_client.transfer(
             &env.current_contract_address(),
             &swap.buyer,
-            &swap.price,
+            &refund_amount,
         );
+
+        // #1173: Settle collateral and dispute bonds on timeout
+        if swap.collateral_amount > 0 {
+            if let Some(collateral) = env
+                .storage()
+                .persistent()
+                .get::<_, i128>(&DataKey::SwapCollateral(swap_id))
+            {
+                token_client.transfer(&env.current_contract_address(), &swap.buyer, &collateral);
+                env.storage()
+                    .persistent()
+                    .remove(&DataKey::SwapCollateral(swap_id));
+            }
+        }
+
+        Self::release_dispute_bonds_uncontested(&env, swap_id, &swap);
+
+        // #1174: Release insurance reservation
+        Self::release_insurance_reservation(&env, swap_id, &swap.token);
+
+        // #1172: Record history on timeout resolution
+        Self::append_history(&env, swap_id, SwapStatus::Cancelled);
 
         env.storage().persistent().set(
             &DataKey::CancelReason(swap_id),
@@ -2403,6 +2434,9 @@ impl AtomicSwap {
             .persistent()
             .remove(&DataKey::ActiveSwap(swap.ip_id));
 
+        // #1174: Release insurance reservation
+        Self::release_insurance_reservation(&env, swap_id, &swap.token);
+
         // #253: Log history entry
         Self::append_history(&env, swap_id, SwapStatus::Cancelled);
 
@@ -2436,8 +2470,14 @@ impl AtomicSwap {
 
         let token_client = token::Client::new(&env, &swap.token);
 
-        // Refund buyer's escrowed payment (Issue #35)
-        token_client.transfer(&env.current_contract_address(), &swap.buyer, &swap.price);
+        // #1175: Refund installment swaps by amount actually paid
+        let refund_amount = if swap.is_installment && swap.paid_amount < swap.price {
+            swap.paid_amount
+        } else {
+            swap.price
+        };
+
+        token_client.transfer(&env.current_contract_address(), &swap.buyer, &refund_amount);
 
         // #350: Refund collateral on cancellation
         if swap.collateral_amount > 0 {
@@ -2461,6 +2501,9 @@ impl AtomicSwap {
                 );
             }
         }
+
+        // #1174: Release insurance reservation
+        Self::release_insurance_reservation(&env, swap_id, &swap.token);
 
         // #253: Log history entry
         Self::append_history(&env, swap_id, SwapStatus::Cancelled);
@@ -5028,16 +5071,22 @@ impl AtomicSwap {
         env.storage()
             .persistent()
             .remove(&DataKey::EscrowDeposit(swap_id));
-        Self::append_history(&env, swap_id, SwapStatus::Cancelled);
 
-        // Refund buyer
+        let token_client = token::Client::new(&env, &swap.token);
+
+        // Refund buyer's escrow deposit
         if deposit > 0 {
-            token::Client::new(&env, &swap.token).transfer(
+            token_client.transfer(
                 &env.current_contract_address(),
                 &swap.buyer,
                 &deposit,
             );
         }
+
+        // #1174: Release insurance reservation
+        Self::release_insurance_reservation(&env, swap_id, &swap.token);
+
+        Self::append_history(&env, swap_id, SwapStatus::Cancelled);
 
         env.events().publish(
             (soroban_sdk::symbol_short!("esc_wdr"),),
