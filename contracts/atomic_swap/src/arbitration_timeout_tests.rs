@@ -173,6 +173,37 @@ mod arbitration_timeout_tests {
     }
 
     #[test]
+    fn test_auto_resolve_dispute_releases_insurance_reservation() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+
+        let (client, swap_id, _seller, buyer) = setup_disputed_swap(&env);
+
+        // Reserve insurance for the disputed swap.
+        let reserved_before = client.get_reserved_insurance();
+        assert!(
+            reserved_before > 0,
+            "disputed swap must hold an insurance reservation"
+        );
+
+        let evidence = BytesN::from_array(&env, &[0x01u8; 32]);
+        client.request_arbitration(&swap_id, &buyer, &evidence);
+
+        // Advance past the arbitration timeout so the dispute auto-resolves.
+        env.ledger().with_mut(|l| l.timestamp += 1_209_601);
+        client.auto_resolve_dispute(&swap_id);
+
+        let swap = client.get_swap(&swap_id).unwrap();
+        assert_eq!(swap.status, SwapStatus::Cancelled);
+        assert_eq!(
+            client.get_reserved_insurance(),
+            0,
+            "insurance reservation must be released on auto_resolve_dispute"
+        );
+    }
+
+    #[test]
     fn test_arbitration_timestamp_not_overwritten_on_second_request() {
         let env = Env::default();
         env.mock_all_auths();

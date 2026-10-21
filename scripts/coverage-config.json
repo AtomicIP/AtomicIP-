@@ -16,5 +16,10 @@
     "ip_registry",
     "atomic_swap"
   ],
+  "js_modules": [
+    "src/recommendations/swapRecommendations.js",
+    "src/batch/bulkSwapOperations.js",
+    "src/notifications/notificationPreferences.js"
+  ],
   "ratchet_increment": 2
 }

@@ -6,7 +6,7 @@ use axum::{
     middleware::Next,
     response::Response,
 };
-use metrics::{counter, histogram, describe_counter, describe_histogram};
+use metrics::{counter, histogram, describe_counter, describe_gauge, describe_histogram};
 use tracing::info;
 
 use once_cell::sync::Lazy;
@@ -46,6 +46,10 @@ static PROMETHEUS_HANDLE: Lazy<Mutex<metrics_exporter_prometheus::PrometheusHand
     describe_counter!(
         "http_slow_requests_total",
         "HTTP requests slower than SLOW_REQUEST_THRESHOLD_MS"
+    );
+    describe_gauge!(
+        "cache_entries",
+        "Current number of entries stored in the response cache"
     );
     
     Mutex::new(handle)

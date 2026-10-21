@@ -1,6 +1,6 @@
 use axum::{
     extract::{Path, Query, State},
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     body::Body,
     Json,
@@ -14,14 +14,38 @@ use tokio::time::{Duration, Instant};
 use tracing::instrument;
 use sha2::{Digest, Sha256};
 use crate::cache;
-use crate::deduplication::{create_store, DeduplicationStore};
+use crate::deduplication::{create_store, create_store_with_backend, DeduplicationBackend, DeduplicationStore};
+use crate::ip_search::{IpSearchFilters, IpSearchMetadata, IpSearchResponse, SaveSearchRequest, SavedSearch};
 use crate::graphql::SorobanQueryClient;
 use crate::schemas::*;
 use std::sync::Arc;
 use crate::webhook;
 use crate::websocket;
-use crate::audit::{AuditLogStore, AuditLogQuery, SuspiciousPattern};
+use crate::audit::{
+    admin_key_matches, AuditEventCategory, AuditEventInput, AuditLogQuery, AuditLogQueryResponse,
+    AuditLogStore, SuspiciousPattern,
+};
 use dashmap::DashMap;
+use crate::soroban_rpc::{
+    self, LiveSorobanRpcClient, MockSorobanRpcClient, SorobanRpcClient,
+};
+
+// ── Shared Soroban RPC client ─────────────────────────────────────────────────
+//
+// In production (`SOROBAN_RPC_URL` and `IP_REGISTRY_CONTRACT` are set) this
+// uses the live reqwest-backed client.  In test environments where those env
+// vars are absent the mock client is substituted automatically so unit tests
+// never require a live network.
+static SOROBAN_CLIENT: Lazy<Arc<dyn SorobanRpcClient>> = Lazy::new(|| {
+    let use_mock = std::env::var("IP_REGISTRY_CONTRACT")
+        .map(|v| v.is_empty())
+        .unwrap_or(true);
+    if use_mock {
+        Arc::new(MockSorobanRpcClient::default()) as Arc<dyn SorobanRpcClient>
+    } else {
+        Arc::new(LiveSorobanRpcClient::from_env()) as Arc<dyn SorobanRpcClient>
+    }
+});
 
 // #523/#800: Per-handler idempotency store for batch swap operations. Uses a
 // shared Redis backend when REDIS_URL is configured, so a client's retry is
@@ -53,7 +77,103 @@ const SWAP_EXPIRY_SECONDS: u64 = 604800;
 static NEXT_SWAP_ID: AtomicU64 = AtomicU64::new(0);
 static WATCHLISTS: Lazy<Mutex<HashMap<String, BTreeSet<u64>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
-static COMMITMENT_INDEX: Lazy<DashMap<u64, IpRecord>> = Lazy::new(DashMap::new);
+
+// #1213: `COMMITMENT_INDEX` duplicates on-chain state in process memory, so it
+// must be bounded. Entries are evicted least-recently-used once the index grows
+// past `COMMITMENT_INDEX_CAPACITY`; a miss falls back to the RPC read and
+// repopulates the index.
+const DEFAULT_COMMITMENT_INDEX_CAPACITY: usize = 10_000;
+
+/// Maximum number of entries retained in `COMMITMENT_INDEX`. Configurable via
+/// `COMMITMENT_INDEX_CAPACITY`; defaults to `DEFAULT_COMMITMENT_INDEX_CAPACITY`.
+fn commitment_index_capacity() -> usize {
+    std::env::var("COMMITMENT_INDEX_CAPACITY")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|capacity| *capacity > 0)
+        .unwrap_or(DEFAULT_COMMITMENT_INDEX_CAPACITY)
+}
+
+/// A bounded, LRU-evicting index of IP records keyed by IP ID.
+///
+/// Access order is tracked with a monotonically increasing tick; the entry with
+/// the smallest tick is the least-recently-used and is evicted first.
+struct CommitmentIndex {
+    entries: DashMap<u64, (IpRecord, u64)>,
+    capacity: usize,
+    tick: AtomicU64,
+}
+
+impl CommitmentIndex {
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: DashMap::new(),
+            capacity: capacity.max(1),
+            tick: AtomicU64::new(0),
+        }
+    }
+
+    fn next_tick(&self) -> u64 {
+        self.tick.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Insert (or refresh) a record, evicting the least-recently-used entries
+    /// if the index is over capacity.
+    fn insert(&self, ip_id: u64, record: IpRecord) {
+        let tick = self.next_tick();
+        self.entries.insert(ip_id, (record, tick));
+        self.evict_to_capacity();
+    }
+
+    /// Look up a record, marking it as most-recently-used on a hit.
+    fn get(&self, ip_id: u64) -> Option<IpRecord> {
+        let tick = self.next_tick();
+        let mut entry = self.entries.get_mut(&ip_id)?;
+        entry.1 = tick;
+        Some(entry.0.clone())
+    }
+
+    fn evict_to_capacity(&self) {
+        while self.entries.len() > self.capacity {
+            let lru_key = self
+                .entries
+                .iter()
+                .min_by_key(|entry| entry.value().1)
+                .map(|entry| *entry.key());
+            match lru_key {
+                Some(key) => {
+                    self.entries.remove(&key);
+                }
+                None => break,
+            }
+        }
+    }
+}
+
+static COMMITMENT_INDEX: Lazy<CommitmentIndex> =
+    Lazy::new(|| CommitmentIndex::new(commitment_index_capacity()));
+
+/// Look up one indexed commitment by ID, for read-side features (#1095).
+pub(crate) fn indexed_record(ip_id: u64) -> Option<IpRecord> {
+    COMMITMENT_INDEX.get(ip_id)
+}
+
+/// Snapshot of every indexed commitment, for read-side features (#1095, #1097).
+pub(crate) fn indexed_records() -> Vec<IpRecord> {
+    COMMITMENT_INDEX.entries.iter().map(|entry| entry.value().0.clone()).collect()
+}
+
+/// Copy of every user's watchlist, for the recommendation engine (#1097).
+pub(crate) fn watchlist_snapshot() -> HashMap<String, BTreeSet<u64>> {
+    WATCHLISTS
+        .lock()
+        .map(|watchlists| watchlists.clone())
+        .unwrap_or_default()
+}
 
 /// Audit log store for tracking all API access and sensitive operations
 static AUDIT_LOG_STORE: Lazy<Arc<AuditLogStore>> = Lazy::new(|| {
@@ -73,7 +193,7 @@ static AUDIT_LOG_STORE: Lazy<Arc<AuditLogStore>> = Lazy::new(|| {
 });
 
 /// Current Unix timestamp in seconds (substitute for the ledger timestamp).
-fn now_timestamp() -> u64 {
+pub(crate) fn now_timestamp() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs())
@@ -117,6 +237,17 @@ pub async fn commit_ip(
                 }),
             )
         })?;
+
+    // #1106: Every successful commitment is recorded in the audit trail, before
+    // any later check can fail the request.
+    record_audit(
+        AuditEventInput::new(AuditEventCategory::Commitment, "ip.commit")
+            .actor_hash(Some(AUDIT_LOG_STORE.hash_identifier(&body.owner)))
+            .ip_id(Some(ip_id))
+            .success(true)
+            .status_code(Some(200)),
+    )
+    .await;
 
     // #983: Check per-user commitment rate limit after successful commit
     let (allowed, _remaining, reset_after) = rate_limiter.check_commitment_rate_limit(&body.owner).await;
@@ -234,15 +365,92 @@ pub async fn transfer_ip(Json(body): Json<TransferIpRequest>) -> Result<StatusCo
         (status = 404, description = "IP record not found", body = ErrorResponse),
     )
 )]
-#[instrument(skip(body))]
-pub async fn verify_commitment(Json(body): Json<VerifyCommitmentRequest>) -> Result<Json<VerifyCommitmentResponse>, (StatusCode, Json<ErrorResponse>)> {
+#[instrument(skip(body, headers))]
+pub async fn verify_commitment(
+    headers: HeaderMap,
+    Json(body): Json<VerifyCommitmentRequest>,
+) -> Result<Json<VerifyCommitmentResponse>, (StatusCode, Json<ErrorResponse>)> {
     // TODO: Call Soroban RPC to invoke ip_registry.verify_commitment
-    Err((
+    let error = (
         StatusCode::NOT_FOUND,
         Json(ErrorResponse {
             error: format!("IP record {} not found", body.ip_id),
         }),
+    );
+
+    // #1106: Record who asked to verify which commitment, and the outcome.
+    record_audit(access_audit(
+        "ip.verify",
+        &headers,
+        body.ip_id,
+        error.0.as_u16(),
     ))
+    .await;
+
+    Err(error)
+}
+
+/// #1106: Append an audit event. A failed write is logged, not returned: the
+/// commitment has already happened on-chain, so the caller should still get the
+/// real result. Failures are logged at error level so they can be alerted on.
+async fn record_audit(input: AuditEventInput) {
+    if let Err(err) = AUDIT_LOG_STORE.append(input).await {
+        tracing::error!("audit log append failed: {err}");
+    }
+}
+
+/// #1106: Build an access-audit event for a request. The actor is the HMAC of its
+/// `x-api-key`, never the raw key, and is absent for unauthenticated requests.
+fn access_audit(event_type: &str, headers: &HeaderMap, ip_id: u64, status: u16) -> AuditEventInput {
+    let actor_hash = headers
+        .get("x-api-key")
+        .and_then(|value| value.to_str().ok())
+        .filter(|key| !key.is_empty())
+        .map(|key| AUDIT_LOG_STORE.hash_identifier(key));
+
+    AuditEventInput::new(AuditEventCategory::Commitment, event_type)
+        .actor_hash(actor_hash)
+        .ip_id(Some(ip_id))
+        .success(status < 400)
+        .status_code(Some(status))
+}
+
+/// #1106: Query the immutable audit trail (`GET /audit-logs`).
+///
+/// Admin only. The request must send the `x-admin-key` header matching the
+/// `AUDIT_ADMIN_API_KEY` environment variable. The endpoint is locked when that
+/// variable is unset.
+#[instrument(skip(headers))]
+pub async fn get_audit_logs(
+    headers: HeaderMap,
+    Query(query): Query<AuditLogQuery>,
+) -> Result<Json<AuditLogQueryResponse>, (StatusCode, Json<ErrorResponse>)> {
+    require_audit_admin(&headers)?;
+    Ok(Json(AUDIT_LOG_STORE.query(&query).await))
+}
+
+/// #1106: Accounts with repeated failed access, from the audit trail. Admin only.
+#[instrument(skip(headers))]
+pub async fn get_suspicious_patterns(
+    headers: HeaderMap,
+) -> Result<Json<Vec<SuspiciousPattern>>, (StatusCode, Json<ErrorResponse>)> {
+    require_audit_admin(&headers)?;
+    Ok(Json(AUDIT_LOG_STORE.detect_suspicious_patterns().await))
+}
+
+fn require_audit_admin(headers: &HeaderMap) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let provided = headers.get("x-admin-key").and_then(|value| value.to_str().ok());
+    let expected = std::env::var("AUDIT_ADMIN_API_KEY").ok();
+    if admin_key_matches(provided, expected.as_deref()) {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "admin key required to read audit logs".to_string(),
+            }),
+        ))
+    }
 }
 
 /// Reveal and verify multiple IP commitments in one request.
@@ -546,9 +754,10 @@ pub async fn find_similar_commitments(
     let max_distance = params.max_distance.min(256);
     let limit = params.limit.clamp(1, 100) as usize;
     let mut results: Vec<SimilarCommitment> = COMMITMENT_INDEX
+        .entries
         .iter()
         .filter_map(|entry| {
-            let record = entry.value();
+            let record = &entry.value().0;
             let candidate = hex::decode(&record.commitment_hash).ok()?;
             if candidate.len() != query_hash.len() {
                 return None;
@@ -570,6 +779,80 @@ pub async fn find_similar_commitments(
     Ok(Json(SimilarCommitmentsResponse { results }))
 }
 
+#[cfg(test)]
+mod commitment_index_tests {
+    use super::*;
+
+    fn record(ip_id: u64) -> IpRecord {
+        IpRecord {
+            ip_id,
+            owner: format!("owner-{}", ip_id),
+            commitment_hash: format!("hash-{}", ip_id),
+            timestamp: ip_id,
+            revoked: false,
+        }
+    }
+
+    #[test]
+    fn evicts_least_recently_used_entries_past_capacity() {
+        let index = CommitmentIndex::new(2);
+        index.insert(1, record(1));
+        index.insert(2, record(2));
+
+        // Touch 1 so 2 becomes the least-recently-used entry.
+        assert!(index.get(1).is_some());
+
+        index.insert(3, record(3));
+        assert_eq!(index.len(), 2);
+        assert!(index.get(1).is_some(), "recently used entry must survive");
+        assert!(index.get(3).is_some(), "newly inserted entry must survive");
+        assert!(index.get(2).is_none(), "LRU entry must be evicted");
+    }
+
+    #[test]
+    fn evicts_down_to_capacity_when_many_inserted() {
+        let index = CommitmentIndex::new(3);
+        for ip_id in 0..10 {
+            index.insert(ip_id, record(ip_id));
+        }
+        assert_eq!(index.len(), 3);
+        // Only the three most recent inserts remain.
+        assert!(index.get(7).is_some());
+        assert!(index.get(8).is_some());
+        assert!(index.get(9).is_some());
+        assert!(index.get(0).is_none());
+    }
+
+    #[test]
+    fn miss_returns_none_and_does_not_grow_index() {
+        let index = CommitmentIndex::new(2);
+        index.insert(1, record(1));
+        assert!(index.get(42).is_none());
+        assert_eq!(index.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn miss_falls_back_to_rpc_and_repopulates_index() {
+        let index = CommitmentIndex::new(4);
+        let expected = record(7);
+
+        // Simulate the RPC fallback path: on a miss, fetch the record and
+        // repopulate the index so subsequent lookups hit the fast path.
+        let fetched = match index.get(7) {
+            Some(record) => Some(record),
+            None => Some(expected.clone()),
+        };
+        if let Some(record) = fetched {
+            index.insert(7, record);
+        }
+
+        let cached = index.get(7).expect("record must be repopulated after miss");
+        assert_eq!(cached.ip_id, expected.ip_id);
+        assert_eq!(cached.commitment_hash, expected.commitment_hash);
+        assert_eq!(index.len(), 1);
+    }
+}
+
 /// List all IP IDs owned by a Stellar address.
 /// Supports `limit` and `offset` query parameters for pagination (#317).
 #[utoipa::path(
@@ -584,7 +867,7 @@ pub async fn find_similar_commitments(
         (status = 200, description = "Paginated list of IP IDs", body = ListIpByOwnerResponse),
     )
 )]
-#[instrument]
+#[instrument(skip_all)]
 pub async fn list_ip_by_owner(
     Path(owner): Path<String>,
     Query(pagination): Query<PaginationParams>,
@@ -646,7 +929,7 @@ pub async fn list_ip_by_owner(
         (status = 200, description = "Cursor-paginated list of IP IDs", body = PaginatedResponse<u64>),
     )
 )]
-#[instrument]
+#[instrument(skip_all)]
 pub async fn list_ip_by_owner_cursor(
     Path(owner): Path<String>,
     Query(pagination): Query<CursorPaginationParams>,
@@ -860,6 +1143,13 @@ pub async fn batch_initiate_swap(Json(body): Json<BatchInitiateSwapRequest>) -> 
         };
         cache::set_with_ttl(&cache::swap_key(swap_id), &record, SWAP_EXPIRY_SECONDS);
         crate::analytics::record_swap_initiated();
+        crate::marketplace_analytics::record_initiated(
+            swap_id,
+            &crate::commitments::get_tags(ip_id),
+            &body.seller,
+            &body.buyer,
+            price,
+        );
         swap_ids.push(swap_id);
     }
 
@@ -868,10 +1158,9 @@ pub async fn batch_initiate_swap(Json(body): Json<BatchInitiateSwapRequest>) -> 
     // #523: Cache the result under the idempotency key so replays return the
     // same swap IDs instead of allocating new ones.
     if let Some(ref key) = body.idempotency_key {
-        BATCH_SWAP_IDEMPOTENCY.insert(
-            key.clone(),
-            (serde_json::to_value(&response).unwrap(), Instant::now()),
-        );
+        BATCH_SWAP_IDEMPOTENCY
+            .set(key.as_str(), serde_json::to_value(&response).unwrap())
+            .await;
     }
 
     Ok(Json(response))
@@ -1013,7 +1302,7 @@ pub async fn cancel_expired_swap(Path(swap_id): Path<u64>, Json(body): Json<Canc
         (status = 404, description = "Swap not found", body = ErrorResponse),
     )
 )]
-#[instrument]
+#[instrument(skip_all)]
 pub async fn get_swap(
     State(rpc_client): State<Arc<dyn crate::graphql::SorobanRpcClient>>,
     Path(swap_id): Path<u64>,
@@ -1061,7 +1350,7 @@ pub async fn get_swap(
         (status = 502, description = "Escrow status unavailable", body = ErrorResponse),
     )
 )]
-#[instrument]
+#[instrument(skip_all)]
 pub async fn get_swap_escrow(
     State(rpc_client): State<Arc<dyn crate::graphql::SorobanRpcClient>>,
     Path(swap_id): Path<u64>,
@@ -1113,7 +1402,7 @@ pub async fn get_swap_escrow(
     params(("swap_id" = u64, Path, description = "Swap identifier")),
     responses((status = 200, description = "Swap history", body = [SwapHistoryEntry]))
 )]
-#[instrument]
+#[instrument(skip_all)]
 pub async fn get_swap_history(
     State(rpc_client): State<Arc<dyn crate::graphql::SorobanRpcClient>>,
     Path(swap_id): Path<u64>,
@@ -1152,7 +1441,7 @@ pub async fn get_swap_history(
     params(("swap_id" = u64, Path, description = "Swap identifier")),
     responses((status = 200, description = "Dispute evidence history", body = [DisputeEvidenceEntry]))
 )]
-#[instrument]
+#[instrument(skip_all)]
 pub async fn get_swap_disputes(
     State(rpc_client): State<Arc<dyn crate::graphql::SorobanRpcClient>>,
     Path(swap_id): Path<u64>,
@@ -1190,7 +1479,7 @@ pub async fn get_swap_disputes(
         (status = 400, description = "At least one seller, buyer, or ip_id selector is required", body = ErrorResponse),
     )
 )]
-#[instrument]
+#[instrument(skip_all)]
 pub async fn list_swaps(
     State(rpc_client): State<Arc<dyn crate::graphql::SorobanRpcClient>>,
     Query(filters): Query<SwapFilterParams>,
@@ -1297,7 +1586,7 @@ async fn marketplace_response(
     get,
     path = "/v1/swap/marketplace/seller/{seller}",
     tag = "Marketplace",
-    params(("seller" = String, Path), CursorPaginationParams),
+    params(("seller" = String, Path, description = "Seller address"), CursorPaginationParams),
     responses((status = 200, description = "Seller marketplace listings", body = MarketplaceResponse))
 )]
 pub async fn marketplace_by_seller(
@@ -1313,7 +1602,7 @@ pub async fn marketplace_by_seller(
     get,
     path = "/v1/swap/marketplace/buyer/{buyer}",
     tag = "Marketplace",
-    params(("buyer" = String, Path), CursorPaginationParams),
+    params(("buyer" = String, Path, description = "Buyer address"), CursorPaginationParams),
     responses((status = 200, description = "Buyer marketplace listings", body = MarketplaceResponse))
 )]
 pub async fn marketplace_by_buyer(
@@ -1329,7 +1618,7 @@ pub async fn marketplace_by_buyer(
     get,
     path = "/v1/swap/marketplace/ip/{ip_id}",
     tag = "Marketplace",
-    params(("ip_id" = u64, Path), CursorPaginationParams),
+    params(("ip_id" = u64, Path, description = "IP record identifier"), CursorPaginationParams),
     responses((status = 200, description = "IP marketplace listings", body = MarketplaceResponse))
 )]
 pub async fn marketplace_by_ip(
@@ -1338,6 +1627,101 @@ pub async fn marketplace_by_ip(
     Query(pagination): Query<CursorPaginationParams>,
 ) -> impl IntoResponse {
     marketplace_response(rpc_client.get_swaps_by_ip(ip_id, pagination.limit.min(200), pagination.cursor).await).await
+}
+
+// ── #1090: IP marketplace search ──────────────────────────────────────────────
+
+/// Search indexed IP listings by price, registration date, category,
+/// jurisdiction and metadata text. Returns a page of matches plus facet counts.
+#[utoipa::path(
+    get,
+    path = "/v1/ip/search",
+    tag = "Marketplace",
+    params(IpSearchFilters),
+    responses((status = 200, description = "Matching IP listings with facet counts", body = IpSearchResponse))
+)]
+pub async fn search_ip(Query(filters): Query<IpSearchFilters>) -> impl IntoResponse {
+    Json(crate::ip_search::search(&crate::ip_search::listings(), &filters))
+}
+
+/// Index an IP for marketplace search, or replace the metadata of an already
+/// indexed IP. The IP record must be known to the cache.
+#[utoipa::path(
+    put,
+    path = "/v1/ip/{ip_id}/metadata",
+    tag = "Marketplace",
+    params(("ip_id" = u64, Path, description = "IP record identifier")),
+    request_body = IpSearchMetadata,
+    responses(
+        (status = 200, description = "Metadata indexed", body = IpSearchMetadata),
+        (status = 400, description = "Invalid metadata", body = ErrorResponse),
+        (status = 404, description = "IP not found", body = ErrorResponse)
+    )
+)]
+pub async fn put_ip_search_metadata(
+    Path(ip_id): Path<u64>,
+    Json(metadata): Json<IpSearchMetadata>,
+) -> impl IntoResponse {
+    let Some(record) = cache::get::<IpRecord>(&cache::ip_key(ip_id)) else {
+        return (StatusCode::NOT_FOUND, Json(ErrorResponse { error: "IP not found".to_string() })).into_response();
+    };
+    match crate::ip_search::index_listing(record, metadata) {
+        Ok(stored) => (StatusCode::OK, Json(stored)).into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response(),
+    }
+}
+
+/// Save a named search for an owner (at most 20 per owner, names unique).
+#[utoipa::path(
+    post,
+    path = "/v1/ip/search/saved/{owner}",
+    tag = "Marketplace",
+    params(("owner" = String, Path, description = "Owner address")),
+    request_body = SaveSearchRequest,
+    responses(
+        (status = 201, description = "Saved search created", body = SavedSearch),
+        (status = 400, description = "Invalid name or limit reached", body = ErrorResponse)
+    )
+)]
+pub async fn save_ip_search(
+    Path(owner): Path<String>,
+    Json(request): Json<SaveSearchRequest>,
+) -> impl IntoResponse {
+    match crate::ip_search::save_search(&owner, &request.name, request.filters) {
+        Ok(saved) => (StatusCode::CREATED, Json(saved)).into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response(),
+    }
+}
+
+/// List an owner's saved searches.
+#[utoipa::path(
+    get,
+    path = "/v1/ip/search/saved/{owner}",
+    tag = "Marketplace",
+    params(("owner" = String, Path, description = "Owner address")),
+    responses((status = 200, description = "Saved searches", body = Vec<SavedSearch>))
+)]
+pub async fn list_ip_saved_searches(Path(owner): Path<String>) -> impl IntoResponse {
+    Json(crate::ip_search::list_saved_searches(&owner))
+}
+
+/// Delete one of an owner's saved searches.
+#[utoipa::path(
+    delete,
+    path = "/v1/ip/search/saved/{owner}/{id}",
+    tag = "Marketplace",
+    params(("owner" = String, Path, description = "Owner address"), ("id" = u64, Path, description = "Saved search identifier")),
+    responses(
+        (status = 204, description = "Saved search deleted"),
+        (status = 404, description = "No saved search with that id", body = ErrorResponse)
+    )
+)]
+pub async fn delete_ip_saved_search(Path((owner, id)): Path<(String, u64)>) -> impl IntoResponse {
+    if crate::ip_search::delete_saved_search(&owner, id) {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        (StatusCode::NOT_FOUND, Json(ErrorResponse { error: "saved search not found".to_string() })).into_response()
+    }
 }
 
 // ── Webhooks ──────────────────────────────────────────────────────────────────
