@@ -1944,11 +1944,12 @@ mod tests {
         client.set_notary_public_key(&public_key);
 
         let record = client.get_ip(&ip_id);
-        let mut msg_bytes = [0u8; 16];
-        msg_bytes[..8].copy_from_slice(&ip_id.to_be_bytes());
-        msg_bytes[8..].copy_from_slice(&record.timestamp.to_be_bytes());
+        let msg = crate::notary_signing_message(&env, &contract_id, ip_id, record.timestamp);
+        let mut msg_bytes = [0u8; 256];
+        let msg_len = msg.len() as usize;
+        msg.copy_into_slice(&mut msg_bytes[..msg_len]);
 
-        let sig = signing_key.sign(&msg_bytes);
+        let sig = signing_key.sign(&msg_bytes[..msg_len]);
         let notary_sig = soroban_sdk::Bytes::from_slice(&env, &sig.to_bytes());
 
         client.notarize_ip_timestamp(&ip_id, &notary_sig);

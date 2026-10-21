@@ -219,6 +219,33 @@ pub const METADATA_FIELD_ACCESS_LEVEL: u32 = 1;
 /// This is a placeholder - should be set during contract initialization
 pub const NOTARY_PUBLIC_KEY: &[u8] = b"notary_public_key_placeholder";
 
+/// Version byte that prefixes every notary signing message (#1149).
+/// The original untagged `ip_id || timestamp` format is no longer accepted.
+pub const NOTARY_MESSAGE_VERSION: u8 = 1;
+
+/// Domain-separation tag for notary signing messages (#1149).
+pub const NOTARY_DOMAIN_TAG: &[u8] = b"AtomicIP/notary";
+
+/// Build the exact bytes a notary signs to notarize `ip_id` at `timestamp`
+/// for the deployment at `contract` (#1149). Layout, all concatenated:
+///
+/// 1. version byte (`NOTARY_MESSAGE_VERSION`, 1 byte)
+/// 2. domain tag (`NOTARY_DOMAIN_TAG`)
+/// 3. network id (32 bytes, `Ledger::network_id`)
+/// 4. contract address (XDR encoding)
+/// 5. `ip_id` (8 bytes, big-endian)
+/// 6. `timestamp` (8 bytes, big-endian)
+pub fn notary_signing_message(env: &Env, contract: &Address, ip_id: u64, timestamp: u64) -> Bytes {
+    let mut message = Bytes::new(env);
+    message.push_back(NOTARY_MESSAGE_VERSION);
+    message.append(&Bytes::from_slice(env, NOTARY_DOMAIN_TAG));
+    message.append(&Bytes::from(env.ledger().network_id()));
+    message.append(&contract.clone().to_xdr(env));
+    message.append(&Bytes::from_array(env, &ip_id.to_be_bytes()));
+    message.append(&Bytes::from_array(env, &timestamp.to_be_bytes()));
+    message
+}
+
 /// Issue #437: Number of storage shards for commitment distribution.
 pub const NUM_SHARDS: u32 = 16;
 
@@ -4007,15 +4034,54 @@ impl IpRegistry {
     ///
     /// # Panics
     ///
-    /// Panics with `Unauthorized` if `access_level` is 0 or > 3, or if caller is not the owner.
+    /// Panics with `InvalidAccessLevel` if `access_level` is 0 or > 3 (#1150),
+    /// or with `Unauthorized` if caller is not the owner.
     pub fn grant_ip_access(env: Env, ip_id: u64, grantee: Address, access_level: u32) {
+        Self::grant_ip_access_with_expiry(env, ip_id, grantee, access_level, None);
+    }
+
+    /// Grant access like `grant_ip_access`, with an optional expiry (#1151).
+    ///
+    /// `expires_at` is a ledger timestamp. Once `ledger.timestamp() >= expires_at`
+    /// the grant no longer passes `check_ip_access`. `None` means no expiry.
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// * The IP does not exist (IpNotFound error)
+    /// * The caller is not the owner (Unauthorized error)
+    /// * `access_level` is 0 or > 3 (InvalidAccessLevel error)
+    /// * `grantee` is the owner (SelfGrantNotAllowed error)
+    /// * `expires_at` is not in the future (InvalidExpiry error)
+    pub fn grant_ip_access_with_expiry(
+        env: Env,
+        ip_id: u64,
+        grantee: Address,
+        access_level: u32,
+        expires_at: Option<u64>,
+    ) {
         let record = require_ip_exists(&env, ip_id);
         record.owner.require_auth();
 
         if !(1..=3).contains(&access_level) {
             env.panic_with_error(Error::from_contract_error(
-                ContractError::Unauthorized as u32,
+                ContractError::InvalidAccessLevel as u32,
             ));
+        }
+
+        // #1151: owner already has full access; a self-grant only adds noise.
+        if grantee == record.owner {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::SelfGrantNotAllowed as u32,
+            ));
+        }
+
+        if let Some(expiry) = expires_at {
+            if expiry <= env.ledger().timestamp() {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::InvalidExpiry as u32,
+                ));
+            }
         }
 
         let mut grants: Vec<IpAccessGrant> = env
@@ -4032,6 +4098,7 @@ impl IpRegistry {
                     IpAccessGrant {
                         grantee: grantee.clone(),
                         access_level,
+                        expires_at,
                     },
                 );
                 found = true;
@@ -4042,6 +4109,7 @@ impl IpRegistry {
             grants.push_back(IpAccessGrant {
                 grantee: grantee.clone(),
                 access_level,
+                expires_at,
             });
         }
 
@@ -4113,6 +4181,7 @@ impl IpRegistry {
     /// a grantee with level 3 satisfies a check for level 1 or 2.
     ///
     /// Returns `true` if access is granted, `false` otherwise.
+    /// Expired grants (#1151) are treated as absent.
     pub fn check_ip_access(env: Env, ip_id: u64, grantee: Address, required_level: u32) -> bool {
         let record = require_ip_exists(&env, ip_id);
         // Owner always has full access
@@ -4124,8 +4193,14 @@ impl IpRegistry {
             .persistent()
             .get(&DataKey::IpAccessGrants(ip_id))
             .unwrap_or(Vec::new(&env));
+        let now = env.ledger().timestamp();
         for grant in grants.iter() {
             if grant.grantee == grantee {
+                if let Some(expiry) = grant.expires_at {
+                    if now >= expiry {
+                        return false;
+                    }
+                }
                 return grant.access_level >= required_level;
             }
         }
@@ -4169,19 +4244,33 @@ impl IpRegistry {
 
     /// Notarize an IP timestamp with a notary Ed25519 signature.
     ///
-    /// The notary must sign the message `ip_id_be_bytes || timestamp_be_bytes`
-    /// (8 bytes each, big-endian) with the private key corresponding to the
-    /// stored notary public key. The 64-byte signature is verified on-chain.
+    /// The notary must sign the message built by `notary_signing_message` (see
+    /// `docs/notary-signature-format.md`) with the private key corresponding to
+    /// the stored notary public key. The 64-byte signature is verified on-chain.
+    /// The message is bound to this contract's address and network, so a
+    /// signature issued for one deployment is rejected by any other (#1149).
+    ///
+    /// # Panics
+    ///
+    /// Notarization is write-once: a second call for the same IP is rejected
+    /// rather than silently replacing the first signature (#1148).
     ///
     /// # Panics
     ///
     /// Panics if:
     /// * The IP does not exist (IpNotFound error)
+    /// * The IP is already notarized (AlreadyNotarized error)
     /// * The notary public key has not been set (Unauthorized error)
     /// * The signature is not exactly 64 bytes (Unauthorized error)
     /// * The Ed25519 signature verification fails (Unauthorized error)
     pub fn notarize_ip_timestamp(env: Env, ip_id: u64, notary_signature: Bytes) {
         let mut record = require_ip_exists(&env, ip_id);
+
+        if record.notary_signature.is_some() {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::AlreadyNotarized as u32,
+            ));
+        }
 
         // Require notary public key to be configured
         let public_key: BytesN<32> = match env.storage().persistent().get(&DataKey::NotaryPublicKey)
@@ -4209,10 +4298,12 @@ impl IpRegistry {
             }
         };
 
-        // Message: ip_id (8 bytes BE) || timestamp (8 bytes BE)
-        let mut message = Bytes::new(&env);
-        message.append(&Bytes::from_array(&env, &ip_id.to_be_bytes()));
-        message.append(&Bytes::from_array(&env, &record.timestamp.to_be_bytes()));
+        let message = notary_signing_message(
+            &env,
+            &env.current_contract_address(),
+            ip_id,
+            record.timestamp,
+        );
 
         // Verify Ed25519 signature — panics if invalid
         env.crypto().ed25519_verify(&public_key, &message, &sig);

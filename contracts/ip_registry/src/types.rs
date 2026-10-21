@@ -30,6 +30,9 @@ pub const ACCESS_TRANSFER: u32 = 3; // Can initiate transfer (view + verify + tr
 pub struct IpAccessGrant {
     pub grantee: Address,
     pub access_level: u32, // 1 = view, 2 = verify, 3 = transfer
+    /// Ledger timestamp at which the grant stops being valid (#1151).
+    /// `None` means the grant never expires.
+    pub expires_at: Option<u64>,
 }
 
 /// Cached proof path tied to the owner's current Merkle root.
