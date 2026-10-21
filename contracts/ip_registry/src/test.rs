@@ -31,6 +31,7 @@ mod tests {
             secret: BytesN<32>,
             blinding_factor: BytesN<32>,
         ) -> bool;
+        fn notify_ip_expiry(env: Env, ip_id: u64) -> bool;
         fn list_ip_by_owner(env: Env, owner: Address) -> Vec<u64>;
         fn get_stake(env: Env, ip_id: u64) -> Option<StakeRecord>;
         fn transfer_ip(env: Env, ip_id: u64, new_owner: Address);
@@ -2945,7 +2946,7 @@ mod expiry_tests {
     }
 
     #[test]
-    fn test_verify_commitment_emits_expiry_event_exactly_once() {
+    fn test_notify_ip_expiry_emits_event_exactly_once() {
         let (env, client, _owner, ip_id) = setup();
         let now = env.ledger().timestamp();
         client.set_ip_expiry(&ip_id, &(now + 100), &500);
@@ -2953,19 +2954,15 @@ mod expiry_tests {
         // Advance past expiry but still within the grace period.
         env.ledger().with_mut(|l| l.timestamp = now + 150);
 
-        let secret = BytesN::from_array(&env, &[1u8; 32]);
-        let blinding = BytesN::from_array(&env, &[2u8; 32]);
-
         // No events emitted yet (set_ip_expiry does not publish).
         assert_eq!(env.events().all().events().len(), 0);
 
-        // Calling verify_commitment repeatedly must only fire the expiry
-        // event once for this expiry transition.
-        client.verify_commitment(&ip_id, &secret, &blinding);
+        // The first notification emits EXPIRY_TOPIC; repeats must not.
+        assert!(client.notify_ip_expiry(&ip_id));
         assert_eq!(env.events().all().events().len(), 1);
 
-        client.verify_commitment(&ip_id, &secret, &blinding);
-        client.verify_commitment(&ip_id, &secret, &blinding);
+        assert!(!client.notify_ip_expiry(&ip_id));
+        assert!(!client.notify_ip_expiry(&ip_id));
         assert_eq!(
             env.events().all().events().len(),
             1,

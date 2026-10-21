@@ -1192,8 +1192,8 @@ impl IpRegistry {
             .set(&DataKey::CommitmentOwner(commitment_hash.clone()), &owner);
         env.storage().persistent().extend_ttl(
             &DataKey::CommitmentOwner(commitment_hash.clone()),
-            50000,
-            50000,
+            LEDGER_BUMP,
+            LEDGER_BUMP,
         );
 
         env.storage().persistent().set(&DataKey::NextId, &(id + 1));
@@ -1336,8 +1336,8 @@ impl IpRegistry {
                 .set(&DataKey::CommitmentOwner(commitment_hash.clone()), &owner);
             env.storage().persistent().extend_ttl(
                 &DataKey::CommitmentOwner(commitment_hash.clone()),
-                50000,
-                50000,
+                LEDGER_BUMP,
+                LEDGER_BUMP,
             );
 
             env.events()
@@ -1498,8 +1498,8 @@ impl IpRegistry {
             );
             env.storage().persistent().extend_ttl(
                 &DataKey::CommitmentOwner(commitment_hash.clone()),
-                50000,
-                50000,
+                LEDGER_BUMP,
+                LEDGER_BUMP,
             );
 
             // Record blinded owner mapping for later on-chain/off-chain proof if needed.
@@ -1596,10 +1596,9 @@ impl IpRegistry {
     ) -> u64 {
         owner.require_auth();
 
-        require!(
-            commitment_hashes.len() > 0,
-            ContractError::BatchSizeMismatch
-        );
+        if commitment_hashes.len() == 0 {
+            panic_with_error!(&env, ContractError::BatchSizeMismatch);
+        }
 
         let root_hash = Self::compute_merkle_root(&env, &commitment_hashes);
         let timestamp = env.ledger().timestamp();
@@ -1626,7 +1625,7 @@ impl IpRegistry {
             .extend_ttl(&DataKey::MerkleRootRecord(root_id), LEDGER_BUMP, LEDGER_BUMP);
 
         env.events()
-            .publish((symbol_short!("merkle_root"),), (root_id, timestamp, root_hash));
+            .publish((Symbol::new(&env, "merkle_root"),), (root_id, timestamp, root_hash));
 
         root_id
     }
@@ -1728,7 +1727,9 @@ impl IpRegistry {
         owner.require_auth();
 
         let current_time = env.ledger().timestamp();
-        require!(unlock_time > current_time, ContractError::InvalidTimeLock);
+        if unlock_time <= current_time {
+            panic_with_error!(&env, ContractError::InvalidTimeLock);
+        }
         require_non_zero_commitment(&env, &commitment_hash);
         require_unique_commitment(&env, &commitment_hash);
 
@@ -1784,7 +1785,7 @@ impl IpRegistry {
             .extend_ttl(&DataKey::NextId, LEDGER_BUMP, LEDGER_BUMP);
 
         env.events().publish(
-            (symbol_short!("timelock_crt"),),
+            (Symbol::new(&env, "timelock_crt"),),
             (id, unlock_time, current_time),
         );
 
@@ -1832,7 +1833,7 @@ impl IpRegistry {
             .set(&DataKey::TimeLockRecord(commitment_id), &lock);
 
         env.events()
-            .publish((symbol_short!("timelock_unlock"),), (commitment_id, current_time));
+            .publish((Symbol::new(&env, "timelock_unlock"),), (commitment_id, current_time));
 
         true
     }
@@ -1951,10 +1952,9 @@ impl IpRegistry {
         privacy_level: u32,
         allowed_addresses: Vec<Address>,
     ) -> bool {
-        require!(
-            privacy_level <= 3,
-            ContractError::InvalidPrivacyLevel
-        );
+        if privacy_level > 3 {
+            panic_with_error!(&env, ContractError::InvalidPrivacyLevel);
+        }
 
         let mut record: Option<IpRecord> = env
             .storage()
@@ -2000,7 +2000,7 @@ impl IpRegistry {
             ip_record.owner.clone(),
         );
         env.events()
-            .publish((symbol_short!("privacy_set"),), (commitment_id, privacy_level));
+            .publish((Symbol::new(&env, "privacy_set"),), (commitment_id, privacy_level));
 
         true
     }
@@ -2261,7 +2261,7 @@ impl IpRegistry {
             .set(&DataKey::OwnerIps(old_owner.clone()), &old_ids);
         env.storage()
             .persistent()
-            .extend_ttl(&DataKey::OwnerIps(old_owner.clone()), 50000, 50000);
+            .extend_ttl(&DataKey::OwnerIps(old_owner.clone()), LEDGER_BUMP, LEDGER_BUMP);
 
         // Add to new owner's index
         let mut new_ids: Vec<u64> = env
@@ -2275,7 +2275,7 @@ impl IpRegistry {
             .set(&DataKey::OwnerIps(new_owner.clone()), &new_ids);
         env.storage()
             .persistent()
-            .extend_ttl(&DataKey::OwnerIps(new_owner.clone()), 50000, 50000);
+            .extend_ttl(&DataKey::OwnerIps(new_owner.clone()), LEDGER_BUMP, LEDGER_BUMP);
 
         // Update commitment index
         env.storage().persistent().set(
@@ -2287,6 +2287,11 @@ impl IpRegistry {
             LEDGER_BUMP,
             LEDGER_BUMP,
         );
+
+        // #1146: authority state belongs to the outgoing owner, so clear it.
+        // The new owner starts with a single-owner cap table and no grants.
+        validation::clear_owner_scoped_state(&env, ip_id);
+        record.co_owners = Vec::new(&env);
 
         record.owner = new_owner.clone();
         env.storage()
@@ -2342,7 +2347,7 @@ impl IpRegistry {
             .set(&DataKey::IpRecord(ip_id), &record);
         env.storage()
             .persistent()
-            .extend_ttl(&DataKey::IpRecord(ip_id), 50000, 50000);
+            .extend_ttl(&DataKey::IpRecord(ip_id), LEDGER_BUMP, LEDGER_BUMP);
 
         env.events().publish(
             (REVOKE_TOPIC, record.owner.clone()),
@@ -2760,6 +2765,9 @@ impl IpRegistry {
         blinding_factor: BytesN<32>,
     ) -> bool {
         let record = require_ip_exists(&env, ip_id);
+        if record.revoked {
+            return false;
+        }
         if env
             .storage()
             .persistent()
@@ -2769,23 +2777,16 @@ impl IpRegistry {
             return false;
         }
 
-        // Emit EXPIRY_TOPIC exactly once per expiry transition so off-chain
-        // indexers can cheaply detect an IP crossing into its grace period.
-        if record.expiry_timestamp != 0 && env.ledger().timestamp() >= record.expiry_timestamp {
-            let already_notified: bool = env
-                .storage()
-                .persistent()
-                .get(&DataKey::ExpiryNotified(ip_id))
-                .unwrap_or(false);
-            if !already_notified {
-                env.events().publish(
-                    (EXPIRY_TOPIC, ip_id),
-                    (record.owner.clone(), record.expiry_timestamp),
-                );
-                env.storage()
-                    .persistent()
-                    .set(&DataKey::ExpiryNotified(ip_id), &true);
-            }
+        // Expired past the grace period: the commitment is no longer verifiable.
+        // Inside the grace period (expiry..expiry+grace) verification still succeeds.
+        // Read-only: expiry transition events are emitted by `notify_ip_expiry`.
+        if record.expiry_timestamp != 0
+            && env.ledger().timestamp()
+                >= record
+                    .expiry_timestamp
+                    .saturating_add(record.grace_period_seconds)
+        {
+            return false;
         }
 
         let algorithm: CommitmentAlgorithm = env
@@ -3041,7 +3042,7 @@ impl IpRegistry {
         );
 
         env.events().publish(
-            (symbol_short!("partial"), record.owner),
+            (symbol_short!("partial"), record.owner.clone()),
             (ip_id, partial_hash),
         );
 
@@ -3814,7 +3815,7 @@ impl IpRegistry {
             }
         }
 
-        Self::verify_merkle_proof(&env, &record.commitment_hash, &proof, &hashes)
+        Self::verify_merkle_leaf_path(&env, &record.commitment_hash, &proof, &hashes)
     }
 
     // ── Issue #435: Generate Merkle Proof ─────────────────────────────────────
@@ -3965,7 +3966,7 @@ impl IpRegistry {
         current_level.get(0).unwrap()
     }
 
-    fn verify_merkle_proof(
+    fn verify_merkle_leaf_path(
         env: &Env,
         leaf: &BytesN<32>,
         proof: &Vec<BytesN<32>>,
@@ -6860,6 +6861,40 @@ impl IpRegistry {
         env.storage()
             .persistent()
             .remove(&DataKey::ExpiryNotified(ip_id));
+    }
+
+    /// Emit `EXPIRY_TOPIC` once for an IP's expiry transition. Anyone can call.
+    ///
+    /// Expiry notifications used to be emitted from `verify_commitment`, which made a
+    /// read path write state and emit events. This state-changing entry point owns
+    /// that transition instead. Indexers should call it, or watch for the event.
+    ///
+    /// Returns `true` only when this call emitted the event. It returns `false` if
+    /// the IP has no expiry, has not reached it yet, or was already notified for the
+    /// current expiry. `set_ip_expiry` and `renew_ip_commitment` reset the flag.
+    pub fn notify_ip_expiry(env: Env, ip_id: u64) -> bool {
+        let record = require_ip_exists(&env, ip_id);
+        if record.expiry_timestamp == 0 || env.ledger().timestamp() < record.expiry_timestamp {
+            return false;
+        }
+
+        let already_notified: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ExpiryNotified(ip_id))
+            .unwrap_or(false);
+        if already_notified {
+            return false;
+        }
+
+        env.events().publish(
+            (EXPIRY_TOPIC, ip_id),
+            (record.owner.clone(), record.expiry_timestamp),
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::ExpiryNotified(ip_id), &true);
+        true
     }
 
     /// Renew an IP commitment's expiry. Owner-only.
