@@ -98,3 +98,5 @@ receivers:
       - url: http://atomicip-api.atomicip-production.svc/v1/admin/incidents/alertmanager
         send_resolved: true
         max_alerts: 50
+        http_config:
+          bearer_token_file: /etc/alertmanager/secrets/incident-tracker-token

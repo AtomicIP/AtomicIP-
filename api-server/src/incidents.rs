@@ -26,12 +26,13 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use axum::extract::Path;
-use axum::http::StatusCode;
+use axum::http::{header::AUTHORIZATION, HeaderMap, StatusCode};
 use axum::Json;
 use metrics::{counter, histogram};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use crate::alerting::{self, Notification, Severity};
 
@@ -120,6 +121,7 @@ pub struct ActionItem {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Postmortem {
+    #[serde(default)]
     pub author: String,
     pub summary: String,
     pub impact: String,
@@ -196,6 +198,8 @@ pub struct NewIncident {
 pub enum IncidentError {
     NotFound,
     InvalidState(&'static str),
+    /// Malformed request payload (e.g. an invalid Alertmanager webhook).
+    InvalidPayload(&'static str),
 }
 
 // ── Provider integration ─────────────────────────────────────────────────────
@@ -372,8 +376,8 @@ impl IncidentManager {
     /// Open a new incident, or record a re-trigger on the open incident with
     /// the same dedup key. Returns the incident id and whether it was new.
     pub fn trigger(&self, new: NewIncident, now: u64) -> (String, bool) {
-        let mut open = self.open_by_key.lock().unwrap();
-        let mut incidents = self.incidents.lock().unwrap();
+        let mut open = self.open_by_key.lock().unwrap_or_else(|e| e.into_inner());
+        let mut incidents = self.incidents.lock().unwrap_or_else(|e| e.into_inner());
 
         if let Some(id) = open.get(&new.dedup_key) {
             if let Some(inc) = incidents.get_mut(id) {
@@ -447,7 +451,7 @@ impl IncidentManager {
     }
 
     pub fn acknowledge(&self, id: &str, actor: &str, now: u64) -> Result<Incident, IncidentError> {
-        let mut incidents = self.incidents.lock().unwrap();
+        let mut incidents = self.incidents.lock().unwrap_or_else(|e| e.into_inner());
         let inc = incidents.get_mut(id).ok_or(IncidentError::NotFound)?;
         match inc.status {
             IncidentStatus::Resolved => return Err(IncidentError::InvalidState("incident already resolved")),
@@ -470,8 +474,8 @@ impl IncidentManager {
 
     pub fn resolve(&self, id: &str, actor: &str, note: Option<String>, now: u64) -> Result<Incident, IncidentError> {
         // Lock order must match `trigger`: open_by_key before incidents.
-        let mut open = self.open_by_key.lock().unwrap();
-        let mut incidents = self.incidents.lock().unwrap();
+        let mut open = self.open_by_key.lock().unwrap_or_else(|e| e.into_inner());
+        let mut incidents = self.incidents.lock().unwrap_or_else(|e| e.into_inner());
         let inc = incidents.get_mut(id).ok_or(IncidentError::NotFound)?;
         if inc.status == IncidentStatus::Resolved {
             return Ok(inc.clone());
@@ -499,22 +503,31 @@ impl IncidentManager {
 
     /// Resolve by dedup key (used when the upstream alert clears).
     pub fn resolve_by_key(&self, dedup_key: &str, actor: &str, now: u64) -> Option<Incident> {
-        let id = { self.open_by_key.lock().unwrap().get(dedup_key).cloned()? };
+        let id = {
+            self.open_by_key
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(dedup_key)
+                .cloned()?
+        };
         self.resolve(&id, actor, Some("source alert resolved".into()), now).ok()
     }
 
     pub fn add_note(&self, id: &str, actor: &str, message: String, now: u64) -> Result<Incident, IncidentError> {
-        let mut incidents = self.incidents.lock().unwrap();
+        let mut incidents = self.incidents.lock().unwrap_or_else(|e| e.into_inner());
         let inc = incidents.get_mut(id).ok_or(IncidentError::NotFound)?;
         inc.push(now, "note", actor, message);
         Ok(inc.clone())
     }
 
     pub fn submit_postmortem(&self, id: &str, mut pm: Postmortem, now: u64) -> Result<Incident, IncidentError> {
-        let mut incidents = self.incidents.lock().unwrap();
+        let mut incidents = self.incidents.lock().unwrap_or_else(|e| e.into_inner());
         let inc = incidents.get_mut(id).ok_or(IncidentError::NotFound)?;
         if inc.status != IncidentStatus::Resolved {
             return Err(IncidentError::InvalidState("postmortem can only be attached to a resolved incident"));
+        }
+        if inc.postmortem.is_some() {
+            return Err(IncidentError::InvalidState("postmortem has already been submitted"));
         }
         pm.submitted_at = now;
         let author = pm.author.clone();
@@ -525,14 +538,18 @@ impl IncidentManager {
     }
 
     pub fn get(&self, id: &str) -> Option<Incident> {
-        self.incidents.lock().unwrap().get(id).cloned()
+        self.incidents
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .cloned()
     }
 
     pub fn list(&self, status: Option<IncidentStatus>) -> Vec<Incident> {
         let mut out: Vec<Incident> = self
             .incidents
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .values()
             .filter(|i| status.map_or(true, |s| i.status == s))
             .cloned()
@@ -542,7 +559,7 @@ impl IncidentManager {
     }
 
     pub fn stats(&self) -> IncidentStats {
-        let incidents = self.incidents.lock().unwrap();
+        let incidents = self.incidents.lock().unwrap_or_else(|e| e.into_inner());
         let mut s = IncidentStats { provider: self.provider.name().into(), ..Default::default() };
         let (mut tta, mut ttr) = (Vec::new(), Vec::new());
         for i in incidents.values() {
@@ -616,6 +633,7 @@ fn map_err(e: IncidentError) -> (StatusCode, Json<serde_json::Value>) {
     match e {
         IncidentError::NotFound => (StatusCode::NOT_FOUND, Json(json!({ "error": "incident not found" }))),
         IncidentError::InvalidState(msg) => (StatusCode::CONFLICT, Json(json!({ "error": msg }))),
+        IncidentError::InvalidPayload(msg) => (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))),
     }
 }
 
@@ -649,7 +667,7 @@ pub struct CreateRequest {
 }
 
 /// `POST /v1/admin/incidents` – declare an incident manually.
-pub async fn create_handler(Json(req): Json<CreateRequest>) -> (StatusCode, Json<Incident>) {
+pub async fn create_handler(Json(req): Json<CreateRequest>) -> ApiResult<Incident> {
     let now = alerting::now_secs();
     let (id, _) = INCIDENTS.trigger(
         NewIncident {
@@ -663,7 +681,10 @@ pub async fn create_handler(Json(req): Json<CreateRequest>) -> (StatusCode, Json
         },
         now,
     );
-    (StatusCode::CREATED, Json(INCIDENTS.get(&id).expect("just inserted")))
+    let incident = INCIDENTS
+        .get(&id)
+        .ok_or_else(|| map_err(IncidentError::NotFound))?;
+    Ok(Json(incident))
 }
 
 #[derive(Debug, Deserialize)]
@@ -695,7 +716,12 @@ pub async fn note_handler(Path(id): Path<String>, Json(req): Json<NoteRequest>) 
 }
 
 /// `POST /v1/admin/incidents/{id}/postmortem`
-pub async fn postmortem_handler(Path(id): Path<String>, Json(pm): Json<Postmortem>) -> ApiResult<Incident> {
+pub async fn postmortem_handler(
+    Path(id): Path<String>,
+    crate::auth::AuthExtension(claims): crate::auth::AuthExtension,
+    Json(mut pm): Json<Postmortem>,
+) -> ApiResult<Incident> {
+    pm.author = claims.sub;
     INCIDENTS.submit_postmortem(&id, pm, alerting::now_secs()).map(Json).map_err(map_err)
 }
 
@@ -705,9 +731,16 @@ pub struct AlertmanagerWebhook {
     pub alerts: Vec<AlertmanagerAlert>,
 }
 
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AlertmanagerStatus {
+    Firing,
+    Resolved,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct AlertmanagerAlert {
-    pub status: String,
+    pub status: AlertmanagerStatus,
     #[serde(default)]
     pub labels: HashMap<String, String>,
     #[serde(default)]
@@ -718,15 +751,36 @@ pub struct AlertmanagerAlert {
     pub generator_url: String,
 }
 
+impl AlertmanagerWebhook {
+    /// Validates a parsed webhook before it is turned into incidents.
+    fn validate(&self) -> Result<(), IncidentError> {
+        if self.alerts.is_empty() {
+            return Err(IncidentError::InvalidPayload("alerts must not be empty"));
+        }
+        for a in &self.alerts {
+            match a.status.as_str() {
+                "firing" | "resolved" => {}
+                _ => return Err(IncidentError::InvalidPayload("alert status must be 'firing' or 'resolved'")),
+            }
+        }
+        Ok(())
+    }
+}
+
 /// `POST /v1/admin/incidents/alertmanager` – Alertmanager webhook receiver.
 /// Firing alerts open (or re-trigger) incidents; resolved alerts resolve them.
-pub async fn alertmanager_webhook_handler(Json(hook): Json<AlertmanagerWebhook>) -> Json<serde_json::Value> {
+/// Malformed payloads are rejected with 400.
+pub async fn alertmanager_webhook_handler(
+    body: Result<Json<AlertmanagerWebhook>, axum::extract::rejection::JsonRejection>,
+) -> ApiResult<serde_json::Value> {
+    let Json(hook) = body.map_err(|_| map_err(IncidentError::InvalidPayload("malformed Alertmanager payload")))?;
+    hook.validate().map_err(map_err)?;
     let now = alerting::now_secs();
     let (mut opened, mut resolved) = (Vec::new(), Vec::new());
     for a in hook.alerts {
         let name = a.labels.get("alertname").cloned().unwrap_or_else(|| "UnknownAlert".into());
-        let dedup_key = format!("am-{}", if a.fingerprint.is_empty() { &name } else { &a.fingerprint });
-        if a.status == "resolved" {
+        let dedup_key = format!("am-{}", a.fingerprint);
+        if a.status == AlertmanagerStatus::Resolved {
             if let Some(inc) = INCIDENTS.resolve_by_key(&dedup_key, "alertmanager", now) {
                 resolved.push(inc.id);
             }
@@ -751,5 +805,77 @@ pub async fn alertmanager_webhook_handler(Json(hook): Json<AlertmanagerWebhook>)
         );
         opened.push(id);
     }
-    Json(json!({ "opened_or_retriggered": opened, "resolved": resolved }))
+    Ok(Json(json!({ "opened_or_retriggered": opened, "resolved": resolved })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(body: &str) -> Result<AlertmanagerWebhook, IncidentError> {
+        let hook: AlertmanagerWebhook = serde_json::from_str(body)
+            .map_err(|_| IncidentError::InvalidPayload("malformed Alertmanager payload"))?;
+        hook.validate()?;
+        Ok(hook)
+    }
+
+    #[test]
+    fn rejects_malformed_json() {
+        assert_eq!(
+            parse("{ not json").unwrap_err(),
+            IncidentError::InvalidPayload("malformed Alertmanager payload")
+        );
+    }
+
+    #[test]
+    fn rejects_missing_alerts_field() {
+        assert_eq!(
+            parse(r#"{"version": "4"}"#).unwrap_err(),
+            IncidentError::InvalidPayload("malformed Alertmanager payload")
+        );
+    }
+
+    #[test]
+    fn rejects_wrong_field_types() {
+        assert_eq!(
+            parse(r#"{"alerts": "nope"}"#).unwrap_err(),
+            IncidentError::InvalidPayload("malformed Alertmanager payload")
+        );
+        assert_eq!(
+            parse(r#"{"alerts": [{"status": 42}]}"#).unwrap_err(),
+            IncidentError::InvalidPayload("malformed Alertmanager payload")
+        );
+    }
+
+    #[test]
+    fn rejects_empty_alerts() {
+        assert_eq!(
+            parse(r#"{"alerts": []}"#).unwrap_err(),
+            IncidentError::InvalidPayload("alerts must not be empty")
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_status() {
+        assert_eq!(
+            parse(r#"{"alerts": [{"status": "exploded"}]}"#).unwrap_err(),
+            IncidentError::InvalidPayload("alert status must be 'firing' or 'resolved'")
+        );
+    }
+
+    #[test]
+    fn accepts_valid_payload() {
+        let hook = parse(
+            r#"{"alerts": [{"status": "firing", "labels": {"alertname": "HighErrorRate"}}]}"#,
+        )
+        .expect("valid payload");
+        assert_eq!(hook.alerts.len(), 1);
+        assert_eq!(hook.alerts[0].status, "firing");
+    }
+
+    #[test]
+    fn invalid_payload_maps_to_bad_request() {
+        let (status, _) = map_err(IncidentError::InvalidPayload("bad"));
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
 }

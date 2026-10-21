@@ -207,9 +207,34 @@ app.post('/v1/sign', signLimiter, signHandler);
 app.use('/v1/', apiLimiter);
 ```
 
-### 8. Error Handling
+### 8. Mutex Poison Handling
+
+A panic while holding a `std::sync::Mutex` poisons it. If the next request calls `lock().unwrap()`, that request panics too, and a single failure cascades into every later request that takes the same lock.
+
+**Policy for `api-server/src`:**
+
+- `lock().unwrap()` and `lock().expect(...)` are **forbidden** in `api-server/src`. A poisoned mutex must never be turned into a panic.
+- Use the shared helpers instead:
+  - `lock_or_recover(&mutex)` — returns the guard, recovering from poison with a `warn!` log so the request can continue.
+  - `try_lock_or_error(&mutex)` — returns a structured error (e.g. `ApiError::LockUnavailable`) when the lock is poisoned or contended, so the caller can respond with a proper status code.
+- Choose recovery (`lock_or_recover`) for state that is safe to reuse after a panic; choose the structured error (`try_lock_or_error`) where continuing with possibly inconsistent state is unacceptable.
+- Never `unwrap()` a `MutexGuard` result in request handlers, background tasks, or tests that exercise handlers.
+
+```rust
+// ✗ Forbidden: a poisoned lock panics the next request
+let guard = state.lock().unwrap();
+
+// ✓ Recover with a warning
+let guard = lock_or_recover(&state);
+
+// ✓ Or surface a structured error
+let guard = try_lock_or_error(&state)?;
+```
+
+### 9. Error Handling
 
 Never expose internal details in error messages:
+=======
 
 ```javascript
 // ✓ Good: Generic message to user

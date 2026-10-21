@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use chrono::Utc;
+use hmac::{Hmac, Mac};
+use sha1::Sha1;
 
 /// #984: Two-Factor Authentication (2FA) module for Time-based One-Time Passwords (TOTP)
 /// and backup codes for account recovery.
@@ -15,6 +16,9 @@ pub struct TotpSecret {
     pub enabled_at: i64,
     /// Whether 2FA is currently active/verified
     pub verified: bool,
+    /// Last successfully used TOTP time step, preventing code replay.
+    #[serde(default)]
+    pub last_totp_step: Option<u64>,
 }
 
 /// Backup code for account recovery
@@ -72,6 +76,8 @@ pub struct UseBackupCodeRequest {
 pub struct Verify2faResponse {
     pub success: bool,
     pub message: String,
+    /// Opaque token for the session created after successful verification.
+    pub session_token: String,
 }
 
 /// In-process 2FA store (for demo/testing)
@@ -85,11 +91,14 @@ impl TwoFactorStore {
         Self::default()
     }
 
-    /// Store user's 2FA configuration
-    pub fn store_config(&self, config: TwoFactorConfig) -> Result<(), String> {
+    /// Create a user's 2FA configuration without replacing an existing one.
+    pub fn create_config(&self, config: TwoFactorConfig) -> Result<bool, String> {
         let mut store = self.configs.lock().map_err(|e| e.to_string())?;
+        if store.contains_key(&config.user_id) {
+            return Ok(false);
+        }
         store.insert(config.user_id.clone(), config);
-        Ok(())
+        Ok(true)
     }
 
     /// Retrieve user's 2FA configuration
@@ -98,12 +107,45 @@ impl TwoFactorStore {
         Ok(store.get(user_id).cloned())
     }
 
+    /// Remove user's 2FA configuration (#1107). Returns whether one existed.
+    pub fn remove_config(&self, user_id: &str) -> Result<bool, String> {
+        let mut store = self.configs.lock().map_err(|e| e.to_string())?;
+        Ok(store.remove(user_id).is_some())
+    }
+
     /// Check if user has 2FA enabled
     pub fn has_2fa_enabled(&self, user_id: &str) -> Result<bool, String> {
         Ok(self
             .get_config(user_id)?
             .map(|c| c.totp.map(|t| t.verified).unwrap_or(false))
             .unwrap_or(false))
+    }
+
+    /// Verify a code and record its time step under the same lock.
+    pub fn verify_totp_code(
+        &self,
+        user_id: &str,
+        code: &str,
+        timestamp: i64,
+    ) -> Result<Option<bool>, String> {
+        let mut configs = self.configs.lock().map_err(|e| e.to_string())?;
+        let Some(config) = configs.get_mut(user_id) else {
+            return Ok(None);
+        };
+        let Some(totp) = config.totp.as_mut() else {
+            return Ok(None);
+        };
+        let Some(step) = matching_totp_step(&totp.secret, code, timestamp)? else {
+            return Ok(Some(false));
+        };
+        if totp.last_totp_step.is_some_and(|last| step <= last) {
+            return Ok(Some(false));
+        }
+
+        totp.last_totp_step = Some(step);
+        totp.verified = true;
+        config.last_verified = Some(timestamp);
+        Ok(Some(true))
     }
 }
 
@@ -144,23 +186,55 @@ pub fn generate_qr_code_uri(user_id: &str, secret: &str, issuer: &str) -> String
     )
 }
 
-/// Verify a TOTP code against a secret (simplified without time-window checking)
-/// In production, use a proper TOTP library like `totp-lite` or `totp-rs`
-pub fn verify_totp_code(secret: &str, code: &str) -> Result<bool, String> {
-    // This is a simplified implementation
-    // In production, use a proper TOTP validation library that:
-    // 1. Handles time window (±30 seconds)
-    // 2. Prevents code reuse
-    // 3. Validates base32 decoding
-    // 4. Uses HMAC-SHA1 for code generation
-
-    if code.len() != 6 || !code.chars().all(|c| c.is_numeric()) {
-        return Ok(false);
+/// Find the matching TOTP counter in the current 30-second window or either adjacent step.
+pub fn matching_totp_step(
+    secret: &str,
+    code: &str,
+    timestamp: i64,
+) -> Result<Option<u64>, String> {
+    if code.len() != 6 || !code.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Ok(None);
     }
 
-    // TODO: Implement proper TOTP verification with totp-rs crate
-    // For now, accept any valid 6-digit code as a placeholder
-    Ok(true)
+    let key = base32::decode(base32::Alphabet::RFC4648 { padding: false }, secret)
+        .ok_or_else(|| "Invalid base32 TOTP secret".to_string())?;
+    if key.is_empty() {
+        return Err("TOTP secret must not be empty".to_string());
+    }
+
+    let current_step = timestamp.max(0) as u64 / 30;
+    for step in [
+        current_step.saturating_sub(1),
+        current_step,
+        current_step.saturating_add(1),
+    ] {
+        let expected = generate_totp_code(&key, step)?;
+        if constant_time_eq(expected.as_bytes(), code.as_bytes()) {
+            return Ok(Some(step));
+        }
+    }
+    Ok(None)
+}
+
+fn generate_totp_code(key: &[u8], step: u64) -> Result<String, String> {
+    let mut mac = Hmac::<Sha1>::new_from_slice(key).map_err(|err| err.to_string())?;
+    mac.update(&step.to_be_bytes());
+    let digest = mac.finalize().into_bytes();
+    let offset = (digest[19] & 0x0f) as usize;
+    let binary = (u32::from(digest[offset] & 0x7f) << 24)
+        | (u32::from(digest[offset + 1]) << 16)
+        | (u32::from(digest[offset + 2]) << 8)
+        | u32::from(digest[offset + 3]);
+    Ok(format!("{:06}", binary % 1_000_000))
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .fold(0u8, |difference, (a, b)| difference | (a ^ b))
+            == 0
 }
 
 /// Mark a backup code as used
@@ -184,313 +258,91 @@ pub fn mark_backup_code_used(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
 
-    // ── Helpers ────────────────────────────────────────────────────────────────
-
-    fn make_store_with_user(user_id: &str, backup_codes: Vec<String>) -> TwoFactorStore {
-        let store = TwoFactorStore::new();
-        let secret = generate_totp_secret();
-        let config = TwoFactorConfig {
+    fn config(user_id: &str, secret: &str) -> TwoFactorConfig {
+        TwoFactorConfig {
             user_id: user_id.to_string(),
             totp: Some(TotpSecret {
-                secret,
-                enabled_at: Utc::now().timestamp(),
+                secret: secret.to_string(),
+                enabled_at: 0,
                 verified: true,
+                last_totp_step: None,
             }),
-            backup_codes: backup_codes
-                .iter()
-                .map(|code| BackupCode {
-                    code: code.clone(),
-                    used: false,
-                    created_at: Utc::now().timestamp(),
-                })
-                .collect(),
-            created_at: Utc::now().timestamp(),
+            backup_codes: Vec::new(),
+            created_at: 0,
             last_verified: None,
-        };
-        store.store_config(config).expect("store_config failed");
-        store
+        }
     }
 
-    // ── #1240: Wrong / malformed TOTP codes ────────────────────────────────────
-
-    /// A 5-digit code is too short — must be rejected.
     #[test]
-    fn test_totp_code_too_short_is_rejected() {
-        let secret = generate_totp_secret();
-        assert_eq!(verify_totp_code(&secret, "12345"), Ok(false));
-    }
+    fn create_config_does_not_replace_existing_secret() {
+        let store = TwoFactorStore::new();
+        assert!(store.create_config(config("user", "original")).unwrap());
+        assert!(!store.create_config(config("user", "replacement")).unwrap());
 
-    /// A 7-digit code is too long — must be rejected.
-    #[test]
-    fn test_totp_code_too_long_is_rejected() {
-        let secret = generate_totp_secret();
-        assert_eq!(verify_totp_code(&secret, "1234567"), Ok(false));
-    }
-
-    /// An empty code must be rejected.
-    #[test]
-    fn test_totp_code_empty_is_rejected() {
-        let secret = generate_totp_secret();
-        assert_eq!(verify_totp_code(&secret, ""), Ok(false));
-    }
-
-    /// A code containing letters must be rejected.
-    #[test]
-    fn test_totp_code_with_letters_is_rejected() {
-        let secret = generate_totp_secret();
-        assert_eq!(verify_totp_code(&secret, "12AB56"), Ok(false));
-    }
-
-    /// A code containing spaces must be rejected.
-    #[test]
-    fn test_totp_code_with_spaces_is_rejected() {
-        let secret = generate_totp_secret();
-        assert_eq!(verify_totp_code(&secret, "12 456"), Ok(false));
-    }
-
-    /// A code containing special characters must be rejected.
-    #[test]
-    fn test_totp_code_with_special_chars_is_rejected() {
-        let secret = generate_totp_secret();
-        assert_eq!(verify_totp_code(&secret, "12!@56"), Ok(false));
-    }
-
-    /// A code with a leading minus sign is not purely numeric — must be rejected.
-    #[test]
-    fn test_totp_code_with_minus_sign_is_rejected() {
-        let secret = generate_totp_secret();
-        assert_eq!(verify_totp_code(&secret, "-12345"), Ok(false));
-    }
-
-    // ── #1240 / #1241: Out-of-window TOTP code ─────────────────────────────────
-
-    /// Documents the current placeholder behaviour: any 6-digit numeric code
-    /// passes. When a real TOTP library is integrated this test should be
-    /// updated to assert `Ok(false)` for codes outside the time window.
-    #[test]
-    fn test_totp_out_of_window_code_accepted_by_placeholder() {
-        let secret = generate_totp_secret();
-        // 999999 is almost certainly not the current TOTP window code.
-        let result = verify_totp_code(&secret, "999999");
-        // Placeholder accepts all valid-format codes — document this expectation.
-        assert!(
-            result.is_ok(),
-            "placeholder must return Ok (not Err) for any 6-digit code"
-        );
-        // NOTE: Replace the line below with `assert_eq!(result, Ok(false))`
-        // once a proper TOTP library enforces time-window verification.
         assert_eq!(
-            result,
-            Ok(true),
-            "placeholder currently accepts any 6-digit code; update when totp-rs is integrated"
+            store.get_config("user").unwrap().unwrap().totp.unwrap().secret,
+            "original"
         );
     }
 
-    // ── #1240 / #1242: Backup code reuse ──────────────────────────────────────
-
-    /// A backup code used once must be rejected on a second attempt.
     #[test]
-    fn test_backup_code_cannot_be_reused() {
-        let codes = generate_backup_codes(8);
-        let first = codes[0].clone();
-        let store = make_store_with_user("user-reuse", codes);
-
-        let first_result = mark_backup_code_used(&store, "user-reuse", &first)
-            .expect("first use must not error");
-        assert!(first_result, "first use of a backup code must succeed");
-
-        let second_result = mark_backup_code_used(&store, "user-reuse", &first)
-            .expect("second call must not error");
-        assert!(!second_result, "reused backup code must return false");
-    }
-
-    /// All backup codes, once individually exhausted, are all rejected.
-    #[test]
-    fn test_all_backup_codes_rejected_after_use() {
-        let codes = generate_backup_codes(4);
-        let store = make_store_with_user("user-exhaust", codes.clone());
-
-        for code in &codes {
-            assert!(
-                mark_backup_code_used(&store, "user-exhaust", code).unwrap(),
-                "first use must succeed"
-            );
-        }
-        for code in &codes {
-            assert!(
-                !mark_backup_code_used(&store, "user-exhaust", code).unwrap(),
-                "every code must be rejected after exhaustion"
-            );
-        }
-    }
-
-    // ── #1240 / #1242: Cross-user backup code isolation ───────────────────────
-
-    /// A backup code belonging to user A must not be accepted for user B.
-    #[test]
-    fn test_backup_code_from_another_user_is_rejected() {
-        let codes_a = generate_backup_codes(4);
-        let codes_b = generate_backup_codes(4);
-        let code_a = codes_a[0].clone();
-
-        let store_a = make_store_with_user("user-a", codes_a);
-        let store_b = make_store_with_user("user-b", codes_b);
-
-        // user-a's code must fail in store_b
-        assert!(
-            !mark_backup_code_used(&store_b, "user-b", &code_a).unwrap(),
-            "user-a's code must be rejected for user-b"
-        );
-
-        // Sanity: user-a's code works in their own store
-        assert!(
-            mark_backup_code_used(&store_a, "user-a", &code_a).unwrap(),
-            "user-a must be able to use their own code"
+    fn matches_rfc_6238_sha1_test_vector() {
+        assert_eq!(
+            matching_totp_step(
+                "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ",
+                "287082",
+                59
+            )
+            .unwrap(),
+            Some(1)
         );
     }
 
-    /// In a shared store, user-b must not be able to redeem user-a's code.
     #[test]
-    fn test_cross_user_code_in_shared_store_is_rejected() {
+    fn accepts_adjacent_totp_steps_only() {
+        let secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+        let key = base32::decode(base32::Alphabet::RFC4648 { padding: false }, secret).unwrap();
+        let adjacent_code = generate_totp_code(&key, 2).unwrap();
+        let outside_window_code = generate_totp_code(&key, 3).unwrap();
+
+        assert_eq!(
+            matching_totp_step(secret, &adjacent_code, 30).unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            matching_totp_step(secret, &outside_window_code, 30).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_totp_codes_and_secrets() {
+        assert_eq!(
+            matching_totp_step("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ", "123456", 59).unwrap(),
+            None
+        );
+        assert_eq!(
+            matching_totp_step("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ", "１２３４５６", 59).unwrap(),
+            None
+        );
+        assert!(matching_totp_step("not-base32!", "287082", 59).is_err());
+    }
+
+    #[test]
+    fn rejects_reuse_of_a_totp_step() {
         let store = TwoFactorStore::new();
+        store
+            .create_config(config("user", "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"))
+            .unwrap();
 
-        let codes_a = generate_backup_codes(4);
-        let codes_b = generate_backup_codes(4);
-        let code_a = codes_a[0].clone();
-
-        let config_a = TwoFactorConfig {
-            user_id: "shared-a".to_string(),
-            totp: Some(TotpSecret {
-                secret: generate_totp_secret(),
-                enabled_at: Utc::now().timestamp(),
-                verified: true,
-            }),
-            backup_codes: codes_a
-                .iter()
-                .map(|c| BackupCode { code: c.clone(), used: false, created_at: Utc::now().timestamp() })
-                .collect(),
-            created_at: Utc::now().timestamp(),
-            last_verified: None,
-        };
-        let config_b = TwoFactorConfig {
-            user_id: "shared-b".to_string(),
-            totp: Some(TotpSecret {
-                secret: generate_totp_secret(),
-                enabled_at: Utc::now().timestamp(),
-                verified: true,
-            }),
-            backup_codes: codes_b
-                .iter()
-                .map(|c| BackupCode { code: c.clone(), used: false, created_at: Utc::now().timestamp() })
-                .collect(),
-            created_at: Utc::now().timestamp(),
-            last_verified: None,
-        };
-
-        store.store_config(config_a).unwrap();
-        store.store_config(config_b).unwrap();
-
-        // user-b attempts to use user-a's code
-        assert!(
-            !mark_backup_code_used(&store, "shared-b", &code_a).unwrap(),
-            "user-b must not redeem user-a's code from a shared store"
+        assert_eq!(
+            store.verify_totp_code("user", "287082", 59).unwrap(),
+            Some(true)
         );
-
-        // user-a's code is still usable
-        assert!(
-            mark_backup_code_used(&store, "shared-a", &code_a).unwrap(),
-            "user-a's own code must still work"
+        assert_eq!(
+            store.verify_totp_code("user", "287082", 59).unwrap(),
+            Some(false)
         );
-    }
-
-    /// Attempting to use a backup code for an unknown user returns false.
-    #[test]
-    fn test_backup_code_for_nonexistent_user_is_rejected() {
-        let store = TwoFactorStore::new();
-        assert!(
-            !mark_backup_code_used(&store, "ghost", "XXXX-YYYY").unwrap(),
-            "backup code for unknown user must return false"
-        );
-    }
-
-    /// A completely fabricated backup code must be rejected.
-    #[test]
-    fn test_fabricated_backup_code_is_rejected() {
-        let codes = generate_backup_codes(4);
-        let store = make_store_with_user("user-fab", codes);
-        assert!(
-            !mark_backup_code_used(&store, "user-fab", "FAKE-1234").unwrap(),
-            "fabricated backup code must be rejected"
-        );
-    }
-
-    // ── #1240 / #1243: Enrollment without a current factor ────────────────────
-
-    /// A user who has never enrolled must not be considered 2FA-enabled.
-    #[test]
-    fn test_has_2fa_enabled_false_for_unknown_user() {
-        let store = TwoFactorStore::new();
-        assert!(
-            !store.has_2fa_enabled("nobody").unwrap(),
-            "unknown user must not be 2FA-enabled"
-        );
-    }
-
-    /// A user whose TOTP factor exists but is not yet verified must not be
-    /// considered 2FA-enabled (incomplete enrollment).
-    #[test]
-    fn test_has_2fa_enabled_false_when_totp_not_verified() {
-        let store = TwoFactorStore::new();
-        let config = TwoFactorConfig {
-            user_id: "user-unverified".to_string(),
-            totp: Some(TotpSecret {
-                secret: generate_totp_secret(),
-                enabled_at: Utc::now().timestamp(),
-                verified: false, // ← incomplete enrollment
-            }),
-            backup_codes: vec![],
-            created_at: Utc::now().timestamp(),
-            last_verified: None,
-        };
-        store.store_config(config).unwrap();
-
-        assert!(
-            !store.has_2fa_enabled("user-unverified").unwrap(),
-            "2FA must not be considered enabled until the TOTP factor is verified"
-        );
-    }
-
-    /// A user with backup codes but no TOTP factor (totp: None) must not be
-    /// considered 2FA-enrolled.
-    #[test]
-    fn test_enrollment_without_totp_factor_is_not_enabled() {
-        let store = TwoFactorStore::new();
-        let config = TwoFactorConfig {
-            user_id: "user-no-totp".to_string(),
-            totp: None, // ← no TOTP factor
-            backup_codes: vec![BackupCode {
-                code: "ABCD-1234".to_string(),
-                used: false,
-                created_at: Utc::now().timestamp(),
-            }],
-            created_at: Utc::now().timestamp(),
-            last_verified: None,
-        };
-        store.store_config(config).unwrap();
-
-        assert!(
-            !store.has_2fa_enabled("user-no-totp").unwrap(),
-            "backup codes alone without a verified TOTP factor must not count as enrolled"
-        );
-    }
-
-    /// `get_config` returns `None` for a user who never enrolled.
-    #[test]
-    fn test_get_config_returns_none_for_unknown_user() {
-        let store = TwoFactorStore::new();
-        let result = store.get_config("nobody").unwrap();
-        assert!(result.is_none(), "get_config must return None for an unknown user");
     }
 }

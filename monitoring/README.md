@@ -13,6 +13,42 @@ Metrics are exported on the api-server `/metrics` endpoint by
 The api-server also exposes JSON views at `GET /v1/admin/commitments/lifecycle`
 and `GET /v1/admin/alerts`.
 
+## Protecting the `/metrics` endpoint (#1207)
+
+`/metrics` is no longer a public route. It is served on a separate internal
+metrics port (configured via `METRICS_PORT`, default `9090`) that should only be
+reachable from the internal network / Prometheus scraper, and every scrape must
+present the bearer token configured in `METRICS_AUTH_TOKEN`:
+
+```
+Authorization: Bearer $METRICS_AUTH_TOKEN
+```
+
+Requests without a valid token are refused with `401 Unauthorized`, and the
+metrics port is not exposed through the public ingress.
+
+### Prometheus scrape configuration
+
+The Prometheus scrape job for the api-server has been updated to target the
+internal metrics port and to send the bearer token. The token is read from a
+file so it never appears in the committed config:
+
+```yaml
+scrape_configs:
+  - job_name: api-server
+    metrics_path: /metrics
+    scheme: http
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/secrets/metrics_auth_token
+    static_configs:
+      - targets: ["api-server-internal:9090"]
+```
+
+Make sure the `metrics_auth_token` secret file is mounted into the Prometheus
+pod and matches the api-server's `METRICS_AUTH_TOKEN`. Unauthenticated scrapes
+are covered by a test in the api-server test suite.
+
 See [`docs/alerting-best-practices.md`](../docs/alerting-best-practices.md),
 [`docs/disaster-recovery.md`](../docs/disaster-recovery.md),
 [`docs/incident-response.md`](../docs/incident-response.md) and

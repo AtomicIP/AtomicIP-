@@ -643,7 +643,7 @@ Emitted when a new IP is committed.
 | `OwnerIps(Address)` | Persistent | Maps owner → Vec of IP IDs |
 | `NextId` | Persistent | Next available IP ID (monotonic counter) |
 | `CommitmentOwner(BytesN<32>)` | Persistent | Maps commitment hash → owner (duplicate detection) |
-| `Admin` | Persistent | Admin address gating admin-only functions; set once via `initialize(admin)` (never auto-derived), rotatable via `set_admin(new_admin)` |
+| `Admin` | Persistent | Admin address gating admin-only functions; set once via `initialize(admin)` (never auto-derived), rotatable in two steps via `propose_admin(new_admin)` then `accept_admin()` (signed by the nominee); `cancel_admin_proposal()` withdraws a nomination |
 
 ---
 
@@ -1130,6 +1130,91 @@ match combined.validate() {
 
 GraphQL requests validate input at the resolver level. All scalar inputs use the same validation rules as REST endpoints.
 
+### GraphQL Depth and Complexity Limits
+
+The GraphQL endpoint enforces a maximum query depth and a maximum query
+complexity so that a deeply nested or wide query cannot consume unbounded CPU
+and memory. Both limits are applied before execution; a query that exceeds
+either one is rejected without running any resolver.
+
+| Setting | Environment variable | Default |
+|---|---|---|
+| Maximum query depth | `GRAPHQL_MAX_DEPTH` | `10` |
+| Maximum query complexity | `GRAPHQL_MAX_COMPLEXITY` | `1000` |
+
+Depth counts nested selection sets from the root query or mutation. Complexity
+is the sum of the estimated cost of every selected field, so a wide query with
+many sibling fields is bounded as well as a deeply nested one.
+
+A rejected query returns HTTP `400 Bad Request` with a GraphQL error body whose
+message identifies which limit was exceeded:
+
+```json
+{
+  "errors": [
+    {
+      "message": "Query is nested too deep: depth 12 exceeds the maximum of 10",
+      "locations": [{ "line": 1, "column": 1 }]
+    }
+  ]
+}
+```
+
+```json
+{
+  "errors": [
+    {
+      "message": "Query is too complex: complexity 1500 exceeds the maximum of 1000",
+      "locations": [{ "line": 1, "column": 1 }]
+    }
+  ]
+}
+```
+
+Clients should request only the fields they need and split large queries into
+several smaller ones. Operators can raise the limits through the environment
+variables above, but should keep them as low as their clients allow.
+
+### GraphQL Introspection
+
+Introspection is **disabled by default outside development**. In production the
+schema cannot be enumerated through `__schema` or `__type` queries; such a query
+is rejected with a GraphQL error and no schema data is returned.
+
+| Environment variable | Values | Default |
+|---|---|---|
+| `GRAPHQL_INTROSPECTION` | `true`, `false` | `true` when the server runs in development mode, `false` otherwise |
+
+Set `GRAPHQL_INTROSPECTION=true` explicitly to enable introspection in a
+non-development environment (for example, a staging deployment used to generate
+client code). Leaving it unset in production keeps introspection off.
+
+### Metrics Endpoint
+
+`/metrics` is **not** part of the public API surface. It exposes request counts,
+error rates, and internal labels, so it is protected in two ways:
+
+- **Separate internal port** — metrics are served on the internal metrics
+  listener rather than the public API port, so they are only reachable from the
+  internal network.
+- **Bearer token** — when the metrics listener is exposed, scrapes must send
+  `Authorization: Bearer <token>`. Requests without a valid token are refused
+  with `401 Unauthorized` and no metrics are returned.
+
+The Prometheus scrape configuration must therefore target the internal metrics
+port and include the bearer token:
+
+```yaml
+scrape_configs:
+  - job_name: ip-registry-api
+    metrics_path: /metrics
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/ip-registry-metrics-token
+    static_configs:
+      - targets: ["ip-registry-api-internal:9090"]
+```
+
 Example mutation with validation:
 
 ```graphql
@@ -1259,6 +1344,37 @@ When migrating between major versions:
 3. **Test in staging**: Verify your integration against the new version
 4. **Monitor deprecation headers**: Watch for `Deprecation` and `Sunset` headers
 5. **Migrate before sunset**: Complete migration before the sunset date
+
+## Documentation endpoint
+
+The API server serves its generated API documentation directly, so the
+reference is always available alongside the running service.
+
+| Property | Value |
+|---|---|
+| Path | `GET /docs` |
+| Response format | `text/html` (rendered documentation page) |
+| Auth | None — publicly readable |
+
+The handler is mounted in the main router and returns `200 OK` with the
+rendered documentation body. Any other method on `/docs` is rejected by the
+router.
+
+## Connection limits (WebSocket and SSE)
+
+Streaming endpoints (`websocket.rs` and `events.rs`) enforce connection caps so
+that a single client cannot exhaust file descriptors or memory.
+
+| Limit | Scope | Behavior when exceeded |
+|---|---|---|
+| Global connection cap | All streaming connections on the process | New connection is rejected (closed immediately) |
+| Per-IP connection cap | Connections from one source IP | New connection from that IP is rejected; other IPs are unaffected |
+| Idle timeout | Per connection | Connection is closed after the configured idle period with no traffic |
+
+The TCP peer address is used for per-IP accounting, consistent with rate
+limiting (see [Proxy deployment](#proxy-deployment)). The number of currently
+open streaming connections is exported as a metric so operators can alert on
+saturation before the caps are hit.
 
 ## Rate limiting
 

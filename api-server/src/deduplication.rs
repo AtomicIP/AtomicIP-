@@ -144,9 +144,10 @@ struct RedisBackend {
 
 impl std::fmt::Debug for RedisBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `ConnectionManager` is not `Debug`; the live connection is omitted.
         f.debug_struct("RedisBackend")
-            .field("client", &"<redis::Client>")
-            .finish()
+            .field("client", &self.client)
+            .finish_non_exhaustive()
     }
 }
 

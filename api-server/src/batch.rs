@@ -273,7 +273,7 @@ mod tests {
             })
             .collect();
 
-        let batch_request = BatchRequest { mode: None, requests };
+        let batch_request = BatchRequest { requests, mode: None };
         let result = batch_handler(Json(batch_request)).await;
         assert!(result.is_err());
     }

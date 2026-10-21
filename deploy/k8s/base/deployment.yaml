@@ -23,7 +23,9 @@ spec:
         app: atomicip-api
       annotations:
         prometheus.io/scrape: "true"
-        prometheus.io/port: "8080"
+        # Metrics are served on the internal metrics port (#1207), not the
+        # public HTTP port.
+        prometheus.io/port: "9090"
         prometheus.io/path: /metrics
     spec:
       serviceAccountName: atomicip-api
@@ -41,12 +43,52 @@ spec:
           ports:
             - name: http
               containerPort: 8080
+            - name: metrics
+              containerPort: 9090
           envFrom:
             - configMapRef:
                 name: atomicip-api-config
             - secretRef:
                 name: atomicip-api-secrets
                 optional: true
+          env:
+            # Internal metrics listener (#1207); scraped via the metrics port.
+            - name: METRICS_PORT
+              value: "9090"
+            # Token required for /metrics scrapes (#1207).
+            - name: METRICS_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: atomicip-api-secrets
+                  key: metrics-auth-token
+                  optional: true
+            # CORS allowlist per environment (#1204).
+            - name: CORS_ALLOWED_ORIGINS
+              valueFrom:
+                configMapKeyRef:
+                  name: atomicip-api-config
+                  key: cors-allowed-origins
+                  optional: true
+            # GraphQL depth/complexity limits (#1205).
+            - name: GRAPHQL_MAX_DEPTH
+              valueFrom:
+                configMapKeyRef:
+                  name: atomicip-api-config
+                  key: graphql-max-depth
+                  optional: true
+            - name: GRAPHQL_MAX_COMPLEXITY
+              valueFrom:
+                configMapKeyRef:
+                  name: atomicip-api-config
+                  key: graphql-max-complexity
+                  optional: true
+            # Explicit introspection toggle (#1206); off outside development.
+            - name: GRAPHQL_INTROSPECTION
+              valueFrom:
+                configMapKeyRef:
+                  name: atomicip-api-config
+                  key: graphql-introspection
+                  optional: true
           # Right-sized requests are the main cost lever (#1067): requests
           # drive scheduling/bin-packing, limits only cap bursts.
           resources:
