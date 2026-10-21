@@ -49,6 +49,7 @@ pub mod distributed_tracing;
 pub mod events;
 pub mod graphql;
 pub mod handlers;
+pub mod ip_search;
 pub mod health;
 pub mod invariants;
 pub mod load_balancer;

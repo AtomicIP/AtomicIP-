@@ -55,6 +55,7 @@ mod event_topics;
 mod events;
 mod graphql;
 mod handlers;
+mod ip_search;
 mod metrics;
 mod middleware_pipeline;
 mod schemas;
@@ -106,6 +107,11 @@ mod snapshot_tests;
         handlers::marketplace_by_seller,
         handlers::marketplace_by_buyer,
         handlers::marketplace_by_ip,
+        handlers::search_ip,
+        handlers::put_ip_search_metadata,
+        handlers::save_ip_search,
+        handlers::list_ip_saved_searches,
+        handlers::delete_ip_saved_search,
         handlers::initiate_swap,
         handlers::batch_initiate_swap,
         handlers::accept_swap,
@@ -132,6 +138,13 @@ mod snapshot_tests;
         events::events_handler,
     ),
     components(schemas(
+        ip_search::IpSearchFilters,
+        ip_search::IpSearchMetadata,
+        ip_search::IpSearchResponse,
+        ip_search::FacetCount,
+        ip_search::SearchFacets,
+        ip_search::SaveSearchRequest,
+        ip_search::SavedSearch,
         schemas::CommitIpRequest,
         schemas::CommitmentTagsResponse,
         schemas::MarketplaceResponse,
@@ -470,6 +483,10 @@ fn build_app() -> Router {
         .route("/v1/swap/marketplace/seller/{seller}", get(handlers::marketplace_by_seller))
         .route("/v1/swap/marketplace/buyer/{buyer}",  get(handlers::marketplace_by_buyer))
         .route("/v1/swap/marketplace/ip/{ip_id}",     get(handlers::marketplace_by_ip))
+        .route("/v1/ip/search", get(handlers::search_ip))
+        .route("/v1/ip/{ip_id}/metadata", axum::routing::put(handlers::put_ip_search_metadata))
+        .route("/v1/ip/search/saved/{owner}", get(handlers::list_ip_saved_searches).post(handlers::save_ip_search))
+        .route("/v1/ip/search/saved/{owner}/{id}", axum::routing::delete(handlers::delete_ip_saved_search))
         .route("/v1/ip/owner/{owner}/cursor", get(handlers::list_ip_by_owner_cursor))
         .route("/v1/swap/initiate", post(handlers::initiate_swap))
         .route("/v1/swap/batch-initiate", post(handlers::batch_initiate_swap))
