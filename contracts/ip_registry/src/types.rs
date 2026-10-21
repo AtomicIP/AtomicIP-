@@ -51,6 +51,36 @@ pub enum CommitmentAlgorithm {
 
 // ── Storage Keys ────────────────────────────────────────────────────────────
 
+#[contracttype]
+#[derive(Debug, PartialEq)]
+pub enum DataKey {
+    IpRecord(u64),
+    OwnerIps(Address),
+    NextId,
+    CommitmentOwner(BytesN<32>), // tracks which owner already holds a commitment hash
+    /// Marks an old commitment as archived without deleting its immutable ID.
+    Archived(u64),
+    Admin,
+    CategoryIps(BytesN<32>),    // maps category hash -> Vec<u64> of IP IDs
+    IpLineage(u64),             // stores parent_ip_id for versioning
+    IpVersions(u64),            // stores Vec<u64> of all version IDs for a given IP
+    IpCommitmentChecksum, // Issue #346: stores hash of all commitments for rollback protection
+    IpAccessGrants(u64),  // Issue #344: stores Vec of (grantee, access_level) for tiered access
+    NotarySignature(u64), // Issue #345: stores notary signature for timestamp notarization
+    IpVersionChain(u64),  // stores Vec<u64> of the full version chain rooted at a given IP
+    OwnershipChallenge(u64), // Issue #433: stores OwnershipChallenge for a given challenge_id
+    NextChallengeId,      // Issue #433: monotonic challenge ID counter
+    EncryptionKeyRotation(u64), // Issue #434: stores Vec<BytesN<32>> of old commitment hashes
+    MerkleRoot(Address),  // Issue #435: cached Merkle root for an owner's commitment set
+    NotaryPublicKey,      // Issue #428: stores the trusted notary Ed25519 public key (32 bytes)
+    CommitmentHashes, // Issue #429: stores Vec<BytesN<32>> of all commitment hashes for rollback protection
+    /// Issue #973: Maps ip_id -> encrypted metadata (title, description, tags)
+    IpMetadata(u64),
+    /// Issue #973: Maps tag hash -> Vec<u64> of IP IDs with that tag (for search)
+    MetadataTagIndex(BytesN<32>),
+    /// Issue #1105: Maps ip_id -> EncryptedMetadataRecord (field-level ciphertext)
+    EncryptedMetadata(u64),
+}
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -109,6 +139,28 @@ pub struct OwnershipChallenge {
     pub expires_at: u64,
 }
 
+/// Issue #1104: Open random-nonce ownership challenge for a commitment.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CommitmentChallenge {
+    /// 32 random bytes generated on-chain by `challenge_ownership`.
+    pub challenge: Bytes,
+    pub issued_at: u64,
+    /// Unix timestamp (seconds) after which the challenge can no longer be answered.
+    pub expires_at: u64,
+    /// True once the holder has answered, correctly or not. Each challenge is single-use.
+    pub answered: bool,
+}
+
+/// Issue #1104: Outcome counters for commitment ownership challenges.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct ChallengeStats {
+    pub issued: u64,
+    pub succeeded: u64,
+    pub failed: u64,
+}
+
 /// Issue #973: Encrypted metadata for commitment discovery and discoverability.
 /// Stores encrypted title, description, and searchable tags for each IP commitment.
 /// The metadata is encrypted to preserve privacy while enabling search.
@@ -139,62 +191,49 @@ pub struct MetadataSearchResult {
     pub next_cursor: Option<BytesN<32>>,
 }
 
-/// #974: Merkle tree proof for batch commitments
+/// Issue #1105: One independently encrypted metadata field. Each field has its
+/// own nonce so a single field can be released without exposing the others.
 #[contracttype]
-#[derive(Clone)]
-pub struct MerkleProof {
-    pub leaf_index: u32,
-    pub proof_path: soroban_sdk::Vec<BytesN<32>>,
+#[derive(Clone, Debug, PartialEq)]
+pub struct EncryptedField {
+    pub ciphertext: Bytes,
+    pub nonce: BytesN<12>,
 }
 
-/// #974: Merkle root record for tracking batch commitments
+/// Issue #1105: Field-level encrypted metadata for one commitment. Encryption and
+/// decryption happen client-side. The contract stores ciphertext and the key ID
+/// only, never key material.
 #[contracttype]
-#[derive(Clone)]
-pub struct MerkleRootRecord {
-    pub root_id: u64,
-    pub root_hash: BytesN<32>,
-    pub owner: Address,
+#[derive(Clone, Debug, PartialEq)]
+pub struct EncryptedMetadataRecord {
+    pub ip_id: u64,
+    /// Registered metadata key the fields were encrypted under.
+    pub key_id: u32,
+    /// Ciphertext per field name, e.g. `title`, `description`.
+    pub fields: soroban_sdk::Map<soroban_sdk::Symbol, EncryptedField>,
     pub timestamp: u64,
-    pub leaf_count: u32,
+    /// Blinded search tags. Indexed exactly like plaintext-tag metadata.
+    pub tag_hashes: soroban_sdk::Vec<BytesN<32>>,
 }
 
-/// #975: Time-lock record for time-locked commitments
+/// Issue #1105: Public, non-sensitive summary of an encrypted metadata record.
 #[contracttype]
-#[derive(Clone)]
-pub struct TimeLockRecord {
-    pub commitment_id: u64,
-    pub unlock_time: u64,
-    pub revealed: bool,
-}
-
-/// #976: Amendment record for tracking commitment amendments
-#[contracttype]
-#[derive(Clone)]
-pub struct CommitmentAmendment {
-    pub amendment_id: u64,
-    pub commitment_id: u64,
-    pub old_hash: BytesN<32>,
-    pub new_hash: BytesN<32>,
+#[derive(Clone, Debug, PartialEq)]
+pub struct EncryptedMetadataInfo {
+    pub key_id: u32,
+    /// Field names only. Ciphertexts are released per field by access check.
+    pub field_names: soroban_sdk::Vec<soroban_sdk::Symbol>,
     pub timestamp: u64,
-    pub amender: Address,
 }
 
-/// #977: Privacy level enumeration for access control
+/// Issue #1105: A registered metadata encryption key. Only a fingerprint
+/// (e.g. the SHA-256 of the key) is stored on-chain.
 #[contracttype]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-#[repr(u32)]
-pub enum PrivacyLevel {
-    Public = 0,
-    Private = 1,
-    Restricted = 2,
-    Confidential = 3,
-}
-
-/// #977: Commitment privacy metadata
-#[contracttype]
-#[derive(Clone)]
-pub struct CommitmentPrivacy {
-    pub commitment_id: u64,
-    pub privacy_level: u32,
-    pub allowed_addresses: soroban_sdk::Vec<Address>,
+#[derive(Clone, Debug, PartialEq)]
+pub struct MetadataKeyRecord {
+    pub key_id: u32,
+    pub fingerprint: BytesN<32>,
+    pub registered_at: u64,
+    /// Retired keys still decrypt existing data but cannot be used for new writes.
+    pub retired: bool,
 }

@@ -29,6 +29,9 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Check for disabled test modules
+        # Enforces the tracked checklist of disabled test modules and fails on
+        # any new #[ignore] attribute that does not reference a linked issue
+        # (e.g. `#[ignore = "reason (#1234)"]`). See scripts/check-disabled-tests.sh.
         run: ./scripts/check-disabled-tests.sh
 
       - uses: dtolnay/rust-toolchain@stable
@@ -96,13 +99,48 @@ jobs:
       - name: Build
         run: cargo build --workspace --verbose
 
+      - name: Verify api-server is a workspace member (#1227)
+        # #1227: api-server was previously excluded from the workspace, which
+        # meant its integration tests never ran in CI. Fail loudly if it is
+        # ever excluded again.
+        run: |
+          if ! cargo metadata --no-deps --format-version 1 \
+            | grep -q '"name":"api-server"'; then
+            echo "::error::api-server is missing from the Cargo workspace members (#1227)." >&2
+            exit 1
+          fi
+          echo "api-server is a workspace member — OK"
+
       - name: Test (Rust)
         run: cargo test --workspace --verbose
         env:
           REDIS_URL: redis://localhost:6379
 
+      - name: Load tests (api-server)
+        # Exercises api-server/src/load_testing.rs (#1218). Runs in mock mode
+        # (LOAD_TEST_BASE_URL unset) so no live server is required.
+        run: cargo test -p api-server load_ -- --nocapture
+      - name: Test api-server integration tests (#1227)
+        # Explicitly exercise the api-server integration test binaries so a
+        # future re-exclusion of the crate fails CI loudly.
+        run: |
+          cargo test -p api-server --tests --verbose --no-fail-fast
+          # Confirm the integration test binaries were actually discovered.
+          if ! cargo test -p api-server --tests --no-run 2>&1 \
+            | grep -q 'Executable tests/'; then
+            echo "::error::No api-server integration test binaries were discovered (#1227)." >&2
+            exit 1
+          fi
+        env:
+          REDIS_URL: redis://localhost:6379
+
       - name: Test (JS)
         run: npm test -- --coverage
+
+      - name: Coverage threshold gate (JS)
+        # Enforces the per-module thresholds in coverage-config.json, including
+        # the royaltyCalculation.js (#1234) and swapMetrics.js (#1235) entries.
+        run: ./scripts/coverage-threshold-gate.sh
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v3

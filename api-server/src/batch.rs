@@ -222,6 +222,7 @@ mod tests {
     #[tokio::test]
     async fn test_batch_request_processing() {
         let batch_request = BatchRequest {
+            mode: None,
             requests: vec![
                 SingleRequest {
                     id: "req1".to_string(),
@@ -252,6 +253,7 @@ mod tests {
     #[tokio::test]
     async fn test_batch_request_size_limits() {
         let batch_request = BatchRequest {
+            mode: None,
             requests: vec![],
         };
 
@@ -271,7 +273,7 @@ mod tests {
             })
             .collect();
 
-        let batch_request = BatchRequest { requests };
+        let batch_request = BatchRequest { requests, mode: None };
         let result = batch_handler(Json(batch_request)).await;
         assert!(result.is_err());
     }
@@ -279,6 +281,7 @@ mod tests {
     #[tokio::test]
     async fn test_batch_request_duplicate_ids() {
         let batch_request = BatchRequest {
+            mode: None,
             requests: vec![
                 SingleRequest {
                     id: "req1".to_string(),
@@ -304,6 +307,7 @@ mod tests {
     #[tokio::test]
     async fn test_batch_request_get_swap() {
         let batch_request = BatchRequest {
+            mode: None,
             requests: vec![SingleRequest {
                 id: "req1".to_string(),
                 method: "GET".to_string(),

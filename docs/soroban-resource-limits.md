@@ -71,6 +71,9 @@ const MAX_BATCH_SIZE: usize = 50;  // Issue #520
 ### Contract Level (`contracts/ip_registry/src/lib.rs`, `contracts/atomic_swap/src/lib.rs`)
 
 - **Batch Commit**: Mirrors MAX_BATCH_SIZE from API server
+- **`MAX_BATCH_COMMIT = 100`** (#1161): `batch_commit_ip` rejects any call with more than 100 hashes using `ContractError::BatchTooLarge` (code 60). The cap bounds CPU and ledger-entry use per transaction (about 3 writes per hash, so about 300 writes at the cap, under the 1,000 limit).
+- **`MAX_ANON_BATCH_COMMIT = MAX_BATCH_COMMIT`** (#1160): per-call cap for `batch_commit_ip_anonymous`, also returning `BatchTooLarge`.
+- **`MAX_ANON_COMMITS_PER_LEDGER = 500`** (#1160): anonymous commits are rate limited per ledger sequence across all callers, using temporary storage keyed by `DataKey::AnonLedgerCommits(sequence)`. Exceeding it returns `AnonRateLimitExceeded` (code 61).
 - **Batch Verify**: Typically 50-100 entries
 - **Batch Transfer**: Typically 10-20 (due to co-owner set complexity)
 
