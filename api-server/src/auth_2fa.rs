@@ -105,6 +105,12 @@ impl TwoFactorStore {
         Ok(store.get(user_id).cloned())
     }
 
+    /// Remove user's 2FA configuration (#1107). Returns whether one existed.
+    pub fn remove_config(&self, user_id: &str) -> Result<bool, String> {
+        let mut store = self.configs.lock().map_err(|e| e.to_string())?;
+        Ok(store.remove(user_id).is_some())
+    }
+
     /// Check if user has 2FA enabled
     pub fn has_2fa_enabled(&self, user_id: &str) -> Result<bool, String> {
         Ok(self

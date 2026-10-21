@@ -6,6 +6,47 @@
 use crate::{ContractError, DataKey, IpRecord, OwnershipShare};
 use soroban_sdk::{symbol_short, Address, BytesN, Env, Error, Vec};
 
+/// Clears per-IP state that grants authority to the outgoing owner (#1146).
+///
+/// Called by `transfer_ip`. Authority state is removed so the new owner starts
+/// with a clean slate and the previous owner's grantees, licensees, delegates,
+/// co-owners and threshold signers lose access.
+///
+/// | Storage key                         | Policy   |
+/// |-------------------------------------|----------|
+/// | `IpAccessGrants(ip_id)`             | clear    |
+/// | `IpLicenses(ip_id)`                 | clear    |
+/// | `AccessDelegationList` + `AccessDelegation(ip_id, _)` | clear |
+/// | `OwnershipShares(ip_id)`            | clear (co-owners reset in the record) |
+/// | `ThresholdConfig(ip_id)`            | clear    |
+/// | `ThresholdSignatures(ip_id)`        | clear    |
+///
+/// Every other per-IP key is history or attestation, not authority, and is
+/// retained: `IpVersions`, `IpVersionChain`, `IpLineage`, `IpAuditTrail`,
+/// `RenewalCount`, `NotarySignature`, `MultiNotaryRecord`, `PartialDisclosure`,
+/// `IpDisputes`, `IpStake`, `CommitmentAlgorithm`, `IpPowDifficulty`,
+/// `CommitmentPrivacy`, `EncryptedCommitment`, `CompressedCommitment`,
+/// `CompressionSelection`, `EncryptionKeyRotation`, `BatchMetadata`,
+/// `CommitmentLinks`, `LinkedCommitments`, `MerkleRootRecord`, `TimeLockRecord`,
+/// `AmendmentHistory`, `Archived`, `ExpiryNotified`, `IpMetadata`,
+/// `SuggestedPrice` and `IpInsurancePolicy`.
+pub fn clear_owner_scoped_state(env: &Env, ip_id: u64) {
+    let storage = env.storage().persistent();
+    storage.remove(&DataKey::IpAccessGrants(ip_id));
+    storage.remove(&DataKey::IpLicenses(ip_id));
+    storage.remove(&DataKey::OwnershipShares(ip_id));
+    storage.remove(&DataKey::ThresholdConfig(ip_id));
+    storage.remove(&DataKey::ThresholdSignatures(ip_id));
+
+    let list_key = DataKey::AccessDelegationList(ip_id);
+    if let Some(delegates) = storage.get::<_, Vec<Address>>(&list_key) {
+        for delegate in delegates.iter() {
+            storage.remove(&DataKey::AccessDelegation(ip_id, delegate));
+        }
+    }
+    storage.remove(&list_key);
+}
+
 /// Retrieves an IP record by ID, panicking if not found.
 ///
 /// # Arguments
@@ -216,7 +257,6 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "ZeroCommitmentHash")]
-    #[ignore]
     fn test_require_non_zero_commitment_panics_for_zero() {
         let env = Env::default();
         let hash = BytesN::from_array(&env, &[0u8; 32]);
@@ -224,7 +264,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn test_require_unique_commitment_succeeds_for_new() {
         let env = Env::default();
         let hash = BytesN::from_array(&env, &[1u8; 32]);
@@ -234,7 +273,6 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "CommitmentAlreadyRegistered")]
-    #[ignore]
     fn test_require_unique_commitment_panics_for_duplicate() {
         let env = Env::default();
         let hash = BytesN::from_array(&env, &[1u8; 32]);
@@ -259,6 +297,8 @@ mod tests {
             notary_signature: None,
             expiry_timestamp: 0,
             grace_period_seconds: 0,
+            unlock_time: 0,
+            privacy_level: 0,
         };
         // Should not panic
         require_not_revoked(&env, &record);
@@ -266,7 +306,6 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "IpAlreadyRevoked")]
-    #[ignore]
     fn test_require_not_revoked_panics_when_revoked() {
         let env = Env::default();
         let record = IpRecord {
@@ -280,6 +319,8 @@ mod tests {
             notary_signature: None,
             expiry_timestamp: 0,
             grace_period_seconds: 0,
+            unlock_time: 0,
+            privacy_level: 0,
         };
         require_not_revoked(&env, &record);
     }
@@ -299,6 +340,8 @@ mod tests {
             notary_signature: None,
             expiry_timestamp: 0,
             grace_period_seconds: 0,
+            unlock_time: 0,
+            privacy_level: 0,
         };
         // Should not panic
         require_owner(&env, &owner, &record);
@@ -306,7 +349,6 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "Unauthorized")]
-    #[ignore]
     fn test_require_owner_panics_when_not_matching() {
         let env = Env::default();
         let owner = Address::generate(&env);
@@ -322,6 +364,8 @@ mod tests {
             notary_signature: None,
             expiry_timestamp: 0,
             grace_period_seconds: 0,
+            unlock_time: 0,
+            privacy_level: 0,
         };
         require_owner(&env, &not_owner, &record);
     }
