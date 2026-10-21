@@ -25,6 +25,66 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+/// An entry in the trusted-proxy allowlist: either a single IP address or a
+/// CIDR range (e.g. `10.0.0.0/8`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyEntry {
+    Ip(IpAddr),
+    Cidr { network: IpAddr, prefix: u8 },
+}
+
+impl ProxyEntry {
+    /// Parse an allowlist entry from either a bare IP (`10.0.0.1`) or a CIDR
+    /// range (`10.0.0.0/8`, `2001:db8::/32`).
+    pub fn parse(entry: &str) -> Result<Self, String> {
+        let entry = entry.trim();
+        if let Some((addr, prefix)) = entry.split_once('/') {
+            let network: IpAddr = addr
+                .parse()
+                .map_err(|_| format!("invalid proxy allowlist address: {addr}"))?;
+            let prefix: u8 = prefix
+                .parse()
+                .map_err(|_| format!("invalid proxy allowlist prefix: {prefix}"))?;
+            let max = if network.is_ipv4() { 32 } else { 128 };
+            if prefix > max {
+                return Err(format!("proxy allowlist prefix {prefix} exceeds {max}"));
+            }
+            Ok(Self::Cidr { network, prefix })
+        } else {
+            let ip: IpAddr = entry
+                .parse()
+                .map_err(|_| format!("invalid proxy allowlist address: {entry}"))?;
+            Ok(Self::Ip(ip))
+        }
+    }
+
+    /// Whether `ip` falls within this allowlist entry.
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        match *self {
+            Self::Ip(allowed) => allowed == ip,
+            Self::Cidr { network, prefix } => match (network, ip) {
+                (IpAddr::V4(net), IpAddr::V4(ip)) => {
+                    let mask = if prefix == 0 {
+                        0
+                    } else {
+                        u32::MAX << (32 - prefix)
+                    };
+                    (u32::from(net) & mask) == (u32::from(ip) & mask)
+                }
+                (IpAddr::V6(net), IpAddr::V6(ip)) => {
+                    let mask = if prefix == 0 {
+                        0
+                    } else {
+                        u128::MAX << (128 - prefix)
+                    };
+                    (u128::from(net) & mask) == (u128::from(ip) & mask)
+                }
+                _ => false,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RateLimitTier {
     Free,
@@ -89,6 +149,11 @@ pub struct RateLimitConfig {
     pub enterprise: BucketQuota,
     /// Honor forwarding headers only when the immediate peer is a trusted proxy.
     pub trust_proxy_headers: bool,
+    /// Peers (IPs or CIDR ranges) whose `X-Forwarded-For` header is trusted.
+    /// The header is only consulted when the socket peer address matches one
+    /// of these entries; otherwise the socket address is used as the client
+    /// identity, so arbitrary clients cannot spoof their identity.
+    pub trusted_proxies: Vec<ProxyEntry>,
     pub base_backoff: Duration,
     pub max_backoff: Duration,
     /// Bounds attacker-controlled cardinality. New identities share overflow buckets.
@@ -117,6 +182,7 @@ impl Default for RateLimitConfig {
             premium: BucketQuota::new(600, 200),
             enterprise: BucketQuota::new(6_000, 1_000),
             trust_proxy_headers: false,
+            trusted_proxies: Vec::new(),
             base_backoff: Duration::from_secs(1),
             max_backoff: Duration::from_secs(60),
             max_tracked_ips: 100_000,
@@ -771,6 +837,30 @@ fn parse_forwarded_ip(req: &Request) -> Option<IpAddr> {
         .ok()
 }
 
+impl RateLimitMiddleware {
+    /// Whether `peer` is in the configured trusted-proxy allowlist.
+    fn is_trusted_proxy(&self, peer: IpAddr) -> bool {
+        self.config
+            .trusted_proxies
+            .iter()
+            .any(|entry| entry.contains(peer))
+    }
+
+    /// Resolve the client identity for rate limiting. `X-Forwarded-For` is
+    /// only honored when proxy headers are enabled *and* the immediate peer
+    /// is a configured trusted proxy; otherwise the socket address is used.
+    fn client_ip(&self, req: &Request, peer: Option<IpAddr>) -> Option<IpAddr> {
+        if self.config.trust_proxy_headers {
+            if let Some(peer) = peer {
+                if self.is_trusted_proxy(peer) {
+                    return parse_forwarded_ip(req).or(Some(peer));
+                }
+            }
+        }
+        peer
+    }
+}
+
 /// Axum middleware entry point for `from_fn_with_state`.
 pub async fn rate_limit_middleware(
     State(limiter): State<RateLimitMiddleware>,
@@ -781,13 +871,10 @@ pub async fn rate_limit_middleware(
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|c| c.0.ip());
-    let ip = if limiter.config.trust_proxy_headers {
-        parse_forwarded_ip(&req).or(peer_ip)
-    } else {
-        peer_ip
-    }
-    .map(|v| v.to_string())
-    .unwrap_or_else(|| "unknown".to_string());
+    let ip = limiter
+        .client_ip(&req, peer_ip)
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
     let user = req
         .extensions()
         .get::<AuthExtension>()
@@ -922,6 +1009,78 @@ mod tests {
         let local = limiter.local.lock().unwrap();
         assert_eq!(local.cardinality_ips.len(), 1);
         assert_eq!(local.cardinality_users.len(), 1);
+    }
+
+    #[test]
+    fn proxy_entry_parses_and_matches_ips_and_cidrs() {
+        let single = ProxyEntry::parse("10.0.0.1").unwrap();
+        assert!(single.contains("10.0.0.1".parse().unwrap()));
+        assert!(!single.contains("10.0.0.2".parse().unwrap()));
+
+        let v4 = ProxyEntry::parse("10.0.0.0/8").unwrap();
+        assert!(v4.contains("10.1.2.3".parse().unwrap()));
+        assert!(!v4.contains("11.0.0.1".parse().unwrap()));
+
+        let v6 = ProxyEntry::parse("2001:db8::/32").unwrap();
+        assert!(v6.contains("2001:db8::1".parse().unwrap()));
+        assert!(!v6.contains("2001:db9::1".parse().unwrap()));
+
+        assert!(ProxyEntry::parse("10.0.0.0/33").is_err());
+        assert!(ProxyEntry::parse("not-an-ip").is_err());
+    }
+
+    fn request_with_forwarded(peer: SocketAddr, forwarded: &str) -> Request {
+        let mut request = Request::builder()
+            .uri("/")
+            .header("x-forwarded-for", forwarded)
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(ConnectInfo(peer));
+        request
+    }
+
+    #[tokio::test]
+    async fn spoofed_forwarded_header_from_untrusted_peer_is_ignored() {
+        let mut cfg = config();
+        cfg.trust_proxy_headers = true;
+        cfg.trusted_proxies = vec![ProxyEntry::parse("10.0.0.0/8").unwrap()];
+        let limiter = RateLimitMiddleware::new(cfg);
+
+        let peer = SocketAddr::from(([203, 0, 113, 7], 1234));
+        let req = request_with_forwarded(peer, "1.2.3.4");
+        assert_eq!(
+            limiter.client_ip(&req, Some(peer.ip())),
+            Some(peer.ip()),
+            "untrusted peer must not be able to spoof its identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarded_header_from_trusted_proxy_is_honored() {
+        let mut cfg = config();
+        cfg.trust_proxy_headers = true;
+        cfg.trusted_proxies = vec![ProxyEntry::parse("10.0.0.0/8").unwrap()];
+        let limiter = RateLimitMiddleware::new(cfg);
+
+        let peer = SocketAddr::from(([10, 0, 0, 5], 1234));
+        let req = request_with_forwarded(peer, "1.2.3.4, 10.0.0.5");
+        assert_eq!(
+            limiter.client_ip(&req, Some(peer.ip())),
+            Some("1.2.3.4".parse().unwrap()),
+            "trusted proxy's forwarded client address must be used"
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarded_header_ignored_when_proxy_trust_disabled() {
+        let mut cfg = config();
+        cfg.trust_proxy_headers = false;
+        cfg.trusted_proxies = vec![ProxyEntry::parse("10.0.0.0/8").unwrap()];
+        let limiter = RateLimitMiddleware::new(cfg);
+
+        let peer = SocketAddr::from(([10, 0, 0, 5], 1234));
+        let req = request_with_forwarded(peer, "1.2.3.4");
+        assert_eq!(limiter.client_ip(&req, Some(peer.ip())), Some(peer.ip()));
     }
 
     #[tokio::test]

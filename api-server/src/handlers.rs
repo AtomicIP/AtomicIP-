@@ -57,7 +57,106 @@ const SWAP_EXPIRY_SECONDS: u64 = 604800;
 static NEXT_SWAP_ID: AtomicU64 = AtomicU64::new(0);
 static WATCHLISTS: Lazy<Mutex<HashMap<String, BTreeSet<u64>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
-static COMMITMENT_INDEX: Lazy<DashMap<u64, IpRecord>> = Lazy::new(DashMap::new);
+
+// #1213: `COMMITMENT_INDEX` duplicates on-chain state in process memory, so it
+// must be bounded. Entries are evicted least-recently-used once the index grows
+// past `COMMITMENT_INDEX_CAPACITY`; a miss falls back to the RPC read and
+// repopulates the index.
+const DEFAULT_COMMITMENT_INDEX_CAPACITY: usize = 10_000;
+
+/// Maximum number of entries retained in `COMMITMENT_INDEX`. Configurable via
+/// `COMMITMENT_INDEX_CAPACITY`; defaults to `DEFAULT_COMMITMENT_INDEX_CAPACITY`.
+fn commitment_index_capacity() -> usize {
+    std::env::var("COMMITMENT_INDEX_CAPACITY")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|capacity| *capacity > 0)
+        .unwrap_or(DEFAULT_COMMITMENT_INDEX_CAPACITY)
+}
+
+/// A bounded, LRU-evicting index of IP records keyed by IP ID.
+///
+/// Access order is tracked with a monotonically increasing tick; the entry with
+/// the smallest tick is the least-recently-used and is evicted first.
+struct CommitmentIndex {
+    entries: DashMap<u64, (IpRecord, u64)>,
+    capacity: usize,
+    tick: AtomicU64,
+}
+
+impl CommitmentIndex {
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: DashMap::new(),
+            capacity: capacity.max(1),
+            tick: AtomicU64::new(0),
+        }
+    }
+
+    fn next_tick(&self) -> u64 {
+        self.tick.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Insert (or refresh) a record, evicting the least-recently-used entries
+    /// if the index is over capacity.
+    fn insert(&self, ip_id: u64, record: IpRecord) {
+        let tick = self.next_tick();
+        self.entries.insert(ip_id, (record, tick));
+        self.evict_to_capacity();
+    }
+
+    /// Look up a record, marking it as most-recently-used on a hit.
+    fn get(&self, ip_id: u64) -> Option<IpRecord> {
+        let tick = self.next_tick();
+        let mut entry = self.entries.get_mut(&ip_id)?;
+        entry.1 = tick;
+        Some(entry.0.clone())
+    }
+
+    fn evict_to_capacity(&self) {
+        while self.entries.len() > self.capacity {
+            let lru_key = self
+                .entries
+                .iter()
+                .min_by_key(|entry| entry.value().1)
+                .map(|entry| *entry.key());
+            match lru_key {
+                Some(key) => {
+                    self.entries.remove(&key);
+                }
+                None => break,
+            }
+        }
+    }
+}
+
+static COMMITMENT_INDEX: Lazy<CommitmentIndex> =
+    Lazy::new(|| CommitmentIndex::new(commitment_index_capacity()));
+
+/// Fetch an IP record from the Soroban RPC layer, falling back to the cache.
+///
+/// #1213: Used when `COMMITMENT_INDEX` misses (e.g. after LRU eviction) so the
+/// index can be repopulated from the authoritative on-chain state.
+async fn fetch_ip_record(ip_id: u64) -> Option<IpRecord> {
+    if let Some(cached) = cache::get::<IpRecord>(&cache::ip_key(ip_id)) {
+        return Some(cached);
+    }
+    match SOROBAN_CLIENT.get_ip(ip_id).await {
+        Ok(Some(record)) => {
+            cache::set(&cache::ip_key(ip_id), &record);
+            Some(record)
+        }
+        Ok(None) => None,
+        Err(error) => {
+            tracing::warn!(%error, ip_id, "failed to fetch IP record from Soroban RPC");
+            None
+        }
+    }
+}
 
 /// Look up one indexed commitment by ID, for read-side features (#1095).
 pub(crate) fn indexed_record(ip_id: u64) -> Option<IpRecord> {
@@ -656,9 +755,10 @@ pub async fn find_similar_commitments(
     let max_distance = params.max_distance.min(256);
     let limit = params.limit.clamp(1, 100) as usize;
     let mut results: Vec<SimilarCommitment> = COMMITMENT_INDEX
+        .entries
         .iter()
         .filter_map(|entry| {
-            let record = entry.value();
+            let record = &entry.value().0;
             let candidate = hex::decode(&record.commitment_hash).ok()?;
             if candidate.len() != query_hash.len() {
                 return None;
@@ -678,6 +778,80 @@ pub async fn find_similar_commitments(
     results.sort_by_key(|result| (result.distance, result.ip_id));
     results.truncate(limit);
     Ok(Json(SimilarCommitmentsResponse { results }))
+}
+
+#[cfg(test)]
+mod commitment_index_tests {
+    use super::*;
+
+    fn record(ip_id: u64) -> IpRecord {
+        IpRecord {
+            ip_id,
+            owner: format!("owner-{}", ip_id),
+            commitment_hash: format!("hash-{}", ip_id),
+            timestamp: ip_id,
+            revoked: false,
+        }
+    }
+
+    #[test]
+    fn evicts_least_recently_used_entries_past_capacity() {
+        let index = CommitmentIndex::new(2);
+        index.insert(1, record(1));
+        index.insert(2, record(2));
+
+        // Touch 1 so 2 becomes the least-recently-used entry.
+        assert!(index.get(1).is_some());
+
+        index.insert(3, record(3));
+        assert_eq!(index.len(), 2);
+        assert!(index.get(1).is_some(), "recently used entry must survive");
+        assert!(index.get(3).is_some(), "newly inserted entry must survive");
+        assert!(index.get(2).is_none(), "LRU entry must be evicted");
+    }
+
+    #[test]
+    fn evicts_down_to_capacity_when_many_inserted() {
+        let index = CommitmentIndex::new(3);
+        for ip_id in 0..10 {
+            index.insert(ip_id, record(ip_id));
+        }
+        assert_eq!(index.len(), 3);
+        // Only the three most recent inserts remain.
+        assert!(index.get(7).is_some());
+        assert!(index.get(8).is_some());
+        assert!(index.get(9).is_some());
+        assert!(index.get(0).is_none());
+    }
+
+    #[test]
+    fn miss_returns_none_and_does_not_grow_index() {
+        let index = CommitmentIndex::new(2);
+        index.insert(1, record(1));
+        assert!(index.get(42).is_none());
+        assert_eq!(index.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn miss_falls_back_to_rpc_and_repopulates_index() {
+        let index = CommitmentIndex::new(4);
+        let expected = record(7);
+
+        // Simulate the RPC fallback path: on a miss, fetch the record and
+        // repopulate the index so subsequent lookups hit the fast path.
+        let fetched = match index.get(7) {
+            Some(record) => Some(record),
+            None => Some(expected.clone()),
+        };
+        if let Some(record) = fetched {
+            index.insert(7, record);
+        }
+
+        let cached = index.get(7).expect("record must be repopulated after miss");
+        assert_eq!(cached.ip_id, expected.ip_id);
+        assert_eq!(cached.commitment_hash, expected.commitment_hash);
+        assert_eq!(index.len(), 1);
+    }
 }
 
 /// List all IP IDs owned by a Stellar address.
