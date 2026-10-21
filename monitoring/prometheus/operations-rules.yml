@@ -1,5 +1,8 @@
 # #1066 backup verification, #1067 cost optimization, #1069 GitOps sync alerts.
 # Backup / cost metrics are pushed by scripts/ops/*.sh via the Pushgateway.
+# #1207 the api-server is scraped on its internal metrics port with a bearer
+# token (see monitoring/prometheus/prometheus.yml); the public /metrics route
+# is no longer exposed, so rules must not rely on it.
 groups:
   - name: backup-verification
     rules:
@@ -60,6 +63,7 @@ groups:
         expr: |
           kube_horizontalpodautoscaler_status_current_replicas{horizontalpodautoscaler="atomicip-api"}
             >= kube_horizontalpodautoscaler_spec_max_replicas{horizontalpodautoscaler="atomicip-api"}
+        # Scraped from the internal metrics port (job="atomicip-api-metrics").
         for: 30m
         labels:
           severity: warning
@@ -89,3 +93,13 @@ groups:
         annotations:
           summary: 'Argo CD application {{ $labels.name }} is Degraded'
           runbook: docs/gitops.md#rollback
+      - alert: ApiServerMetricsScrapeFailing
+        expr: up{job="atomicip-api-metrics"} == 0
+        for: 10m
+        labels:
+          severity: warning
+          team: platform
+          service: api-server
+        annotations:
+          summary: Prometheus cannot scrape the api-server internal metrics port (check the bearer token)
+          runbook: docs/monitoring.md#metrics-endpoint

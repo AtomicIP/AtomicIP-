@@ -389,9 +389,13 @@ async fn main() {
     let subscription_broadcaster = init_subscription_broadcaster().await;
     let rpc_client: Arc<dyn graphql::SorobanRpcClient> = Arc::new(graphql::MockSorobanRpcClient::default());
     let query_client = Arc::new(graphql::SorobanQueryClient::new(rpc_client.clone()));
-    let schema = graphql::build_schema_with_broadcaster(
+
+    // #1205/#1206: depth/complexity limits and explicit introspection setting.
+    let graphql_config = graphql::GraphQLConfig::from_env();
+    let schema = graphql::build_schema_with_broadcaster_and_config(
         rpc_client.clone(),
         subscription_broadcaster.clone(),
+        &graphql_config,
     );
 
     let rate_limiter = rate_limit::RateLimitMiddleware::new(rate_limit::RateLimitConfig::default());
@@ -451,7 +455,26 @@ async fn main() {
         .merge(signed_ip_routes)
         .route("/health",          get(health::health_handler))
         .route("/health/detailed", get(health::detailed_health_handler))
-        .route("/metrics",         get(metrics::metrics_handler))
+        .route("/ip/{ip_id}",      get(handlers::get_ip))
+        .route("/ip/owner/{owner}", get(handlers::list_ip_by_owner))
+        .route("/ip/owner/{owner}/cursor", get(handlers::list_ip_by_owner_cursor))
+        .route("/ip/tag/{tag}",    get(handlers::list_commitments_by_tag))
+        .route("/ip/similar",      get(handlers::find_similar_commitments))
+        .route("/ip/export",       get(handlers::export_commitments))
+        .route("/analytics/commitments", get(handlers::commitment_analytics))
+        .route("/swap/marketplace/seller/{seller}", get(handlers::marketplace_by_seller))
+        .route("/swap/marketplace/buyer/{buyer}",   get(handlers::marketplace_by_buyer))
+        .route("/swap/marketplace/ip/{ip_id}",      get(handlers::marketplace_by_ip))
+        .route("/swap/{swap_id}",  get(handlers::get_swap))
+        .route("/openapi.json",    get(openapi_handler))
+        .layer(middleware::from_fn_with_state(
+            cors_config.clone(),
+            middleware_pipeline::cors_middleware,
+        ));
+
+    let app = Router::new()
+        .merge(signed_routes)
+        .merge(public_read_routes)
         .route("/graphql",         post(graphql_handler))
         .route("/graphql/ws",      get(graphql_ws_handler))
         .route("/ws",              get(ws_handler))
@@ -476,7 +499,6 @@ async fn main() {
         .route("/ip/{ip_id}",                     get(handlers::get_ip))
         .route("/ip/verify",                      post(handlers::verify_commitment))
         .route("/ip/reveal-batch",                post(handlers::batch_reveal_commitments))
-        .route("/ip/export",                     get(handlers::export_commitments))
         .route("/watchlist",                    post(handlers::add_to_watchlist).get(handlers::get_watchlist))
         .route("/watchlist/{user_id}/{ip_id}",  axum::routing::delete(handlers::remove_from_watchlist))
         .route("/ip/similar",                  get(handlers::find_similar_commitments))
@@ -506,7 +528,6 @@ async fn main() {
         .layer(middleware::from_fn(distributed_tracing::distributed_tracing_middleware))
         .layer(middleware::from_fn(versioning::version_negotiation))
         .layer(middleware::from_fn(compression::compression_middleware))
-        .layer(middleware::from_fn(middleware_pipeline::cors_middleware))
         .layer(middleware::from_fn(require_json_content_type));
 
     let bind_addr = resolve_bind_addr();
@@ -576,7 +597,9 @@ async fn events_handler(
 fn build_app() -> Router {
     let rpc_client: Arc<dyn graphql::SorobanRpcClient> = Arc::new(graphql::MockSorobanRpcClient::default());
     let query_client = Arc::new(graphql::SorobanQueryClient::new(rpc_client.clone()));
-    let schema = graphql::build_schema_with_context(rpc_client.clone());
+    // Mirror production: config-aware schema builder (#1205/#1206).
+    let graphql_config = graphql::GraphQLConfig::from_env();
+    let schema = graphql::build_schema_with_context_and_config(rpc_client.clone(), &graphql_config);
     let health_checker = Arc::new(health::HealthChecker::new());
     let rate_limiter = Arc::new(rate_limit::RateLimitMiddleware::new(rate_limit::RateLimitConfig::default()));
 
@@ -593,14 +616,35 @@ fn build_app() -> Router {
     // surface any regression as a panic here (tests only).
     let state = build_state(&container).expect("test container must resolve all dependencies");
 
+    // #1204: same CORS allowlist wiring as production, applied only to public
+    // read routes.
+    let cors_config = middleware_pipeline::CorsConfig::from_env();
+    let public_read_routes = Router::new()
+        .route("/health", get(health::health_handler))
+        .route("/health/detailed", get(health::detailed_health_handler))
+        .route("/version", get(versioning::get_version_info))
+        .route("/v1/ip/{ip_id}", get(handlers::get_ip))
+        .route("/v1/ip/export", get(handlers::export_commitments))
+        .route("/v1/ip/similar", get(handlers::find_similar_commitments))
+        .route("/v1/ip/owner/{owner}", get(handlers::list_ip_by_owner))
+        .route("/v1/ip/owner/{owner}/cursor", get(handlers::list_ip_by_owner_cursor))
+        .route("/v1/ip/tag/{tag}", get(handlers::list_commitments_by_tag))
+        .route("/v1/analytics/commitments", get(handlers::commitment_analytics))
+        .route("/v1/swap/marketplace/seller/{seller}", get(handlers::marketplace_by_seller))
+        .route("/v1/swap/marketplace/buyer/{buyer}",  get(handlers::marketplace_by_buyer))
+        .route("/v1/swap/marketplace/ip/{ip_id}",     get(handlers::marketplace_by_ip))
+        .route("/v1/swap/{swap_id}", get(handlers::get_swap))
+        .route("/openapi.json", get(openapi_handler))
+        .layer(middleware::from_fn_with_state(
+            cors_config.clone(),
+            middleware_pipeline::cors_middleware,
+        ));
+
     // #535: same signing enforcement as the production router, so the test
     // router exercises the identical middleware on the six write endpoints.
     let signed = middleware::from_fn(request_signing::verify_request_signature);
     Router::new()
-        .route("/health", get(health::health_handler))
-        .route("/health/detailed", get(health::detailed_health_handler))
-        .route("/metrics", get(metrics::metrics_handler))
-        .route("/version", get(versioning::get_version_info))
+        .merge(public_read_routes)
         .route("/graphql", post(graphql_handler))
         .route("/graphql/ws", get(graphql_ws_handler))
         .route("/ws", get(ws_handler))
@@ -619,18 +663,11 @@ fn build_app() -> Router {
         .route("/v1/auth/recovery/verify-question", post(account_recovery::verify_security_question))
         .route("/v1/graphql", post(graphql_handler))
         .route("/v1/ip/commit", post(handlers::commit_ip).layer(signed.clone()))
-        .route("/v1/ip/{ip_id}", get(handlers::get_ip))
         .route("/v1/ip/transfer", post(handlers::transfer_ip).layer(signed.clone()))
         .route("/v1/ip/verify", post(handlers::verify_commitment))
         .route("/v1/ip/reveal-batch", post(handlers::batch_reveal_commitments))
-        .route("/v1/ip/export", get(handlers::export_commitments))
         .route("/v1/watchlist", post(handlers::add_to_watchlist).get(handlers::get_watchlist))
         .route("/v1/watchlist/{user_id}/{ip_id}", axum::routing::delete(handlers::remove_from_watchlist))
-        .route("/v1/ip/similar", get(handlers::find_similar_commitments))
-        .route("/v1/ip/owner/{owner}", get(handlers::list_ip_by_owner))
-        .route("/v1/ip/owner/{owner}/cursor", get(handlers::list_ip_by_owner_cursor))
-        .route("/v1/ip/tag/{tag}", get(handlers::list_commitments_by_tag))
-        .route("/v1/analytics/commitments", get(handlers::commitment_analytics))
         .route("/v1/webhooks", post(handlers::register_webhook).get(handlers::list_webhooks))
         .route("/v1/webhooks/{id}", axum::routing::delete(handlers::unregister_webhook))
         .route("/v1/swap/marketplace/seller/{seller}", get(handlers::marketplace_by_seller))
@@ -1794,5 +1831,152 @@ mod tests {
         // Middleware verified the signature and let the request through; the
         // commit_ip stub then returns 400 ("not yet implemented").
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ── #1204: CORS allowlist ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_unlisted_origin_receives_no_allow_origin_header() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/ip/1")
+                    .header("Origin", "https://evil.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            resp.headers().get("access-control-allow-origin").is_none(),
+            "unlisted origin must not receive an allow-origin header"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_admin_route_never_gets_cors_headers() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/admin/audit/logs")
+                    .header("Origin", "https://app.atomicip.io")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(resp.headers().get("access-control-allow-origin").is_none());
+    }
+
+    // ── #1205/#1206: GraphQL limits and introspection ────────────────────────
+
+    #[tokio::test]
+    async fn test_graphql_over_depth_query_is_rejected() {
+        let app = build_app();
+        // Build a query nested far beyond the configured depth limit.
+        let mut query = String::from("{ ip(id: 1) ");
+        for _ in 0..40 {
+            query.push_str("{ id ");
+        }
+        for _ in 0..40 {
+            query.push('}');
+        }
+        query.push('}');
+        let body = serde_json::json!({ "query": query }).to_string();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/graphql")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            json["errors"].is_array(),
+            "over-depth query must be rejected with errors"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_graphql_introspection_disabled_in_production() {
+        // Build a schema with introspection explicitly disabled.
+        let config = graphql::GraphQLConfig {
+            introspection_enabled: false,
+            ..graphql::GraphQLConfig::default()
+        };
+        let rpc_client: Arc<dyn graphql::SorobanRpcClient> = Arc::new(graphql::MockSorobanRpcClient::default());
+        let schema = graphql::build_schema_with_context_and_config(rpc_client, &config);
+        let resp = schema
+            .execute(async_graphql::Request::new("{ __schema { queryType { name } } }"))
+            .await;
+        assert!(!resp.errors.is_empty(), "introspection must be disabled");
+    }
+
+    // ── #1207: metrics auth ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_metrics_requires_token() {
+        let config = metrics::MetricsAuthConfig {
+            token: Some("secret-token".to_string()),
+            port: 0,
+        };
+        let app = metrics::metrics_router(config);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_accepts_valid_token() {
+        let config = metrics::MetricsAuthConfig {
+            token: Some("secret-token".to_string()),
+            port: 0,
+        };
+        let app = metrics::metrics_router(config);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/metrics")
+                    .header("authorization", "Bearer secret-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_public_router_does_not_serve_metrics() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }

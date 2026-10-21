@@ -5,6 +5,8 @@ use axum::{
     http::StatusCode,
     middleware::Next,
     response::Response,
+    routing::get,
+    Router,
 };
 use metrics::{counter, gauge, histogram, describe_counter, describe_gauge, describe_histogram};
 use tracing::info;

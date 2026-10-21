@@ -944,24 +944,133 @@ async fn tail_redis_streams(broadcaster: Arc<SubscriptionBroadcaster>, mut conn:
 
 pub type AtomicIpSchema = Schema<QueryRoot, EmptyMutation, SubscriptionRoot>;
 
+/// Default maximum query nesting depth accepted by the schema.
+pub const DEFAULT_MAX_DEPTH: usize = 10;
+/// Default maximum query complexity accepted by the schema.
+pub const DEFAULT_MAX_COMPLEXITY: usize = 500;
+
+/// Security-related limits applied to the GraphQL schema.
+///
+/// Loaded from the environment via [`GraphQLSecurityConfig::from_env`]:
+/// - `GRAPHQL_MAX_DEPTH`      — maximum query nesting depth (default 10)
+/// - `GRAPHQL_MAX_COMPLEXITY` — maximum query complexity (default 500)
+/// - `GRAPHQL_INTROSPECTION`  — `true`/`false`; defaults to off unless
+///   `APP_ENV`/`ENVIRONMENT` is `development`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GraphQLSecurityConfig {
+    pub depth_limit: usize,
+    pub complexity_limit: usize,
+    pub introspection_enabled: bool,
+}
+
+impl Default for GraphQLSecurityConfig {
+    fn default() -> Self {
+        Self {
+            depth_limit: DEFAULT_MAX_DEPTH,
+            complexity_limit: DEFAULT_MAX_COMPLEXITY,
+            introspection_enabled: false,
+        }
+    }
+}
+
+impl GraphQLSecurityConfig {
+    /// Builds the config from environment variables, falling back to the
+    /// defaults above for anything unset or unparseable.
+    pub fn from_env() -> Self {
+        let defaults = Self::default();
+
+        let depth_limit = std::env::var("GRAPHQL_MAX_DEPTH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(defaults.depth_limit);
+
+        let complexity_limit = std::env::var("GRAPHQL_MAX_COMPLEXITY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(defaults.complexity_limit);
+
+        let introspection_enabled = match std::env::var("GRAPHQL_INTROSPECTION") {
+            Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+            Err(_) => is_development_env(),
+        };
+
+        Self {
+            depth_limit,
+            complexity_limit,
+            introspection_enabled,
+        }
+    }
+}
+
+/// Returns `true` when `APP_ENV` or `ENVIRONMENT` indicates development.
+fn is_development_env() -> bool {
+    ["APP_ENV", "ENVIRONMENT"]
+        .iter()
+        .filter_map(|key| std::env::var(key).ok())
+        .any(|v| v.trim().eq_ignore_ascii_case("development"))
+}
+
+/// Applies the security limits to a schema builder.
+fn apply_security<Q, M, S>(
+    mut builder: async_graphql::SchemaBuilder<Q, M, S>,
+    security: &GraphQLSecurityConfig,
+) -> async_graphql::SchemaBuilder<Q, M, S>
+where
+    Q: async_graphql::ObjectType + 'static,
+    M: async_graphql::ObjectType + 'static,
+    S: async_graphql::SubscriptionType + 'static,
+{
+    builder = builder
+        .limit_depth(security.depth_limit)
+        .limit_complexity(security.complexity_limit);
+    if !security.introspection_enabled {
+        builder = builder.disable_introspection();
+    }
+    builder
+}
+
 pub fn build_schema() -> AtomicIpSchema {
     build_schema_with_context(Arc::new(MockSorobanRpcClient::default()))
 }
 
 pub fn build_schema_with_context(rpc_client: Arc<dyn SorobanRpcClient>) -> AtomicIpSchema {
-    Schema::build(QueryRoot, EmptyMutation, SubscriptionRoot)
-        .data(GraphQLContext::new(rpc_client))
-        .finish()
+    build_schema_with_security(rpc_client, &GraphQLSecurityConfig::from_env())
+}
+
+/// Builds a schema with an explicit security configuration (used by tests
+/// and callers that want to override the environment-derived defaults).
+pub fn build_schema_with_security(
+    rpc_client: Arc<dyn SorobanRpcClient>,
+    security: &GraphQLSecurityConfig,
+) -> AtomicIpSchema {
+    let builder = Schema::build(QueryRoot, EmptyMutation, SubscriptionRoot)
+        .data(GraphQLContext::new(rpc_client));
+    apply_security(builder, security).finish()
 }
 
 pub fn build_schema_with_broadcaster(
     rpc_client: Arc<dyn SorobanRpcClient>,
     broadcaster: Arc<SubscriptionBroadcaster>,
 ) -> AtomicIpSchema {
-    Schema::build(QueryRoot, EmptyMutation, SubscriptionRoot)
+    build_schema_with_broadcaster_and_security(
+        rpc_client,
+        broadcaster,
+        &GraphQLSecurityConfig::from_env(),
+    )
+}
+
+/// Broadcaster variant with an explicit security configuration.
+pub fn build_schema_with_broadcaster_and_security(
+    rpc_client: Arc<dyn SorobanRpcClient>,
+    broadcaster: Arc<SubscriptionBroadcaster>,
+    security: &GraphQLSecurityConfig,
+) -> AtomicIpSchema {
+    let builder = Schema::build(QueryRoot, EmptyMutation, SubscriptionRoot)
         .data(GraphQLContext::new(rpc_client))
-        .data(broadcaster)
-        .finish()
+        .data(broadcaster);
+    apply_security(builder, security).finish()
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1085,6 +1194,87 @@ mod tests {
             .await;
         assert!(res.errors.is_empty(), "unexpected errors: {:?}", res.errors);
         assert_eq!(serde_json::to_string(&res.data).unwrap(), r#"{"swapsByIp":{"swapIds":[],"hasNextPage":false,"cursor":null}}"#);
+    }
+
+    // ── Security: depth / complexity / introspection ─────────────────────────
+
+    fn test_security_config() -> GraphQLSecurityConfig {
+        GraphQLSecurityConfig {
+            depth_limit: 3,
+            complexity_limit: 10,
+            introspection_enabled: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_query_exceeding_depth_limit_is_rejected() {
+        let schema = build_schema_with_security(
+            Arc::new(MockSorobanRpcClient::default()),
+            &test_security_config(),
+        );
+        // Nesting depth of 4 exceeds the configured limit of 3.
+        let query = r#"{ swap(swapId: 1) { swapId } }"#;
+        let res = schema.execute(Request::new(query)).await;
+        // Sanity: a shallow query is fine.
+        let ok = schema.execute(Request::new("{ ip(ipId: 1) { ipId } }")).await;
+        assert!(ok.errors.is_empty(), "shallow query should pass: {:?}", ok.errors);
+        assert!(!res.errors.is_empty(), "over-depth query should be rejected");
+    }
+
+    #[tokio::test]
+    async fn test_query_exceeding_complexity_limit_is_rejected() {
+        let security = GraphQLSecurityConfig {
+            depth_limit: 100,
+            complexity_limit: 1,
+            introspection_enabled: false,
+        };
+        let schema = build_schema_with_security(
+            Arc::new(MockSorobanRpcClient::default()),
+            &security,
+        );
+        let res = schema
+            .execute(Request::new(
+                r#"{ a: ip(ipId: 1) { ipId } b: ip(ipId: 2) { ipId } c: ip(ipId: 3) { ipId } }"#,
+            ))
+            .await;
+        assert!(!res.errors.is_empty(), "over-complexity query should be rejected");
+    }
+
+    #[tokio::test]
+    async fn test_introspection_disabled_returns_error() {
+        let schema = build_schema_with_security(
+            Arc::new(MockSorobanRpcClient::default()),
+            &test_security_config(),
+        );
+        let res = schema
+            .execute(Request::new("{ __schema { queryType { name } } }"))
+            .await;
+        assert!(!res.errors.is_empty(), "introspection should be disabled");
+    }
+
+    #[tokio::test]
+    async fn test_introspection_enabled_succeeds() {
+        let security = GraphQLSecurityConfig {
+            depth_limit: 100,
+            complexity_limit: 1000,
+            introspection_enabled: true,
+        };
+        let schema = build_schema_with_security(
+            Arc::new(MockSorobanRpcClient::default()),
+            &security,
+        );
+        let res = schema
+            .execute(Request::new("{ __schema { queryType { name } } }"))
+            .await;
+        assert!(res.errors.is_empty(), "introspection should be enabled: {:?}", res.errors);
+    }
+
+    #[test]
+    fn test_security_config_defaults_disable_introspection() {
+        let cfg = GraphQLSecurityConfig::default();
+        assert_eq!(cfg.depth_limit, DEFAULT_MAX_DEPTH);
+        assert_eq!(cfg.complexity_limit, DEFAULT_MAX_COMPLEXITY);
+        assert!(!cfg.introspection_enabled);
     }
 
     // ── Subscription broadcaster unit tests ───────────────────────────────────
