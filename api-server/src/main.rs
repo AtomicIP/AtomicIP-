@@ -46,6 +46,14 @@ mod session;
 mod batch;
 mod cache;
 mod commitments;
+mod licensing;
+mod portfolio;
+mod transfers;
+mod valuation;
+mod due_diligence;
+mod marketplace_analytics;
+mod recommendations;
+mod collections;
 mod analytics;
 mod circuit_breaker;
 mod commitment_monitoring;
@@ -55,6 +63,7 @@ mod event_topics;
 mod events;
 mod graphql;
 mod handlers;
+mod ip_search;
 mod metrics;
 mod middleware_pipeline;
 mod schemas;
@@ -107,6 +116,11 @@ mod snapshot_tests;
         handlers::marketplace_by_seller,
         handlers::marketplace_by_buyer,
         handlers::marketplace_by_ip,
+        handlers::search_ip,
+        handlers::put_ip_search_metadata,
+        handlers::save_ip_search,
+        handlers::list_ip_saved_searches,
+        handlers::delete_ip_saved_search,
         handlers::initiate_swap,
         handlers::batch_initiate_swap,
         handlers::accept_swap,
@@ -133,6 +147,13 @@ mod snapshot_tests;
         events::events_handler,
     ),
     components(schemas(
+        ip_search::IpSearchFilters,
+        ip_search::IpSearchMetadata,
+        ip_search::IpSearchResponse,
+        ip_search::FacetCount,
+        ip_search::SearchFacets,
+        ip_search::SaveSearchRequest,
+        ip_search::SavedSearch,
         schemas::CommitIpRequest,
         schemas::CommitmentTagsResponse,
         schemas::MarketplaceResponse,
@@ -250,6 +271,69 @@ async fn init_subscription_broadcaster() -> Arc<graphql::SubscriptionBroadcaster
     }
 }
 
+/// Typed error raised while resolving the application's dependencies at
+/// startup. Any missing dependency aborts startup with a clear message
+/// instead of panicking the process (#1220).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DependencyError {
+    /// A required dependency was not registered in the container.
+    Missing(&'static str),
+}
+
+impl std::fmt::Display for DependencyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DependencyError::Missing(name) => {
+                write!(f, "missing required dependency: {name}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DependencyError {}
+
+/// Resolve a required dependency from a container, returning a typed error
+/// instead of panicking when it is absent.
+fn require_dependency<T: Clone>(
+    container: &dependency_injection::ServiceContainer,
+    name: &'static str,
+) -> Result<T, DependencyError> {
+    container
+        .resolve::<T>()
+        .ok_or(DependencyError::Missing(name))
+}
+
+/// Build the shared application state, resolving every dependency through the
+/// container. Returns a typed error (never panics) when a dependency is
+/// missing so `main` can log and exit non-zero.
+fn build_state(
+    container: &dependency_injection::ServiceContainer,
+) -> Result<AppState, DependencyError> {
+    let schema = require_dependency::<graphql::AtomicIpSchema>(container, "graphql_schema")?;
+    let query_client =
+        require_dependency::<Arc<graphql::SorobanQueryClient>>(container, "query_client")?;
+    let rpc_client =
+        require_dependency::<Arc<dyn graphql::SorobanRpcClient>>(container, "rpc_client")?;
+    let ws_broadcaster =
+        require_dependency::<Arc<websocket::EventBroadcaster>>(container, "ws_broadcaster")?;
+    let sse_broadcaster =
+        require_dependency::<Arc<events::EventBroadcaster>>(container, "sse_broadcaster")?;
+    let health_checker =
+        require_dependency::<Arc<health::HealthChecker>>(container, "health_checker")?;
+    let rate_limiter =
+        require_dependency::<Arc<rate_limit::RateLimitMiddleware>>(container, "rate_limiter")?;
+
+    Ok(AppState {
+        schema,
+        query_client,
+        rpc_client,
+        ws_broadcaster,
+        sse_broadcaster,
+        health_checker,
+        rate_limiter,
+    })
+}
+
 #[tokio::main]
 async fn main() {
     // Initialise OpenTelemetry SDK (OTLP exporter) + tracing subscriber.
@@ -270,14 +354,25 @@ async fn main() {
 
     let rate_limiter = Arc::new(rate_limit::RateLimitMiddleware::new(rate_limit::RateLimitConfig::default()));
 
-    let state = AppState {
-        schema,
-        query_client,
-        rpc_client,
-        ws_broadcaster:  Arc::new(websocket::EventBroadcaster::new()),
-        sse_broadcaster: Arc::new(events::create_event_broadcaster().0),
-        health_checker:  Arc::new(health::HealthChecker::new()),
-        rate_limiter: rate_limiter.clone(),
+    // Register every dependency in the container, then resolve the state
+    // through it. A missing dependency yields a typed error rather than a
+    // panic; log it clearly and exit non-zero.
+    let mut container = dependency_injection::ServiceContainer::new();
+    container.register(schema);
+    container.register(query_client);
+    container.register(rpc_client);
+    container.register(Arc::new(websocket::EventBroadcaster::new()));
+    container.register(Arc::new(events::create_event_broadcaster().0));
+    container.register(Arc::new(health::HealthChecker::new()));
+    container.register(rate_limiter.clone());
+
+    let state = match build_state(&container) {
+        Ok(state) => state,
+        Err(e) => {
+            tracing::error!("failed to start API server: {e}");
+            eprintln!("failed to start API server: {e}");
+            std::process::exit(1);
+        }
     };
     let request_queue = Arc::new(request_queue::RequestQueue::new(
         request_queue::QueueConfig::default(),
@@ -294,6 +389,15 @@ async fn main() {
         .route("/swap/{swap_id}/reveal",          post(handlers::reveal_key))
         .route("/swap/{swap_id}/cancel",          post(handlers::cancel_swap))
         .route("/swap/{swap_id}/cancel-expired",  post(handlers::cancel_expired_swap))
+        // #1098: collections identify the caller by the verified X-Public-Key header,
+        // so every collection route, reads included, must be signed.
+        .route("/collections",                          post(collections::create_collection).get(collections::list_collections))
+        .route("/collections/{id}",                     get(collections::get_collection).delete(collections::delete_collection))
+        .route("/collections/{id}/ips",                 post(collections::add_collection_ips))
+        .route("/collections/{id}/ips/{ip_id}",         axum::routing::delete(collections::remove_collection_ip))
+        .route("/collections/{id}/shares",              post(collections::share_collection))
+        .route("/collections/{id}/shares/{user}",       axum::routing::delete(collections::unshare_collection))
+        .route("/collections/{id}/summary",             get(collections::collection_summary))
         .route_layer(middleware::from_fn(request_signing::verify_request_signature));
 
     let app = Router::new()
@@ -306,6 +410,7 @@ async fn main() {
         .route("/ws",              get(ws_handler))
         .route("/events",          get(events_handler))
         .route("/batch",           post(batch::batch_handler))
+        .route("/audit-logs",                        get(handlers::get_audit_logs))
         .route("/v1/admin/audit/logs",               get(handlers::get_audit_logs))
         .route("/v1/admin/audit/suspicious-patterns", get(handlers::get_suspicious_patterns))
         .route("/v1/admin/commitments/lifecycle", get(commitment_monitoring::lifecycle_handler))
@@ -334,6 +439,9 @@ async fn main() {
         .route("/ip/owner/{owner}/cursor",        get(handlers::list_ip_by_owner_cursor))
         .route("/ip/tag/{tag}",                   get(handlers::list_commitments_by_tag))
         .route("/analytics/commitments",          get(handlers::commitment_analytics))
+        .route("/analytics/marketplace",          get(marketplace_analytics::marketplace_analytics_handler))
+        .route("/ip/{ip_id}/due-diligence",       get(due_diligence::get_due_diligence))
+        .route("/recommendations",                get(recommendations::get_recommendations))
         .route("/webhooks",                       post(handlers::register_webhook).get(handlers::list_webhooks))
         .route("/webhooks/{id}",                  axum::routing::delete(handlers::unregister_webhook))
         .route("/swap/marketplace/seller/{seller}", get(handlers::marketplace_by_seller))
@@ -415,15 +523,20 @@ fn build_app() -> Router {
     let query_client = Arc::new(graphql::SorobanQueryClient::new(rpc_client.clone()));
     let schema = graphql::build_schema_with_context(rpc_client.clone());
     let health_checker = Arc::new(health::HealthChecker::new());
-    let rate_limiter = rate_limit::RateLimitMiddleware::new(rate_limit::RateLimitConfig::default());
-    let state = AppState {
-        schema,
-        query_client,
-        ws_broadcaster: Arc::new(websocket::EventBroadcaster::new()),
-        sse_broadcaster: Arc::new(events::create_event_broadcaster().0),
-        health_checker,
-        rpc_client,
-    };
+    let rate_limiter = Arc::new(rate_limit::RateLimitMiddleware::new(rate_limit::RateLimitConfig::default()));
+
+    let mut container = dependency_injection::ServiceContainer::new();
+    container.register(schema);
+    container.register(query_client);
+    container.register(rpc_client);
+    container.register(Arc::new(websocket::EventBroadcaster::new()));
+    container.register(Arc::new(events::create_event_broadcaster().0));
+    container.register(health_checker);
+    container.register(rate_limiter.clone());
+
+    // The test router registers every dependency, so resolution cannot fail;
+    // surface any regression as a panic here (tests only).
+    let state = build_state(&container).expect("test container must resolve all dependencies");
 
     // #535: same signing enforcement as the production router, so the test
     // router exercises the identical middleware on the six write endpoints.
@@ -438,6 +551,7 @@ fn build_app() -> Router {
         .route("/ws", get(ws_handler))
         .route("/events", get(events_handler))
         .route("/batch", post(batch::batch_handler))
+        .route("/audit-logs", get(handlers::get_audit_logs))
         .route("/v1/admin/audit/logs", get(handlers::get_audit_logs))
         .route("/v1/admin/audit/suspicious-patterns", get(handlers::get_suspicious_patterns))
         .route("/v1/admin/commitments/lifecycle", get(commitment_monitoring::lifecycle_handler))
@@ -474,6 +588,10 @@ fn build_app() -> Router {
         .route("/v1/swap/marketplace/seller/{seller}", get(handlers::marketplace_by_seller))
         .route("/v1/swap/marketplace/buyer/{buyer}",  get(handlers::marketplace_by_buyer))
         .route("/v1/swap/marketplace/ip/{ip_id}",     get(handlers::marketplace_by_ip))
+        .route("/v1/ip/search", get(handlers::search_ip))
+        .route("/v1/ip/{ip_id}/metadata", axum::routing::put(handlers::put_ip_search_metadata))
+        .route("/v1/ip/search/saved/{owner}", get(handlers::list_ip_saved_searches).post(handlers::save_ip_search))
+        .route("/v1/ip/search/saved/{owner}/{id}", axum::routing::delete(handlers::delete_ip_saved_search))
         .route("/v1/ip/owner/{owner}/cursor", get(handlers::list_ip_by_owner_cursor))
         .route("/v1/swap/initiate", post(handlers::initiate_swap))
         .route("/v1/swap/batch-initiate", post(handlers::batch_initiate_swap))
@@ -492,6 +610,19 @@ fn build_app() -> Router {
         .route("/v1/bulk/commit-ip", post(handlers::bulk_commit_ip))
         .route("/v1/bulk/initiate-swap", post(handlers::bulk_initiate_swap))
         .route("/v1/swaps/execute-batch", post(handlers::execute_batch_swaps))
+        .route("/v1/portfolio/{owner}", get(portfolio::get_portfolio))
+        .route("/v1/portfolio/{owner}/holdings", post(portfolio::put_holdings))
+        .route("/v1/valuation/sales", post(valuation::post_sale))
+        .route("/v1/valuation/{commitment_id}", get(valuation::get_valuation))
+        .route("/v1/transfers", post(transfers::create_transfer).layer(signed.clone()))
+        .route("/v1/transfers/{id}", get(transfers::get_transfer))
+        .route("/v1/transfers/{id}/validate", post(transfers::validate_transfer))
+        .route("/v1/transfers/{id}/escrow", post(transfers::fund_transfer_escrow))
+        .route("/v1/transfers/{id}/cancel", post(transfers::cancel_transfer))
+        .route("/v1/licenses", post(licensing::create_license))
+        .route("/v1/licenses/{id}", get(licensing::get_license))
+        .route("/v1/licenses/{id}/terms", post(licensing::update_license_terms))
+        .route("/v1/licenses/{id}/royalties", post(licensing::record_license_royalty))
         .route("/auth/2fa/enable", post(handlers::enable_2fa))
         .route("/auth/2fa/verify", post(handlers::verify_2fa))
         .route("/auth/2fa/backup-code", post(handlers::use_backup_code))
@@ -524,17 +655,67 @@ mod tests {
         let query_client = Arc::new(graphql::SorobanQueryClient::new(rpc_client.clone()));
         let schema = graphql::build_schema();
         let health_checker = Arc::new(health::HealthChecker::new());
-        let state = AppState {
-            schema,
-            query_client,
-            rpc_client,
-            ws_broadcaster:  Arc::new(websocket::EventBroadcaster::new()),
-            sse_broadcaster: Arc::new(events::create_event_broadcaster().0),
-            health_checker,
-        };
+        let rate_limiter = Arc::new(rate_limit::RateLimitMiddleware::new(rate_limit::RateLimitConfig::default()));
+
+        let mut container = dependency_injection::ServiceContainer::new();
+        container.register(schema);
+        container.register(query_client);
+        container.register(rpc_client);
+        container.register(Arc::new(websocket::EventBroadcaster::new()));
+        container.register(Arc::new(events::create_event_broadcaster().0));
+        container.register(health_checker);
+        container.register(rate_limiter);
+
+        let state = build_state(&container).expect("test container must resolve all dependencies");
         Router::new()
             .route("/v1/swap/{swap_id}", get(handlers::get_swap))
             .with_state(state)
+    }
+
+    // ── #1220: typed dependency-resolution errors ────────────────────────────
+
+    #[test]
+    fn test_missing_dependency_yields_typed_error_not_panic() {
+        // An empty container has no dependencies registered; resolving must
+        // return the typed error rather than panicking.
+        let container = dependency_injection::ServiceContainer::new();
+        let result = build_state(&container);
+        match result {
+            Err(DependencyError::Missing(name)) => {
+                assert_eq!(name, "graphql_schema");
+            }
+            Ok(_) => panic!("expected a missing-dependency error from an empty container"),
+        }
+    }
+
+    #[test]
+    fn test_missing_dependency_error_message_names_dependency() {
+        let container = dependency_injection::ServiceContainer::new();
+        let err = require_dependency::<graphql::AtomicIpSchema>(&container, "graphql_schema")
+            .expect_err("empty container must not resolve the schema");
+        assert_eq!(err, DependencyError::Missing("graphql_schema"));
+        assert!(err.to_string().contains("graphql_schema"));
+    }
+
+    #[test]
+    fn test_fully_registered_container_resolves_state() {
+        let rpc_client: Arc<dyn graphql::SorobanRpcClient> =
+            Arc::new(graphql::MockSorobanRpcClient::default());
+        let query_client = Arc::new(graphql::SorobanQueryClient::new(rpc_client.clone()));
+        let schema = graphql::build_schema_with_context(rpc_client.clone());
+        let rate_limiter =
+            Arc::new(rate_limit::RateLimitMiddleware::new(rate_limit::RateLimitConfig::default()));
+
+        let mut container = dependency_injection::ServiceContainer::new();
+        container.register(schema);
+        container.register(query_client);
+        container.register(rpc_client);
+        container.register(Arc::new(websocket::EventBroadcaster::new()));
+        container.register(Arc::new(events::create_event_broadcaster().0));
+        container.register(Arc::new(health::HealthChecker::new()));
+        container.register(rate_limiter);
+
+        assert!(build_state(&container).is_ok());
     }
 
     #[tokio::test]

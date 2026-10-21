@@ -480,6 +480,264 @@ mod prop_tests {
         client.accept_swap(&swap_id);
     }
 
+    // ── Insurance reservation release on terminal paths (#1231) ───────────────
+
+    /// Builds an environment with a registry, token, and initialized swap
+    /// contract, minting `mint_amount` to the buyer.
+    fn setup_insurance_env(
+        mint_amount: i128,
+    ) -> (
+        Env,
+        AtomicSwapClient<'static>,
+        Address,
+        Address,
+        Address,
+        Address,
+    ) {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let admin = Address::generate(&env);
+
+        let registry_id = env.register(IpRegistry, ());
+        let registry = IpRegistryClient::new(&env, &registry_id);
+
+        let secret = BytesN::from_array(&env, &[0x5Au8; 32]);
+        let blinding = BytesN::from_array(&env, &[0x6Bu8; 32]);
+        let mut preimage = soroban_sdk::Bytes::new(&env);
+        preimage.append(&soroban_sdk::Bytes::from(secret.clone()));
+        preimage.append(&soroban_sdk::Bytes::from(blinding.clone()));
+        let hash: BytesN<32> = env.crypto().sha256(&preimage).into();
+        let ip_id = registry.commit_ip(&seller, &hash, &0u32);
+
+        let token_id = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        StellarAssetClient::new(&env, &token_id).mint(&buyer, &mint_amount);
+
+        let contract_id = env.register(AtomicSwap, ());
+        let client = AtomicSwapClient::new(&env, &contract_id);
+        client.initialize(&registry_id);
+
+        (env, client, token_id, ip_id, seller, buyer)
+    }
+
+    /// Reads the total reserved insurance amount tracked by the contract.
+    fn reserved_total(env: &Env, client: &AtomicSwapClient) -> i128 {
+        env.as_contract(&client.address, || {
+            env.storage()
+                .instance()
+                .get(&crate::DataKey::InsuranceReservedTotal)
+                .unwrap_or(0)
+        })
+    }
+
+    /// Reads the per-swap reserved insurance amount, defaulting to zero.
+    fn reserved_for(env: &Env, client: &AtomicSwapClient, swap_id: u64) -> i128 {
+        env.as_contract(&client.address, || {
+            env.storage()
+                .persistent()
+                .get(&crate::DataKey::InsuranceReserved(swap_id))
+                .unwrap_or(0)
+        })
+    }
+
+    /// Asserts the aggregate invariant: the total reserved amount equals the
+    /// sum of per-swap reservations over all swaps that are still active.
+    fn assert_reserved_invariant(
+        env: &Env,
+        client: &AtomicSwapClient,
+        swap_ids: &[u64],
+    ) -> i128 {
+        let mut sum = 0i128;
+        for id in swap_ids.iter() {
+            let swap = client.get_swap(id).unwrap();
+            let reserved = reserved_for(env, client, *id);
+            if swap.status == SwapStatus::Pending || swap.status == SwapStatus::Accepted {
+                sum = sum.checked_add(reserved).unwrap();
+            } else {
+                assert_eq!(
+                    reserved, 0,
+                    "terminal swap {} must not hold a reservation",
+                    id
+                );
+            }
+        }
+        let total = reserved_total(env, client);
+        assert_eq!(total, sum, "reserved total must equal sum of active swaps");
+        total
+    }
+
+    /// Cancelling a Pending swap releases its insurance reservation.
+    #[test]
+    fn test_cancel_swap_releases_insurance_reservation() {
+        let (env, client, token_id, ip_id, seller, buyer) = setup_insurance_env(10_000);
+
+        let swap_id = client.initiate_swap(
+            &token_id, &ip_id, &seller, &1000, &buyer, &0_u32, &None, &0i128, &true,
+        );
+        let reserved = reserved_for(&env, &client, swap_id);
+        assert!(reserved > 0, "insurance should be reserved on initiation");
+        assert_eq!(reserved_total(&env, &client), reserved);
+
+        client.cancel_swap(&swap_id, &seller);
+
+        assert_eq!(client.get_swap(&swap_id).unwrap().status, SwapStatus::Cancelled);
+        assert_eq!(reserved_for(&env, &client, swap_id), 0);
+        assert_eq!(reserved_total(&env, &client), 0);
+        assert_reserved_invariant(&env, &client, &[swap_id]);
+    }
+
+    /// Cancelling an expired swap releases its insurance reservation.
+    #[test]
+    fn test_cancel_expired_swap_releases_insurance_reservation() {
+        let (env, client, token_id, ip_id, seller, buyer) = setup_insurance_env(10_000);
+
+        let swap_id = client.initiate_swap(
+            &token_id, &ip_id, &seller, &1000, &buyer, &0_u32, &None, &0i128, &true,
+        );
+        assert!(reserved_for(&env, &client, swap_id) > 0);
+
+        // Advance the ledger past the swap's expiry.
+        let swap = client.get_swap(&swap_id).unwrap();
+        env.ledger().set_sequence_number(swap.expiry_ledger + 1);
+
+        client.cancel_expired_swap(&swap_id);
+
+        assert_eq!(client.get_swap(&swap_id).unwrap().status, SwapStatus::Cancelled);
+        assert_eq!(reserved_for(&env, &client, swap_id), 0);
+        assert_eq!(reserved_total(&env, &client), 0);
+        assert_reserved_invariant(&env, &client, &[swap_id]);
+    }
+
+    /// Withdrawing escrow from an Accepted swap releases its reservation.
+    #[test]
+    fn test_escrow_withdraw_releases_insurance_reservation() {
+        let (env, client, token_id, ip_id, seller, buyer) = setup_insurance_env(10_000);
+
+        let swap_id = client.initiate_swap(
+            &token_id, &ip_id, &seller, &1000, &buyer, &0_u32, &None, &0i128, &true,
+        );
+        client.accept_swap(&swap_id);
+        assert!(reserved_for(&env, &client, swap_id) > 0);
+
+        client.escrow_withdraw(&swap_id, &seller);
+
+        assert_eq!(reserved_for(&env, &client, swap_id), 0);
+        assert_eq!(reserved_total(&env, &client), 0);
+        assert_reserved_invariant(&env, &client, &[swap_id]);
+    }
+
+    /// Auto-resolving a disputed swap releases its reservation.
+    #[test]
+    fn test_auto_resolve_dispute_releases_insurance_reservation() {
+        let (env, client, token_id, ip_id, seller, buyer) = setup_insurance_env(10_000);
+
+        let swap_id = client.initiate_swap(
+            &token_id, &ip_id, &seller, &1000, &buyer, &0_u32, &None, &0i128, &true,
+        );
+        client.accept_swap(&swap_id);
+        assert!(reserved_for(&env, &client, swap_id) > 0);
+
+        client.raise_dispute(&swap_id, &buyer);
+
+        // Advance past the dispute resolution window.
+        let swap = client.get_swap(&swap_id).unwrap();
+        env.ledger().set_sequence_number(swap.expiry_ledger + 1);
+
+        client.auto_resolve_dispute(&swap_id);
+
+        assert_eq!(reserved_for(&env, &client, swap_id), 0);
+        assert_eq!(reserved_total(&env, &client), 0);
+        assert_reserved_invariant(&env, &client, &[swap_id]);
+    }
+
+    proptest! {
+        /// The aggregate reserved amount always equals the sum of per-swap
+        /// reservations over active insured swaps, across random sequences of
+        /// initiate/accept/cancel/expire/withdraw/dispute-resolve operations.
+        #[test]
+        fn prop_insurance_reserved_total_matches_active_swaps(
+            ops in prop::collection::vec(0u8..6u8, 1..12),
+            price in 1i128..1_000i128,
+        ) {
+            let (env, client, token_id, ip_id, seller, buyer) =
+                setup_insurance_env(1_000_000);
+
+            let mut swap_ids: std::vec::Vec<u64> = std::vec::Vec::new();
+
+            for op in ops.iter() {
+                match op {
+                    // Initiate a new insured swap (only if no active swap for ip).
+                    0 => {
+                        let active = swap_ids.iter().any(|id| {
+                            let s = client.get_swap(id).unwrap();
+                            s.status == SwapStatus::Pending
+                                || s.status == SwapStatus::Accepted
+                        });
+                        if !active {
+                            let id = client.initiate_swap(
+                                &token_id, &ip_id, &seller, &price, &buyer, &0_u32,
+                                &None, &0i128, &true,
+                            );
+                            swap_ids.push(id);
+                        }
+                    }
+                    // Accept the most recent Pending swap.
+                    1 => {
+                        if let Some(id) = swap_ids.iter().rev().find(|id| {
+                            client.get_swap(id).unwrap().status == SwapStatus::Pending
+                        }) {
+                            client.accept_swap(id);
+                        }
+                    }
+                    // Cancel the most recent Pending swap.
+                    2 => {
+                        if let Some(id) = swap_ids.iter().rev().find(|id| {
+                            client.get_swap(id).unwrap().status == SwapStatus::Pending
+                        }) {
+                            client.cancel_swap(id, &seller);
+                        }
+                    }
+                    // Expire the most recent Pending swap.
+                    3 => {
+                        if let Some(id) = swap_ids.iter().rev().find(|id| {
+                            client.get_swap(id).unwrap().status == SwapStatus::Pending
+                        }) {
+                            let s = client.get_swap(id).unwrap();
+                            env.ledger().set_sequence_number(s.expiry_ledger + 1);
+                            client.cancel_expired_swap(id);
+                        }
+                    }
+                    // Withdraw escrow from the most recent Accepted swap.
+                    4 => {
+                        if let Some(id) = swap_ids.iter().rev().find(|id| {
+                            client.get_swap(id).unwrap().status == SwapStatus::Accepted
+                        }) {
+                            client.escrow_withdraw(id, &seller);
+                        }
+                    }
+                    // Dispute + auto-resolve the most recent Accepted swap.
+                    _ => {
+                        if let Some(id) = swap_ids.iter().rev().find(|id| {
+                            client.get_swap(id).unwrap().status == SwapStatus::Accepted
+                        }) {
+                            client.raise_dispute(id, &buyer);
+                            let s = client.get_swap(id).unwrap();
+                            env.ledger().set_sequence_number(s.expiry_ledger + 1);
+                            client.auto_resolve_dispute(id);
+                        }
+                    }
+                }
+
+                let total = assert_reserved_invariant(&env, &client, &swap_ids);
+                prop_assert!(total >= 0);
+            }
+        }
+    }
+
     /// Verifies that only one active swap per IP is allowed at a time.
     #[test]
     #[should_panic(expected = "Error(Contract, #5)")]

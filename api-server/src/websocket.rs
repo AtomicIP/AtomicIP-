@@ -304,6 +304,7 @@ impl EventBroadcaster {
                     timestamp,
                 });
             }
+            _ => {}
         }
     }
 

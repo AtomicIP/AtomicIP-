@@ -81,11 +81,11 @@ impl ResponseFormatter {
     /// Create a successful response
     pub fn success<T: Serialize>(
         data: T,
-        message: impl Into<String>,
+        message: impl Into<String> + Clone,
     ) -> ApiResponse<T> {
         ApiResponse {
             status: 200,
-            message: message.into(),
+            message: message.clone().into(),
             data: Some(data),
             error: None,
             meta: Self::create_meta(),
@@ -95,11 +95,11 @@ impl ResponseFormatter {
     /// Create a created response (201)
     pub fn created<T: Serialize>(
         data: T,
-        message: impl Into<String>,
+        message: impl Into<String> + Clone,
     ) -> ApiResponse<T> {
         ApiResponse {
             status: 201,
-            message: message.into(),
+            message: message.clone().into(),
             data: Some(data),
             error: None,
             meta: Self::create_meta(),
@@ -109,11 +109,11 @@ impl ResponseFormatter {
     /// Create an accepted response (202)
     pub fn accepted<T: Serialize>(
         data: T,
-        message: impl Into<String>,
+        message: impl Into<String> + Clone,
     ) -> ApiResponse<T> {
         ApiResponse {
             status: 202,
-            message: message.into(),
+            message: message.clone().into(),
             data: Some(data),
             error: None,
             meta: Self::create_meta(),
@@ -127,12 +127,12 @@ impl ResponseFormatter {
 
     /// Create a bad request error response (400)
     pub fn bad_request(
-        message: impl Into<String>,
+        message: impl Into<String> + Clone,
         code: impl Into<String>,
     ) -> ApiResponse<()> {
         ApiResponse {
             status: 400,
-            message: message.into(),
+            message: message.clone().into(),
             data: None,
             error: Some(ErrorDetails {
                 code: code.into(),
@@ -145,13 +145,13 @@ impl ResponseFormatter {
 
     /// Create a bad request error with field details
     pub fn bad_request_with_details(
-        message: impl Into<String>,
+        message: impl Into<String> + Clone,
         code: impl Into<String>,
         details: HashMap<String, Vec<String>>,
     ) -> ApiResponse<()> {
         ApiResponse {
             status: 400,
-            message: message.into(),
+            message: message.clone().into(),
             data: None,
             error: Some(ErrorDetails {
                 code: code.into(),
@@ -163,10 +163,10 @@ impl ResponseFormatter {
     }
 
     /// Create an unauthorized error response (401)
-    pub fn unauthorized(message: impl Into<String>) -> ApiResponse<()> {
+    pub fn unauthorized(message: impl Into<String> + Clone) -> ApiResponse<()> {
         ApiResponse {
             status: 401,
-            message: message.into(),
+            message: message.clone().into(),
             data: None,
             error: Some(ErrorDetails {
                 code: "UNAUTHORIZED".to_string(),
@@ -178,10 +178,10 @@ impl ResponseFormatter {
     }
 
     /// Create a forbidden error response (403)
-    pub fn forbidden(message: impl Into<String>) -> ApiResponse<()> {
+    pub fn forbidden(message: impl Into<String> + Clone) -> ApiResponse<()> {
         ApiResponse {
             status: 403,
-            message: message.into(),
+            message: message.clone().into(),
             data: None,
             error: Some(ErrorDetails {
                 code: "FORBIDDEN".to_string(),
@@ -193,10 +193,10 @@ impl ResponseFormatter {
     }
 
     /// Create a not found error response (404)
-    pub fn not_found(message: impl Into<String>) -> ApiResponse<()> {
+    pub fn not_found(message: impl Into<String> + Clone) -> ApiResponse<()> {
         ApiResponse {
             status: 404,
-            message: message.into(),
+            message: message.clone().into(),
             data: None,
             error: Some(ErrorDetails {
                 code: "NOT_FOUND".to_string(),
@@ -208,10 +208,10 @@ impl ResponseFormatter {
     }
 
     /// Create a conflict error response (409)
-    pub fn conflict(message: impl Into<String>) -> ApiResponse<()> {
+    pub fn conflict(message: impl Into<String> + Clone) -> ApiResponse<()> {
         ApiResponse {
             status: 409,
-            message: message.into(),
+            message: message.clone().into(),
             data: None,
             error: Some(ErrorDetails {
                 code: "CONFLICT".to_string(),
@@ -223,10 +223,10 @@ impl ResponseFormatter {
     }
 
     /// Create an internal server error response (500)
-    pub fn internal_error(message: impl Into<String>) -> ApiResponse<()> {
+    pub fn internal_error(message: impl Into<String> + Clone) -> ApiResponse<()> {
         ApiResponse {
             status: 500,
-            message: message.into(),
+            message: message.clone().into(),
             data: None,
             error: Some(ErrorDetails {
                 code: "INTERNAL_ERROR".to_string(),
@@ -243,7 +243,7 @@ impl ResponseFormatter {
         total: u64,
         page: u64,
         per_page: u64,
-        message: impl Into<String>,
+        message: impl Into<String> + Clone,
     ) -> PaginatedApiResponse<T> {
         let total_pages = (total + per_page - 1) / per_page;
         let has_next = page < total_pages;
@@ -251,7 +251,7 @@ impl ResponseFormatter {
 
         PaginatedApiResponse {
             status: 200,
-            message: message.into(),
+            message: message.clone().into(),
             data,
             pagination: PaginationMeta {
                 total,

@@ -5,6 +5,12 @@
 ///
 /// Run with: cargo test invariant_ -p ip_registry
 #[cfg(test)]
+mod transfer_migration_property_tests;
+
+#[cfg(test)]
+mod revocation_property_tests;
+
+#[cfg(test)]
 mod invariant_tests {
     extern crate std;
 

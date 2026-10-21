@@ -51,6 +51,10 @@ static PROMETHEUS_HANDLE: Lazy<Mutex<metrics_exporter_prometheus::PrometheusHand
         "open_connections",
         "Currently open WebSocket/SSE connections"
     );
+    describe_gauge!(
+        "cache_entries",
+        "Current number of entries stored in the response cache"
+    );
     
     Mutex::new(handle)
 });
