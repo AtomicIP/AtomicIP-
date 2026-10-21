@@ -384,6 +384,7 @@ async fn main() {
     metrics::init();
     // #1064/#1065: periodic lifecycle anomaly detection + alert escalation.
     commitment_monitoring::spawn_background_evaluator();
+    handlers::spawn_session_cleanup_task();
 
     let subscription_broadcaster = init_subscription_broadcaster().await;
     let rpc_client: Arc<dyn graphql::SorobanRpcClient> = Arc::new(graphql::MockSorobanRpcClient::default());
@@ -469,6 +470,11 @@ async fn main() {
         .route("/v1/auth/recovery/verify-token",  post(account_recovery::verify_recovery_token))
         .route("/v1/auth/recovery/questions",     get(account_recovery::get_security_questions))
         .route("/v1/auth/recovery/verify-question", post(account_recovery::verify_security_question))
+        .route("/auth/2fa/enable", post(handlers::enable_2fa))
+        .route("/auth/2fa/verify", post(handlers::verify_2fa))
+        .route("/auth/2fa/backup-code", post(handlers::use_backup_code))
+        .route("/auth/session/status", post(handlers::check_session))
+        .route("/auth/extend-session", post(handlers::extend_session))
         .route("/ip/{ip_id}",                     get(handlers::get_ip))
         .route("/ip/verify",                      post(handlers::verify_commitment))
         .route("/ip/reveal-batch",                post(handlers::batch_reveal_commitments))
@@ -488,12 +494,6 @@ async fn main() {
         .route("/swap/marketplace/seller/{seller}", get(handlers::marketplace_by_seller))
         .route("/swap/marketplace/buyer/{buyer}",  get(handlers::marketplace_by_buyer))
         .route("/swap/marketplace/ip/{ip_id}",     get(handlers::marketplace_by_ip))
-        .route("/swap/initiate",                  post(handlers::initiate_swap).layer(signed.clone()))
-        .route("/swap/batch-initiate",            post(handlers::batch_initiate_swap))
-        .route("/swap/{swap_id}/accept",          post(handlers::accept_swap).layer(signed.clone()))
-        .route("/swap/{swap_id}/reveal",          post(handlers::reveal_key).layer(signed.clone()))
-        .route("/swap/{swap_id}/cancel",          post(handlers::cancel_swap).layer(signed.clone()))
-        .route("/swap/{swap_id}/cancel-expired",  post(handlers::cancel_expired_swap))
         .route("/swap/{swap_id}",                 get(handlers::get_swap))
         .route("/openapi.json", get(openapi_handler))
         .route("/docs", get(docs::docs_handler))
@@ -662,8 +662,6 @@ fn build_app() -> Router {
         .route("/v1/swap/{swap_id}/history", get(handlers::get_swap_history))
         .route("/v1/swap/{swap_id}/disputes", get(handlers::get_swap_disputes))
         .route("/v1/swaps", get(handlers::list_swaps))
-        .route("/v1/webhooks", post(handlers::register_webhook))
-        .route("/v1/webhooks/{id}", axum::routing::delete(handlers::unregister_webhook))
         .route("/v1/bulk/commit-ip", post(handlers::bulk_commit_ip))
         .route("/v1/bulk/initiate-swap", post(handlers::bulk_initiate_swap))
         .route("/v1/swaps/execute-batch", post(handlers::execute_batch_swaps))

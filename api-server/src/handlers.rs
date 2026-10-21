@@ -2429,14 +2429,14 @@ pub async fn enable_2fa(
 }
 
 /// #984: Verify 2FA code during login
-/// Returns success if TOTP code is valid and marks 2FA as verified
+/// Returns success if TOTP code is valid, marks 2FA as verified, and creates a session.
 #[utoipa::path(
     post,
     path = "/auth/2fa/verify",
     tag = "Authentication",
     request_body = Verify2faRequest,
     responses(
-        (status = 200, description = "2FA code verified successfully", body = Verify2faResponse),
+        (status = 200, description = "2FA code verified and session created", body = Verify2faResponse),
         (status = 401, description = "Invalid 2FA code", body = ErrorResponse),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 404, description = "2FA not configured for user", body = ErrorResponse),
@@ -2486,6 +2486,7 @@ pub async fn verify_2fa(
             Ok(Json(Verify2faResponse {
                 success: true,
                 message: "2FA verified successfully".to_string(),
+                session_token,
             }))
         }
         Some(false) => Err((
@@ -2511,7 +2512,7 @@ pub async fn verify_2fa(
     tag = "Authentication",
     request_body = UseBackupCodeRequest,
     responses(
-        (status = 200, description = "Backup code accepted, account recovered", body = Verify2faResponse),
+        (status = 200, description = "Backup code accepted, account recovered, and session created", body = Verify2faResponse),
         (status = 401, description = "Invalid or already used backup code", body = ErrorResponse),
         (status = 404, description = "User not found", body = ErrorResponse),
     )
@@ -2557,9 +2558,11 @@ pub async fn use_backup_code(
         ));
     }
 
+    let session_token = issue_session_token(&body.user_id)?;
     Ok(Json(Verify2faResponse {
         success: true,
         message: "Account recovered with backup code. Please update your 2FA settings.".to_string(),
+        session_token,
     }))
 }
 
@@ -2567,6 +2570,32 @@ pub async fn use_backup_code(
 
 pub(crate) static SESSION_STORE: once_cell::sync::Lazy<crate::session::SessionStore> =
     once_cell::sync::Lazy::new(|| crate::session::SessionStore::new(crate::session::SessionConfig::default()));
+
+fn issue_session_token(
+    user_id: &str,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    let token = uuid::Uuid::new_v4().to_string();
+    SESSION_STORE
+        .create_session(user_id, &token)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error })))?;
+    Ok(token)
+}
+
+pub fn spawn_session_cleanup_task() {
+    tokio::spawn(async {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            match SESSION_STORE.cleanup_expired_sessions() {
+                Ok(removed) if removed > 0 => {
+                    tracing::debug!(removed, "cleaned up expired sessions");
+                }
+                Ok(_) => {}
+                Err(error) => tracing::error!(%error, "failed to clean up expired sessions"),
+            }
+        }
+    });
+}
 
 /// #985: Check current session status
 /// Returns session status including timeout warnings and grace period info
