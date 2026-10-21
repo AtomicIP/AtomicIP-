@@ -527,6 +527,41 @@ impl AuditLogStore {
 
         suspicious
     }
+
+    /// Erases personal data recorded against `actor_hash` (#1107).
+    ///
+    /// Matching events keep their sequence, timestamp, category and outcome,
+    /// but lose `actor_hash`, `request_id`, `trace_id` and `details`. Each
+    /// signature covers the previous one, so the chain from the first affected
+    /// event onward is re-signed with the server key and rewritten atomically.
+    /// Returns the number of events anonymized.
+    pub async fn anonymize_actor(&self, actor_hash: &str) -> Result<usize, AuditLogError> {
+        let key = self.key.clone();
+        let path = self.path.clone();
+        let target = actor_hash.to_string();
+
+        let (count, rewritten) =
+            tokio::task::spawn_blocking(move || anonymize_actor_locked(&path, &key, &target))
+                .await
+                .map_err(|error| AuditLogError::Io(format!("anonymize task panicked: {error}")))??;
+
+        if count > 0 {
+            *self.events.write().await = rewritten;
+        }
+
+        Ok(count)
+    }
+
+    /// Counts persisted events still attributed to `actor_hash`. Used to
+    /// verify that an erasure left no references behind.
+    pub async fn count_actor_events(&self, actor_hash: &str) -> usize {
+        self.events
+            .read()
+            .await
+            .iter()
+            .filter(|event| event.actor_hash.as_deref() == Some(actor_hash))
+            .count()
+    }
 }
 
 /// Walks the persisted chain at `path` and confirms every `signature`
@@ -751,6 +786,65 @@ fn append_locked(
     file.sync_all()?;
 
     Ok(event)
+}
+
+/// Rewrites the backing file with personal data for `target` removed and the
+/// chain re-signed from the first affected event. Runs under the append lock
+/// so no concurrent append can interleave with the rewrite.
+fn anonymize_actor_locked(
+    path: &Path,
+    key: &[u8],
+    target: &str,
+) -> Result<(usize, Vec<AuditEvent>), AuditLogError> {
+    let _lock = AppendLockGuard::acquire(path)?;
+
+    let mut events = read_events(path)?;
+    let mut count = 0;
+    let mut first_changed: Option<usize> = None;
+
+    for (index, event) in events.iter_mut().enumerate() {
+        if event.actor_hash.as_deref() == Some(target) {
+            event.actor_hash = None;
+            event.request_id = None;
+            event.trace_id = None;
+            event.details = Value::Object(Map::new());
+            count += 1;
+            first_changed.get_or_insert(index);
+        }
+    }
+
+    let Some(start) = first_changed else {
+        return Ok((0, events));
+    };
+
+    let mut previous_signature = if start == 0 {
+        GENESIS_SIGNATURE.to_string()
+    } else {
+        events[start - 1].signature.clone()
+    };
+    for event in events.iter_mut().skip(start) {
+        event.previous_signature = previous_signature.clone();
+        event.signature = compute_signature(key, event);
+        previous_signature = event.signature.clone();
+    }
+
+    let mut body = String::new();
+    for event in &events {
+        body.push_str(&serde_json::to_string(event).map_err(|_| AuditLogError::Serialization)?);
+        body.push('\n');
+    }
+
+    let mut tmp_os = path.as_os_str().to_owned();
+    tmp_os.push(".tmp");
+    let tmp_path = PathBuf::from(tmp_os);
+    {
+        let mut file = File::create(&tmp_path)?;
+        file.write_all(body.as_bytes())?;
+        file.sync_all()?;
+    }
+    fs::rename(&tmp_path, path)?;
+
+    Ok((count, events))
 }
 
 /// Reads and parses every record in the backing file. A trailing line that
@@ -1122,6 +1216,72 @@ mod tests {
         let dirty = verify_persisted_chain(temp.path(), &key).unwrap();
         assert_eq!(dirty.status, AuditIntegrityStatus::Invalid);
         assert_eq!(dirty.broken_at_sequence, Some(1));
+    }
+
+    #[tokio::test]
+    async fn anonymize_actor_redacts_personal_data_and_keeps_chain_valid() {
+        let key = vec![9; 32];
+        let (store, temp) = open_store("anonymize", key.clone());
+        let target = store.hash_identifier("user-to-erase");
+        let other = store.hash_identifier("bystander");
+
+        store
+            .append(
+                AuditEventInput::new(AuditEventCategory::Commitment, "ip.commit.requested")
+                    .actor_hash(Some(target.clone()))
+                    .request_id(Some("req-1".to_string()))
+                    .detail("owner", "user-to-erase"),
+            )
+            .await
+            .unwrap();
+        store
+            .append(
+                AuditEventInput::new(AuditEventCategory::Swap, "swap.accept.requested")
+                    .actor_hash(Some(other.clone()))
+                    .detail("buyer", "bystander"),
+            )
+            .await
+            .unwrap();
+        store
+            .append(
+                AuditEventInput::new(AuditEventCategory::Admin, "admin.action")
+                    .actor_hash(Some(target.clone())),
+            )
+            .await
+            .unwrap();
+
+        let count = store.anonymize_actor(&target).await.unwrap();
+
+        assert_eq!(count, 2);
+        assert_eq!(store.count_actor_events(&target).await, 0);
+        assert_eq!(store.count_actor_events(&other).await, 1);
+
+        let persisted = read_events(temp.path()).unwrap();
+        assert_eq!(persisted.len(), 3);
+        assert_eq!(persisted[0].actor_hash, None);
+        assert_eq!(persisted[0].request_id, None);
+        assert_eq!(persisted[0].details, Value::Object(Map::new()));
+        assert_eq!(persisted[0].event_type, "ip.commit.requested");
+        assert_eq!(persisted[1].details["buyer"], "bystander");
+
+        let verification = verify_persisted_chain(temp.path(), &key).unwrap();
+        assert_eq!(verification.status, AuditIntegrityStatus::Valid);
+    }
+
+    #[tokio::test]
+    async fn anonymize_actor_is_noop_for_unknown_actor() {
+        let key = vec![5; 32];
+        let (store, temp) = open_store("anonymize-noop", key.clone());
+        store
+            .append(AuditEventInput::new(AuditEventCategory::Admin, "admin.action"))
+            .await
+            .unwrap();
+        let before = fs::read_to_string(temp.path()).unwrap();
+
+        let count = store.anonymize_actor(&store.hash_identifier("nobody")).await.unwrap();
+
+        assert_eq!(count, 0);
+        assert_eq!(fs::read_to_string(temp.path()).unwrap(), before);
     }
 }
 
