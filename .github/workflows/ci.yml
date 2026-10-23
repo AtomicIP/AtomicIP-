@@ -23,6 +23,11 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Check security policy links
+        uses: lycheeverse/lychee-action@v2
+        with:
+          args: --offline --include-fragments SECURITY.md
+
       - name: Secret scanning (Gitleaks)
         uses: gitleaks/gitleaks-action@v2
         env:

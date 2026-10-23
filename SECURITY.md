@@ -229,18 +229,16 @@ gitleaks detect --staged -v --exit-code 1
 
 ## Automated Security Scanning
 
-Every push and pull request is scanned automatically in CI/CD:
+CI runs Gitleaks secret scanning and JavaScript tests with coverage enforcement.
+Rust dependency audits, coverage, and mutation checks are available as local gates;
+they are not currently part of the CI workflow.
 
-- **Security scanning** — supply-chain policy (cargo-deny), secret detection
-  (gitleaks), and static analysis. See [Security Scanning](docs/security-scanning.md).
-- **Dependency vulnerability scanning** — cargo-audit + cargo-deny against the
-  RustSec advisory database, plus Dependabot. See [Dependency Scanning](docs/dependency-scanning.md).
-- **Code coverage enforcement** — a minimum coverage threshold is enforced in
-  CI. See [Code Coverage](docs/code-coverage.md).
-- **Mutation testing** — verifies the test suite catches logic errors. See
-  [Mutation Testing](docs/mutation-testing.md).
+- **Security scanning** — Gitleaks runs in CI; see [Security Scanning](docs/security-scanning.md#security-scanning).
+- **Dependency vulnerability scanning** — cargo-audit and cargo-deny are available locally; see [Dependency Scanning](docs/security-scanning.md#dependency-scanning).
+- **Code coverage enforcement** — JavaScript coverage is enforced in CI; see [Code Coverage](docs/security-scanning.md#code-coverage).
+- **Mutation testing** — run cargo-mutants locally; see [Mutation Testing](docs/security-scanning.md#mutation-testing).
 
-Run all gates locally with `./scripts/security-checks.sh`.
+Run the available Rust gates locally with `./scripts/security-checks.sh`.
 
 ## Security Audits
 
