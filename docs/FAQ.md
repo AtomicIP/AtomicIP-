@@ -130,7 +130,7 @@ header and back off exponentially.
 The API caches IP (60 s) and swap (30 s) queries. Writes invalidate the relevant keys;
 if Redis is unavailable the cache falls back to per-instance memory, so other
 replicas may serve stale data until TTL expiry.
-→ [Performance Tuning Guide](performance-tuning-guide.md#caching-strategies)
+→ [Performance Tuning Guide](PERFORMANCE.md#caching-strategies)
 
 ### Where is the error format documented?
 → [Error Response Schema](error-response-schema.md)
@@ -154,7 +154,7 @@ replicas may serve stale data until TTL expiry.
 ### My WASM is too large to deploy.
 Check with `./scripts/check-wasm-size.sh` against `scripts/wasm-size-baseline.json`
 and build in release mode with `opt-level = "z"`.
-→ [Performance Tuning Guide](performance-tuning-guide.md#gas--resource-optimization)
+→ [Performance Tuning Guide](PERFORMANCE.md#gas--resource-optimization)
 
 ### How do I report a security issue?
 Privately, per [SECURITY.md](../SECURITY.md). Do not open a public issue.

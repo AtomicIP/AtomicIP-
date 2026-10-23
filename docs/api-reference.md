@@ -649,9 +649,10 @@ Emitted when a new IP is committed.
 
 ## TTL Management
 
-All persistent storage entries are extended with a TTL of **~1 year** (6,307,200 ledgers at 5s/ledger).
-
-See [TTL_MANAGEMENT.md](../TTL_MANAGEMENT.md) for details.
+Every persistent storage write extends the entry's TTL using `LEDGER_BUMP` for both
+the threshold and extension duration: 6,307,200 ledgers (about one year at 5 seconds
+per ledger). See the [persistent storage TTL policy](soroban-resource-limits.md#persistent-storage-ttl-policy-1147)
+for enforcement details.
 
 ---
 
