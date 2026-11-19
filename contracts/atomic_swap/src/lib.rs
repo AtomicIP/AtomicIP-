@@ -4621,7 +4621,9 @@ impl AtomicSwap {
 
         let len = swap_ids.len();
         if reasons.len() != len {
-            env.panic_with_error(Error::from_contract_error(ContractError::InvalidKey as u32));
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::BatchSizeMismatch as u32,
+            ));
         }
 
         let mut cancelled_ids: Vec<u64> = Vec::new(&env);
@@ -7032,6 +7034,28 @@ mod batch_enhancement_tests {
         assert_eq!(cancelled.len(), 1);
         let rec = client.get_swap(&1).unwrap();
         assert_eq!(rec.status, SwapStatus::Cancelled);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #52)")]
+    fn test_batch_cancel_swaps_length_mismatch_returns_batch_size_mismatch() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AtomicSwap, ());
+        let client = AtomicSwapClient::new(&env, &contract_id);
+
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        env.as_contract(&contract_id, || {
+            setup_swap(&env, 1, &seller, &buyer, 100, &token, SwapStatus::Pending);
+            setup_swap(&env, 2, &seller, &buyer, 200, &token, SwapStatus::Pending);
+        });
+
+        let swap_ids: Vec<u64> = Vec::from_array(&env, [1, 2]);
+        let reasons: Vec<Bytes> = Vec::from_array(&env, [Bytes::from_slice(&env, b"reason")]);
+        client.batch_cancel_swaps(&swap_ids, &seller, &reasons);
     }
 
     #[test]
