@@ -2721,7 +2721,17 @@ impl AtomicSwap {
     }
 
     fn protocol_config(env: &Env) -> ProtocolConfig {
-        // Return default config since storage is disabled
+        // #1358: a stored config overrides the defaults, so every initiation
+        // path reads the same `swap_expiry_seconds`.
+        if let Some(stored) = env
+            .storage()
+            .persistent()
+            .get::<_, ProtocolConfig>(&DataKey::ProtocolConfig)
+        {
+            return stored;
+        }
+
+        // Otherwise return the default config.
         ProtocolConfig {
             protocol_fee_bps: 250,
             treasury: Address::from_string(&soroban_sdk::String::from_str(
@@ -3566,7 +3576,7 @@ impl AtomicSwap {
                 price: winning_bid,
                 token: auction.token.clone(),
                 status: SwapStatus::Accepted,
-                expiry: env.ledger().timestamp() + 604800u64,
+                expiry: env.ledger().timestamp() + Self::protocol_config(&env).swap_expiry_seconds,
                 accept_timestamp: env.ledger().timestamp(),
                 required_approvals: 0,
                 dispute_timestamp: 0,
@@ -3677,7 +3687,7 @@ impl AtomicSwap {
             price: total_price,
             token: token.clone(),
             status: SwapStatus::Pending,
-            expiry: env.ledger().timestamp() + 604800u64,
+            expiry: env.ledger().timestamp() + Self::protocol_config(&env).swap_expiry_seconds,
             accept_timestamp: 0,
             required_approvals: 0,
             dispute_timestamp: 0,
@@ -3908,7 +3918,7 @@ impl AtomicSwap {
             price,
             token: token.clone(),
             status: SwapStatus::Pending,
-            expiry: env.ledger().timestamp() + 604800u64,
+            expiry: env.ledger().timestamp() + Self::protocol_config(&env).swap_expiry_seconds,
             accept_timestamp: 0,
             required_approvals: 0,
             dispute_timestamp: 0,
@@ -4834,7 +4844,7 @@ impl AtomicSwap {
                 price,
                 token: token.clone(),
                 status: SwapStatus::Pending,
-                expiry: env.ledger().timestamp() + 604800u64,
+                expiry: env.ledger().timestamp() + Self::protocol_config(&env).swap_expiry_seconds,
                 accept_timestamp: 0,
                 required_approvals,
                 dispute_timestamp: 0,
@@ -5947,7 +5957,7 @@ impl AtomicSwap {
             price,
             token: token.clone(),
             status: SwapStatus::Pending,
-            expiry: env.ledger().timestamp() + 604800u64,
+            expiry: env.ledger().timestamp() + Self::protocol_config(&env).swap_expiry_seconds,
             accept_timestamp: 0,
             required_approvals: 0,
             dispute_timestamp: 0,
@@ -6694,6 +6704,10 @@ mod arbitration_tests;
 // #1355: auction minimum increment and anti-sniping extension.
 #[cfg(test)]
 mod auction_tests;
+
+// #1358: swap expiry comes from ProtocolConfig on every initiation path.
+#[cfg(test)]
+mod swap_expiry_tests;
 
 // #824: compile errors fixed — re-enabled
 // Temporarily disabled: does not compile yet (pre-existing errors). Re-enable after fixing.
