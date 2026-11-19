@@ -153,7 +153,16 @@ pub enum ContractError {
     SelfTradeNotAllowed = 79,
     /// #1170: an ID counter would overflow u64 on increment.
     IdCounterOverflow = 80,
+    /// #1353: auction duration is below the minimum or above the maximum.
+    InvalidAuctionDuration = 81,
+    /// #1353: start_time + duration would overflow u64.
+    AuctionTimeOverflow = 82,
 }
+
+/// #1353: shortest auction duration accepted by `start_ip_auction` (1 hour).
+pub const MIN_AUCTION_DURATION_SECONDS: u64 = 3_600;
+/// #1353: longest auction duration accepted by `start_ip_auction` (30 days).
+pub const MAX_AUCTION_DURATION_SECONDS: u64 = 30 * 24 * 3_600;
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
 
@@ -3262,8 +3271,22 @@ impl AtomicSwap {
             .get(&DataKey::NextAuctionId)
             .unwrap_or(0);
 
+        // #1353: bound the duration so an auction cannot end immediately or lock
+        // the IP for an unbounded time.
+        if !(MIN_AUCTION_DURATION_SECONDS..=MAX_AUCTION_DURATION_SECONDS)
+            .contains(&duration_seconds)
+        {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::InvalidAuctionDuration as u32,
+            ));
+        }
+
         let start_time = env.ledger().timestamp();
-        let end_time = start_time + duration_seconds;
+        let Some(end_time) = start_time.checked_add(duration_seconds) else {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::AuctionTimeOverflow as u32,
+            ));
+        };
 
         let auction = AuctionRecord {
             auction_id,

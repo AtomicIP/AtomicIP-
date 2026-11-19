@@ -7,10 +7,12 @@ mod tests {
         testutils::Address as _, token::StellarAssetClient, Address, Bytes, BytesN, Env,
     };
 
-    use crate::{AtomicSwap, AtomicSwapClient};
+    use crate::{
+        AtomicSwap, AtomicSwapClient, MAX_AUCTION_DURATION_SECONDS, MIN_AUCTION_DURATION_SECONDS,
+    };
 
     const MIN_BID: i128 = 100;
-    const DURATION: u64 = 3_600;
+    const DURATION: u64 = MIN_AUCTION_DURATION_SECONDS;
 
     fn commit_ip(env: &Env, registry_id: &Address, owner: &Address) -> u64 {
         let registry = IpRegistryClient::new(env, registry_id);
@@ -63,18 +65,68 @@ mod tests {
         }
     }
 
+    fn start(f: &Fixture, duration: u64) -> u64 {
+        f.client()
+            .start_ip_auction(&f.token_id, &f.ip_id, &f.seller, &MIN_BID, &duration)
+    }
+
+    #[test]
+    fn test_auction_accepts_minimum_duration() {
+        let f = fixture();
+        let auction_id = start(&f, MIN_AUCTION_DURATION_SECONDS);
+        let auction = f.client().get_auction(&auction_id);
+        assert_eq!(
+            auction.end_time - auction.start_time,
+            MIN_AUCTION_DURATION_SECONDS
+        );
+    }
+
+    #[test]
+    fn test_auction_accepts_maximum_duration() {
+        let f = fixture();
+        let auction_id = start(&f, MAX_AUCTION_DURATION_SECONDS);
+        let auction = f.client().get_auction(&auction_id);
+        assert_eq!(
+            auction.end_time - auction.start_time,
+            MAX_AUCTION_DURATION_SECONDS
+        );
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_auction_rejects_zero_duration() {
+        let f = fixture();
+        start(&f, 0);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_auction_rejects_below_minimum_duration() {
+        let f = fixture();
+        start(&f, MIN_AUCTION_DURATION_SECONDS - 1);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_auction_rejects_above_maximum_duration() {
+        let f = fixture();
+        start(&f, MAX_AUCTION_DURATION_SECONDS + 1);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_auction_rejects_u64_max_duration() {
+        let f = fixture();
+        start(&f, u64::MAX);
+    }
+
     #[test]
     #[should_panic]
     fn test_seller_cannot_bid_on_own_auction() {
         let f = fixture();
         let client = f.client();
-        let auction_id = client.start_ip_auction(
-            &f.token_id,
-            &f.ip_id,
-            &f.seller,
-            &MIN_BID,
-            &DURATION,
-        );
+        let auction_id =
+            client.start_ip_auction(&f.token_id, &f.ip_id, &f.seller, &MIN_BID, &DURATION);
 
         // #1354: the seller bidding on their own auction must panic.
         client.place_bid(&auction_id, &f.seller, &(MIN_BID + 1));
