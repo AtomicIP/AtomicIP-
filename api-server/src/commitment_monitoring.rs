@@ -35,6 +35,7 @@ use once_cell::sync::Lazy;
 use serde::Serialize;
 
 use crate::alerting::{self, Alert, Severity};
+use crate::lock_or_recover;
 
 /// Lifecycle state of a commitment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -156,7 +157,7 @@ impl CommitmentLifecycleMonitor {
 
     /// Record a lifecycle transition at an explicit timestamp (seconds).
     pub fn record_transition_at(&self, from: CommitmentState, to: CommitmentState, now: u64) {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = lock_or_recover(&self.inner);
         let inner = &mut *guard;
 
         if !from.can_transition_to(to) {
@@ -201,7 +202,7 @@ impl CommitmentLifecycleMonitor {
     /// Evaluate anomaly detection and update trend gauges. Call periodically
     /// (once per bucket is sufficient) from a background task.
     pub fn evaluate(&self, now: u64) -> Vec<Alert> {
-        let inner = self.inner.lock().unwrap();
+        let inner = lock_or_recover(&self.inner);
         let current_bucket = now - now % self.config.bucket_secs;
         let mut alerts = Vec::new();
 
@@ -264,7 +265,7 @@ impl CommitmentLifecycleMonitor {
     }
 
     pub fn snapshot(&self, now: u64) -> LifecycleSnapshot {
-        let inner = self.inner.lock().unwrap();
+        let inner = lock_or_recover(&self.inner);
         let current_bucket = now - now % self.config.bucket_secs;
         let transitions = inner
             .series
@@ -396,4 +397,29 @@ pub async fn lifecycle_handler() -> axum::Json<LifecycleSnapshot> {
 /// `GET /v1/admin/alerts` – open (unresolved) alerts after dedup/correlation.
 pub async fn open_alerts_handler() -> axum::Json<Vec<alerting::TrackedAlert>> {
     axum::Json(alerting::ALERT_MANAGER.open_alerts())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn monitor_keeps_working_after_lock_is_poisoned() {
+        let monitor = Arc::new(CommitmentLifecycleMonitor::new(MonitorConfig::default()));
+
+        // Poison the inner mutex by panicking while holding its guard.
+        let poisoner = Arc::clone(&monitor);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.inner.lock().unwrap();
+            panic!("poison the monitor lock");
+        })
+        .join();
+        assert!(monitor.inner.is_poisoned());
+
+        // Every entry point must recover instead of panicking.
+        monitor.record_transition_at(CommitmentState::New, CommitmentState::Active, 0);
+        let _ = monitor.evaluate(0);
+        let _ = monitor.snapshot(0);
+    }
 }
