@@ -48,5 +48,8 @@
         "statements": 70
       }
     }
+  },
+  "dependencies": {
+    "@stellar/stellar-sdk": "13.3.0"
   }
 }
