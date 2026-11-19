@@ -305,4 +305,28 @@ mod tests {
         assert!(f.client().try_execute_finality_callbacks(&f.swap_id).is_err());
         assert_eq!(receiver_client.hits(), 0);
     }
+
+    // ── #1362: register_finality_callback has no target allowlist ───────────
+    //
+    // Any contract and function pair is accepted at registration time. There
+    // is no admin allowlist or opt-in check. This test pins that behaviour.
+
+    #[test]
+    fn test_register_accepts_arbitrary_unlisted_target() {
+        let f = settled_swap();
+        let unlisted = Address::generate(&f.env);
+
+        f.client().register_finality_callback(
+            &f.swap_id,
+            &f.buyer,
+            &unlisted,
+            &symbol_short!("transfer"),
+        );
+        f.client().register_finality_callback(
+            &f.swap_id,
+            &f.seller,
+            &f.contract_id,
+            &symbol_short!("withdraw"),
+        );
+    }
 }
