@@ -7438,15 +7438,9 @@ impl IpRegistry {
         nonce: BytesN<12>,
         tag_hashes: Vec<BytesN<32>>,
     ) {
-        // Verify IP exists
-        if env
-            .storage()
-            .persistent()
-            .get::<_, IpRecord>(&DataKey::IpRecord(ip_id))
-            .is_none()
-        {
-            env.panic_with_error(Error::from_contract_error(ContractError::IpNotFound as u32));
-        }
+        // Only the IP owner may attach or overwrite commitment metadata.
+        let record = require_ip_exists(&env, ip_id);
+        record.owner.require_auth();
 
         metadata::store_metadata(&env, ip_id, encrypted_data, nonce, tag_hashes);
     }
