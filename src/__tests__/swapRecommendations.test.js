@@ -111,3 +111,23 @@ describe('swapRecommendations', () => {
     });
   });
 });
+
+describe('swapRecommendations regression (#1317)', () => {
+  const { recommendSwaps: recommend } = require('../recommendations/swapRecommendations');
+  const mod = require('../recommendations/swapRecommendations');
+
+  it('exports rankCandidates as a function', () => {
+    expect(typeof mod.rankCandidates).toBe('function');
+  });
+
+  it('keeps a caller-supplied recommendationScore instead of recomputing it', () => {
+    const candidates = [
+      { id: 'supplied', recommendationScore: 95, priceMatch: false },
+    ];
+
+    const [first] = recommend(candidates);
+
+    expect(first.id).toBe('supplied');
+    expect(first.recommendationScore).toBe(95);
+  });
+});
