@@ -42,14 +42,32 @@ pub struct Valuation {
     pub estimated_value: i128,
 }
 
+/// Upper bound on retained comparable sales. When full, the oldest entry is
+/// evicted so memory stays bounded.
+const MAX_SALES: usize = 10_000;
+
 static SALES: Lazy<Mutex<Vec<Sale>>> = Lazy::new(|| Mutex::new(Vec::new()));
+
+/// Append `sale` to `store`, evicting the oldest entries so that `store`
+/// never holds more than `max` sales.
+fn push_bounded(store: &mut Vec<Sale>, sale: Sale, max: usize) {
+    if max == 0 {
+        return;
+    }
+    if store.len() >= max {
+        let excess = store.len() + 1 - max;
+        store.drain(..excess);
+    }
+    store.push(sale);
+}
 
 /// Record a completed sale to be used as a comparable.
 pub fn record_sale(sale: Sale) -> Result<(), String> {
     if sale.price <= 0 {
         return Err("sale price must be positive".to_string());
     }
-    SALES.lock().unwrap_or_else(|e| e.into_inner()).push(sale);
+    let mut store = SALES.lock().unwrap_or_else(|e| e.into_inner());
+    push_bounded(&mut store, sale, MAX_SALES);
     Ok(())
 }
 
@@ -192,6 +210,26 @@ pub async fn post_sale(Json(sale): Json<Sale>) -> Result<StatusCode, (StatusCode
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn push_bounded_evicts_oldest_sales_at_capacity() {
+        let mut store = Vec::new();
+        for id in 0..5u64 {
+            push_bounded(&mut store, sale(id, 100, id, &["cap"]), 3);
+        }
+        assert_eq!(store.len(), 3);
+        let ids: Vec<u64> = store.iter().map(|s| s.ip_id).collect();
+        assert_eq!(ids, vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn record_sale_store_is_capped_at_max_sales() {
+        // Use a unique tag so this test is not affected by other tests sharing the global store.
+        for id in 0..(MAX_SALES as u64 + 50) {
+            record_sale(sale(900_000_000 + id, 1, id, &["sales-cap-test"])).unwrap();
+        }
+        assert!(SALES.lock().unwrap().len() <= MAX_SALES);
+    }
 
     fn sale(ip_id: u64, price: i128, timestamp: u64, tags: &[&str]) -> Sale {
         Sale {

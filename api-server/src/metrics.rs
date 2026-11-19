@@ -15,7 +15,7 @@ use once_cell::sync::Lazy;
 use std::sync::Mutex;
 use std::env;
 
-use crate::lock_utils::lock_or_recover;
+use crate::lock_or_recover;
 
 const DEFAULT_SLOW_REQUEST_THRESHOLD_MS: u64 = 1_000;
 

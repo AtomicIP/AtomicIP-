@@ -18,7 +18,6 @@ use crate::deduplication::{create_store, create_store_with_backend, Deduplicatio
 use crate::ip_search::{IpSearchFilters, IpSearchMetadata, IpSearchResponse, SaveSearchRequest, SavedSearch};
 use crate::graphql::SorobanQueryClient;
 use crate::schemas::*;
-use crate::soroban_rpc;
 use std::sync::Arc;
 use crate::webhook;
 use crate::websocket;
@@ -66,13 +65,6 @@ static BATCH_SWAP_IDEMPOTENCY: Lazy<DeduplicationStore> = Lazy::new(|| match std
         create_store()
     }
 });
-
-/// Process-local Soroban RPC client. In production this is replaced by a
-/// `LiveSorobanRpcClient` injected via Axum's State extractor; this static
-/// is a fallback used by handlers that have not been fully wired to the
-/// dependency-injection layer yet.
-static SOROBAN_CLIENT: Lazy<std::sync::Arc<dyn crate::soroban_rpc::SorobanRpcClient>> =
-    Lazy::new(|| std::sync::Arc::new(crate::soroban_rpc::MockSorobanRpcClient::default()));
 
 // #520: Mirrors the contract's MAX_BATCH_SIZE cap on a single batch.
 const MAX_BATCH_SIZE: usize = 50;
@@ -617,9 +609,7 @@ pub async fn batch_reveal_commitments(
                     Json(ErrorResponse { error: "user_id must not be empty".to_string() }),
                 ));
             }
-            let mut watchlists = crate::lock_recover(&WATCHLISTS).map_err(|_| {
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "watchlist unavailable".to_string() }))
-            })?;
+            let mut watchlists = crate::lock_or_recover(&WATCHLISTS);
             // #1200: Reject new users once the total-user cap is reached.
             if !watchlists.contains_key(&body.user_id) && watchlists.len() >= MAX_WATCHLIST_USERS {
                 return Err((
@@ -671,9 +661,7 @@ pub async fn batch_reveal_commitments(
                     Json(ErrorResponse { error: "user_id must not be empty".to_string() }),
                 ));
             }
-            let watchlists = crate::lock_recover(&WATCHLISTS).map_err(|_| {
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "watchlist unavailable".to_string() }))
-            })?;
+            let watchlists = crate::lock_or_recover(&WATCHLISTS);
             Ok(Json(WatchlistResponse {
                 user_id: query.user_id.clone(),
                 ip_ids: watchlists
@@ -704,9 +692,7 @@ pub async fn batch_reveal_commitments(
                     Json(ErrorResponse { error: "user_id must not be empty".to_string() }),
                 ));
             }
-            let mut watchlists = crate::lock_recover(&WATCHLISTS).map_err(|_| {
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "watchlist unavailable".to_string() }))
-            })?;
+            let mut watchlists = crate::lock_or_recover(&WATCHLISTS);
             let ids = watchlists.entry(user_id.clone()).or_default();
             ids.remove(&ip_id);
             Ok(Json(WatchlistResponse {
@@ -2122,7 +2108,7 @@ pub async fn register_webhook(Json(body): Json<RegisterWebhookRequest>) -> Resul
 
     // #1202: Reject targets that resolve to loopback, private, or link-local
     // addresses so webhook delivery cannot reach internal services.
-    if let Err(reason) = webhook::validate_webhook_target(&url).await {
+    if let Err(reason) = webhook::validate_webhook_url(url.as_str()).await {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
@@ -2492,6 +2478,7 @@ pub async fn verify_2fa(
             )
         })? {
         Some(true) => {
+            let session_token = issue_session_token(&body.user_id)?;
             Ok(Json(Verify2faResponse {
                 success: true,
                 message: "2FA verified successfully".to_string(),
