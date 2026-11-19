@@ -29,6 +29,8 @@ pub mod cross_contract;
 // mod swap_collateral_tests;
 #[cfg(test)]
 mod contingency_tests;
+#[cfg(test)]
+mod auction_swap_lock_tests;
 
 use soroban_sdk::xdr::{FromXdr, ToXdr};
 use soroban_sdk::{
@@ -3256,6 +3258,9 @@ impl AtomicSwap {
             env.panic_with_error(Error::from_contract_error(ContractError::SwapExists as u32));
         }
 
+        // #1332: an IP already in a swap (Pending/Accepted) cannot also be auctioned.
+        require_no_active_swap(&env, ip_id);
+
         let auction_id: u64 = env
             .storage()
             .persistent()
@@ -3472,6 +3477,18 @@ impl AtomicSwap {
                 .set(&DataKey::Swap(swap_id), &swap);
             env.storage().persistent().extend_ttl(
                 &DataKey::Swap(swap_id),
+                LEDGER_BUMP,
+                LEDGER_BUMP,
+            );
+
+            // Lock the IP for the auction-won swap so `initiate_swap` cannot
+            // create a second concurrent swap for the same IP (released on the
+            // swap's terminal transition, like the normal swap path).
+            env.storage()
+                .persistent()
+                .set(&DataKey::ActiveSwap(auction.ip_id), &swap_id);
+            env.storage().persistent().extend_ttl(
+                &DataKey::ActiveSwap(auction.ip_id),
                 LEDGER_BUMP,
                 LEDGER_BUMP,
             );
