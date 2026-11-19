@@ -8,7 +8,7 @@ mod tests {
     use ip_registry::{IpRegistry, IpRegistryClient};
     use soroban_sdk::{
         testutils::{Address as _, Ledger},
-        token::StellarAssetClient,
+        token::{StellarAssetClient, TokenClient},
         Address, Bytes, BytesN, Env, Vec,
     };
 
@@ -139,5 +139,38 @@ mod tests {
         ids.push_back(swap_b);
         ids.push_back(swap_a);
         client.batch_accept_swaps(&ids, &buyer);
+    }
+
+    // ── #1336: escrow_deposit honours swap expiry ─────────────────────────────
+
+    /// Depositing into escrow after expiry fails and the buyer's balance is
+    /// unchanged, because the guard runs before the token transfer.
+    #[test]
+    fn test_escrow_deposit_after_expiry_fails_and_balance_unchanged() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (client, registry_id) = setup_swap_contract(&env);
+        let ip_id = commit_ip(&env, &registry_id, &seller, 0x21);
+        let token_id = setup_token(&env, &admin, &buyer, 1000);
+        let token = TokenClient::new(&env, &token_id);
+
+        set_timestamp(&env, 1_000);
+        let timeout = 1_000 + 3600;
+        let swap_id =
+            client.initiate_escrow_swap(&token_id, &ip_id, &seller, &500_i128, &buyer, &timeout);
+
+        set_timestamp(&env, timeout);
+        let result = client.try_escrow_deposit(&swap_id);
+
+        assert!(result.is_err());
+        assert_eq!(token.balance(&buyer), 1000);
+        assert_eq!(
+            client.get_swap(&swap_id).unwrap().status,
+            SwapStatus::Pending
+        );
     }
 }

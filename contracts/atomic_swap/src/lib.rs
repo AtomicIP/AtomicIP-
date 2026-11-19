@@ -5112,6 +5112,7 @@ impl AtomicSwap {
         }
 
         require_swap_status(&env, &swap, SwapStatus::Pending, ContractError::NotPending);
+        Self::require_not_expired(&env, &swap);
         Self::validate_contingencies(&env, swap_id);
 
         // Transfer payment from buyer into contract escrow
