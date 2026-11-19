@@ -1,5 +1,7 @@
 # Security Considerations for IP Creators
 
+> Part of the security docs set. Hardening requirements are authoritative in [`security-hardening.md`](security-hardening.md); see [`security-index.md`](security-index.md).
+
 This guide covers best practices for protecting your intellectual property when using AtomicIP.
 
 ## Secret Management

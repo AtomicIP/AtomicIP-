@@ -1,5 +1,7 @@
 # Security Policy
 
+> Security guidance index: [`docs/security-index.md`](docs/security-index.md).
+
 ## Overview
 
 The AtomicIP project handles real XLM and intellectual property assets through Soroban smart contracts. Security is critical to protect users' funds and IP rights.

@@ -21,20 +21,30 @@ options considered, what was chosen and the consequences. ADRs keep the
 - ADRs live in `docs/adr/` in this repository, versioned with the code they
   describe.
 - File name: `NNNN-kebab-case-title.md`, where `NNNN` is the next free
-  zero-padded number. Numbers are never reused.
+  zero-padded number. For example, the fifth record is:
+
+  ```text
+  docs/adr/0005-use-redis-for-rate-limit-state.md
+  ```
+
+  Numbers are never reused.
 - Add every new ADR to the index above in the same PR.
 
 ## Lifecycle
 
 ```
-Proposed ──review──▶ Accepted ──(later ADR)──▶ Superseded by NNNN
+Proposed ──review──▶ Accepted ──(later ADR)──▶ Superseded by 0005
     │                    │
     └──▶ Rejected        └──▶ Deprecated
 ```
 
 Once an ADR is **Accepted**, its body is immutable. Only its status line may
 change. To change a decision, write a new ADR that supersedes it, and update the
-old one's status to `Superseded by [NNNN](NNNN-…md)`.
+old one's status to a link to the new record, for example:
+
+```markdown
+- **Status:** Superseded by [0005](0005-use-redis-for-rate-limit-state.md)
+```
 
 ## When to write an ADR
 
@@ -52,7 +62,7 @@ If in doubt, write a short one. Most ADRs should fit on one screen.
 
 1. Copy [`0000-template.md`](0000-template.md) to the next number and set
    **Status: Proposed**.
-2. Open a PR titled `ADR-NNNN: <title>` with the `adr` label. The ADR can go in
+2. Open a PR titled `ADR-0005: <title>` with the `adr` label. The ADR can go in
    the same PR as the implementation or before it.
 3. Request review from at least **two maintainers**. For decisions that touch
    cryptography or contract storage, one of them must be a security reviewer
@@ -66,6 +76,12 @@ If in doubt, write a short one. Most ADRs should fit on one screen.
    kept.
 7. ADRs are revisited in the quarterly architecture review. Any ADR whose
    *Consequences* no longer hold gets a superseding ADR.
+
+## Checking links
+
+`scripts/check-adr-links.sh` fails if any relative Markdown link in
+`docs/adr/` points at a file that does not exist. CI runs it on every PR.
+Fenced code blocks and inline code are not checked, so examples are safe.
 
 ## Linking ADRs from code
 

@@ -230,6 +230,11 @@ For security issues, see [SECURITY.md](SECURITY.md).
 - Reference related documentation
 - Update table of contents if adding sections
 - Keep API documentation in-code (Rust doc comments, JSDoc)
+- **Filenames in `docs/` use kebab-case** (`security-hardening.md`, `faq.md`).
+  Do not use `UPPER_CASE` names. Root-level files such as `README.md`,
+  `CONTRIBUTING.md` and `SECURITY.md` keep their conventional names.
+- Link to docs by their exact current filename. Check links after renaming a file.
+- Security guidance: see [`docs/security-index.md`](docs/security-index.md) for which file is authoritative.
 
 ## CI/CD and Deployment
 
