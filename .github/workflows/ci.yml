@@ -39,6 +39,9 @@ jobs:
         # (e.g. `#[ignore = "reason (#1234)"]`). See scripts/check-disabled-tests.sh.
         run: ./scripts/check-disabled-tests.sh
 
+      - name: Check ADR links
+        run: ./scripts/check-adr-links.sh
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: actions/setup-node@v4

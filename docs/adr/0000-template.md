@@ -1,6 +1,9 @@
-# ADR-NNNN: <Short title in imperative form>
+# ADR-0005: <Short title in imperative form>
 
-- **Status:** Proposed | Accepted | Rejected | Deprecated | Superseded by [NNNN](NNNN-title.md)
+<!-- Use the next free number. Example: "ADR-0005: Use Redis for rate-limit state". -->
+
+- **Status:** Proposed | Accepted | Rejected | Deprecated | Superseded by `[0005](0005-example-title.md)`
+  <!-- Pick one status. The superseding link is an example: use the real number and file name. -->
 - **Date:** YYYY-MM-DD
 - **Deciders:** @github-handles
 - **Related issues / PRs:** #
