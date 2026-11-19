@@ -96,6 +96,16 @@ pub fn require_positive_price(env: &Env, price: i128) {
     }
 }
 
+/// #1343: Rejects `required_approvals` above `MAX_REQUIRED_APPROVALS` at creation time,
+/// so a swap can never be created in a state where it cannot be accepted.
+pub fn require_valid_approvals(env: &Env, required_approvals: u32) {
+    if required_approvals > crate::MAX_REQUIRED_APPROVALS {
+        env.panic_with_error(Error::from_contract_error(
+            ContractError::ApprovalsTooHigh as u32,
+        ));
+    }
+}
+
 /// Validates that the caller is the seller of the swap.
 ///
 /// # Arguments

@@ -29,6 +29,8 @@ pub mod cross_contract;
 // mod swap_collateral_tests;
 #[cfg(test)]
 mod contingency_tests;
+#[cfg(test)]
+mod required_approvals_bound_tests;
 
 use soroban_sdk::xdr::{FromXdr, ToXdr};
 use soroban_sdk::{
@@ -153,6 +155,8 @@ pub enum ContractError {
     SelfTradeNotAllowed = 79,
     /// #1170: an ID counter would overflow u64 on increment.
     IdCounterOverflow = 80,
+    /// #1343: `required_approvals` exceeds `MAX_REQUIRED_APPROVALS`, so the swap could never be accepted.
+    ApprovalsTooHigh = 81,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -171,6 +175,10 @@ pub const MAX_FINALITY_CALLBACKS: u32 = 5;
 
 /// Maximum number of items allowed in a single batch operation.
 pub const MAX_BATCH_SIZE: u32 = 50;
+
+/// #1343: Upper bound on `required_approvals` for a swap. A value above this could
+/// never be satisfied by the approver set, which would lock the IP until expiry.
+pub const MAX_REQUIRED_APPROVALS: u32 = 10;
 
 /// #781: Minimum non-refundable dispute bond, in the swap token's smallest
 /// unit — 1 XLM in stroops, per docs/threat-model.md's stated minimum. The
@@ -600,6 +608,9 @@ impl AtomicSwap {
                 ContractError::SelfTradeNotAllowed as u32,
             ));
         }
+
+        // #1343: reject approval thresholds that the approver set could never meet.
+        require_valid_approvals(&env, required_approvals);
 
         // Verify seller owns the IP and it's not revoked
         registry::ensure_seller_owns_active_ip(&env, ip_id, &seller);
@@ -3104,6 +3115,9 @@ impl AtomicSwap {
             ));
         }
 
+        // #1343: reject approval thresholds that the approver set could never meet.
+        require_valid_approvals(&env, required_approvals);
+
         let config = Self::protocol_config(&env);
         let len = ip_ids.len();
 
@@ -4691,6 +4705,9 @@ impl AtomicSwap {
     ) -> Vec<u64> {
         require_not_paused(&env);
         seller.require_auth();
+
+        // #1343: reject approval thresholds that the approver set could never meet.
+        require_valid_approvals(&env, required_approvals);
 
         let len = ip_ids.len();
         let mut swap_ids: Vec<u64> = Vec::new(&env);
