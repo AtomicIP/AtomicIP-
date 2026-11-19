@@ -134,3 +134,22 @@ describe('bulkSwapOperations', () => {
     });
   });
 });
+
+describe('bulkSwapOperations module contract (#1316)', () => {
+  const bulkModule = require('../batch/bulkSwapOperations');
+
+  it('exports executeBulkSwap as a function', () => {
+    expect(typeof bulkModule.executeBulkSwap).toBe('function');
+  });
+
+  it('validateSwapOperation returns { valid: false, error } instead of throwing', () => {
+    let result;
+    expect(() => {
+      result = validateSwapOperation({ action: 'swap' });
+    }).not.toThrow();
+    expect(result).toEqual({
+      valid: false,
+      error: expect.stringMatching(/swapId/i),
+    });
+  });
+});
