@@ -2400,9 +2400,18 @@ impl IpRegistry {
     /// * The IP record does not exist (IpNotFound error)
     /// * The current owner does not authorize the transaction (auth error)
     pub fn transfer_ip(env: Env, ip_id: u64, new_owner: Address) {
-        let mut record = require_ip_exists(&env, ip_id);
+        let record = require_ip_exists(&env, ip_id);
 
         record.owner.require_auth();
+
+        Self::transfer_ip_unchecked(env, ip_id, new_owner);
+    }
+
+    /// Internal: move IP ownership without checking authorization. Callers
+    /// must perform their own authorization (e.g. the current owner's auth in
+    /// `transfer_ip`, or admin auth plus a party check in `resolve_dispute`).
+    fn transfer_ip_unchecked(env: Env, ip_id: u64, new_owner: Address) {
+        let mut record = require_ip_exists(&env, ip_id);
 
         let old_owner = record.owner.clone();
 
@@ -5719,8 +5728,8 @@ impl IpRegistry {
             .persistent()
             .get(&DataKey::NextDisputeId)
             .unwrap_or(1);
-
         let timestamp = env.ledger().timestamp();
+
         let record = DisputeRecord {
             dispute_id,
             ip_id,
@@ -5860,9 +5869,18 @@ impl IpRegistry {
         index
     }
 
-
-    /// Resolve a dispute. Admin-only. Transfers IP ownership to `winner` if
-    /// winner differs from the current owner.
+    /// Resolve a dispute. Admin-only.
+    ///
+    /// `winner` must be the dispute's challenger or the current IP owner
+    /// (#1364). If `winner` is the challenger, IP ownership is transferred to
+    /// them and per-owner authority state is cleared, as in `transfer_ip`. If
+    /// `winner` is the current owner, the ruling is recorded and ownership is
+    /// unchanged.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the caller is not the admin, the dispute does not exist or is
+    /// already resolved, or `winner` is neither party to the dispute.
     pub fn resolve_dispute(env: Env, dispute_id: u64, winner: Address) {
         let admin: Address = env
             .storage()
@@ -5881,12 +5899,14 @@ impl IpRegistry {
             panic_with_error!(&env, ContractError::DisputeAlreadyResolved);
         }
 
-        // #1366: the challenger may open a new dispute on this IP once it is resolved.
-        env.storage()
-            .persistent()
-            .remove(&DataKey::OpenDispute(record.challenger.clone(), record.ip_id));
+        // #1364: the winner must be a party to the dispute.
+        let ip_record = require_ip_exists(&env, record.ip_id);
+        if winner != record.challenger && winner != ip_record.owner {
+            panic_with_error!(&env, ContractError::Unauthorized);
+        }
 
         record.resolved = true;
+        record.winner = Some(winner.clone());
         env.storage()
             .persistent()
             .set(&DataKey::IpDisputes(dispute_id), &record);
@@ -5895,6 +5915,16 @@ impl IpRegistry {
             LEDGER_BUMP,
             LEDGER_BUMP,
         );
+
+        // #1366: the challenger may open a new dispute on this IP once it is resolved.
+        env.storage()
+            .persistent()
+            .remove(&DataKey::OpenDispute(record.challenger.clone(), record.ip_id));
+
+        // #1364: a challenger win transfers ownership.
+        if winner != ip_record.owner {
+            Self::transfer_ip_unchecked(env.clone(), record.ip_id, winner.clone());
+        }
 
         env.events().publish(
             (symbol_short!("disp_res"), winner.clone()),

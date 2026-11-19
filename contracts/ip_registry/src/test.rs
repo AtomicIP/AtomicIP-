@@ -2205,6 +2205,79 @@ mod tests {
         assert_eq!(client.get_dispute(&dispute_id).evidence_hash, owner_evidence);
     }
 
+    // #1364: the winner must be one of the dispute's parties.
+    #[test]
+    #[should_panic(expected = "Error(Contract, #6)")]
+    fn test_resolve_dispute_rejects_winner_outside_parties() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = <Address as TestAddress>::generate(&env);
+        let challenger = <Address as TestAddress>::generate(&env);
+        let stranger = <Address as TestAddress>::generate(&env);
+        env.mock_all_auths();
+        client.initialize(&owner);
+
+        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[24u8; 32]), &0u32);
+        let dispute_id = client.initiate_dispute(
+            &ip_id,
+            &challenger,
+            &BytesN::from_array(&env, &[0x24u8; 32]),
+        );
+
+        client.resolve_dispute(&dispute_id, &stranger);
+    }
+
+    // #1364: a challenger win transfers ownership and the dispute records it.
+    #[test]
+    fn test_resolve_dispute_challenger_win_transfers_ownership() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = <Address as TestAddress>::generate(&env);
+        let challenger = <Address as TestAddress>::generate(&env);
+        env.mock_all_auths();
+        client.initialize(&owner);
+
+        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[25u8; 32]), &0u32);
+        let dispute_id = client.initiate_dispute(
+            &ip_id,
+            &challenger,
+            &BytesN::from_array(&env, &[0x25u8; 32]),
+        );
+
+        client.resolve_dispute(&dispute_id, &challenger);
+
+        assert_eq!(client.get_ip(&ip_id).owner, challenger);
+        assert!(client.get_ip(&ip_id).co_owners.is_empty());
+        let record = client.get_dispute(&dispute_id);
+        assert!(record.resolved);
+        assert_eq!(record.winner, Some(challenger));
+    }
+
+    // #1364: an owner win records the ruling and leaves ownership unchanged.
+    #[test]
+    fn test_resolve_dispute_owner_win_keeps_ownership() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = <Address as TestAddress>::generate(&env);
+        let challenger = <Address as TestAddress>::generate(&env);
+        env.mock_all_auths();
+        client.initialize(&owner);
+
+        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[26u8; 32]), &0u32);
+        let dispute_id = client.initiate_dispute(
+            &ip_id,
+            &challenger,
+            &BytesN::from_array(&env, &[0x26u8; 32]),
+        );
+
+        client.resolve_dispute(&dispute_id, &owner);
+
+        assert_eq!(client.get_ip(&ip_id).owner, owner);
+    }
+
     #[test]
     #[should_panic]
     fn test_notarize_ip_timestamp_invalid_signature_panics() {
