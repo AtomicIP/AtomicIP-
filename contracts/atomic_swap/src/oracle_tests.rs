@@ -8,7 +8,7 @@
 /// - initiate_swap_with_oracle_price: uses oracle price, respects slippage bounds
 /// - Signature verification: a well-formed, positive, but unsigned/forged/wrong-key price is rejected
 /// - Deviation bound: a validly signed price that moves too far from the last accepted price is rejected
-/// - Staleness validation: detects stale prices (>5 min), falls back to the (already-verified) cached price
+/// - Staleness validation: detects stale prices (>5 min) and refreshes them from a fresh attestation (#1328)
 /// - Error cases: oracle not configured, price invalid, price out of bounds, stale data with no cache
 #[cfg(test)]
 mod oracle_tests {
@@ -845,7 +845,7 @@ mod oracle_tests {
     }
 
     #[test]
-    fn test_oracle_price_staleness_exceeds_threshold_uses_cache() {
+    fn test_oracle_price_staleness_exceeds_threshold_refreshes_price() {
         let env = Env::default();
         env.mock_all_auths();
         let seller = Address::generate(&env);
@@ -874,18 +874,19 @@ mod oracle_tests {
         // Simulate time passing beyond staleness threshold (>300 seconds)
         env.ledger().set_timestamp(env.ledger().timestamp() + 301);
 
-        // Publish a new price (but staleness should trigger a cache fallback
-        // instead of fetching this one)
+        // Publish a new price. A stale cache must trigger a fresh fetch (#1328),
+        // so the new price is returned and written back to the cache.
         publish_price(&env, &oracle_client, &token_id, 700_000_i128);
 
         let stale_price = client.get_oracle_price(&token_id);
 
-        // Due to staleness, the cached (pre-lapse) price is used, not the new one.
-        assert_eq!(stale_price, 500_000_i128);
+        assert_eq!(stale_price, 700_000_i128);
+        let config = client.get_oracle_config().unwrap();
+        assert_eq!(config.cached_price, 700_000_i128);
     }
 
     #[test]
-    fn test_stale_price_with_no_cache_is_rejected() {
+    fn test_stale_price_with_no_cache_refreshes_from_oracle() {
         let env = Env::default();
         env.mock_all_auths();
         let seller = Address::generate(&env);
@@ -899,17 +900,13 @@ mod oracle_tests {
             setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
 
         // Enable, but never successfully fetch a price, then let the clock run
-        // past the staleness window: there is no cache to fall back to.
+        // past the staleness window. With no cache, the call fetches a fresh price.
         let pubkey = pubkey_bytes(&env, &test_signing_key());
         client.set_oracle(&admin_addr, &oracle_id, &pubkey, &true, &0_u32);
         env.ledger().set_timestamp(env.ledger().timestamp() + 301);
         publish_price(&env, &oracle_client, &token_id, 500_000_i128);
 
-        let result = client.try_get_oracle_price(&token_id);
-        assert_eq!(
-            result.unwrap_err().unwrap(),
-            ContractError::OraclePriceInvalid.into()
-        );
+        assert_eq!(client.get_oracle_price(&token_id), 500_000_i128);
     }
 
     #[test]
@@ -1044,7 +1041,7 @@ mod oracle_tests {
     /// branch: the cached (previously-verified) price is returned and the newly
     /// published price is NOT fetched.
     #[test]
-    fn test_oracle_price_staleness_just_past_threshold_uses_cache() {
+    fn test_oracle_price_staleness_just_past_threshold_refreshes_price() {
         let env = Env::default();
         env.mock_all_auths();
         let seller = Address::generate(&env);
@@ -1075,19 +1072,59 @@ mod oracle_tests {
         env.ledger()
             .set_timestamp(env.ledger().timestamp() + 301);
 
-        // Publish a new signed price; it should NOT be used.
+        // Publish a new signed price; a stale cache must fetch and use it (#1328).
         publish_price(&env, &oracle_client, &token_id, 700_000_i128);
 
         let price = client.get_oracle_price(&token_id);
-        // Just-past-threshold → stale branch → cached price returned.
         assert_eq!(
-            price, 500_000_i128,
-            "price at 301 s should use the stale-fallback path and return the cached price"
+            price, 700_000_i128,
+            "price at 301 s should refresh from the oracle, not return the stale cache"
         );
 
-        // The cache must NOT have been updated (stale path does not write back).
+        // The refreshed price is written back, so the staleness window can recover.
         let config = client.get_oracle_config().unwrap();
-        assert_eq!(config.cached_price, 500_000_i128);
+        assert_eq!(config.cached_price, 700_000_i128);
+        assert_eq!(config.last_update_timestamp, env.ledger().timestamp());
+    }
+
+    /// #1328 regression: the cache must keep refreshing across repeated staleness
+    /// gaps. Before the fix, the first stale call left `last_update_timestamp`
+    /// frozen, so a later call after a second gap kept returning the old price.
+    #[test]
+    fn test_oracle_price_recovers_after_repeated_staleness() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (registry_id, ip_id, _, _) = setup_registry(&env, &seller);
+        let token_id = setup_token(&env, &admin, &buyer, 10_000_000);
+        let oracle_id = env.register(MockOracle, ());
+        let oracle_client = MockOracleClient::new(&env, &oracle_id);
+        let (client, admin_addr) =
+            setup_swap_contract(&env, &registry_id, &token_id, ip_id, &seller, &buyer);
+        enable_oracle(
+            &env,
+            &client,
+            &admin_addr,
+            &oracle_id,
+            &oracle_client,
+            &token_id,
+            500_000_i128,
+        );
+        assert_eq!(client.get_oracle_price(&token_id), 500_000_i128);
+
+        // First gap: stale refresh to 550k.
+        env.ledger().set_timestamp(env.ledger().timestamp() + 301);
+        publish_price(&env, &oracle_client, &token_id, 550_000_i128);
+        assert_eq!(client.get_oracle_price(&token_id), 550_000_i128);
+
+        // Second gap: must refresh again to 600k, not keep serving the 550k cache.
+        env.ledger().set_timestamp(env.ledger().timestamp() + 301);
+        publish_price(&env, &oracle_client, &token_id, 600_000_i128);
+        assert_eq!(client.get_oracle_price(&token_id), 600_000_i128);
+        let config = client.get_oracle_config().unwrap();
+        assert_eq!(config.last_update_timestamp, env.ledger().timestamp());
     }
 
     #[test]
@@ -1146,7 +1183,7 @@ mod oracle_tests {
     }
 
     #[test]
-    fn test_oracle_price_staleness_just_past_threshold_swap_uses_cache() {
+    fn test_oracle_price_staleness_just_past_threshold_swap_refreshes_price() {
         let env = Env::default();
         env.mock_all_auths();
         let seller = Address::generate(&env);
@@ -1176,7 +1213,7 @@ mod oracle_tests {
         env.ledger()
             .set_timestamp(env.ledger().timestamp() + 301);
 
-        // Publish a new price; stale path should ignore it and use the cache.
+        // Publish a new price; the stale cache must be refreshed from it (#1328).
         publish_price(&env, &oracle_client, &token_id, 700_000_i128);
 
         // setup_swap_contract already cancelled the seeding swap (id 0),
@@ -1195,8 +1232,8 @@ mod oracle_tests {
         );
         let swap = client.get_swap(&swap_id).unwrap();
         assert_eq!(
-            swap.price, 500_000_i128,
-            "swap at just-past-threshold should use the cached price, not the new oracle price"
+            swap.price, 700_000_i128,
+            "swap at just-past-threshold should use the refreshed oracle price"
         );
     }
 
