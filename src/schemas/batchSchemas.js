@@ -14,6 +14,8 @@ const BATCH_CONSTANTS = Object.freeze({
   DISPUTE_MAX_BATCH_SIZE: 50,
   DISPUTE_VALID_SPLIT_RANGE_MIN: 0.01,
   DISPUTE_VALID_SPLIT_RANGE_MAX: 0.99,
+  DISPUTE_VALID_SPLIT_BPS_MIN: 100,
+  DISPUTE_VALID_SPLIT_BPS_MAX: 9900,
 
   // General constraints
   MAX_STRING_LENGTH: 10000,
@@ -119,6 +121,11 @@ const BATCH_SCHEMAS = {
             type: {
               type: "string",
               enum: ["REFUND", "RELEASE", "SPLIT", "ESCALATE"],
+            },
+            splitBps: {
+              type: "integer",
+              minimum: BATCH_CONSTANTS.DISPUTE_VALID_SPLIT_BPS_MIN,
+              maximum: BATCH_CONSTANTS.DISPUTE_VALID_SPLIT_BPS_MAX,
             },
             splitRatio: {
               type: "number",
