@@ -15,9 +15,15 @@ on:
       - main
       - develop
 
+permissions:
+  contents: read
+
 jobs:
   regenerate-and-validate-sdk:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write  # github-script posts the PR validation comment
     steps:
       - uses: actions/checkout@v4
         with:
@@ -29,19 +35,19 @@ jobs:
           targets: wasm32-unknown-unknown
 
       - name: Cache cargo registry
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: ~/.cargo/registry
           key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Cache cargo index
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: ~/.cargo/git
           key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Cache cargo build
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: target
           key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
@@ -138,7 +144,7 @@ jobs:
 
       - name: Upload OpenAPI spec as artifact
         if: env.SCHEMA_CHANGED == 'true'
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: openapi-spec-change
           path: /tmp/atomicip/openapi.json

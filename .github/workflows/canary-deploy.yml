@@ -18,7 +18,7 @@ on:
         default: atomicip
         type: string
       metrics_url:
-        description: Endpoint returning {"error_rate": number}
+        description: 'Endpoint returning {"error_rate": number}'
         required: true
         type: string
       max_error_rate:
@@ -30,6 +30,9 @@ on:
 concurrency:
   group: canary-production
   cancel-in-progress: false
+
+permissions:
+  contents: read
 
 jobs:
   deploy:

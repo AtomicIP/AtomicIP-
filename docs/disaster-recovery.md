@@ -269,3 +269,27 @@ incident, confirm that every on-call engineer has:
 - [ ] Deploy rights for the API server
 - [ ] The key custodian contact list
 - [ ] Status page publish rights
+
+## 9. Deploy credential rotation (KUBE_CONFIG)
+
+The `blue-green-deploy.yml` and `canary-deploy.yml` workflows authenticate
+to the production cluster with the `KUBE_CONFIG` secret in the `production`
+environment. A leaked kubeconfig grants cluster access until it is revoked,
+so rotate it on a schedule and immediately after any suspected exposure.
+
+Rotation procedure (current stored-kubeconfig method):
+
+1. Create a new deploy service account in the production namespace with
+   only the verbs the deploy scripts use (`get`, `list`, `patch` on
+   deployments and services).
+2. Generate a kubeconfig for that service account with a fresh token.
+3. Update the `KUBE_CONFIG` secret in the `production` environment, and
+   confirm a manual `workflow_dispatch` run of `blue-green-deploy.yml`
+   succeeds against staging before using production.
+4. Revoke the previous service account token and delete the old kubeconfig
+   from any local machine.
+5. Record the rotation date in the drill log in section 7.
+
+Planned change: migrate both workflows to OIDC federation so no long-lived
+cluster credential is stored. Until that lands, this section is the only
+rotation procedure.
