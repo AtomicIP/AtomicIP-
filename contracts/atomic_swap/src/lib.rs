@@ -35,6 +35,8 @@ mod required_approvals_bound_tests;
 mod referrer_validation_tests;
 #[cfg(test)]
 mod ip_swaps_index_tests;
+#[cfg(test)]
+mod auto_refund_timeout_tests;
 
 use soroban_sdk::xdr::{FromXdr, ToXdr};
 use soroban_sdk::{
@@ -4105,12 +4107,42 @@ impl AtomicSwap {
         // since no committee ruling occurred here.
         Self::release_dispute_bonds_uncontested(&env, swap_id, &swap);
 
-        // Refund buyer
-        token::Client::new(&env, &swap.token).transfer(
-            &env.current_contract_address(),
-            &swap.buyer,
-            &swap.price,
-        );
+        let token_client = token::Client::new(&env, &swap.token);
+
+        // #1346: refund only what the buyer deposited. An installment swap may have
+        // paid less than the full price, and refunding `price` would draw on other
+        // swaps' funds. Same rule as `cancel_expired_swap` (#1175).
+        let refund_amount = if swap.is_installment && swap.paid_amount < swap.price {
+            swap.paid_amount
+        } else {
+            swap.price
+        };
+        if refund_amount > 0 {
+            token_client.transfer(&env.current_contract_address(), &swap.buyer, &refund_amount);
+        }
+
+        // #1346: return collateral, which this path previously kept from the buyer.
+        if swap.collateral_amount > 0 {
+            if let Some(collateral) = env
+                .storage()
+                .persistent()
+                .get::<_, i128>(&DataKey::SwapCollateral(swap_id))
+            {
+                token_client.transfer(&env.current_contract_address(), &swap.buyer, &collateral);
+                env.storage()
+                    .persistent()
+                    .remove(&DataKey::SwapCollateral(swap_id));
+
+                env.events().publish(
+                    (soroban_sdk::symbol_short!("coll_ref"),),
+                    CollateralRefundedEvent {
+                        swap_id,
+                        buyer: swap.buyer.clone(),
+                        collateral_amount: collateral,
+                    },
+                );
+            }
+        }
 
         env.storage().persistent().set(
             &DataKey::CancelReason(swap_id),
