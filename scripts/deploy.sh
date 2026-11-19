@@ -153,7 +153,29 @@ EOF
     fi
 
     source .env
+    validate_config || exit 1
     log_success "Prerequisites check passed"
+}
+
+# Reject placeholder or zero-address config values before anything is deployed.
+# Only values that are set are checked; empty values are left to the caller.
+# Returns non-zero (after logging each problem) if any value is invalid.
+validate_config() {
+    local failed=0
+    local key value
+    for key in TREASURY_ADDRESS ADMIN_PUBLIC_KEY NOTARY_PUBLIC_KEY; do
+        value="${!key:-}"
+        [[ -z "$value" ]] && continue
+
+        if [[ "$value" == *PLACEHOLDER* ]]; then
+            log_error "$key is set to a placeholder value; configure a real value"
+            failed=1
+        elif [[ "$value" =~ ^(0x)?0+$ || "$value" =~ ^GA{20,}$ ]]; then
+            log_error "$key is a zero address; configure a real value"
+            failed=1
+        fi
+    done
+    return $failed
 }
 
 # Build contracts
@@ -365,4 +387,7 @@ main() {
     log "Full log saved to: $LOG_FILE"
 }
 
-main "$@"
+# Run main only when executed directly, so tests can source the functions.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
