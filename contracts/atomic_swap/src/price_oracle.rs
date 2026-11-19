@@ -258,19 +258,21 @@ pub fn fetch_oracle_price(env: &Env, token: &Address) -> i128 {
 }
 
 /// Fetches the oracle price with staleness validation.
-/// If the price is stale (> 5 minutes since last update), falls back to cached
-/// price. Fresh prices are signature-verified before being accepted; the cached
-/// fallback was itself signature-verified when it was originally fetched.
+/// Every call attempts a fresh, signature-verified attestation (#1328). If the
+/// cached price is older than 5 minutes, a `pr_stale` audit event is emitted
+/// first, and the refreshed price replaces the cache so the staleness window
+/// can recover.
 ///
 /// # Returns
-/// The fresh oracle price or the cached price if oracle is stale.
+/// The freshly attested oracle price.
 ///
 /// # Errors
 /// Panics with `OracleNotConfigured` if no oracle is set or it is disabled.
 /// Panics if a fresh attestation's signature does not verify.
 /// Panics with `OraclePriceInvalid` if the resulting price is ≤ 0.
 /// Panics with `OracleDeviationExceeded` if a fresh price moves too far from
-/// the last accepted price.
+/// the last accepted price. If the oracle cannot supply a valid price, the call
+/// fails rather than falling back to the cached price.
 pub fn fetch_oracle_price_with_staleness_check(env: &Env, token: &Address) -> i128 {
     let config = load_oracle_config(env).unwrap_or_else(|| {
         env.panic_with_error(soroban_sdk::Error::from_contract_error(
@@ -287,21 +289,9 @@ pub fn fetch_oracle_price_with_staleness_check(env: &Env, token: &Address) -> i1
     let current_timestamp = env.ledger().timestamp();
     let staleness_secs = current_timestamp.saturating_sub(config.last_update_timestamp);
 
-    if staleness_secs <= ORACLE_STALENESS_THRESHOLD_SECS {
-        // Price is fresh: fetch and verify a new attestation from the oracle.
-        let price = fetch_and_accept(env, &config, token);
-
-        let updated_config = OracleConfig {
-            last_update_timestamp: current_timestamp,
-            cached_price: price,
-            ..config
-        };
-        store_oracle_config(env, &updated_config);
-
-        price
-    } else {
-        // Price is stale: use the (already-verified) cached price and emit
-        // an audit event distinguishing this from a fresh acceptance.
+    if staleness_secs > ORACLE_STALENESS_THRESHOLD_SECS {
+        // Audit event: the cached price is past the staleness window. A refresh
+        // is attempted below (#1328) instead of serving the stale cache forever.
         env.events().publish(
             (symbol_short!("pr_stale"),),
             OraclePriceRejectedStaleEvent {
@@ -310,15 +300,21 @@ pub fn fetch_oracle_price_with_staleness_check(env: &Env, token: &Address) -> i1
                 staleness_secs,
             },
         );
-
-        if config.cached_price <= 0 {
-            env.panic_with_error(soroban_sdk::Error::from_contract_error(
-                ContractError::OraclePriceInvalid as u32,
-            ));
-        }
-
-        config.cached_price
     }
+
+    // #1328: always attempt a fresh attestation. Previously the refresh only ran
+    // while the cache was fresh, so `last_update_timestamp` never advanced once
+    // it went stale and every later call kept serving the frozen cache.
+    let price = fetch_and_accept(env, &config, token);
+
+    let updated_config = OracleConfig {
+        last_update_timestamp: current_timestamp,
+        cached_price: price,
+        ..config
+    };
+    store_oracle_config(env, &updated_config);
+
+    price
 }
 
 /// Validates that `price` falls within `[min_price, max_price]` if bounds are set.
