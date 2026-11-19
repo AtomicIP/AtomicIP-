@@ -775,6 +775,25 @@ pub struct PoolSwapEvent {
     pub token_reserve: i128,
 }
 
+/// #1352: emitted when the admin withdraws part of a pool's token reserve.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct LiquidityWithdrawnEvent {
+    pub commitment_id: u64,
+    pub admin: Address,
+    pub amount: i128,
+    pub token_reserve: i128,
+}
+
+/// #1352: emitted when the admin closes an empty pool and reclaims its reserve.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PoolClosedEvent {
+    pub commitment_id: u64,
+    pub admin: Address,
+    pub refunded: i128,
+}
+
 // ── #1089: Settlement Finality Types ──────────────────────────────────────────
 
 /// A contract call executed once a swap's settlement is final. The callee

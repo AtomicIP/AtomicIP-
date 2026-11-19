@@ -157,6 +157,8 @@ pub enum ContractError {
     InvalidAuctionDuration = 81,
     /// #1353: start_time + duration would overflow u64.
     AuctionTimeOverflow = 82,
+    /// #1352: pool still holds IP units and cannot be closed.
+    PoolNotEmpty = 83,
 }
 
 /// #1353: shortest auction duration accepted by `start_ip_auction` (1 hour).
@@ -5583,6 +5585,80 @@ impl AtomicSwap {
             },
         );
         true
+    }
+
+    /// #1352: Admin withdraws `amount` tokens from a pool's token reserve.
+    ///
+    /// `amount` must be positive and strictly less than the current token reserve,
+    /// so the pool keeps a non-zero reserve for pricing. Use `close_liquidity_pool`
+    /// to reclaim the full reserve once the pool has no IP left.
+    pub fn withdraw_liquidity(env: Env, admin: Address, commitment_id: u64, amount: i128) {
+        require_not_paused(&env);
+        admin.require_auth();
+        require_admin(&env, &admin);
+
+        let mut pool = Self::load_pool(&env, commitment_id);
+        if amount <= 0 || amount >= pool.token_reserve {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::InvalidPoolParams as u32,
+            ));
+        }
+
+        token::Client::new(&env, &pool.token).transfer(
+            &env.current_contract_address(),
+            &admin,
+            &amount,
+        );
+
+        pool.token_reserve -= amount;
+        Self::save_pool(&env, &pool);
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("pool_wd"),),
+            LiquidityWithdrawnEvent {
+                commitment_id,
+                admin,
+                amount,
+                token_reserve: pool.token_reserve,
+            },
+        );
+    }
+
+    /// #1352: Admin closes a pool that has no IP units left and returns the
+    /// remaining token reserve to the admin.
+    pub fn close_liquidity_pool(env: Env, admin: Address, commitment_id: u64) {
+        require_not_paused(&env);
+        admin.require_auth();
+        require_admin(&env, &admin);
+
+        let pool = Self::load_pool(&env, commitment_id);
+        if pool.ip_reserve != 0 {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::PoolNotEmpty as u32,
+            ));
+        }
+
+        let refunded = pool.token_reserve;
+        if refunded > 0 {
+            token::Client::new(&env, &pool.token).transfer(
+                &env.current_contract_address(),
+                &admin,
+                &refunded,
+            );
+        }
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::LiquidityPool(commitment_id));
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("pool_cls"),),
+            PoolClosedEvent {
+                commitment_id,
+                admin,
+                refunded,
+            },
+        );
     }
 
     /// #1088: Current pool state, including reserves and slippage limit.
