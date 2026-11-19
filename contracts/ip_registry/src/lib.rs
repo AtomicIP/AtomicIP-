@@ -348,6 +348,8 @@ pub enum DataKey {
     DelegateDepth(Address), // stores delegation depth for a given delegate
     IpDisputes(u64),        // stores DisputeRecord for a given dispute_id
     NextDisputeId,          // monotonic dispute ID counter
+    DisputeEvidenceCount(u64), // number of append-only evidence entries for a dispute_id
+    DisputeEvidence(u64, u32), // (dispute_id, index) -> DisputeEvidence entry
     IpStake(u64),           // Issue #447: stores StakeRecord for a given ip_id
     OwnerReputation(Address), // Issue #448: stores ReputationRecord for a given owner
     ArbitrationCase(u64),   // Issue #449: stores ArbitrationRecord for a given arbitration_id
@@ -641,10 +643,20 @@ pub struct DisputeRecord {
     pub dispute_id: u64,
     pub ip_id: u64,
     pub challenger: Address,
+    /// Hash of the most recent evidence submission (kept for compatibility).
     pub evidence_hash: BytesN<32>,
     pub timestamp: u64,
     pub resolved: bool,
     pub winner: Option<Address>,
+}
+
+/// One append-only evidence entry for a dispute.
+#[contracttype]
+#[derive(Clone)]
+pub struct DisputeEvidence {
+    pub submitter: Address,
+    pub evidence_hash: BytesN<32>,
+    pub timestamp: u64,
 }
 
 /// Issue #447: Stake record for an IP commitment.
@@ -5698,12 +5710,13 @@ impl IpRegistry {
             .get(&DataKey::NextDisputeId)
             .unwrap_or(1);
 
+        let timestamp = env.ledger().timestamp();
         let record = DisputeRecord {
             dispute_id,
             ip_id,
             challenger: challenger.clone(),
-            evidence_hash,
-            timestamp: env.ledger().timestamp(),
+            evidence_hash: evidence_hash.clone(),
+            timestamp,
             resolved: false,
             winner: None,
         };
@@ -5716,6 +5729,9 @@ impl IpRegistry {
             LEDGER_BUMP,
             LEDGER_BUMP,
         );
+
+        // #1365: the challenger's initial evidence is entry 0 of the history.
+        Self::append_dispute_evidence(&env, dispute_id, challenger.clone(), evidence_hash, timestamp);
 
         env.storage()
             .persistent()
@@ -5756,6 +5772,17 @@ impl IpRegistry {
             panic_with_error!(&env, ContractError::Unauthorized);
         }
 
+        // #1365: append to the history so earlier submissions are not lost.
+        // The record keeps the latest hash so `get_dispute` is unchanged.
+        let timestamp = env.ledger().timestamp();
+        Self::append_dispute_evidence(
+            &env,
+            dispute_id,
+            submitter.clone(),
+            evidence_hash.clone(),
+            timestamp,
+        );
+
         record.evidence_hash = evidence_hash;
         env.storage()
             .persistent()
@@ -5769,6 +5796,53 @@ impl IpRegistry {
         env.events()
             .publish((symbol_short!("disp_ev"), submitter), dispute_id);
     }
+
+    /// Get the number of evidence entries recorded for a dispute.
+    pub fn get_dispute_evidence_count(env: Env, dispute_id: u64) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DisputeEvidenceCount(dispute_id))
+            .unwrap_or(0)
+    }
+
+    /// Get one evidence entry by its zero-based index.
+    pub fn get_dispute_evidence(env: Env, dispute_id: u64, index: u32) -> DisputeEvidence {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DisputeEvidence(dispute_id, index))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::DisputeNotFound))
+    }
+
+    /// Internal helper: append one evidence entry and return its index.
+    fn append_dispute_evidence(
+        env: &Env,
+        dispute_id: u64,
+        submitter: Address,
+        evidence_hash: BytesN<32>,
+        timestamp: u64,
+    ) -> u32 {
+        let count_key = DataKey::DisputeEvidenceCount(dispute_id);
+        let index: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+
+        let entry_key = DataKey::DisputeEvidence(dispute_id, index);
+        let entry = DisputeEvidence {
+            submitter,
+            evidence_hash,
+            timestamp,
+        };
+        env.storage().persistent().set(&entry_key, &entry);
+        env.storage()
+            .persistent()
+            .extend_ttl(&entry_key, LEDGER_BUMP, LEDGER_BUMP);
+
+        env.storage().persistent().set(&count_key, &(index + 1));
+        env.storage()
+            .persistent()
+            .extend_ttl(&count_key, LEDGER_BUMP, LEDGER_BUMP);
+
+        index
+    }
+
 
     /// Resolve a dispute. Admin-only. Transfers IP ownership to `winner` if
     /// winner differs from the current owner.

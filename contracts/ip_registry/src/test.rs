@@ -2117,6 +2117,37 @@ mod tests {
         assert_eq!(record.evidence_hash, new_evidence);
     }
 
+    // #1365: evidence is append-only; both parties' submissions are retained.
+    #[test]
+    fn test_submit_dispute_evidence_retains_both_parties_submissions() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = <Address as TestAddress>::generate(&env);
+        let challenger = <Address as TestAddress>::generate(&env);
+        env.mock_all_auths();
+
+        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[23u8; 32]), &0u32);
+        let challenger_evidence = BytesN::from_array(&env, &[0x31u8; 32]);
+        let owner_evidence = BytesN::from_array(&env, &[0x32u8; 32]);
+
+        let dispute_id = client.initiate_dispute(&ip_id, &challenger, &challenger_evidence);
+        client.submit_dispute_evidence(&dispute_id, &owner, &owner_evidence);
+
+        assert_eq!(client.get_dispute_evidence_count(&dispute_id), 2);
+
+        let first = client.get_dispute_evidence(&dispute_id, &0u32);
+        assert_eq!(first.submitter, challenger);
+        assert_eq!(first.evidence_hash, challenger_evidence);
+
+        let second = client.get_dispute_evidence(&dispute_id, &1u32);
+        assert_eq!(second.submitter, owner);
+        assert_eq!(second.evidence_hash, owner_evidence);
+
+        // The existing getter still reports the latest submission.
+        assert_eq!(client.get_dispute(&dispute_id).evidence_hash, owner_evidence);
+    }
+
     #[test]
     #[should_panic]
     fn test_notarize_ip_timestamp_invalid_signature_panics() {
