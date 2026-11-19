@@ -4356,6 +4356,17 @@ impl AtomicSwap {
             ));
         }
 
+        // #1337: A repeated ID would be charged twice but accepted once.
+        for i in 0..swap_ids.len() {
+            for j in (i + 1)..swap_ids.len() {
+                if swap_ids.get(i) == swap_ids.get(j) {
+                    env.panic_with_error(Error::from_contract_error(
+                        ContractError::DuplicateBatchId as u32,
+                    ));
+                }
+            }
+        }
+
         // #522: Pre-validation pass — no mutations; ensures full atomicity
         for swap_id in swap_ids.iter() {
             let swap = require_swap_exists(&env, swap_id);
@@ -4387,6 +4398,8 @@ impl AtomicSwap {
         // Execution pass — all validations passed, safe to mutate
         for swap_id in swap_ids.iter() {
             let mut swap = require_swap_exists(&env, swap_id);
+            // #1337: Defence in depth — never move tokens for a swap that is no longer Pending.
+            require_swap_status(&env, &swap, SwapStatus::Pending, ContractError::NotPending);
 
             if swap.collateral_amount > 0 {
                 if !env

@@ -173,4 +173,38 @@ mod tests {
             SwapStatus::Pending
         );
     }
+
+    // ── #1337: batch_accept_swaps rejects duplicate IDs ───────────────────────
+
+    /// `[id, id]` for a Pending swap is rejected and no tokens move.
+    #[test]
+    fn test_batch_accept_duplicate_id_rejected_no_tokens_move() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (client, registry_id) = setup_swap_contract(&env);
+        let ip_id = commit_ip(&env, &registry_id, &seller, 0x31);
+        let token_id = setup_token(&env, &admin, &buyer, 1000);
+        let token = TokenClient::new(&env, &token_id);
+
+        let swap_id = client.initiate_swap(
+            &token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None, &0_i128, &false,
+        );
+
+        let mut ids = Vec::new(&env);
+        ids.push_back(swap_id);
+        ids.push_back(swap_id);
+        let result = client.try_batch_accept_swaps(&ids, &buyer);
+
+        assert!(result.is_err());
+        assert_eq!(token.balance(&buyer), 1000);
+        assert_eq!(token.balance(&client.address), 0);
+        assert_eq!(
+            client.get_swap(&swap_id).unwrap().status,
+            SwapStatus::Pending
+        );
+    }
 }
