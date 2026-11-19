@@ -1,0 +1,45 @@
+name: Prometheus Rules
+
+# Validates the Prometheus alerting/recording rules before they reach
+# production, where a syntax error or broken PromQL is otherwise only found
+# when Prometheus reloads. Issue #1266.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "monitoring/prometheus/**"
+      - ".github/workflows/prometheus-rules.yml"
+  pull_request:
+    paths:
+      - "monitoring/prometheus/**"
+      - ".github/workflows/prometheus-rules.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  promtool:
+    name: promtool check and unit tests
+    runs-on: ubuntu-latest
+    env:
+      PROMETHEUS_VERSION: "2.53.0"
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install promtool
+        run: |
+          set -euo pipefail
+          archive="prometheus-${PROMETHEUS_VERSION}.linux-amd64.tar.gz"
+          curl -sSfL -o "$RUNNER_TEMP/$archive" \
+            "https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/${archive}"
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" \
+            --strip-components=1 "prometheus-${PROMETHEUS_VERSION}.linux-amd64/promtool"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Check rule syntax and PromQL
+        # Any check error makes promtool exit non-zero and fails the job.
+        run: promtool check rules monitoring/prometheus/*-rules.yml
+
+      - name: Run alert unit tests
+        run: promtool test rules monitoring/prometheus/tests/*.test.yml

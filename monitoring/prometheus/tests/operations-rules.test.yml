@@ -1,0 +1,131 @@
+# promtool unit tests for monitoring/prometheus/operations-rules.yml (#1266).
+# Run: promtool test rules monitoring/prometheus/tests/*.test.yml
+rule_files:
+  - ../operations-rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  # ── BackupVerificationFailed: fires as soon as the restore test reports 0 ──
+  - interval: 1m
+    input_series:
+      - series: 'atomicip_backup_verify_success'
+        values: '1 1 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: BackupVerificationFailed
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: BackupVerificationFailed
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              team: platform
+              service: backups
+            exp_annotations:
+              summary: Latest backup restore test failed
+              runbook: docs/backup-strategy.md#5-when-verification-fails
+
+  # ── BackupTooOld: postgres_base beyond its 26h RPO fires ──
+  - interval: 1m
+    input_series:
+      - series: 'atomicip_backup_age_seconds{kind="postgres_base"}'
+        values: '100000x5'
+      - series: 'atomicip_backup_age_seconds{kind="postgres_wal"}'
+        values: '10x5'
+      - series: 'atomicip_backup_age_seconds{kind="audit_log"}'
+        values: '10x5'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: BackupTooOld
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              team: platform
+              service: backups
+              kind: postgres_base
+            exp_annotations:
+              summary: postgres_base backup older than its RPO
+              runbook: docs/backup-strategy.md#5-when-verification-fails
+
+  # ── BackupTooOld: every kind within its RPO stays silent ──
+  - interval: 1m
+    input_series:
+      - series: 'atomicip_backup_age_seconds{kind="postgres_base"}'
+        values: '3600x5'
+      - series: 'atomicip_backup_age_seconds{kind="postgres_wal"}'
+        values: '60x5'
+      - series: 'atomicip_backup_age_seconds{kind="audit_log"}'
+        values: '60x5'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: BackupTooOld
+        exp_alerts: []
+
+  # ── ApiServerAtMaxReplicas: must hold for 30m before firing ──
+  - interval: 1m
+    input_series:
+      - series: 'kube_horizontalpodautoscaler_status_current_replicas{horizontalpodautoscaler="atomicip-api"}'
+        values: '10x40'
+      - series: 'kube_horizontalpodautoscaler_spec_max_replicas{horizontalpodautoscaler="atomicip-api"}'
+        values: '10x40'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: ApiServerAtMaxReplicas
+        exp_alerts: []
+      - eval_time: 35m
+        alertname: ApiServerAtMaxReplicas
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              team: platform
+              service: api-server
+              horizontalpodautoscaler: atomicip-api
+            exp_annotations:
+              summary: api-server HPA pinned at maxReplicas for 30m; raise the cap or investigate load
+              runbook: docs/cost-optimization.md#1-auto-scaling
+
+  # ── ArgoAppDegraded: a Degraded app for 10m fires ──
+  - interval: 1m
+    input_series:
+      - series: 'argocd_app_info{project="atomicip",name="api",sync_status="Synced",health_status="Degraded"}'
+        values: '1x15'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: ArgoAppDegraded
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: ArgoAppDegraded
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              team: platform
+              project: atomicip
+              name: api
+              sync_status: Synced
+              health_status: Degraded
+            exp_annotations:
+              summary: Argo CD application api is Degraded
+              runbook: docs/gitops.md#rollback
+
+  # ── ApiServerMetricsScrapeFailing: a failed scrape for 10m fires ──
+  - interval: 1m
+    input_series:
+      - series: 'up{job="atomicip-api-metrics",instance="api:9100"}'
+        values: '1 0x14'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: ApiServerMetricsScrapeFailing
+        exp_alerts: []
+      - eval_time: 14m
+        alertname: ApiServerMetricsScrapeFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              team: platform
+              service: api-server
+              job: atomicip-api-metrics
+              instance: api:9100
+            exp_annotations:
+              summary: Prometheus cannot scrape the api-server internal metrics port (check the bearer token)
+              runbook: docs/monitoring.md#metrics-endpoint
