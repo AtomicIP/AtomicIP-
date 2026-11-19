@@ -374,6 +374,13 @@ pub struct AuctionRecord {
     pub start_time: u64,
     pub end_time: u64,
     pub finalized: bool,
+    /// #1355: Minimum raise over the current highest bid, in basis points
+    /// (100 = 1%). Fixed at auction start. A bid must exceed the highest bid by
+    /// at least this share, and by at least 1 unit.
+    pub min_increment_bps: u32,
+    /// #1355: A valid bid placed while `end_time - now <= anti_snipe_window_secs`
+    /// moves `end_time` to `now + anti_snipe_window_secs`. Zero disables extension.
+    pub anti_snipe_window_secs: u64,
 }
 
 #[contracttype]

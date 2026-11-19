@@ -153,6 +153,8 @@ pub enum ContractError {
     SelfTradeNotAllowed = 79,
     /// #1170: an ID counter would overflow u64 on increment.
     IdCounterOverflow = 80,
+    /// #1355: `min_increment_bps` must be at most 10_000 (100%).
+    InvalidIncrement = 81,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -3233,6 +3235,10 @@ impl AtomicSwap {
     // ── #347: IP Auction Mechanism ────────────────────────────────────────────
 
     /// Seller starts an auction for their IP. Returns the auction ID.
+    ///
+    /// `min_increment_bps` sets the minimum raise over the current highest bid
+    /// (basis points, at most 10_000). `anti_snipe_window_secs` sets the
+    /// extension window; zero disables anti-sniping extension (#1355).
     pub fn start_ip_auction(
         env: Env,
         token: Address,
@@ -3240,12 +3246,20 @@ impl AtomicSwap {
         seller: Address,
         min_bid: i128,
         duration_seconds: u64,
+        min_increment_bps: u32,
+        anti_snipe_window_secs: u64,
     ) -> u64 {
         require_not_paused(&env);
         seller.require_auth();
 
         require_positive_price(&env, min_bid);
         registry::ensure_seller_owns_active_ip(&env, ip_id, &seller);
+
+        if min_increment_bps > 10_000 {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::InvalidIncrement as u32,
+            ));
+        }
 
         // Check no active auction exists
         if env
@@ -3276,6 +3290,8 @@ impl AtomicSwap {
             start_time,
             end_time,
             finalized: false,
+            min_increment_bps,
+            anti_snipe_window_secs,
         };
 
         env.storage()
@@ -3341,16 +3357,27 @@ impl AtomicSwap {
             env.panic_with_error(Error::from_contract_error(ContractError::NotExpired as u32));
         }
 
-        if bid_amount < auction.min_bid {
+        // #1355: the bid must clear the minimum increment over the current
+        // highest bid (or `min_bid` for the first bid).
+        let min_next = Self::min_next_bid(&auction).unwrap_or_else(|| {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::PriceTooSmall as u32,
+            ));
+        });
+        if bid_amount < min_next {
             env.panic_with_error(Error::from_contract_error(
                 ContractError::PriceTooSmall as u32,
             ));
         }
 
-        if bid_amount <= auction.highest_bid {
-            env.panic_with_error(Error::from_contract_error(
-                ContractError::PriceTooSmall as u32,
-            ));
+        // #1355: anti-sniping. A bid inside the window pushes the end out to a
+        // full window from now, so a last-ledger bid cannot close the auction
+        // before others can respond.
+        let now = env.ledger().timestamp();
+        if auction.anti_snipe_window_secs > 0
+            && auction.end_time - now <= auction.anti_snipe_window_secs
+        {
+            auction.end_time = now + auction.anti_snipe_window_secs;
         }
 
         // Refund previous highest bidder if exists
@@ -3389,6 +3416,21 @@ impl AtomicSwap {
                 bid_amount,
             },
         );
+    }
+
+    /// #1355: smallest bid currently acceptable on `auction`, or `None` if the
+    /// required amount overflows `i128` (no bid can be placed then).
+    fn min_next_bid(auction: &AuctionRecord) -> Option<i128> {
+        if auction.highest_bid == 0 {
+            return Some(auction.min_bid);
+        }
+        // The step is at least 1 unit, so every accepted bid strictly exceeds
+        // the highest bid even when `min_increment_bps` is zero.
+        let step = auction
+            .highest_bid
+            .checked_mul(auction.min_increment_bps as i128)?
+            / 10_000;
+        auction.highest_bid.checked_add(step.max(1))
     }
 
     /// Finalize an auction after it ends. Creates a swap with the winning bid.
@@ -6575,6 +6617,10 @@ mod finality_tests;
 // calls to a since-removed function; both fixed / removed in this PR).
 #[cfg(test)]
 mod arbitration_tests;
+
+// #1355: auction minimum increment and anti-sniping extension.
+#[cfg(test)]
+mod auction_tests;
 
 // #824: compile errors fixed — re-enabled
 // Temporarily disabled: does not compile yet (pre-existing errors). Re-enable after fixing.
