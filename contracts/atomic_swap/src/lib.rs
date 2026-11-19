@@ -155,6 +155,8 @@ pub enum ContractError {
     IdCounterOverflow = 80,
     /// #1339: a batch call listed the same swap ID more than once.
     DuplicateSwapId = 81,
+    /// #1342: `collateral_amount` must be zero or positive.
+    InvalidCollateralAmount = 82,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -576,6 +578,9 @@ impl AtomicSwap {
     }
 
     /// Seller initiates a patent sale. Returns the swap ID.
+    ///
+    /// **#1342:** panics with `InvalidCollateralAmount` if `collateral_amount` is negative.
+    /// Zero means no collateral is held.
     pub fn initiate_swap(
         env: Env,
         token: Address,
@@ -595,6 +600,14 @@ impl AtomicSwap {
 
         // Guard: price must be positive.
         require_positive_price(&env, price);
+
+        // #1342: a negative collateral would be stored on the swap and later drive
+        // refund/release transfers, and accept_swap would silently skip the deposit.
+        if collateral_amount < 0 {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::InvalidCollateralAmount as u32,
+            ));
+        }
 
         // #1169: reject self-trades (buyer == seller).
         if buyer == seller {

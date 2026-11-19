@@ -326,3 +326,61 @@ mod duplicate_id_props {
         }
     }
 }
+
+// ── #1342: initiate_swap rejects negative collateral ──────────────────────────
+
+/// A negative `collateral_amount` must be refused with a structured error and must
+/// not leave a swap record behind. The seller's IP and the token balances are
+/// unaffected because the call panics before any state is written.
+#[test]
+fn test_initiate_swap_rejects_negative_collateral() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let seller = Address::generate(&env);
+    let buyer = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    let registry_id = setup_registry(&env);
+    let token_id = setup_token(&env, &admin, &buyer, 10_000_000);
+    let contract_id = setup_contract(&env, &registry_id);
+    let client = AtomicSwapClient::new(&env, &contract_id);
+
+    let (ip_id, _secret, _blinding) = commit_ip(&env, &registry_id, &seller, 0x03);
+
+    let result = client.try_initiate_swap(
+        &token_id, &ip_id, &seller, &1000i128, &buyer, &0u32, &None, &-1i128, &false,
+    );
+    assert_eq!(
+        result.unwrap_err(),
+        contract_error(ContractError::InvalidCollateralAmount)
+    );
+    assert!(client.get_swap(&0u64).is_none());
+}
+
+/// Boundary: zero collateral is valid (it means no collateral is held), so the
+/// same call with `0` must still create the swap.
+#[test]
+fn test_initiate_swap_accepts_zero_collateral() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let seller = Address::generate(&env);
+    let buyer = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    let registry_id = setup_registry(&env);
+    let token_id = setup_token(&env, &admin, &buyer, 10_000_000);
+    let contract_id = setup_contract(&env, &registry_id);
+    let client = AtomicSwapClient::new(&env, &contract_id);
+
+    let (ip_id, _secret, _blinding) = commit_ip(&env, &registry_id, &seller, 0x04);
+
+    let swap_id = client.initiate_swap(
+        &token_id, &ip_id, &seller, &1000i128, &buyer, &0u32, &None, &0i128, &false,
+    );
+    assert_eq!(
+        client.get_swap(&swap_id).unwrap().status,
+        SwapStatus::Pending
+    );
+}
