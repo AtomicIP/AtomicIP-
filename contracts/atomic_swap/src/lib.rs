@@ -40,6 +40,8 @@ pub use upgrade::{build_v1_schema, ContractSchema, ErrorEntry, FunctionEntry};
 pub use types::*;
 
 mod validation;
+#[cfg(test)]
+mod protocol_config_tests;
 use multi_currency::{MultiCurrencyConfig, SupportedToken, TokenMetadata};
 use price_oracle::{
     fetch_oracle_price_with_staleness_check, load_oracle_config, store_oracle_config,
@@ -2691,6 +2693,8 @@ impl AtomicSwap {
         }
 
         admin.require_auth();
+        // #1329: reject the zero/placeholder treasury address before storing.
+        validation::require_valid_treasury_address(&env, &treasury);
         Self::store_protocol_config(
             &env,
             &ProtocolConfig {
