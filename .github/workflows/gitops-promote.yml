@@ -23,6 +23,9 @@ permissions:
   contents: write
   packages: write
   pull-requests: write
+  # #1257: keyless cosign signing and build provenance need an OIDC token.
+  id-token: write
+  attestations: write
 
 concurrency:
   group: gitops-promote
@@ -45,10 +48,34 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: docker/build-push-action@v6
+        id: build
         with:
           context: api-server
           push: true
           tags: ${{ env.IMAGE }}:${{ github.sha }}
+
+      # #1257: sign, attest an SBOM, and attest provenance for the pushed digest.
+      - uses: sigstore/cosign-installer@v3
+
+      - uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+
+      - name: Sign image (keyless) and attach SBOM
+        env:
+          DIGEST_REF: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cosign sign --yes "${DIGEST_REF}"
+          cosign attest --yes --type spdxjson --predicate sbom.spdx.json "${DIGEST_REF}"
+
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
 
       - name: Install kustomize
         run: |
@@ -76,6 +103,20 @@ jobs:
 
       - name: Verify image exists
         run: docker manifest inspect "${IMAGE}:${{ inputs.tag }}" > /dev/null
+
+      # #1257: refuse to promote an image that was not signed by this repo's
+      # workflow on the main branch.
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Verify image signature
+        env:
+          IMAGE_REF: ${{ env.IMAGE }}:${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          cosign verify \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-identity-regexp "^https://github.com/${GITHUB_REPOSITORY}/.github/workflows/gitops-promote.yml@refs/heads/main$" \
+            "${IMAGE_REF}" > /dev/null
 
       - name: Install kustomize
         run: |
