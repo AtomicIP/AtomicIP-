@@ -695,7 +695,7 @@ fn build_app() -> Router {
         .route("/v1/swaps/execute-batch", post(handlers::execute_batch_swaps))
         .route("/v1/portfolio/{owner}", get(portfolio::get_portfolio))
         .route("/v1/portfolio/{owner}/holdings", post(portfolio::put_holdings))
-        .route("/v1/valuation/sales", post(valuation::post_sale))
+        .route("/v1/valuation/sales", post(valuation::post_sale).layer(signed.clone()))
         .route("/v1/valuation/{commitment_id}", get(valuation::get_valuation))
         .route("/v1/transfers", post(transfers::create_transfer).layer(signed.clone()))
         .route("/v1/transfers/{id}", get(transfers::get_transfer))
