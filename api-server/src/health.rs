@@ -566,27 +566,6 @@ impl Default for HealthChecker {
     }
 }
 
-pub async fn health_handler(
-    axum::extract::State(checker): axum::extract::State<Arc<HealthChecker>>,
-) -> Response {
-    checker.check_contract_connectivity().await;
-    checker.check_database().await;
-    checker.check_cache().await;
-    checker.check_memory().await;
-    checker.check_disk().await;
-
-    let health = checker.get_health().await;
-
-    // Distinguish degraded (RPC slow/circuit open) from down (process failing)
-    let status_code = match health.status.as_str() {
-        "healthy" => StatusCode::OK,
-        "degraded" => StatusCode::OK,
-        "down" | _ => StatusCode::SERVICE_UNAVAILABLE,
-    };
-
-    (status_code, Json(health)).into_response()
-}
-
 /// Returns the configured internal CIDR allow-list for `/health/detailed`.
 ///
 /// Parsed from `HEALTH_DETAILED_ALLOWED_CIDRS` (comma-separated, e.g.
