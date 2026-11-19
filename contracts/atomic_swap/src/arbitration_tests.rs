@@ -703,4 +703,32 @@ mod arbitration_tests {
         // Disabled — must always panic, regardless of caller or dispute state.
         client.batch_arbitrate_swaps(&swap_ids, &arbitrator, &true);
     }
+
+    // ── #1360: arbitrate_swap is unreachable after set_arbitrator ─────────────
+    //
+    // `set_arbitrator` writes `ArbitratorCommittee`, but `arbitrate_swap` reads
+    // `SwapArbitrator`, which nothing writes. This test pins that the
+    // single-arbitrator entry point always fails with `NoArbitratorSet` even
+    // when a committee is configured for the same swap.
+
+    #[test]
+    fn test_arbitrate_swap_fails_even_when_committee_is_set() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, swap_id, _, _) = setup_disputed_swap(&env);
+        let signers = committee(&env);
+        let admin = Address::generate(&env);
+
+        client.set_admin(&admin);
+        client.set_arbitrator(&swap_id, &admin, &signers, &2u32);
+
+        let arbitrator = signers.get(0).unwrap();
+        let result = client.try_arbitrate_swap(&swap_id, &arbitrator, &true);
+        assert!(result.is_err(), "arbitrate_swap unexpectedly succeeded");
+        assert_eq!(
+            client.get_swap(&swap_id).unwrap().status,
+            SwapStatus::Disputed
+        );
+    }
 }

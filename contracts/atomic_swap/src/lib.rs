@@ -6569,6 +6569,8 @@ mod escrow_release_tests;
 mod liquidity_pool_tests;
 #[cfg(test)]
 mod finality_tests;
+#[cfg(test)]
+mod reputation_sync_tests;
 
 // #781: re-enabled — was blocked by 3 pre-existing, unrelated compile errors
 // (a dropped `commit_ip` arg, and two obsolete `accept_swap_with_quantity`

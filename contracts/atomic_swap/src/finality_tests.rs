@@ -37,6 +37,17 @@ mod tests {
         }
     }
 
+    /// Callback target that always panics, simulating a broken integration.
+    #[contract]
+    pub struct FinalityPanicker;
+
+    #[contractimpl]
+    impl FinalityPanicker {
+        pub fn on_final(_env: Env, _swap_id: u64) {
+            panic!("callback failed");
+        }
+    }
+
     struct Fixture {
         env: Env,
         contract_id: Address,
@@ -258,5 +269,64 @@ mod tests {
                 &symbol_short!("on_final"),
             );
         }
+    }
+
+    // ── #1361: one failing callback blocks the rest ─────────────────────────
+    //
+    // A panicking callback reverts the whole `execute_finality_callbacks`
+    // transaction. The callback list stays in storage, so every later attempt
+    // fails the same way and the healthy callback never runs.
+
+    #[test]
+    fn test_panicking_callback_blocks_healthy_callback() {
+        let f = settled_swap();
+        let panicker = f.env.register(FinalityPanicker, ());
+        let receiver = f.env.register(FinalityReceiver, ());
+        let receiver_client = FinalityReceiverClient::new(&f.env, &receiver);
+
+        f.client().register_finality_callback(
+            &f.swap_id,
+            &f.seller,
+            &panicker,
+            &symbol_short!("on_final"),
+        );
+        f.client().register_finality_callback(
+            &f.swap_id,
+            &f.buyer,
+            &receiver,
+            &symbol_short!("on_final"),
+        );
+
+        f.advance_ledgers(DEFAULT_FINALITY_BLOCKS);
+        assert!(f.client().try_execute_finality_callbacks(&f.swap_id).is_err());
+        assert_eq!(receiver_client.hits(), 0);
+
+        // The failing callback is still stored, so the next run fails too.
+        assert!(f.client().try_execute_finality_callbacks(&f.swap_id).is_err());
+        assert_eq!(receiver_client.hits(), 0);
+    }
+
+    // ── #1362: register_finality_callback has no target allowlist ───────────
+    //
+    // Any contract and function pair is accepted at registration time. There
+    // is no admin allowlist or opt-in check. This test pins that behaviour.
+
+    #[test]
+    fn test_register_accepts_arbitrary_unlisted_target() {
+        let f = settled_swap();
+        let unlisted = Address::generate(&f.env);
+
+        f.client().register_finality_callback(
+            &f.swap_id,
+            &f.buyer,
+            &unlisted,
+            &symbol_short!("transfer"),
+        );
+        f.client().register_finality_callback(
+            &f.swap_id,
+            &f.seller,
+            &f.contract_id,
+            &symbol_short!("withdraw"),
+        );
     }
 }
