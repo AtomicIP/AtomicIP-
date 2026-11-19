@@ -24,12 +24,12 @@ jobs:
           fetch-depth: 0
 
       - name: Check security policy links
-        uses: lycheeverse/lychee-action@v2
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8  # v2
         with:
           args: --offline --include-fragments SECURITY.md
 
       - name: Secret scanning (Gitleaks)
-        uses: gitleaks/gitleaks-action@v2
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7  # v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -42,7 +42,11 @@ jobs:
       - name: Check ADR links
         run: ./scripts/check-adr-links.sh
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Check third-party action pins
+        # Rejects tag or branch pins for third-party actions. See scripts/check-action-pins.sh.
+        run: ./scripts/check-action-pins.sh
+
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca  # stable
 
       - uses: actions/setup-node@v4
         with:
@@ -151,7 +155,7 @@ jobs:
         run: ./scripts/coverage-threshold-gate.sh
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v3
+        uses: codecov/codecov-action@ab904c41d6ece82784817410c45d8b8c02684457  # v3
         with:
           files: ./coverage/lcov.info
           flags: javascript

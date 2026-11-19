@@ -55,3 +55,18 @@ updates:
     rebase-strategy: "auto"
     # Auto-merge patch and minor updates for dependencies
     auto-merge: true
+
+  # GitHub Actions: keeps the commit-SHA pins current (see scripts/check-action-pins.sh)
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "03:00"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+      - "github-actions"
+    commit-message:
+      prefix: "chore(ci):"
+      include: "scope"
