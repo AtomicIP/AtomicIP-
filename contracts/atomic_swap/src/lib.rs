@@ -3297,6 +3297,7 @@ impl AtomicSwap {
             finalized: false,
             min_increment_bps,
             anti_snipe_window_secs,
+            failed: false,
         };
 
         env.storage()
@@ -3502,6 +3503,14 @@ impl AtomicSwap {
             env.panic_with_error(Error::from_contract_error(ContractError::NotExpired as u32));
         }
 
+        // #1357: the IP may have been transferred or revoked while the auction
+        // ran. Re-check ownership now so the buyer is never sold an IP the
+        // seller no longer owns. The non-panicking check lets a failure refund
+        // the winner instead of reverting finalization.
+        let seller_still_owns =
+            registry::seller_owns_active_ip(&env, auction.ip_id, &auction.seller);
+        auction.failed = !seller_still_owns;
+
         auction.finalized = true;
         env.storage()
             .persistent()
@@ -3519,6 +3528,23 @@ impl AtomicSwap {
 
         let winning_bid = auction.highest_bid;
         let winner = auction.highest_bidder.clone();
+
+        // #1357: seller no longer owns the IP. Refund the winner (pull-based)
+        // and report no sale. No swap is created.
+        if !seller_still_owns {
+            if let Some(bidder) = winner {
+                Self::credit_pending_refund(&env, &bidder, &auction.token, winning_bid);
+            }
+            env.events().publish(
+                (soroban_sdk::symbol_short!("auc_fnl"),),
+                AuctionFinalizedEvent {
+                    auction_id,
+                    winner: None,
+                    winning_bid: 0,
+                },
+            );
+            return;
+        }
 
         env.events().publish(
             (soroban_sdk::symbol_short!("auc_fnl"),),

@@ -20,6 +20,8 @@ mod auction_tests {
         token: Address,
         seller: Address,
         auction_id: u64,
+        registry_id: Address,
+        ip_id: u64,
     }
 
     fn setup(env: &Env, min_increment_bps: u32, anti_snipe_window_secs: u64) -> Fixture<'_> {
@@ -57,6 +59,8 @@ mod auction_tests {
             token,
             seller,
             auction_id,
+            registry_id,
+            ip_id,
         }
     }
 
@@ -242,6 +246,61 @@ mod auction_tests {
         let f = setup(&env, 0, 0);
         let stranger = Address::generate(&env);
         f.client.withdraw_refund(&stranger, &f.token);
+    }
+
+    // ── Seller ownership re-check at finalization (#1357) ─────────────────────
+
+    #[test]
+    fn test_finalize_with_seller_still_owner_creates_swap() {
+        let env = Env::default();
+        let f = setup(&env, 0, 0);
+        let winner = bid_as_new(&f, 1_000);
+        set_time(&env, START + DURATION);
+
+        f.client.finalize_auction(&f.auction_id);
+
+        let swap = f.client.get_swap(&0).expect("swap created");
+        assert_eq!(swap.buyer, winner);
+        assert_eq!(swap.price, 1_000);
+        assert!(!f.client.get_auction(&f.auction_id).failed);
+    }
+
+    #[test]
+    fn test_transfer_during_auction_refunds_winner() {
+        let env = Env::default();
+        let f = setup(&env, 0, 0);
+        let winner = bid_as_new(&f, 1_000);
+
+        let registry = IpRegistryClient::new(&env, &f.registry_id);
+        registry.transfer_ip(&f.ip_id, &Address::generate(&env));
+
+        set_time(&env, START + DURATION);
+        f.client.finalize_auction(&f.auction_id);
+
+        assert!(f.client.get_swap(&0).is_none());
+        assert!(f.client.get_auction(&f.auction_id).failed);
+        assert_eq!(f.client.get_pending_refund(&winner, &f.token), 1_000);
+
+        let paid = f.client.withdraw_refund(&winner, &f.token);
+        assert_eq!(paid, 1_000);
+        assert_eq!(TokenClient::new(&env, &f.token).balance(&winner), 1_000);
+    }
+
+    #[test]
+    fn test_revoke_during_auction_refunds_winner() {
+        let env = Env::default();
+        let f = setup(&env, 0, 0);
+        let winner = bid_as_new(&f, 1_000);
+
+        let registry = IpRegistryClient::new(&env, &f.registry_id);
+        registry.revoke_ip(&f.ip_id);
+
+        set_time(&env, START + DURATION);
+        f.client.finalize_auction(&f.auction_id);
+
+        assert!(f.client.get_swap(&0).is_none());
+        assert!(f.client.get_auction(&f.auction_id).failed);
+        assert_eq!(f.client.get_pending_refund(&winner, &f.token), 1_000);
     }
 
     #[test]

@@ -381,6 +381,10 @@ pub struct AuctionRecord {
     /// #1355: A valid bid placed while `end_time - now <= anti_snipe_window_secs`
     /// moves `end_time` to `now + anti_snipe_window_secs`. Zero disables extension.
     pub anti_snipe_window_secs: u64,
+    /// #1357: Set when finalization found the seller no longer owned the IP
+    /// (transferred or revoked during the auction). No swap is created and the
+    /// winning bid is credited back as a pending refund.
+    pub failed: bool,
 }
 
 #[contracttype]
