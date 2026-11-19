@@ -311,4 +311,27 @@ mod metadata_encryption_tests {
         ];
         registry.store_encrypted_metadata(&ip_id, &fields_map(&env, &entries), &Vec::new(&env));
     }
+
+    // ── Plaintext metadata re-tagging ─────────────────────────────────────────
+
+    #[test]
+    fn replacing_commitment_metadata_drops_stale_tag_index() {
+        let (env, registry) = setup();
+        let owner = Address::generate(&env);
+        let ip_id = registry.commit_ip(&owner, &hash(&env, b"retag"), &0);
+        let old_tag = hash(&env, b"old-tag");
+        let new_tag = hash(&env, b"new-tag");
+        let data = Bytes::from_slice(&env, &[0xAAu8; 16]);
+        let nonce = BytesN::from_array(&env, &[0x01u8; 12]);
+
+        registry.store_commitment_metadata(&ip_id, &data, &nonce, &tags(&env, &[old_tag.clone()]));
+        assert_eq!(registry.search_commitment_metadata(&old_tag, &0, &10).ip_ids.len(), 1);
+
+        registry.store_commitment_metadata(&ip_id, &data, &nonce, &tags(&env, &[new_tag.clone()]));
+
+        assert_eq!(registry.search_commitment_metadata(&old_tag, &0, &10).ip_ids.len(), 0);
+        let hits = registry.search_commitment_metadata(&new_tag, &0, &10).ip_ids;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits.get(0), Some(ip_id));
+    }
 }

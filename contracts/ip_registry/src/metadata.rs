@@ -33,6 +33,11 @@ pub fn store_metadata(
         env.panic_with_error(crate::ContractError::MetadataTooLarge);
     }
 
+    // Drop index entries for the previous tag set so replaced tags stop matching.
+    if let Some(previous) = get_metadata(env, ip_id) {
+        remove_tag_indices(env, ip_id, &previous.tag_hashes);
+    }
+
     let metadata = IpMetadata {
         ip_id,
         encrypted_data,
