@@ -350,9 +350,6 @@ pub struct ProtocolConfig {
     pub arbitration_timeout_seconds: u64,
     /// #781: How long (seconds) a committee ruling must wait before
     /// `execute_ruling` can move funds. Default: 48 hours = 172_800 seconds.
-    /// Note: `store_protocol_config` is a pre-existing no-op stub, so this
-    /// field cannot actually be reconfigured at runtime today — see its
-    /// definition below.
     pub arbitration_ruling_delay_secs: u64,
     /// #1168: Insurance premium rate in basis points (100 = 1%), applied to
     /// `price` when insurance is enabled on a swap. Default: 200 (2%),
@@ -1905,12 +1902,11 @@ impl AtomicSwap {
 
     /// #781: Refunds the winning party's dispute bond and forfeits the
     /// losing party's bond. Forfeited bonds go to the current `DataKey::Admin`
-    /// address rather than `protocol_config().treasury` — `protocol_config()`
-    /// (below) unconditionally returns a hardcoded placeholder address
-    /// regardless of what's configured (a pre-existing storage bug this PR
-    /// does not fix); routing real forfeited value through it would be a new,
-    /// self-inflicted loss path, so real value is deliberately kept on the
-    /// one admin-storage path that actually round-trips correctly today.
+    /// address rather than `protocol_config().treasury`. Forfeited bonds stay
+    /// on the admin path deliberately: the treasury returned by
+    /// `protocol_config()` is only the built-in default until an admin sets
+    /// one (#1330), so routing real value through it could send funds to a
+    /// placeholder address.
     fn settle_dispute_bonds(
         env: &Env,
         swap_id: u64,
@@ -2711,14 +2707,29 @@ impl AtomicSwap {
         );
     }
 
-    fn store_protocol_config(_env: &Env, _config: &ProtocolConfig) {
-        // ProtocolConfig storage temporarily disabled due to trait generation issues
-        // env.storage().persistent().set(&DataKey::ProtocolConfig, config);
-        // env.storage().persistent().extend_ttl(&DataKey::ProtocolConfig, LEDGER_BUMP, LEDGER_BUMP);
+    /// #1330: persists the protocol config so `admin_set_protocol_config` takes
+    /// effect. `ProtocolConfig` is a `#[contracttype]`, so it round-trips through
+    /// persistent storage like the other stored records.
+    fn store_protocol_config(env: &Env, config: &ProtocolConfig) {
+        env.storage()
+            .persistent()
+            .set(&DataKey::ProtocolConfig, config);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::ProtocolConfig, LEDGER_BUMP, LEDGER_BUMP);
     }
 
+    /// Returns the stored protocol config, or the built-in defaults if an admin
+    /// has never set one (#1330).
     fn protocol_config(env: &Env) -> ProtocolConfig {
-        // Return default config since storage is disabled
+        if let Some(config) = env
+            .storage()
+            .persistent()
+            .get::<_, ProtocolConfig>(&DataKey::ProtocolConfig)
+        {
+            return config;
+        }
+
         ProtocolConfig {
             protocol_fee_bps: 250,
             treasury: Address::from_string(&soroban_sdk::String::from_str(
