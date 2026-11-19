@@ -15,6 +15,11 @@
 #   --skip-init     Skip initialization
 #   --dry-run       Simulate deployment without executing
 #   --verbose       Enable verbose output
+#   --confirm-network NAME
+#                   Required for mainnet: must be typed as "mainnet"
+#   --allow-mainnet-fresh
+#                   Required with --fresh on mainnet. --fresh deletes the
+#                   deployer key, which administers live contracts (#1258)
 ################################################################################
 
 set -e
@@ -26,6 +31,8 @@ SKIP_BUILD=false
 SKIP_INIT=false
 DRY_RUN=false
 NETWORK="testnet"
+CONFIRM_NETWORK=""
+ALLOW_MAINNET_FRESH=false
 
 # Color output
 RED='\033[0;31m'
@@ -79,6 +86,14 @@ parse_args() {
                 VERBOSE=true
                 shift
                 ;;
+            --confirm-network)
+                CONFIRM_NETWORK="${2:-}"
+                shift 2
+                ;;
+            --allow-mainnet-fresh)
+                ALLOW_MAINNET_FRESH=true
+                shift
+                ;;
             *)
                 log_error "Unknown option: $1"
                 print_usage
@@ -90,6 +105,26 @@ parse_args() {
     # Set network-specific files
     DEPLOY_STATE_FILE=".$NETWORK-state.json"
     LOG_FILE="$NETWORK-deploy-$(date +%Y%m%d-%H%M%S).log"
+}
+
+# #1258: Mainnet guard. Runs before any tool or key operation.
+#  - Any mainnet deployment must type the network name: --confirm-network mainnet
+#  - --fresh on mainnet deletes the deployer key, so it also needs
+#    --allow-mainnet-fresh
+guard_mainnet() {
+    if [[ "$NETWORK" != "mainnet" ]]; then
+        return 0
+    fi
+
+    if [[ "$CONFIRM_NETWORK" != "mainnet" ]]; then
+        log_error "Refusing mainnet deployment: pass --confirm-network mainnet to confirm the target"
+        exit 1
+    fi
+
+    if [[ "$FRESH_DEPLOY" == true && "$ALLOW_MAINNET_FRESH" != true ]]; then
+        log_error "Refusing --fresh on mainnet: it deletes the live deployer key. Pass --allow-mainnet-fresh to proceed"
+        exit 1
+    fi
 }
 
 print_usage() {
@@ -346,6 +381,7 @@ main() {
     trap cleanup EXIT
 
     parse_args "$@"
+    guard_mainnet
 
     log "=== Atomic Patent Deployment ==="
     log "Network: $NETWORK"
