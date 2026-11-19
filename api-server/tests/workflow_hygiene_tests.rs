@@ -89,3 +89,28 @@ mod issue_1252_deprecated_actions {
         }
     }
 }
+
+// ── Issue #1253: upgrade codecov-action from v3 ──────────────────────────────
+
+mod issue_1253_codecov_action {
+    use super::*;
+
+    #[test]
+    fn ci_does_not_use_codecov_action_v3() {
+        let content = read_workflow("ci.yml");
+        assert!(
+            !content.contains("codecov/codecov-action@v3"),
+            "ci.yml must not use codecov/codecov-action@v3"
+        );
+    }
+
+    #[test]
+    fn ci_uses_codecov_action_v5_with_coverage_upload() {
+        let content = read_workflow("ci.yml");
+        assert!(
+            content.contains("codecov/codecov-action@v5"),
+            "ci.yml must pin codecov/codecov-action@v5"
+        );
+        assert!(content.contains("./coverage/lcov.info"));
+    }
+}
