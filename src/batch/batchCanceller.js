@@ -50,6 +50,15 @@ function validateCancellation(cancellation, swap) {
   {throw new TypeError(
     `Swap ${swap.swapId}: invalid refundPolicy '${policy}'.`
   );}
+  const feePaid = cancellation?.feePaid;
+  if (feePaid !== undefined && feePaid !== null) {
+    if (typeof feePaid !== 'number' || !Number.isFinite(feePaid))
+    {throw new TypeError(`Swap ${swap.swapId}: feePaid must be a finite number.`);}
+    if (feePaid < 0)
+    {throw new RangeError(`Swap ${swap.swapId}: feePaid must not be negative.`);}
+    if (feePaid > swap.amount)
+    {throw new RangeError(`Swap ${swap.swapId}: feePaid must not exceed swap amount.`);}
+  }
 }
 
 // ── Refund calculation ────────────────────────────────────────────────────────
