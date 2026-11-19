@@ -1032,28 +1032,8 @@ impl AtomicSwap {
         Self::validate_contingencies(&env, swap_id);
 
         // Verify commitment via IP registry
-        // Guard: if this swap has required signers, all must have signed before reveal.
-        if env
-            .storage()
-            .persistent()
-            .has(&DataKey::SwapSigners(swap_id))
-        {
-            let signers: Vec<Address> = env
-                .storage()
-                .persistent()
-                .get(&DataKey::SwapSigners(swap_id))
-                .unwrap_or(Vec::new(&env));
-            let signed: Vec<Address> = env
-                .storage()
-                .persistent()
-                .get(&DataKey::SwapSignatures(swap_id))
-                .unwrap_or(Vec::new(&env));
-            if signed.len() < signers.len() {
-                env.panic_with_error(Error::from_contract_error(
-                    ContractError::NotAllSigned as u32,
-                ));
-            }
-        }
+        // #1340: shared multi-signer gate (also enforced by batch_reveal_keys).
+        require_all_signed(&env, swap_id);
 
         let valid = registry::verify_commitment(&env, swap.ip_id, &secret, &blinding_factor);
         if !valid {
@@ -4473,6 +4453,11 @@ impl AtomicSwap {
                 ContractError::NotAccepted,
             );
             Self::validate_contingencies(&env, swap_id);
+            // #1340: batch path must enforce the same co-signer gate and buyer conditions as reveal_key.
+            require_all_signed(&env, swap_id);
+            if !swap.conditions.is_empty() {
+                Self::evaluate_conditions(&env, &swap, true);
+            }
             let valid = registry::verify_commitment(
                 &env,
                 swap.ip_id,

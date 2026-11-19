@@ -122,4 +122,68 @@ mod batch_reveal_security_tests {
             "swap must remain Accepted after a rejected batch"
         );
     }
+
+    // ── #1340: multi-signer gate in batch_reveal_keys ────────────────────────
+
+    #[test]
+    fn test_batch_reveal_requires_all_signers() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let signer_a = Address::generate(&env);
+        let signer_b = Address::generate(&env);
+
+        let registry_id = setup_registry(&env);
+        let token_id = setup_token(&env, &admin, &buyer, 10_000_000);
+        let contract_id = setup_contract(&env, &registry_id);
+        let client = AtomicSwapClient::new(&env, &contract_id);
+
+        let (ip1, s1, b1) = commit_ip(&env, &registry_id, &seller, 0x11);
+
+        let mut signers = Vec::new(&env);
+        signers.push_back(signer_a.clone());
+        signers.push_back(signer_b.clone());
+        let swap_id = client
+            .initiate_swap_with_signers(&token_id, &ip1, &seller, &1000i128, &buyer, &signers);
+
+        let mut ids = Vec::new(&env);
+        ids.push_back(swap_id);
+        client.batch_accept_swaps(&ids, &buyer);
+
+        let mut secrets = Vec::new(&env);
+        secrets.push_back(s1);
+        let mut blindings = Vec::new(&env);
+        blindings.push_back(b1);
+
+        // No co-signer has signed: the batch path must refuse, as reveal_key does.
+        let result = client.try_batch_reveal_keys(&ids, &secrets, &blindings, &seller);
+        assert!(
+            result.is_err(),
+            "unsigned multi-signer swap must not reveal via batch"
+        );
+        assert_eq!(
+            client.get_swap(&swap_id).unwrap().status,
+            SwapStatus::Accepted,
+            "swap must remain Accepted while signatures are missing"
+        );
+
+        // One of two signatures present: still refused.
+        client.sign_swap_reveal(&swap_id, &signer_a);
+        let result = client.try_batch_reveal_keys(&ids, &secrets, &blindings, &seller);
+        assert!(
+            result.is_err(),
+            "partially signed swap must not reveal via batch"
+        );
+
+        // All signatures present: the batch reveal succeeds.
+        client.sign_swap_reveal(&swap_id, &signer_b);
+        client.batch_reveal_keys(&ids, &secrets, &blindings, &seller);
+        assert_eq!(
+            client.get_swap(&swap_id).unwrap().status,
+            SwapStatus::Completed
+        );
+    }
 }

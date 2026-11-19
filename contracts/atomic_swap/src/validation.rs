@@ -489,3 +489,30 @@ pub fn require_unique_ids(env: &Env, ids: &Vec<u64>) {
         seen.set(id, ());
     }
 }
+
+/// #1340: a swap with required co-signers can only be revealed once every signer has
+/// signed. Shared by reveal_key and batch_reveal_keys so neither path can skip the gate.
+pub fn require_all_signed(env: &Env, swap_id: u64) {
+    if !env
+        .storage()
+        .persistent()
+        .has(&DataKey::SwapSigners(swap_id))
+    {
+        return;
+    }
+    let signers: Vec<Address> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::SwapSigners(swap_id))
+        .unwrap_or(Vec::new(env));
+    let signed: Vec<Address> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::SwapSignatures(swap_id))
+        .unwrap_or(Vec::new(env));
+    if signed.len() < signers.len() {
+        env.panic_with_error(Error::from_contract_error(
+            ContractError::NotAllSigned as u32,
+        ));
+    }
+}
