@@ -6,9 +6,49 @@
  */
 
 const { BATCH_CONSTANTS } = require("../schemas/batchSchemas");
+const {
+  Account,
+  Contract,
+  Networks,
+  StrKey,
+  TransactionBuilder,
+  BASE_FEE,
+  nativeToScVal,
+} = require("@stellar/stellar-sdk");
+
+/**
+ * Soroban integers cannot represent fractional JS numbers (e.g. a split
+ * ratio of 0.6). Such values are sent as their decimal string so the
+ * contract receives them losslessly; integers are encoded natively.
+ */
+function normalizeForScVal(value) {
+  if (typeof value === "number" && !Number.isInteger(value)) {
+    return String(value);
+  }
+  if (Array.isArray(value)) {
+    return value.map(normalizeForScVal);
+  }
+  if (value && typeof value === "object" && Object.getPrototypeOf(value) === Object.prototype) {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) {
+      out[k] = normalizeForScVal(v);
+    }
+    return out;
+  }
+  return value;
+}
+
+// Placeholder source used only for simulation when no account is supplied.
+// Simulation does not require a funded or signing account.
+const SIMULATION_SOURCE = StrKey.encodeEd25519PublicKey(Buffer.alloc(32));
 
 class ContractBridge {
-  constructor(sorobanRpcUrl, contractId) {
+  /**
+   * @param {string} sorobanRpcUrl
+   * @param {string} contractId      - Soroban contract address (C...)
+   * @param {{ sourceAccount?: string, networkPassphrase?: string }} [options]
+   */
+  constructor(sorobanRpcUrl, contractId, options = {}) {
     if (!sorobanRpcUrl) {
       throw new Error("sorobanRpcUrl is required");
     }
@@ -17,6 +57,8 @@ class ContractBridge {
     }
     this.rpcUrl = sorobanRpcUrl;
     this.contractId = contractId;
+    this.sourceAccount = options.sourceAccount ?? SIMULATION_SOURCE;
+    this.networkPassphrase = options.networkPassphrase ?? Networks.TESTNET;
   }
 
   submitBatchCancellations(batchResult) {
@@ -149,8 +191,21 @@ class ContractBridge {
     };
   }
 
+  /**
+   * Build a base64-encoded, unsigned Soroban transaction envelope that
+   * invokes `method` on the bridge's contract with `params` as a map argument.
+   */
   _buildContractInvocation(method, params) {
-    return `contract_invocation_${method}_${JSON.stringify(params).length}`;
+    const contract = new Contract(this.contractId);
+    const args = params === undefined ? [] : [nativeToScVal(normalizeForScVal(params))];
+    const tx = new TransactionBuilder(new Account(this.sourceAccount, "0"), {
+      fee: BASE_FEE,
+      networkPassphrase: this.networkPassphrase,
+    })
+      .addOperation(contract.call(method, ...args))
+      .setTimeout(30)
+      .build();
+    return tx.toEnvelope().toXDR("base64");
   }
 }
 

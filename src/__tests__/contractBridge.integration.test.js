@@ -21,7 +21,7 @@ const mockRpcResponse = (txHash = "abc123") => {
 describe("ContractBridge", () => {
   let bridge;
   const mockRpcUrl = "http://localhost:8000/soroban/rpc";
-  const mockContractId = "CAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB";
+  const mockContractId = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
 
   beforeEach(() => {
     bridge = new ContractBridge(mockRpcUrl, mockContractId);

@@ -3,7 +3,6 @@
   "version": "1.0.0",
   "description": "Atomic Patent - Decentralized IP Registry on Stellar Soroban",
   "private": true,
-  "type": "module",
   "scripts": {
     "test": "jest",
     "test:watch": "jest --watch",
@@ -49,5 +48,8 @@
         "statements": 70
       }
     }
+  },
+  "dependencies": {
+    "@stellar/stellar-sdk": "13.3.0"
   }
 }
