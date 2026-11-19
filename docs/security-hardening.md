@@ -753,7 +753,7 @@ For security issues:
 
 # Part II: Operational Checklists
 
-*Moved from `SECURITY_CHECKLIST.md`, which now points here. This guide is the single authoritative hardening reference.*
+*Moved from `security-checklist.md`, which now points here. This guide is the single authoritative hardening reference.*
 
 Quick reference checklists for security-critical operations.
 
