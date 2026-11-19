@@ -6,7 +6,7 @@
 //! clock: `Pending` before `start`, `Active` between `start` and `expiry`, and
 //! `Expired` from `expiry` onward.
 
-use axum::{extract::Path, http::StatusCode, Json};
+use axum::{extract::Path, http::{HeaderMap, StatusCode}, Json};
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
@@ -216,10 +216,37 @@ fn respond(result: Result<License, LicenseError>, now: u64) -> Result<Json<Licen
         .map_err(|err| (err.status(), Json(ErrorResponse { error: err.message() })))
 }
 
-/// `POST /v1/licenses` — create a license agreement.
+/// Reject the request unless the signature-verified `X-Public-Key` equals `expected`.
+///
+/// The request-signing layer proves the caller holds the key named in
+/// `X-Public-Key`; this binds that proven key to the party the action is for,
+/// so a caller cannot act under someone else's licensor/licensee name.
+fn require_signer(
+    headers: &HeaderMap,
+    expected: &str,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let signer = headers
+        .get("X-Public-Key")
+        .and_then(|v| v.to_str().ok())
+        .ok_or((
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse { error: "missing X-Public-Key".to_string() }),
+        ))?;
+    if signer != expected {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse { error: "signer does not match the required party".to_string() }),
+        ));
+    }
+    Ok(())
+}
+
+/// `POST /v1/licenses` — create a license agreement. The signer must be the licensor.
 pub async fn create_license(
+    headers: HeaderMap,
     Json(body): Json<CreateLicenseRequest>,
 ) -> Result<(StatusCode, Json<LicenseResponse>), (StatusCode, Json<ErrorResponse>)> {
+    require_signer(&headers, &body.licensor)?;
     let now = now_timestamp();
     match create(body, now) {
         Ok(license) => {
@@ -235,20 +262,32 @@ pub async fn get_license(Path(id): Path<u64>) -> Result<Json<LicenseResponse>, (
     respond(get(id).ok_or(LicenseError::NotFound(id)), now_timestamp())
 }
 
-/// `POST /v1/licenses/{id}/terms` — amend terms before the license starts.
+/// `POST /v1/licenses/{id}/terms` — amend terms before the license starts. The signer must be the licensor.
 pub async fn update_license_terms(
     Path(id): Path<u64>,
+    headers: HeaderMap,
     Json(body): Json<UpdateTermsRequest>,
 ) -> Result<Json<LicenseResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let license = get(id).ok_or((
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse { error: format!("license {id} not found") }),
+    ))?;
+    require_signer(&headers, &license.licensor)?;
     let now = now_timestamp();
     respond(update_terms(id, body, now), now)
 }
 
-/// `POST /v1/licenses/{id}/royalties` — record licensee revenue and accrue royalties.
+/// `POST /v1/licenses/{id}/royalties` — record licensee revenue and accrue royalties. The signer must be the licensee.
 pub async fn record_license_royalty(
     Path(id): Path<u64>,
+    headers: HeaderMap,
     Json(body): Json<RecordRoyaltyRequest>,
 ) -> Result<Json<LicenseResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let license = get(id).ok_or((
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse { error: format!("license {id} not found") }),
+    ))?;
+    require_signer(&headers, &license.licensee)?;
     let now = now_timestamp();
     respond(record_royalty(id, body.gross_revenue, now), now)
 }
@@ -344,5 +383,29 @@ mod tests {
     #[test]
     fn unknown_license_is_not_found() {
         assert_eq!(record_royalty(u64::MAX, 1, 0), Err(LicenseError::NotFound(u64::MAX)));
+    }
+
+    fn headers_with_key(key: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Public-Key", key.parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn require_signer_accepts_matching_key() {
+        assert!(require_signer(&headers_with_key("GLICENSOR"), "GLICENSOR").is_ok());
+    }
+
+    #[test]
+    fn require_signer_rejects_other_key() {
+        // #1310: a caller signing with its own key cannot act for a different licensor/licensee.
+        let err = require_signer(&headers_with_key("GATTACKER"), "GLICENSOR").unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn require_signer_rejects_missing_key_header() {
+        let err = require_signer(&HeaderMap::new(), "GLICENSOR").unwrap_err();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
     }
 }
