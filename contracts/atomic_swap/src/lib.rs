@@ -6574,6 +6574,10 @@ mod finality_tests;
 #[cfg(test)]
 mod self_trade_guard_tests;
 
+// #1348: installment count enforcement and dedicated zero/overpayment errors.
+#[cfg(test)]
+mod installment_limit_tests;
+
 // #781: re-enabled — was blocked by 3 pre-existing, unrelated compile errors
 // (a dropped `commit_ip` arg, and two obsolete `accept_swap_with_quantity`
 // calls to a since-removed function; both fixed / removed in this PR).
