@@ -454,6 +454,28 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
+    /// #1315: the middleware must not panic when no `DeduplicationStore`
+    /// extension was inserted; it should answer with a 500 instead.
+    #[tokio::test]
+    async fn test_deduplication_without_store_extension_returns_500() {
+        use axum::{middleware, routing::post, Router};
+        use tower::ServiceExt;
+
+        let app = Router::new()
+            .route("/test", post(|| async { "ok" }))
+            .layer(middleware::from_fn(deduplication_middleware));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/test")
+            .header("x-idempotency-key", "missing-store-key")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
     #[tokio::test]
     async fn test_concurrent_deduplicator_first_request() {
         let dedup = ConcurrentDeduplicator::new();
