@@ -242,3 +242,87 @@ fn test_batch_reveal_keys_enforces_buyer_conditions() {
         SwapStatus::Completed
     );
 }
+
+// ── #1341: every batch entry point rejects duplicate IDs ──────────────────────
+
+mod duplicate_id_props {
+    use proptest::prelude::*;
+    use soroban_sdk::{testutils::Address as _, Address, BytesN, Env, Vec};
+
+    use crate::{AtomicSwapClient, ContractError};
+
+    use super::{contract_error, setup_contract, setup_registry};
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(24))]
+
+        /// For any batch that contains a repeated ID, every batch entry point must
+        /// refuse it with `DuplicateSwapId`. The IDs here do not refer to real swaps,
+        /// so a result other than `DuplicateSwapId` would mean the duplicate check
+        /// ran too late, after per-swap lookups.
+        #[test]
+        fn prop_batches_with_duplicate_ids_are_rejected(
+            base in proptest::collection::vec(0u64..1_000, 1..=8),
+        ) {
+            // Force a duplicate: append a copy of the first ID.
+            let mut raw = base.clone();
+            raw.push(base[0]);
+
+            let env = Env::default();
+            env.mock_all_auths();
+
+            let buyer = Address::generate(&env);
+            let registry_id = setup_registry(&env);
+            let contract_id = setup_contract(&env, &registry_id);
+            let client = AtomicSwapClient::new(&env, &contract_id);
+
+            let mut ids: Vec<u64> = Vec::new(&env);
+            for id in raw.iter() {
+                ids.push_back(*id);
+            }
+            let dup = contract_error(ContractError::DuplicateSwapId);
+
+            prop_assert_eq!(
+                client.try_execute_batch_swaps(&ids, &false).unwrap_err(),
+                dup.clone()
+            );
+            prop_assert_eq!(
+                client.try_execute_batch_swaps_prioritized(
+                    &ids,
+                    &false,
+                    &{
+                        let mut p = Vec::new(&env);
+                        for _ in 0..ids.len() {
+                            p.push_back(1u32);
+                        }
+                        p
+                    }
+                )
+                .unwrap_err(),
+                dup.clone()
+            );
+            prop_assert_eq!(
+                client.try_batch_escrow_deposit(&ids, &buyer).unwrap_err(),
+                dup.clone()
+            );
+            prop_assert_eq!(
+                client.try_batch_sign_swap_reveal(&ids, &buyer).unwrap_err(),
+                dup.clone()
+            );
+            prop_assert_eq!(
+                client.try_batch_timeout_auto_resolve(&ids).unwrap_err(),
+                dup.clone()
+            );
+            prop_assert_eq!(
+                client
+                    .try_batch_escrow_arbitration(
+                        &ids,
+                        &buyer,
+                        &BytesN::from_array(&env, &[0u8; 32]),
+                    )
+                    .unwrap_err(),
+                dup
+            );
+        }
+    }
+}
