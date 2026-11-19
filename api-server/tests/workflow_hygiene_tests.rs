@@ -12,8 +12,7 @@ fn workflows_dir() -> PathBuf {
 
 fn read_workflow(name: &str) -> String {
     let path = workflows_dir().join(name);
-    fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("failed to read {}: {}", path.display(), e))
+    fs::read_to_string(&path).unwrap_or_else(|e| panic!("failed to read {}: {}", path.display(), e))
 }
 
 fn all_workflow_files() -> Vec<(String, String)> {
@@ -189,5 +188,44 @@ mod issue_1254_workflow_permissions {
             !top.contains("pull-requests: write"),
             "pull-requests: write must not be granted at the workflow level"
         );
+    }
+}
+
+// ── Issue #1255: document deploy credential rotation (partial) ───────────────
+
+mod issue_1255_kube_config_rotation {
+    use super::*;
+
+    fn disaster_recovery_doc() -> String {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../docs/disaster-recovery.md");
+        fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {}", path.display(), e))
+    }
+
+    #[test]
+    fn deploy_workflows_reference_kube_config_secret() {
+        for name in ["blue-green-deploy.yml", "canary-deploy.yml"] {
+            assert!(
+                read_workflow(name).contains("secrets.KUBE_CONFIG"),
+                "{} is expected to use the KUBE_CONFIG secret",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn disaster_recovery_doc_has_kube_config_rotation_section() {
+        let doc = disaster_recovery_doc();
+        assert!(
+            doc.contains("## 9. Deploy credential rotation (KUBE_CONFIG)"),
+            "disaster-recovery.md must document KUBE_CONFIG rotation"
+        );
+        for step in ["service account", "KUBE_CONFIG", "Revoke", "drill log"] {
+            assert!(
+                doc.contains(step),
+                "rotation procedure must mention {:?}",
+                step
+            );
+        }
     }
 }
