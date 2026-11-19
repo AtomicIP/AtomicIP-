@@ -2064,10 +2064,12 @@ mod tests {
         env.mock_all_auths();
 
         let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[1u8; 32]), &0u32);
+        let ip_id_2 = client.commit_ip(&owner, &BytesN::from_array(&env, &[9u8; 32]), &0u32);
         let evidence = BytesN::from_array(&env, &[0xABu8; 32]);
 
+        // One open dispute per (challenger, IP), so use a second IP for the second dispute.
         let d1 = client.initiate_dispute(&ip_id, &challenger, &evidence);
-        let d2 = client.initiate_dispute(&ip_id, &challenger, &evidence);
+        let d2 = client.initiate_dispute(&ip_id_2, &challenger, &evidence);
 
         assert_eq!(d1, 1);
         assert_eq!(d2, 2);
@@ -2115,6 +2117,61 @@ mod tests {
 
         let record = client.get_dispute(&dispute_id);
         assert_eq!(record.evidence_hash, new_evidence);
+    }
+
+    // #1366: one open dispute per (challenger, IP).
+    #[test]
+    #[should_panic(expected = "Error(Contract, #67)")]
+    fn test_initiate_dispute_rejects_duplicate_open_dispute() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = <Address as TestAddress>::generate(&env);
+        let challenger = <Address as TestAddress>::generate(&env);
+        env.mock_all_auths();
+
+        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[20u8; 32]), &0u32);
+        let evidence = BytesN::from_array(&env, &[0x20u8; 32]);
+
+        client.initiate_dispute(&ip_id, &challenger, &evidence);
+        client.initiate_dispute(&ip_id, &challenger, &evidence);
+    }
+
+    #[test]
+    fn test_initiate_dispute_allows_different_challengers_on_same_ip() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = <Address as TestAddress>::generate(&env);
+        let challenger_a = <Address as TestAddress>::generate(&env);
+        let challenger_b = <Address as TestAddress>::generate(&env);
+        env.mock_all_auths();
+
+        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[21u8; 32]), &0u32);
+        let evidence = BytesN::from_array(&env, &[0x21u8; 32]);
+
+        let d1 = client.initiate_dispute(&ip_id, &challenger_a, &evidence);
+        let d2 = client.initiate_dispute(&ip_id, &challenger_b, &evidence);
+        assert_ne!(d1, d2);
+    }
+
+    #[test]
+    fn test_initiate_dispute_allowed_again_after_resolution() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = <Address as TestAddress>::generate(&env);
+        let challenger = <Address as TestAddress>::generate(&env);
+        env.mock_all_auths();
+        client.initialize(&owner);
+
+        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[22u8; 32]), &0u32);
+        let evidence = BytesN::from_array(&env, &[0x22u8; 32]);
+
+        let first = client.initiate_dispute(&ip_id, &challenger, &evidence);
+        client.resolve_dispute(&first, &owner);
+        let second = client.initiate_dispute(&ip_id, &challenger, &evidence);
+        assert_ne!(first, second);
     }
 
     // #1365: evidence is append-only; both parties' submissions are retained.

@@ -201,6 +201,8 @@ pub enum ContractError {
     MetadataKeyAlreadyRegistered = 65,
     /// Issue #1105: The metadata key has been retired and cannot be used for writes.
     MetadataKeyRetired = 66,
+    /// The challenger already has an open dispute against this IP.
+    DuplicateDispute = 67,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -348,6 +350,7 @@ pub enum DataKey {
     DelegateDepth(Address), // stores delegation depth for a given delegate
     IpDisputes(u64),        // stores DisputeRecord for a given dispute_id
     NextDisputeId,          // monotonic dispute ID counter
+    OpenDispute(Address, u64), // (challenger, ip_id) -> dispute_id of their open dispute on that IP
     DisputeEvidenceCount(u64), // number of append-only evidence entries for a dispute_id
     DisputeEvidence(u64, u32), // (dispute_id, index) -> DisputeEvidence entry
     IpStake(u64),           // Issue #447: stores StakeRecord for a given ip_id
@@ -5704,6 +5707,13 @@ impl IpRegistry {
         challenger.require_auth();
         require_ip_exists(&env, ip_id);
 
+        // #1366: a challenger may hold only one open dispute per IP. The marker
+        // is cleared when the dispute is resolved.
+        let open_key = DataKey::OpenDispute(challenger.clone(), ip_id);
+        if env.storage().persistent().has(&open_key) {
+            panic_with_error!(&env, ContractError::DuplicateDispute);
+        }
+
         let dispute_id: u64 = env
             .storage()
             .persistent()
@@ -5729,6 +5739,13 @@ impl IpRegistry {
             LEDGER_BUMP,
             LEDGER_BUMP,
         );
+
+        env.storage()
+            .persistent()
+            .set(&open_key, &dispute_id);
+        env.storage()
+            .persistent()
+            .extend_ttl(&open_key, LEDGER_BUMP, LEDGER_BUMP);
 
         // #1365: the challenger's initial evidence is entry 0 of the history.
         Self::append_dispute_evidence(&env, dispute_id, challenger.clone(), evidence_hash, timestamp);
@@ -5864,8 +5881,12 @@ impl IpRegistry {
             panic_with_error!(&env, ContractError::DisputeAlreadyResolved);
         }
 
+        // #1366: the challenger may open a new dispute on this IP once it is resolved.
+        env.storage()
+            .persistent()
+            .remove(&DataKey::OpenDispute(record.challenger.clone(), record.ip_id));
+
         record.resolved = true;
-        record.winner = Some(winner.clone());
         env.storage()
             .persistent()
             .set(&DataKey::IpDisputes(dispute_id), &record);
