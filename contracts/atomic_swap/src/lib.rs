@@ -6578,6 +6578,10 @@ mod self_trade_guard_tests;
 #[cfg(test)]
 mod installment_limit_tests;
 
+// #1349: fund-moving entry points must halt while the contract is paused.
+#[cfg(test)]
+mod pause_guard_tests;
+
 // #781: re-enabled — was blocked by 3 pre-existing, unrelated compile errors
 // (a dropped `commit_ip` arg, and two obsolete `accept_swap_with_quantity`
 // calls to a since-removed function; both fixed / removed in this PR).
