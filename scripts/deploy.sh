@@ -299,12 +299,33 @@ deploy_atomic_swap() {
     log_success "Atomic Swap deployed: $CONTRACT_ATOMIC_SWAP"
 }
 
+# #1259: Set the IP Registry admin. Without this, every admin-gated function
+# on a fresh deployment is unusable, because the admin is never stored.
+initialize_ip_registry() {
+    log "Initializing IP Registry with deployer admin..."
+    local admin_address="deployer"
+    if [[ "$DRY_RUN" == true ]]; then
+        log "[DRY-RUN] stellar contract invoke --id $CONTRACT_IP_REGISTRY --source deployer --network $NETWORK -- initialize --admin <deployer address>"
+    else
+        admin_address="$(stellar keys address deployer)"
+        stellar contract invoke \
+            --id "$CONTRACT_IP_REGISTRY" \
+            --source deployer \
+            --network "$NETWORK" \
+            -- initialize \
+            --admin "$admin_address"
+    fi
+    log_success "IP Registry initialized"
+}
+
 # Initialize contracts
 initialize_contracts() {
     if [[ "$SKIP_INIT" == true ]]; then
         log_warning "Skipping contract initialization (--skip-init)"
         return
     fi
+
+    initialize_ip_registry
 
     log "Initializing Atomic Swap with IP Registry address..."
     if [[ "$DRY_RUN" == true ]]; then
@@ -327,6 +348,12 @@ validate_deployment() {
     if [[ "$DRY_RUN" == true ]]; then
         log "[DRY-RUN] Skipping live validation"
         return
+    fi
+
+    # #1259: Confirm the IP Registry admin is set.
+    if [[ "$SKIP_INIT" != true ]]; then
+        "$(dirname "$0")/verify_deployment.sh" "$CONTRACT_IP_REGISTRY" "$NETWORK" \
+            || { log_error "IP Registry admin check failed"; return 1; }
     fi
 
     # Verify IP Registry is callable
