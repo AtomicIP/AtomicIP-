@@ -3337,6 +3337,13 @@ impl AtomicSwap {
             ));
         }
 
+        // #1354: a seller bidding on their own auction is shill bidding.
+        if bidder == auction.seller {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::SelfTradeNotAllowed as u32,
+            ));
+        }
+
         if env.ledger().timestamp() >= auction.end_time {
             env.panic_with_error(Error::from_contract_error(ContractError::NotExpired as u32));
         }
@@ -6563,6 +6570,10 @@ impl AtomicSwap {
 // #830: compile errors fixed — re-enabled
 #[cfg(test)]
 mod escrow_tests;
+
+// #1353/#1354: IP auction bid and duration guard tests.
+#[cfg(test)]
+mod auction_tests;
 #[cfg(test)]
 mod escrow_release_tests;
 #[cfg(test)]
