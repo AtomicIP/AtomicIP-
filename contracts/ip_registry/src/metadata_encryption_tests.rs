@@ -312,6 +312,29 @@ mod metadata_encryption_tests {
         registry.store_encrypted_metadata(&ip_id, &fields_map(&env, &entries), &Vec::new(&env));
     }
 
+    // ── Cleanup of expired IPs ────────────────────────────────────────────────
+
+    #[test]
+    fn cleanup_expired_ip_removes_metadata_and_tag_index() {
+        let (env, registry) = setup();
+        let owner = Address::generate(&env);
+        let ip_id = registry.commit_ip(&owner, &hash(&env, b"expiring"), &0);
+        let tag = hash(&env, b"expiring-tag");
+        let data = Bytes::from_slice(&env, &[0xBBu8; 16]);
+        let nonce = BytesN::from_array(&env, &[0x02u8; 12]);
+        registry.store_commitment_metadata(&ip_id, &data, &nonce, &tags(&env, &[tag.clone()]));
+        assert_eq!(registry.search_commitment_metadata(&tag, &0, &10).ip_ids.len(), 1);
+
+        let now = env.ledger().timestamp();
+        registry.set_ip_expiry(&ip_id, &(now + 100), &50);
+        env.ledger().with_mut(|l| l.timestamp = now + 200);
+        registry.cleanup_expired_ips(&Vec::from_array(&env, [ip_id]));
+
+        assert!(registry.try_get_ip(&ip_id).is_err());
+        assert!(registry.get_commitment_metadata(&ip_id).is_none());
+        assert_eq!(registry.search_commitment_metadata(&tag, &0, &10).ip_ids.len(), 0);
+    }
+
     // ── Plaintext metadata re-tagging ─────────────────────────────────────────
 
     #[test]

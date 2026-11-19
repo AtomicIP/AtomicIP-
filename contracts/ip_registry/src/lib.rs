@@ -7412,6 +7412,10 @@ impl IpRegistry {
                         .persistent()
                         .remove(&DataKey::CommitmentOwner(rec.commitment_hash.clone()));
 
+                    // Remove metadata and its tag-index entries so search cannot
+                    // return an IP whose record no longer exists.
+                    metadata::delete_metadata(&env, ip_id);
+
                     env.storage().persistent().remove(&DataKey::IpRecord(ip_id));
                     env.events()
                         .publish((symbol_short!("ip_clean"),), (ip_id, now));
