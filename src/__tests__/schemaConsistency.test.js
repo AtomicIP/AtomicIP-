@@ -181,3 +181,27 @@ describe("Schema Consistency — JSON Schema Validation", () => {
     });
   });
 });
+
+describe("Schema Consistency — MULTI_PARTY resolution (#1318)", () => {
+  const { BATCH_SCHEMAS } = require("../schemas/batchSchemas");
+  const { RESOLUTION_TYPES } = require("../batch/batchDisputeResolver");
+
+  const resolutionItem =
+    BATCH_SCHEMAS.resolveBatchDisputes.properties.resolutions.items;
+
+  test("resolution type enum includes MULTI_PARTY", () => {
+    expect(resolutionItem.properties.type.enum).toContain(
+      RESOLUTION_TYPES.MULTI_PARTY
+    );
+  });
+
+  test("resolution type enum matches every RESOLUTION_TYPES value", () => {
+    expect([...resolutionItem.properties.type.enum].sort()).toEqual(
+      Object.values(RESOLUTION_TYPES).sort()
+    );
+  });
+
+  test("resolution schema defines an allocations property", () => {
+    expect(resolutionItem.properties).toHaveProperty("allocations");
+  });
+});
