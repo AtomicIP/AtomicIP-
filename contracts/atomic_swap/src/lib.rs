@@ -712,6 +712,32 @@ impl AtomicSwap {
         }
     }
 
+    /// Buyer-side acceptance gates shared by `accept_swap` and `batch_accept_swaps`:
+    /// the buyer-set conditions (#351) and the seller's minimum reputation for this swap.
+    /// Keeping them in one place stops the batch path from skipping either check (#1338).
+    fn require_buyer_gates(env: &Env, swap_id: u64, swap: &SwapRecord) {
+        if !swap.conditions.is_empty() {
+            Self::evaluate_conditions(env, swap, false);
+        }
+
+        if let Some(min_rep) = env
+            .storage()
+            .persistent()
+            .get::<_, u32>(&DataKey::ReputationMultiplier(swap_id))
+        {
+            let buyer_rep = env
+                .storage()
+                .persistent()
+                .get::<_, u32>(&DataKey::UserReputation(swap.buyer.clone()))
+                .unwrap_or(50u32);
+            if buyer_rep < min_rep {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::InsufficientReputation as u32,
+                ));
+            }
+        }
+    }
+
     /// Evaluate all conditions on a swap. Panics with ConditionNotMet if any fail.
     /// `check_key_valid` controls whether KeyValid is enforced (true at reveal_key time).
     fn evaluate_conditions(env: &Env, swap: &SwapRecord, check_key_valid: bool) {
@@ -915,28 +941,8 @@ impl AtomicSwap {
             }
         }
 
-        // #351: Evaluate any buyer-set conditions.
-        if !swap.conditions.is_empty() {
-            Self::evaluate_conditions(&env, &swap, false);
-        }
-
-        // Check minimum reputation requirement set by seller
-        if let Some(min_rep) = env
-            .storage()
-            .persistent()
-            .get::<_, u32>(&DataKey::ReputationMultiplier(swap_id))
-        {
-            let buyer_rep = env
-                .storage()
-                .persistent()
-                .get::<_, u32>(&DataKey::UserReputation(swap.buyer.clone()))
-                .unwrap_or(50u32);
-            if buyer_rep < min_rep {
-                env.panic_with_error(Error::from_contract_error(
-                    ContractError::InsufficientReputation as u32,
-                ));
-            }
-        }
+        // #351 / seller reputation gate: shared with batch_accept_swaps.
+        Self::require_buyer_gates(&env, swap_id, &swap);
 
         // #350: Deposit collateral if required
         if swap.collateral_amount > 0 {
@@ -4393,6 +4399,8 @@ impl AtomicSwap {
                 }
             }
             Self::validate_contingencies(&env, swap_id);
+            // #1338: Same buyer-side gates as accept_swap (conditions + seller reputation).
+            Self::require_buyer_gates(&env, swap_id, &swap);
         }
 
         // Execution pass — all validations passed, safe to mutate

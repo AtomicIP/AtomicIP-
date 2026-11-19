@@ -2,6 +2,10 @@
 //!
 //! - #1335: `accept_swap` and `batch_accept_swaps` must reject swaps whose
 //!   expiry has been reached.
+//! - #1336: `escrow_deposit` must reject deposits after expiry.
+//! - #1337: `batch_accept_swaps` must reject duplicate swap IDs.
+//! - #1338: `batch_accept_swaps` must apply the same reputation and
+//!   condition gates as `accept_swap`.
 
 #[cfg(test)]
 mod tests {
@@ -12,7 +16,7 @@ mod tests {
         Address, Bytes, BytesN, Env, Vec,
     };
 
-    use crate::{AtomicSwap, AtomicSwapClient, SwapStatus};
+    use crate::{AtomicSwap, AtomicSwapClient, SwapCondition, SwapStatus};
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -49,6 +53,22 @@ mod tests {
 
     fn set_timestamp(env: &Env, ts: u64) {
         env.ledger().with_mut(|li| li.timestamp = ts);
+    }
+
+    /// Writes buyer-set conditions onto a Pending swap record. The public API only
+    /// attaches conditions while accepting, so tests set them directly to exercise
+    /// the batch path against a Pending swap.
+    fn attach_conditions(
+        env: &Env,
+        contract_id: &Address,
+        swap_id: u64,
+        conditions: Vec<SwapCondition>,
+    ) {
+        env.as_contract(contract_id, || {
+            let mut swap = crate::swap::load_swap(env, swap_id);
+            swap.conditions = conditions;
+            crate::swap::save_swap(env, swap_id, &swap);
+        });
     }
 
     // ── #1335: accept_swap / batch_accept_swaps honour swap expiry ────────────
@@ -202,6 +222,116 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(token.balance(&buyer), 1000);
         assert_eq!(token.balance(&client.address), 0);
+        assert_eq!(
+            client.get_swap(&swap_id).unwrap().status,
+            SwapStatus::Pending
+        );
+    }
+
+    // ── #1338: batch_accept_swaps enforces the same gates as accept_swap ──────
+
+    /// A buyer below the seller's minimum reputation cannot accept through the
+    /// batch path, and no tokens move.
+    #[test]
+    fn test_batch_accept_rejected_below_seller_min_reputation() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (client, registry_id) = setup_swap_contract(&env);
+        let ip_id = commit_ip(&env, &registry_id, &seller, 0x41);
+        let token_id = setup_token(&env, &admin, &buyer, 1000);
+        let token = TokenClient::new(&env, &token_id);
+
+        let swap_id = client.initiate_swap(
+            &token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None, &0_i128, &false,
+        );
+        // Default buyer reputation is 50; require 60.
+        client.set_reputation_multiplier(&swap_id, &60_u32);
+
+        let mut ids = Vec::new(&env);
+        ids.push_back(swap_id);
+        let result = client.try_batch_accept_swaps(&ids, &buyer);
+
+        assert!(result.is_err());
+        assert_eq!(token.balance(&buyer), 1000);
+        assert_eq!(
+            client.get_swap(&swap_id).unwrap().status,
+            SwapStatus::Pending
+        );
+    }
+
+    /// A `PriceBelow` condition that fails blocks batch acceptance. The swap
+    /// price is 500, so a threshold of 100 is not met.
+    #[test]
+    fn test_batch_accept_rejected_when_price_below_condition_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (client, registry_id) = setup_swap_contract(&env);
+        let ip_id = commit_ip(&env, &registry_id, &seller, 0x42);
+        let token_id = setup_token(&env, &admin, &buyer, 1000);
+        let token = TokenClient::new(&env, &token_id);
+
+        let swap_id = client.initiate_swap(
+            &token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None, &0_i128, &false,
+        );
+        attach_conditions(
+            &env,
+            &client.address,
+            swap_id,
+            soroban_sdk::vec![&env, SwapCondition::PriceBelow(100)],
+        );
+
+        let mut ids = Vec::new(&env);
+        ids.push_back(swap_id);
+        let result = client.try_batch_accept_swaps(&ids, &buyer);
+
+        assert!(result.is_err());
+        assert_eq!(token.balance(&buyer), 1000);
+        assert_eq!(
+            client.get_swap(&swap_id).unwrap().status,
+            SwapStatus::Pending
+        );
+    }
+
+    /// A `TimeAfter` condition that is not yet satisfied blocks batch
+    /// acceptance, and no tokens move.
+    #[test]
+    fn test_batch_accept_rejected_when_time_after_condition_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (client, registry_id) = setup_swap_contract(&env);
+        let ip_id = commit_ip(&env, &registry_id, &seller, 0x44);
+        let token_id = setup_token(&env, &admin, &buyer, 1000);
+        let token = TokenClient::new(&env, &token_id);
+
+        set_timestamp(&env, 1_000);
+        let swap_id = client.initiate_swap(
+            &token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None, &0_i128, &false,
+        );
+        attach_conditions(
+            &env,
+            &client.address,
+            swap_id,
+            soroban_sdk::vec![&env, SwapCondition::TimeAfter(5_000)],
+        );
+
+        let mut ids = Vec::new(&env);
+        ids.push_back(swap_id);
+        let result = client.try_batch_accept_swaps(&ids, &buyer);
+
+        assert!(result.is_err());
+        assert_eq!(token.balance(&buyer), 1000);
         assert_eq!(
             client.get_swap(&swap_id).unwrap().status,
             SwapStatus::Pending
