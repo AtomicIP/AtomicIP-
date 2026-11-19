@@ -1,0 +1,42 @@
+# #1256: Default-deny ingress for the api-server namespace, then an explicit
+# allow for the ingress controller (public HTTP) and the monitoring namespace
+# (Prometheus scrapes of the internal metrics port). Admin routes are only
+# reachable through the ingress path; other pods in the cluster are blocked.
+#
+# Namespace names below assume the conventional ingress-nginx and monitoring
+# namespaces. Each is matched by the kubernetes.io/metadata.name label that
+# Kubernetes sets automatically on every namespace.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: atomicip-default-deny-ingress
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: atomicip-api-allow-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app: atomicip-api
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: http
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: metrics
