@@ -75,6 +75,9 @@ mod validator_network_tests;
 #[cfg(test)]
 mod revocation_property_tests;
 
+#[cfg(test)]
+mod merge_shares_tests;
+
 // ── Error Codes ────────────────────────────────────────────────────────────
 
 #[contracterror]
@@ -4816,6 +4819,52 @@ impl IpRegistry {
         let dup_owner = duplicate.owner.clone();
         let already_co_owner = primary.co_owners.iter().any(|a| a == dup_owner);
         if !already_co_owner && dup_owner != primary.owner {
+            // Give the new co-owner a share carved out of the primary owner's
+            // remaining percentage, keeping OwnershipShares in sync with co_owners.
+            let mut shares: Vec<OwnershipShare> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::OwnershipShares(primary_ip_id))
+                .unwrap_or_else(|| {
+                    let mut v = Vec::new(&env);
+                    v.push_back(OwnershipShare {
+                        address: primary.owner.clone(),
+                        percentage: 100,
+                    });
+                    v
+                });
+            let owner_idx = shares
+                .iter()
+                .position(|s| s.address == primary.owner)
+                .unwrap_or_else(|| {
+                    env.panic_with_error(Error::from_contract_error(
+                        ContractError::InvalidShareTotal as u32,
+                    ))
+                }) as u32;
+            let mut owner_share = shares.get(owner_idx).unwrap();
+            let transfer = owner_share.percentage / 2;
+            if transfer == 0 {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::InvalidOwnershipPercentage as u32,
+                ));
+            }
+            owner_share.percentage -= transfer;
+            shares.set(owner_idx, owner_share);
+            shares.push_back(OwnershipShare {
+                address: dup_owner.clone(),
+                percentage: transfer,
+            });
+            require_valid_share_total(&env, &shares);
+
+            env.storage()
+                .persistent()
+                .set(&DataKey::OwnershipShares(primary_ip_id), &shares);
+            env.storage().persistent().extend_ttl(
+                &DataKey::OwnershipShares(primary_ip_id),
+                LEDGER_BUMP,
+                LEDGER_BUMP,
+            );
+
             primary.co_owners.push_back(dup_owner.clone());
             env.storage()
                 .persistent()
@@ -7412,6 +7461,10 @@ impl IpRegistry {
                         .persistent()
                         .remove(&DataKey::CommitmentOwner(rec.commitment_hash.clone()));
 
+                    // Remove metadata and its tag-index entries so search cannot
+                    // return an IP whose record no longer exists.
+                    metadata::delete_metadata(&env, ip_id);
+
                     env.storage().persistent().remove(&DataKey::IpRecord(ip_id));
                     env.events()
                         .publish((symbol_short!("ip_clean"),), (ip_id, now));
@@ -7438,15 +7491,9 @@ impl IpRegistry {
         nonce: BytesN<12>,
         tag_hashes: Vec<BytesN<32>>,
     ) {
-        // Verify IP exists
-        if env
-            .storage()
-            .persistent()
-            .get::<_, IpRecord>(&DataKey::IpRecord(ip_id))
-            .is_none()
-        {
-            env.panic_with_error(Error::from_contract_error(ContractError::IpNotFound as u32));
-        }
+        // Only the IP owner may attach or overwrite commitment metadata.
+        let record = require_ip_exists(&env, ip_id);
+        record.owner.require_auth();
 
         metadata::store_metadata(&env, ip_id, encrypted_data, nonce, tag_hashes);
     }
