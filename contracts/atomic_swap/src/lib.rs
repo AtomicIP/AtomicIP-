@@ -6570,6 +6570,22 @@ mod liquidity_pool_tests;
 #[cfg(test)]
 mod finality_tests;
 
+// #1347: self-trade guard coverage across every swap-creation path.
+#[cfg(test)]
+mod self_trade_guard_tests;
+
+// #1348: installment count enforcement and dedicated zero/overpayment errors.
+#[cfg(test)]
+mod installment_limit_tests;
+
+// #1349: fund-moving entry points must halt while the contract is paused.
+#[cfg(test)]
+mod pause_guard_tests;
+
+// #1350: create_liquidity_pool must verify the pooled IP against ip_registry.
+#[cfg(test)]
+mod liquidity_pool_ip_verification_tests;
+
 // #781: re-enabled — was blocked by 3 pre-existing, unrelated compile errors
 // (a dropped `commit_ip` arg, and two obsolete `accept_swap_with_quantity`
 // calls to a since-removed function; both fixed / removed in this PR).
