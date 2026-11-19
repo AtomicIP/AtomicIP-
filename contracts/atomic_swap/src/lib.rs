@@ -3258,6 +3258,9 @@ impl AtomicSwap {
             env.panic_with_error(Error::from_contract_error(ContractError::SwapExists as u32));
         }
 
+        // #1332: an IP already in a swap (Pending/Accepted) cannot also be auctioned.
+        require_no_active_swap(&env, ip_id);
+
         let auction_id: u64 = env
             .storage()
             .persistent()

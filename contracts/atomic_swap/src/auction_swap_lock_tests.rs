@@ -73,3 +73,18 @@ fn finalize_auction_locks_ip_against_new_swap() {
     );
     assert!(second.is_err(), "IP must be locked by the auction-won swap");
 }
+
+#[test]
+fn start_ip_auction_rejects_ip_with_active_swap() {
+    let f = setup();
+
+    f.client.initiate_swap(
+        &f.token, &f.ip_id, &f.seller, &500, &f.buyer, &0, &None, &0, &false,
+    );
+
+    // The IP is already locked by a pending swap, so it must not be auctionable.
+    let auction = f
+        .client
+        .try_start_ip_auction(&f.token, &f.ip_id, &f.seller, &100, &10);
+    assert!(auction.is_err(), "auction must not start while a swap is active");
+}
