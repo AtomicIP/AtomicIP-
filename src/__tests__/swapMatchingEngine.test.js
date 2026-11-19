@@ -253,3 +253,31 @@ describe("reconcileMatchBeforeSubmission", () => {
     expect(getSwapState).not.toHaveBeenCalled();
   });
 });
+
+describe("findMatchesForBuyer — deterministic tie-breaking (#1265)", () => {
+  // Two sellers identical in every scored dimension, differing only by id.
+  const tiedSeller = (id) => ({ ...seller(), id });
+
+  test("equal scores are ordered by sellerId regardless of input order", () => {
+    const b = buyer();
+    const forward  = findMatchesForBuyer(b, [tiedSeller("seller-a"), tiedSeller("seller-b")], { now: 0 });
+    const reversed = findMatchesForBuyer(b, [tiedSeller("seller-b"), tiedSeller("seller-a")], { now: 0 });
+
+    expect(forward[0].score).toBe(forward[1].score);
+    expect(forward.map((m) => m.sellerId)).toEqual(["seller-a", "seller-b"]);
+    expect(reversed.map((m) => m.sellerId)).toEqual(["seller-a", "seller-b"]);
+  });
+
+  test("a higher score still outranks a lower id", () => {
+    const strong = tiedSeller("seller-z");
+    const weak   = { ...tiedSeller("seller-a"), condition: "fair" };
+    const result = findMatchesForBuyer(buyer(), [weak, strong], { now: 0 });
+    expect(result[0].sellerId).toBe("seller-z");
+  });
+
+  test("tie-break is applied before maxResults truncation", () => {
+    const sellers = ["c", "a", "b"].map(tiedSeller);
+    const top2 = findMatchesForBuyer(buyer(), sellers, { now: 0, maxResults: 2 });
+    expect(top2.map((m) => m.sellerId)).toEqual(["a", "b"]);
+  });
+});

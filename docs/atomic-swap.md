@@ -971,3 +971,19 @@ standard HTLC.
 available quantity and charges the proportional price. Approval requirements
 and non-key conditions are enforced for partial acceptance just as they are
 for a full acceptance.
+
+## #1265: Deterministic Match Tie-Breaking
+
+`findMatchesForBuyer` (and therefore `batchMatch`) ranks candidate sellers by
+composite score, highest first. Two sellers with the **same score** are ordered
+by their `sellerId` in ascending code-unit order (`"seller-a" < "seller-b"`).
+
+Consequences for integrators:
+
+- The result list does not depend on the order in which sellers were supplied.
+  The same buyer and seller pool always yields the same ranking.
+- Scores are integers (`Math.round` per component), so ties are common. Do not
+  assume the first element of `matches` is the only sensible choice; it is the
+  deterministic one.
+- The tie-break is applied before `maxResults` truncation, so the truncated set
+  is also stable.

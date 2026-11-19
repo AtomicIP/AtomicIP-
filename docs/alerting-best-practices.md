@@ -96,8 +96,12 @@ children. Resolving closes them all.
 
 1. **Alert on symptoms, not causes.** Page on “commitments failing” instead of
    “CPU 80%”. Use cause metrics on dashboards.
-2. **Every alert needs a runbook.** Set `annotations.runbook` to a section in
-   `docs/disaster-recovery.md` or another playbook.
+2. **Every alert needs a runbook.** Set `annotations.runbook_url` to a
+   `docs/` path, with an optional `#anchor` for a section (for example
+   `docs/disaster-recovery.md#playbook-key-compromise`). CI fails if the file or
+   anchor does not exist (`scripts/check-prometheus-runbooks.py`, #1267). Keep
+   `annotations.runbook` equal to it if you also set it: Alertmanager still reads
+   that key.
 3. **Use `for:`.** No alert should fire on a single scrape. The minimum is 5m for
    warnings and 1–2m for critical availability alerts.
 4. **Pick severity by required response time.**

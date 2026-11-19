@@ -131,3 +131,67 @@ describe("resolveBatchDisputes — mixed batch", () => {
     expect(result.totalReleased).toBe(200);
   });
 });
+
+describe("resolveBatchDisputes — SPLIT in integer basis points (#1264)", () => {
+  const split = (fields, amount = 10000) =>
+    resolveBatchDisputes(
+      [openDispute("bps", amount)],
+      [{ type: RESOLUTION_TYPES.SPLIT, ...fields }]
+    );
+
+  test("splitBps accepts the lower bound 100 (1%)", () => {
+    const result = split({ splitBps: 100 });
+    expect(result.failedCount).toBe(0);
+    expect(result.results[0].splitBps).toBe(100);
+    expect(result.results[0].initiatorAmount).toBe(100);
+    expect(result.results[0].counterpartyAmount).toBe(9900);
+  });
+
+  test("splitBps accepts the upper bound 9900 (99%)", () => {
+    const result = split({ splitBps: 9900 });
+    expect(result.failedCount).toBe(0);
+    expect(result.results[0].initiatorAmount).toBe(9900);
+    expect(result.results[0].counterpartyAmount).toBe(100);
+  });
+
+  test.each([0, 99, 9901, 10000])("splitBps %i outside [100, 9900] is rejected", (bps) => {
+    const result = split({ splitBps: bps });
+    expect(result.failedCount).toBe(1);
+    expect(result.errors[0].error).toMatch(/splitBps must be an integer between 100 and 9900/);
+  });
+
+  test.each([5000.5, "5000", NaN])("non-integer or non-numeric splitBps %p is rejected", (bps) => {
+    const result = split({ splitBps: bps });
+    expect(result.failedCount).toBe(1);
+    expect(result.errors[0].error).toMatch(/splitBps must be an integer/);
+  });
+
+  test("default split is 5000 bps (50/50)", () => {
+    const result = split({});
+    expect(result.results[0].splitBps).toBe(5000);
+    expect(result.results[0].initiatorAmount).toBe(5000);
+  });
+
+  test("legacy splitRatio 0.1 + 0.2 is accepted as exactly 3000 bps", () => {
+    const result = split({ splitRatio: 0.1 + 0.2 });
+    expect(result.failedCount).toBe(0);
+    expect(result.results[0].splitBps).toBe(3000);
+    expect(result.results[0].initiatorAmount).toBe(3000);
+  });
+
+  test("legacy splitRatio at the bounds 0.01 and 0.99 is accepted", () => {
+    expect(split({ splitRatio: 0.01 }).results[0].splitBps).toBe(100);
+    expect(split({ splitRatio: 0.99 }).results[0].splitBps).toBe(9900);
+  });
+
+  test("legacy splitRatio that is not a whole number of basis points is rejected", () => {
+    const result = split({ splitRatio: 0.12345 });
+    expect(result.failedCount).toBe(1);
+    expect(result.errors[0].error).toMatch(/whole number of basis points/);
+  });
+
+  test("legacy splitRatio outside [0.01, 0.99] is rejected", () => {
+    expect(split({ splitRatio: 0.009 }).failedCount).toBe(1);
+    expect(split({ splitRatio: 0.991 }).failedCount).toBe(1);
+  });
+});
