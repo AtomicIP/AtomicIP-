@@ -52,7 +52,7 @@ mod chaos_tests {
 
         let swap_id = env.register(AtomicSwap, ());
         let swap = AtomicSwapClient::new(&env, &swap_id);
-        swap.initialize(&registry_id);
+        swap.initialize(&<soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env), &registry_id);
 
         let ctx = TestContext {
             env,
@@ -214,7 +214,7 @@ mod chaos_tests {
 
         let swap_id_contract = env.register(AtomicSwap, ());
         let swap = AtomicSwapClient::new(&env, &swap_id_contract);
-        swap.initialize(&registry_id);
+        swap.initialize(&<soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env), &registry_id);
 
         for i in 1u8..=5 {
             let seller = Address::generate(&env);

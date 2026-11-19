@@ -86,7 +86,7 @@ mod tests {
 
         let contract_id = env.register(AtomicSwap, ());
         let client = AtomicSwapClient::new(&env, &contract_id);
-        client.initialize(&registry_id);
+        client.initialize(&<soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env), &registry_id);
         client.set_admin(&admin);
 
         let timeout = env.ledger().timestamp() + 1_000;

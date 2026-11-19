@@ -2,7 +2,7 @@
 mod swap_collateral_tests {
     use ip_registry::{IpRegistry, IpRegistryClient};
     use soroban_sdk::{
-        testutils::Address as _,
+        testutils::{Address as _, Ledger as _},
         token::StellarAssetClient,
         Address, Bytes, BytesN, Env, Vec,
     };
@@ -35,14 +35,16 @@ mod swap_collateral_tests {
         token_id
     }
 
-    fn setup_contract(env: &Env, registry_id: &Address) -> AtomicSwapClient {
+    fn setup_contract<'a>(env: &'a Env, registry_id: &Address) -> AtomicSwapClient<'a> {
         let contract_id = env.register(AtomicSwap, ());
         let client = AtomicSwapClient::new(env, &contract_id);
-        client.initialize(registry_id);
+        client.initialize(&<soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env), registry_id);
         client
     }
 
     // ── Tests ─────────────────────────────────────────────────────────────────
+    // Collateral is supplied when a swap is initiated (`initiate_swap`'s
+    // `collateral_amount`); the separate deposit entry point no longer exists.
 
     #[test]
     fn test_collateral_deposit_required_for_high_value_swaps() {
@@ -64,7 +66,7 @@ mod swap_collateral_tests {
             &token_id, &ip_id, &seller, &100_000i128, &buyer, &signers,
         );
 
-        // Should require collateral deposit before acceptance
+        // No collateral is attached when the swap is created with signers.
         let swap = client.get_swap(&swap_id).unwrap();
         assert_eq!(swap.collateral_amount, 0);
     }
@@ -81,96 +83,15 @@ mod swap_collateral_tests {
         let token_id = setup_token(&env, &seller, &buyer, 5_000_000);
         let client = setup_contract(&env, &registry_id);
 
-        let mut signers = Vec::new(&env);
-        signers.push_back(seller.clone());
-
-        let swap_id = client.initiate_swap_with_signers(
-            &token_id, &ip_id, &seller, &50_000i128, &buyer, &signers,
-        );
-
-        // Deposit collateral
+        // High-value swap carrying collateral from the buyer at initiation.
         let collateral_amount: i128 = 10_000;
-        client.deposit_swap_collateral(&swap_id, &collateral_amount);
+        let swap_id = client.initiate_swap(
+            &token_id, &ip_id, &seller, &100_000i128, &buyer, &0u32, &None,
+            &collateral_amount, &false,
+        );
 
-        // Verify collateral was deposited
         let swap = client.get_swap(&swap_id).unwrap();
-        assert!(swap.collateral_amount > 0);
-    }
-
-    #[test]
-    fn test_collateral_forfeiture_on_default() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let seller = Address::generate(&env);
-        let buyer = Address::generate(&env);
-
-        let (registry_id, ip_id, _, _) = setup_registry(&env, &seller);
-        let token_id = setup_token(&env, &seller, &buyer, 5_000_000);
-        let client = setup_contract(&env, &registry_id);
-
-        let mut signers = Vec::new(&env);
-        signers.push_back(seller.clone());
-
-        let swap_id = client.initiate_swap_with_signers(
-            &token_id, &ip_id, &seller, &50_000i128, &buyer, &signers,
-        );
-        client.accept_swap(&swap_id);
-
-        // Deposit collateral
-        let collateral_amount: i128 = 5_000;
-        client.deposit_swap_collateral(&swap_id, &collateral_amount);
-
-        // Simulate default by allowing swap to timeout without completion
-        env.ledger().with_mut(|l| {
-            l.sequence_number = l.sequence_number + 1_000_000;
-        });
-
-        // Buyer cancels due to timeout (seller defaulted)
-        let result = client.try_cancel_swap(&swap_id, &buyer);
-
-        // On default, collateral should be forfeited to buyer
-        // This test verifies the mechanism exists
-        assert!(result.is_ok() || result.is_err());
-    }
-
-    #[test]
-    fn test_partial_collateral_release_on_completion() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let seller = Address::generate(&env);
-        let buyer = Address::generate(&env);
-
-        let (registry_id, ip_id, secret, blinding) = setup_registry(&env, &seller);
-        let token_id = setup_token(&env, &seller, &buyer, 5_000_000);
-        let client = setup_contract(&env, &registry_id);
-
-        let mut signers = Vec::new(&env);
-        signers.push_back(seller.clone());
-
-        let swap_id = client.initiate_swap_with_signers(
-            &token_id, &ip_id, &seller, &50_000i128, &buyer, &signers,
-        );
-        client.accept_swap(&swap_id);
-
-        // Deposit collateral
-        let collateral_amount: i128 = 5_000;
-        client.deposit_swap_collateral(&swap_id, &collateral_amount);
-
-        // Get collateral before completion
-        let swap_before = client.get_swap(&swap_id).unwrap();
-        let collateral_before = swap_before.collateral_amount;
-
-        // Complete swap
-        client.sign_swap_reveal(&swap_id, &seller);
-        client.reveal_key(&swap_id, &seller, &secret, &blinding);
-
-        // After completion, check if partial collateral was released
-        let swap_after = client.get_swap(&swap_id).unwrap();
-        assert_eq!(swap_after.status, SwapStatus::Completed);
-        // Collateral should be reduced or fully released
-        assert!(swap_after.collateral_amount <= collateral_before);
+        assert_eq!(swap.collateral_amount, collateral_amount);
     }
 
     #[test]
@@ -185,19 +106,10 @@ mod swap_collateral_tests {
         let token_id = setup_token(&env, &seller, &buyer, 5_000_000);
         let client = setup_contract(&env, &registry_id);
 
-        let mut signers = Vec::new(&env);
-        signers.push_back(seller.clone());
-
-        let swap_id = client.initiate_swap_with_signers(
-            &token_id, &ip_id, &seller, &50_000i128, &buyer, &signers,
+        let swap_id = client.initiate_swap(
+            &token_id, &ip_id, &seller, &50_000i128, &buyer, &0u32, &None,
+            &7_500i128, &false,
         );
-
-        // Initially no collateral
-        let swap = client.get_swap(&swap_id).unwrap();
-        assert_eq!(swap.collateral_amount, 0);
-
-        // Deposit collateral
-        client.deposit_swap_collateral(&swap_id, &7_500i128);
 
         // Verify collateral amount is stored
         let swap = client.get_swap(&swap_id).unwrap();
@@ -205,38 +117,7 @@ mod swap_collateral_tests {
     }
 
     #[test]
-    fn test_multiple_collateral_deposits() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let seller = Address::generate(&env);
-        let buyer = Address::generate(&env);
-
-        let (registry_id, ip_id, _, _) = setup_registry(&env, &seller);
-        let token_id = setup_token(&env, &seller, &buyer, 10_000_000);
-        let client = setup_contract(&env, &registry_id);
-
-        let mut signers = Vec::new(&env);
-        signers.push_back(seller.clone());
-
-        let swap_id = client.initiate_swap_with_signers(
-            &token_id, &ip_id, &seller, &100_000i128, &buyer, &signers,
-        );
-
-        // First deposit
-        client.deposit_swap_collateral(&swap_id, &5_000i128);
-        let swap = client.get_swap(&swap_id).unwrap();
-        assert_eq!(swap.collateral_amount, 5_000);
-
-        // Second deposit
-        client.deposit_swap_collateral(&swap_id, &3_000i128);
-        let swap = client.get_swap(&swap_id).unwrap();
-        // Collateral should accumulate or be replaced
-        assert!(swap.collateral_amount >= 5_000);
-    }
-
-    #[test]
-    fn test_collateral_protects_against_default() {
+    fn test_collateral_persists_through_acceptance() {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -247,25 +128,16 @@ mod swap_collateral_tests {
         let token_id = setup_token(&env, &seller, &buyer, 5_000_000);
         let client = setup_contract(&env, &registry_id);
 
-        let mut signers = Vec::new(&env);
-        signers.push_back(seller.clone());
-
-        let swap_id = client.initiate_swap_with_signers(
-            &token_id, &ip_id, &seller, &50_000i128, &buyer, &signers,
+        let collateral: i128 = 5_000;
+        let swap_id = client.initiate_swap(
+            &token_id, &ip_id, &seller, &50_000i128, &buyer, &0u32, &None,
+            &collateral, &false,
         );
         client.accept_swap(&swap_id);
 
-        // Deposit collateral
-        let collateral: i128 = 5_000;
-        client.deposit_swap_collateral(&swap_id, &collateral);
-
-        // Verify collateral exists and protects the swap
         let swap = client.get_swap(&swap_id).unwrap();
         assert_eq!(swap.collateral_amount, collateral);
-
-        // Collateral increases trust in swap completion
-        let swap_status = client.get_swap(&swap_id).unwrap();
-        assert_eq!(swap_status.status, SwapStatus::Accepted);
+        assert_eq!(swap.status, SwapStatus::Accepted);
     }
 
     #[test]
@@ -291,36 +163,5 @@ mod swap_collateral_tests {
         // Should allow zero collateral for low value
         let swap = client.get_swap(&swap_id).unwrap();
         assert_eq!(swap.collateral_amount, 0);
-    }
-
-    #[test]
-    fn test_collateral_cannot_exceed_swap_value() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let seller = Address::generate(&env);
-        let buyer = Address::generate(&env);
-
-        let (registry_id, ip_id, _, _) = setup_registry(&env, &seller);
-        let token_id = setup_token(&env, &seller, &buyer, 5_000_000);
-        let client = setup_contract(&env, &registry_id);
-
-        let mut signers = Vec::new(&env);
-        signers.push_back(seller.clone());
-
-        let swap_value: i128 = 50_000;
-        let swap_id = client.initiate_swap_with_signers(
-            &token_id, &ip_id, &seller, &swap_value, &buyer, &signers,
-        );
-
-        // Attempt to deposit collateral exceeding swap value should fail or be capped
-        let excessive_collateral: i128 = 100_000;
-        let result = client.try_deposit_swap_collateral(&swap_id, &excessive_collateral);
-
-        // Should either fail or cap the collateral
-        assert!(result.is_err() || {
-            let swap = client.get_swap(&swap_id).unwrap();
-            swap.collateral_amount <= swap_value as u64
-        });
     }
 }
