@@ -4,7 +4,7 @@
 //! and ensure consistent error handling across the contract.
 
 use crate::{ContractError, DataKey, SwapRecord, SwapStatus};
-use soroban_sdk::{Address, Env, Error};
+use soroban_sdk::{Address, Env, Error, Map, Vec};
 
 #[allow(unused_imports)]
 #[cfg(test)]
@@ -473,5 +473,19 @@ mod tests {
         let env = Env::default();
         let zero_address = Address::from_contract_id(&env, &soroban_sdk::BytesN::<32>::new());
         require_valid_treasury_address(&env, &zero_address);
+    }
+}
+
+/// #1339/#1341: rejects a batch that names the same swap or IP ID more than once.
+/// Runs before any mutation, so a rejected batch leaves no state behind.
+pub fn require_unique_ids(env: &Env, ids: &Vec<u64>) {
+    let mut seen: Map<u64, ()> = Map::new(env);
+    for id in ids.iter() {
+        if seen.contains_key(id) {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::DuplicateSwapId as u32,
+            ));
+        }
+        seen.set(id, ());
     }
 }

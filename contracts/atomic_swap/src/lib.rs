@@ -153,6 +153,8 @@ pub enum ContractError {
     SelfTradeNotAllowed = 79,
     /// #1170: an ID counter would overflow u64 on increment.
     IdCounterOverflow = 80,
+    /// #1339: a batch call named the same swap or IP ID more than once.
+    DuplicateSwapId = 81,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -4455,6 +4457,9 @@ impl AtomicSwap {
             ));
         }
 
+        // #1339: a repeated ID would pay the seller twice from the shared contract balance.
+        require_unique_ids(&env, &swap_ids);
+
         let mut fee_breakdowns: Vec<SwapFeeBreakdown> = Vec::new(&env);
 
         for i in 0..swap_ids.len() {
@@ -4483,6 +4488,13 @@ impl AtomicSwap {
         for i in 0..swap_ids.len() {
             let swap_id = swap_ids.get(i).unwrap();
             let mut swap = require_swap_exists(&env, swap_id);
+            // #1339: re-check status in the execution pass; the validation pass alone is not enough.
+            require_swap_status(
+                &env,
+                &swap,
+                SwapStatus::Accepted,
+                ContractError::NotAccepted,
+            );
 
             swap.status = SwapStatus::Completed;
             swap::save_swap(&env, swap_id, &swap);
@@ -6592,6 +6604,9 @@ mod batch_swap_features_tests;
 // #832: compile errors fixed — re-enabled
 #[cfg(test)]
 mod batch_history_tests;
+
+#[cfg(test)]
+mod batch_reveal_security_tests;
 
 // #828: compile errors fixed — re-enabled
 // Temporarily disabled: does not compile yet (pre-existing errors). Re-enable after fixing.
