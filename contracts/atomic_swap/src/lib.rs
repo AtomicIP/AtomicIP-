@@ -29,6 +29,8 @@ pub mod cross_contract;
 // mod swap_collateral_tests;
 #[cfg(test)]
 mod contingency_tests;
+#[cfg(test)]
+mod swap_acceptance_guard_tests;
 
 use soroban_sdk::xdr::{FromXdr, ToXdr};
 use soroban_sdk::{
@@ -153,6 +155,10 @@ pub enum ContractError {
     SelfTradeNotAllowed = 79,
     /// #1170: an ID counter would overflow u64 on increment.
     IdCounterOverflow = 80,
+    /// #1335/#1336: The swap's expiry has passed, so it can no longer be accepted or funded.
+    SwapExpired = 81,
+    /// #1337: The same swap ID appears more than once in a batch.
+    DuplicateBatchId = 82,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -698,6 +704,14 @@ impl AtomicSwap {
         id
     }
 
+    /// Panics with SwapExpired once the ledger timestamp has reached `swap.expiry`.
+    /// Matches the boundary used by `cancel_pending_swap`: a swap is live while `now < expiry`.
+    fn require_not_expired(env: &Env, swap: &SwapRecord) {
+        if env.ledger().timestamp() >= swap.expiry {
+            env.panic_with_error(Error::from_contract_error(ContractError::SwapExpired as u32));
+        }
+    }
+
     /// Evaluate all conditions on a swap. Panics with ConditionNotMet if any fail.
     /// `check_key_valid` controls whether KeyValid is enforced (true at reveal_key time).
     fn evaluate_conditions(env: &Env, swap: &SwapRecord, check_key_valid: bool) {
@@ -884,6 +898,7 @@ impl AtomicSwap {
 
         swap.buyer.require_auth();
         require_swap_status(&env, &swap, SwapStatus::Pending, ContractError::NotPending);
+        Self::require_not_expired(&env, &swap);
         Self::validate_contingencies(&env, swap_id);
 
         // #254: Ensure all required approvals have been collected.
@@ -4352,6 +4367,7 @@ impl AtomicSwap {
             }
 
             require_swap_status(&env, &swap, SwapStatus::Pending, ContractError::NotPending);
+            Self::require_not_expired(&env, &swap);
 
             if swap.required_approvals > 0 {
                 let approvals: Vec<Address> = env
