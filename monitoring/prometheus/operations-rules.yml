@@ -15,6 +15,7 @@ groups:
         annotations:
           summary: Latest backup restore test failed
           runbook: docs/backup-strategy.md#5-when-verification-fails
+          runbook_url: docs/backup-strategy.md#5-when-verification-fails
       - alert: BackupVerificationStale
         expr: time() - atomicip_backup_verify_last_success_timestamp_seconds > 2 * 86400
         labels:
@@ -24,6 +25,7 @@ groups:
         annotations:
           summary: No successful backup restore test in over 48h
           runbook: docs/backup-strategy.md#5-when-verification-fails
+          runbook_url: docs/backup-strategy.md#5-when-verification-fails
       - alert: BackupTooOld
         expr: atomicip_backup_age_seconds{kind="postgres_base"} > 26 * 3600
           or atomicip_backup_age_seconds{kind="postgres_wal"} > 900
@@ -35,6 +37,7 @@ groups:
         annotations:
           summary: '{{ $labels.kind }} backup older than its RPO'
           runbook: docs/backup-strategy.md#5-when-verification-fails
+          runbook_url: docs/backup-strategy.md#5-when-verification-fails
       - alert: BackupRestoreSlowerThanRTO
         expr: atomicip_backup_restore_seconds > 7200
         labels:
@@ -44,6 +47,7 @@ groups:
         annotations:
           summary: 'Database restore took {{ $value | humanizeDuration }} (RTO 2h)'
           runbook: docs/backup-strategy.md#4-recovery-time
+          runbook_url: docs/backup-strategy.md#4-recovery-time
 
   - name: cost-optimization
     rules:
@@ -59,6 +63,7 @@ groups:
         annotations:
           summary: Cost optimization job has not run for 3 days
           runbook: docs/cost-optimization.md
+          runbook_url: docs/cost-optimization.md
       - alert: ApiServerAtMaxReplicas
         expr: |
           kube_horizontalpodautoscaler_status_current_replicas{horizontalpodautoscaler="atomicip-api"}
@@ -72,6 +77,7 @@ groups:
         annotations:
           summary: api-server HPA pinned at maxReplicas for 30m; raise the cap or investigate load
           runbook: docs/cost-optimization.md#1-auto-scaling
+          runbook_url: docs/cost-optimization.md#1-auto-scaling
 
   - name: gitops
     rules:
@@ -84,6 +90,7 @@ groups:
         annotations:
           summary: 'Argo CD application {{ $labels.name }} has been {{ $labels.sync_status }} for 30m'
           runbook: docs/gitops.md#troubleshooting
+          runbook_url: docs/gitops.md#troubleshooting
       - alert: ArgoAppDegraded
         expr: argocd_app_info{project="atomicip", health_status="Degraded"} == 1
         for: 10m
@@ -93,6 +100,7 @@ groups:
         annotations:
           summary: 'Argo CD application {{ $labels.name }} is Degraded'
           runbook: docs/gitops.md#rollback
+          runbook_url: docs/gitops.md#rollback
       - alert: ApiServerMetricsScrapeFailing
         expr: up{job="atomicip-api-metrics"} == 0
         for: 10m
@@ -103,3 +111,4 @@ groups:
         annotations:
           summary: Prometheus cannot scrape the api-server internal metrics port (check the bearer token)
           runbook: docs/monitoring.md#metrics-endpoint
+          runbook_url: docs/monitoring.md#metrics-endpoint

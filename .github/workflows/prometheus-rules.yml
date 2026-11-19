@@ -2,17 +2,32 @@ name: Prometheus Rules
 
 # Validates the Prometheus alerting/recording rules before they reach
 # production, where a syntax error or broken PromQL is otherwise only found
-# when Prometheus reloads. Issue #1266.
+# when Prometheus reloads (#1266), and checks that every alert links to an
+# existing runbook (#1267).
 
 on:
   push:
     branches: [main]
     paths:
       - "monitoring/prometheus/**"
+      - "scripts/check-prometheus-runbooks.py"
+      - "docs/disaster-recovery.md"
+      - "docs/commitment-monitoring.md"
+      - "docs/monitoring.md"
+      - "docs/backup-strategy.md"
+      - "docs/cost-optimization.md"
+      - "docs/gitops.md"
       - ".github/workflows/prometheus-rules.yml"
   pull_request:
     paths:
       - "monitoring/prometheus/**"
+      - "scripts/check-prometheus-runbooks.py"
+      - "docs/disaster-recovery.md"
+      - "docs/commitment-monitoring.md"
+      - "docs/monitoring.md"
+      - "docs/backup-strategy.md"
+      - "docs/cost-optimization.md"
+      - "docs/gitops.md"
       - ".github/workflows/prometheus-rules.yml"
 
 permissions:
@@ -43,3 +58,11 @@ jobs:
 
       - name: Run alert unit tests
         run: promtool test rules monitoring/prometheus/tests/*.test.yml
+
+      - name: Install checker dependency
+        run: python3 -m pip install --user "pyyaml==6.0.2"
+
+      - name: Check every alert has a valid runbook_url
+        # Fails if an alert lacks annotations.runbook_url, the linked file is
+        # missing, or the #anchor does not resolve. See #1267.
+        run: python3 scripts/check-prometheus-runbooks.py

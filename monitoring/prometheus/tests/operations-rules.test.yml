@@ -25,6 +25,7 @@ tests:
             exp_annotations:
               summary: Latest backup restore test failed
               runbook: docs/backup-strategy.md#5-when-verification-fails
+              runbook_url: docs/backup-strategy.md#5-when-verification-fails
 
   # ── BackupTooOld: postgres_base beyond its 26h RPO fires ──
   - interval: 1m
@@ -47,6 +48,7 @@ tests:
             exp_annotations:
               summary: postgres_base backup older than its RPO
               runbook: docs/backup-strategy.md#5-when-verification-fails
+              runbook_url: docs/backup-strategy.md#5-when-verification-fails
 
   # ── BackupTooOld: every kind within its RPO stays silent ──
   - interval: 1m
@@ -84,6 +86,7 @@ tests:
             exp_annotations:
               summary: api-server HPA pinned at maxReplicas for 30m; raise the cap or investigate load
               runbook: docs/cost-optimization.md#1-auto-scaling
+              runbook_url: docs/cost-optimization.md#1-auto-scaling
 
   # ── ArgoAppDegraded: a Degraded app for 10m fires ──
   - interval: 1m
@@ -107,6 +110,7 @@ tests:
             exp_annotations:
               summary: Argo CD application api is Degraded
               runbook: docs/gitops.md#rollback
+              runbook_url: docs/gitops.md#rollback
 
   # ── ApiServerMetricsScrapeFailing: a failed scrape for 10m fires ──
   - interval: 1m
@@ -129,3 +133,4 @@ tests:
             exp_annotations:
               summary: Prometheus cannot scrape the api-server internal metrics port (check the bearer token)
               runbook: docs/monitoring.md#metrics-endpoint
+              runbook_url: docs/monitoring.md#metrics-endpoint
