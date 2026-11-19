@@ -155,6 +155,8 @@ pub enum ContractError {
     IdCounterOverflow = 80,
     /// #1339: a batch call named the same swap or IP ID more than once.
     DuplicateSwapId = 81,
+    /// #1342: collateral_amount must not be negative.
+    InvalidCollateral = 82,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -595,6 +597,14 @@ impl AtomicSwap {
 
         // Guard: price must be positive.
         require_positive_price(&env, price);
+
+        // #1342: a negative collateral would be stored on the swap and later read by the
+        // refund paths, which can produce unexpected transfers.
+        if collateral_amount < 0 {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::InvalidCollateral as u32,
+            ));
+        }
 
         // #1169: reject self-trades (buyer == seller).
         if buyer == seller {
@@ -6634,6 +6644,9 @@ mod batch_reveal_security_tests;
 
 #[cfg(test)]
 mod batch_duplicate_id_tests;
+
+#[cfg(test)]
+mod collateral_validation_tests;
 
 // #828: compile errors fixed — re-enabled
 // Temporarily disabled: does not compile yet (pre-existing errors). Re-enable after fixing.
