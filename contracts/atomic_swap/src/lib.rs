@@ -31,6 +31,8 @@ pub mod cross_contract;
 mod contingency_tests;
 #[cfg(test)]
 mod required_approvals_bound_tests;
+#[cfg(test)]
+mod referrer_validation_tests;
 
 use soroban_sdk::xdr::{FromXdr, ToXdr};
 use soroban_sdk::{
@@ -157,6 +159,8 @@ pub enum ContractError {
     IdCounterOverflow = 80,
     /// #1343: `required_approvals` exceeds `MAX_REQUIRED_APPROVALS`, so the swap could never be accepted.
     ApprovalsTooHigh = 81,
+    /// #1344: the referrer must not be the swap's buyer or seller (self-referral rebate).
+    InvalidReferrer = 82,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -611,6 +615,8 @@ impl AtomicSwap {
 
         // #1343: reject approval thresholds that the approver set could never meet.
         require_valid_approvals(&env, required_approvals);
+        // #1344: a referrer must be a third party, not the buyer or seller.
+        require_valid_referrer(&env, &referrer, &seller, &buyer);
 
         // Verify seller owns the IP and it's not revoked
         registry::ensure_seller_owns_active_ip(&env, ip_id, &seller);
@@ -3117,6 +3123,8 @@ impl AtomicSwap {
 
         // #1343: reject approval thresholds that the approver set could never meet.
         require_valid_approvals(&env, required_approvals);
+        // #1344: a referrer must be a third party, not the buyer or seller.
+        require_valid_referrer(&env, &referrer, &seller, &buyer);
 
         let config = Self::protocol_config(&env);
         let len = ip_ids.len();
@@ -4708,6 +4716,8 @@ impl AtomicSwap {
 
         // #1343: reject approval thresholds that the approver set could never meet.
         require_valid_approvals(&env, required_approvals);
+        // #1344: a referrer must be a third party, not the buyer or seller.
+        require_valid_referrer(&env, &referrer, &seller, &buyer);
 
         let len = ip_ids.len();
         let mut swap_ids: Vec<u64> = Vec::new(&env);
