@@ -4,7 +4,7 @@
 //! and ensure consistent error handling across the contract.
 
 use crate::{ContractError, DataKey, SwapRecord, SwapStatus};
-use soroban_sdk::{Address, Env, Error};
+use soroban_sdk::{Address, Env, Error, Map, Vec};
 
 #[allow(unused_imports)]
 #[cfg(test)]
@@ -75,6 +75,27 @@ pub fn require_swap_status(
 ) {
     if swap.status != expected_status {
         env.panic_with_error(Error::from_contract_error(error as u32));
+    }
+}
+
+/// Rejects a batch whose swap IDs contain a repeated value (#1339).
+///
+/// Duplicate IDs in a single batch call would apply the same state change twice
+/// (for example, paying the seller twice from the shared contract balance), so
+/// the whole call is refused before any state is touched. Runs in O(n) using a map.
+///
+/// # Panics
+///
+/// Panics with `DuplicateSwapId` if any ID appears more than once.
+pub fn require_unique_ids(env: &Env, ids: &Vec<u64>) {
+    let mut seen: Map<u64, ()> = Map::new(env);
+    for id in ids.iter() {
+        if seen.contains_key(id) {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::DuplicateSwapId as u32,
+            ));
+        }
+        seen.set(id, ());
     }
 }
 
