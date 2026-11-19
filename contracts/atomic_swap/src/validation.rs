@@ -96,6 +96,34 @@ pub fn require_positive_price(env: &Env, price: i128) {
     }
 }
 
+/// #1343: Rejects `required_approvals` above `MAX_REQUIRED_APPROVALS` at creation time,
+/// so a swap can never be created in a state where it cannot be accepted.
+pub fn require_valid_approvals(env: &Env, required_approvals: u32) {
+    if required_approvals > crate::MAX_REQUIRED_APPROVALS {
+        env.panic_with_error(Error::from_contract_error(
+            ContractError::ApprovalsTooHigh as u32,
+        ));
+    }
+}
+
+/// #1344: A referrer earns a fee rebate from the seller's proceeds, so it must be a
+/// third party. Naming the buyer or seller as referrer would let a party recover part
+/// of the referral fee it controls.
+pub fn require_valid_referrer(
+    env: &Env,
+    referrer: &Option<Address>,
+    seller: &Address,
+    buyer: &Address,
+) {
+    if let Some(referrer) = referrer {
+        if referrer == seller || referrer == buyer {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::InvalidReferrer as u32,
+            ));
+        }
+    }
+}
+
 /// Validates that the caller is the seller of the swap.
 ///
 /// # Arguments
