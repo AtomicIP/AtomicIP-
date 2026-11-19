@@ -155,6 +155,8 @@ pub enum ContractError {
     IdCounterOverflow = 80,
     /// #1355: `min_increment_bps` must be at most 10_000 (100%).
     InvalidIncrement = 81,
+    /// #1356: `withdraw_refund` called with no refund owed.
+    NoPendingRefund = 82,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -231,6 +233,9 @@ pub enum DataKey {
     AuctionBids(u64),
     /// #347: Next auction ID counter.
     NextAuctionId,
+    /// #1356: Maps (bidder, token) → refund amount owed, withdrawn with
+    /// `withdraw_refund`. Refunds are pulled, never pushed inside `place_bid`.
+    PendingRefunds(Address, Address),
     /// #349: Maps swap_id → Vec<PaymentSchedule> for scheduled payments.
     PaymentSchedule(u64),
     /// #349: Maps swap_id → Vec<bool> tracking which payments have been made.
@@ -3380,13 +3385,11 @@ impl AtomicSwap {
             auction.end_time = now + auction.anti_snipe_window_secs;
         }
 
-        // Refund previous highest bidder if exists
-        if let Some(ref prev_bidder) = auction.highest_bidder {
-            token::Client::new(&env, &auction.token).transfer(
-                &env.current_contract_address(),
-                prev_bidder,
-                &auction.highest_bid,
-            );
+        // #1356: pull-based refund. The outbid bidder's funds are credited to
+        // their pending balance and withdrawn with `withdraw_refund`, so a
+        // refund that cannot be paid out never blocks the new bid.
+        if let Some(prev_bidder) = auction.highest_bidder.clone() {
+            Self::credit_pending_refund(&env, &prev_bidder, &auction.token, auction.highest_bid);
         }
 
         // Transfer new bid to contract
@@ -3416,6 +3419,50 @@ impl AtomicSwap {
                 bid_amount,
             },
         );
+    }
+
+    /// #1356: add `amount` to the refund balance owed to `bidder` in `token`.
+    fn credit_pending_refund(env: &Env, bidder: &Address, token: &Address, amount: i128) {
+        let key = DataKey::PendingRefunds(bidder.clone(), token.clone());
+        let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        env.storage().persistent().set(&key, &(current + amount));
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, LEDGER_BUMP, LEDGER_BUMP);
+    }
+
+    /// #1356: withdraw the caller's pending refund in `token`. Returns the
+    /// amount transferred. Panics with `NoPendingRefund` if nothing is owed.
+    pub fn withdraw_refund(env: Env, bidder: Address, token: Address) -> i128 {
+        bidder.require_auth();
+
+        let key = DataKey::PendingRefunds(bidder.clone(), token.clone());
+        let amount: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        if amount <= 0 {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::NoPendingRefund as u32,
+            ));
+        }
+
+        // Clear the balance before transferring so a re-entrant or repeated
+        // call cannot withdraw the same refund twice.
+        env.storage().persistent().remove(&key);
+
+        token::Client::new(&env, &token).transfer(
+            &env.current_contract_address(),
+            &bidder,
+            &amount,
+        );
+
+        amount
+    }
+
+    /// #1356: refund amount currently owed to `bidder` in `token` (zero if none).
+    pub fn get_pending_refund(env: Env, bidder: Address, token: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PendingRefunds(bidder, token))
+            .unwrap_or(0)
     }
 
     /// #1355: smallest bid currently acceptable on `auction`, or `None` if the

@@ -4,7 +4,7 @@ mod auction_tests {
     use ip_registry::{IpRegistry, IpRegistryClient};
     use soroban_sdk::{
         testutils::{Address as _, Ledger},
-        token::StellarAssetClient,
+        token::{StellarAssetClient, TokenClient},
         Address, BytesN, Env,
     };
 
@@ -64,6 +64,14 @@ mod auction_tests {
         let bidder = Address::generate(f.env);
         StellarAssetClient::new(f.env, &f.token).mint(&bidder, &amount);
         f.client.place_bid(&f.auction_id, &bidder, &amount);
+    }
+
+    /// Mint `amount` to a fresh bidder and bid as them. Returns the bidder.
+    fn bid_as_new(f: &Fixture, amount: i128) -> Address {
+        let bidder = Address::generate(f.env);
+        StellarAssetClient::new(f.env, &f.token).mint(&bidder, &amount);
+        f.client.place_bid(&f.auction_id, &bidder, &amount);
+        bidder
     }
 
     fn set_time(env: &Env, t: u64) {
@@ -170,6 +178,70 @@ mod auction_tests {
         set_time(&env, START + DURATION + 50); // past the original end
         bid(&f, MIN_BID + 1);
         assert_eq!(f.client.get_auction(&f.auction_id).highest_bid, MIN_BID + 1);
+    }
+
+    // ── Pull-based refunds (#1356) ────────────────────────────────────────────
+
+    #[test]
+    fn test_outbid_refund_is_credited_not_pushed() {
+        let env = Env::default();
+        let f = setup(&env, 0, 0);
+        let first = bid_as_new(&f, 1_000);
+        bid_as_new(&f, 2_000);
+
+        // The previous bidder's balance is untouched until they withdraw.
+        assert_eq!(TokenClient::new(&env, &f.token).balance(&first), 0);
+        assert_eq!(f.client.get_pending_refund(&first, &f.token), 1_000);
+    }
+
+    #[test]
+    fn test_new_bid_succeeds_when_outbid_bidder_cannot_receive() {
+        let env = Env::default();
+        let f = setup(&env, 0, 0);
+        let first = bid_as_new(&f, 1_000);
+
+        // Deauthorizing the previous bidder makes any transfer to them fail.
+        // The old inline refund would have made this outbid revert.
+        StellarAssetClient::new(&env, &f.token).set_authorized(&first, &false);
+
+        bid_as_new(&f, 2_000);
+        assert_eq!(f.client.get_auction(&f.auction_id).highest_bid, 2_000);
+        assert_eq!(f.client.get_pending_refund(&first, &f.token), 1_000);
+    }
+
+    #[test]
+    fn test_withdraw_refund_pays_outbid_bidder() {
+        let env = Env::default();
+        let f = setup(&env, 0, 0);
+        let first = bid_as_new(&f, 1_000);
+        bid_as_new(&f, 2_000);
+
+        let paid = f.client.withdraw_refund(&first, &f.token);
+
+        assert_eq!(paid, 1_000);
+        assert_eq!(TokenClient::new(&env, &f.token).balance(&first), 1_000);
+        assert_eq!(f.client.get_pending_refund(&first, &f.token), 0);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_withdraw_refund_twice_rejected() {
+        let env = Env::default();
+        let f = setup(&env, 0, 0);
+        let first = bid_as_new(&f, 1_000);
+        bid_as_new(&f, 2_000);
+
+        f.client.withdraw_refund(&first, &f.token);
+        f.client.withdraw_refund(&first, &f.token);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_withdraw_refund_with_nothing_owed_rejected() {
+        let env = Env::default();
+        let f = setup(&env, 0, 0);
+        let stranger = Address::generate(&env);
+        f.client.withdraw_refund(&stranger, &f.token);
     }
 
     #[test]
