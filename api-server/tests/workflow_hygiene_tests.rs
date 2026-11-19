@@ -114,3 +114,80 @@ mod issue_1253_codecov_action {
         assert!(content.contains("./coverage/lcov.info"));
     }
 }
+
+// ── Issue #1254: top-level permissions on every workflow ─────────────────────
+
+mod issue_1254_workflow_permissions {
+    use super::*;
+
+    const WORKFLOWS_MISSING_PERMISSIONS: &[&str] = &[
+        "blue-green-deploy.yml",
+        "canary-deploy.yml",
+        "ci.yml",
+        "contract-upgrade-tests.yml",
+        "sdk-regenerate.yml",
+        "nightly-fuzz.yml",
+    ];
+
+    /// Returns the lines of the top-level `permissions:` block, if present.
+    fn top_level_permissions(content: &str) -> Option<Vec<&str>> {
+        let mut lines = content.lines();
+        lines.find(|l| *l == "permissions:")?;
+        let mut block = Vec::new();
+        for line in lines {
+            if line.is_empty() {
+                continue;
+            }
+            if !line.starts_with("  ") {
+                break;
+            }
+            block.push(line.trim());
+        }
+        Some(block)
+    }
+
+    #[test]
+    fn every_workflow_declares_top_level_permissions() {
+        for (name, content) in all_workflow_files() {
+            assert!(
+                top_level_permissions(&content).is_some(),
+                "{} is missing a top-level permissions block",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn listed_workflows_default_to_read_only_token() {
+        for name in WORKFLOWS_MISSING_PERMISSIONS {
+            let content = read_workflow(name);
+            let block = top_level_permissions(&content)
+                .unwrap_or_else(|| panic!("{} lacks top-level permissions", name));
+            assert_eq!(
+                block,
+                vec!["contents: read"],
+                "{} must default to contents: read only",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn sdk_regenerate_grants_pull_request_write_only_on_its_job() {
+        let content = read_workflow("sdk-regenerate.yml");
+        let job_start = content
+            .find("  regenerate-and-validate-sdk:")
+            .expect("regenerate-and-validate-sdk job must exist");
+        let job = &content[job_start..];
+        let job = job.find("\n  validation:").map_or(job, |i| &job[..i]);
+        assert!(
+            job.contains("pull-requests: write"),
+            "regenerate-and-validate-sdk must grant pull-requests: write for its PR comment"
+        );
+        let top = content[..job_start].to_string();
+        assert!(
+            !top.contains("pull-requests: write"),
+            "pull-requests: write must not be granted at the workflow level"
+        );
+    }
+}

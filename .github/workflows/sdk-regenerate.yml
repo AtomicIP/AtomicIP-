@@ -15,9 +15,15 @@ on:
       - main
       - develop
 
+permissions:
+  contents: read
+
 jobs:
   regenerate-and-validate-sdk:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write  # github-script posts the PR validation comment
     steps:
       - uses: actions/checkout@v4
         with:
