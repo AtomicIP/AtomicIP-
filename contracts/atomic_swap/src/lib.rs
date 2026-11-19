@@ -6582,6 +6582,10 @@ mod installment_limit_tests;
 #[cfg(test)]
 mod pause_guard_tests;
 
+// #1350: create_liquidity_pool must verify the pooled IP against ip_registry.
+#[cfg(test)]
+mod liquidity_pool_ip_verification_tests;
+
 // #781: re-enabled — was blocked by 3 pre-existing, unrelated compile errors
 // (a dropped `commit_ip` arg, and two obsolete `accept_swap_with_quantity`
 // calls to a since-removed function; both fixed / removed in this PR).
