@@ -6570,6 +6570,10 @@ mod liquidity_pool_tests;
 #[cfg(test)]
 mod finality_tests;
 
+// #1347: self-trade guard coverage across every swap-creation path.
+#[cfg(test)]
+mod self_trade_guard_tests;
+
 // #781: re-enabled — was blocked by 3 pre-existing, unrelated compile errors
 // (a dropped `commit_ip` arg, and two obsolete `accept_swap_with_quantity`
 // calls to a since-removed function; both fixed / removed in this PR).
