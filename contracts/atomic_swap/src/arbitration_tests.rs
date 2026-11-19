@@ -67,7 +67,7 @@ mod arbitration_tests {
 
         let contract_id = env.register(AtomicSwap, ());
         let client = AtomicSwapClient::new(env, &contract_id);
-        client.initialize(&registry_id);
+        client.initialize(&<soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env), &registry_id);
 
         // Price is kept small (well under 40) so protocol_fee_bps's fee
         // floors to 0 and the "complete to seller" ruling path never has to
@@ -153,7 +153,7 @@ mod arbitration_tests {
 
         let contract_id = env.register(AtomicSwap, ());
         let client = AtomicSwapClient::new(&env, &contract_id);
-        client.initialize(&registry_id);
+        client.initialize(&<soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env), &registry_id);
 
         let swap_id = client.initiate_swap(
             &token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None, &0_i128, &false,
@@ -557,7 +557,7 @@ mod arbitration_tests {
 
         let contract_id = env.register(AtomicSwap, ());
         let client = AtomicSwapClient::new(&env, &contract_id);
-        client.initialize(&registry_id);
+        client.initialize(&<soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env), &registry_id);
 
         // Initiate with price=1000, default quantity=1 — set quantity via initiate_swap
         // then manually bump quantity to 10 by accepting partial
@@ -597,7 +597,7 @@ mod arbitration_tests {
 
         let contract_id = env.register(AtomicSwap, ());
         let client = AtomicSwapClient::new(&env, &contract_id);
-        client.initialize(&registry_id);
+        client.initialize(&<soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env), &registry_id);
 
         let swap_id = client.initiate_swap(
             &token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None, &0_i128, &false,
@@ -625,7 +625,7 @@ mod arbitration_tests {
 
         let contract_id = env.register(AtomicSwap, ());
         let client = AtomicSwapClient::new(&env, &contract_id);
-        client.initialize(&registry_id);
+        client.initialize(&<soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env), &registry_id);
 
         let swap_id = client.initiate_swap(
             &token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None, &0_i128, &false,
@@ -647,7 +647,7 @@ mod arbitration_tests {
 
         let contract_id = env.register(AtomicSwap, ());
         let client = AtomicSwapClient::new(&env, &contract_id);
-        client.initialize(&registry_id);
+        client.initialize(&<soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env), &registry_id);
 
         let swap_id = client.initiate_swap(
             &token_id, &ip_id, &seller, &500_i128, &buyer, &0_u32, &None, &0_i128, &false,
@@ -685,7 +685,7 @@ mod arbitration_tests {
         let token_id = setup_token(&env, &token_admin, &buyer, 10_000_000);
         let contract_id = env.register(AtomicSwap, ());
         let client = AtomicSwapClient::new(&env, &contract_id);
-        client.initialize(&registry_id);
+        client.initialize(&<soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env), &registry_id);
 
         let mut ip_ids = Vec::new(&env);
         ip_ids.push_back(ip1);

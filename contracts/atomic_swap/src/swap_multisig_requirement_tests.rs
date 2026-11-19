@@ -2,7 +2,7 @@
 mod swap_multisig_requirement_tests {
     use ip_registry::{IpRegistry, IpRegistryClient};
     use soroban_sdk::{
-        testutils::Address as _,
+        testutils::{Address as _, Ledger as _},
         token::StellarAssetClient,
         Address, Bytes, BytesN, Env, Vec,
     };
@@ -35,10 +35,10 @@ mod swap_multisig_requirement_tests {
         token_id
     }
 
-    fn setup_contract(env: &Env, registry_id: &Address) -> AtomicSwapClient {
+    fn setup_contract<'a>(env: &'a Env, registry_id: &Address) -> AtomicSwapClient<'a> {
         let contract_id = env.register(AtomicSwap, ());
         let client = AtomicSwapClient::new(env, &contract_id);
-        client.initialize(registry_id);
+        client.initialize(&<soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env), registry_id);
         client
     }
 

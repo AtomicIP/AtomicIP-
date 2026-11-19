@@ -87,11 +87,11 @@ pub enum ContractError {
     IpAlreadyRevoked = 4,
     UnauthorizedUpgrade = 5,
     /// #1161: Batch exceeds `MAX_BATCH_COMMIT` hashes.
-    BatchTooLarge = 60,
+    BatchTooLarge = 69,
     /// #1160: Anonymous commit rate limit for the current ledger exceeded.
-    AnonRateLimitExceeded = 61,
+    AnonRateLimitExceeded = 70,
     /// #1162: Stake amount must be strictly positive.
-    InvalidStakeAmount = 62,
+    InvalidStakeAmount = 71,
     Unauthorized = 6,
     IpExpired = 7,
     MetadataTooLarge = 8,
@@ -188,21 +188,34 @@ pub enum ContractError {
     /// #1073: Dispute must be resolved before the claim can be verified.
     InsuranceDisputeUnresolved = 59,
     /// Issue #811 / #1104: Ownership challenge TTL has elapsed.
-    ChallengeExpired = 60,
+    ChallengeExpired = 72,
     /// Issue #811 / #1104: Ownership challenge has already been answered.
-    ChallengeAlreadyAnswered = 61,
+    ChallengeAlreadyAnswered = 73,
     /// Issue #1104: No open ownership challenge exists for this commitment.
-    CommitmentChallengeNotFound = 62,
+    CommitmentChallengeNotFound = 74,
     /// Issue #1105: Encrypted metadata is empty, has too many fields, or is too large.
     EncryptedMetadataInvalid = 63,
     /// Issue #1105: No metadata key is registered, or none is active for writes.
-    MetadataKeyNotFound = 64,
+    MetadataKeyNotFound = 75,
     /// Issue #1105: A metadata key with this ID is already registered.
-    MetadataKeyAlreadyRegistered = 65,
+    MetadataKeyAlreadyRegistered = 76,
     /// Issue #1105: The metadata key has been retired and cannot be used for writes.
     MetadataKeyRetired = 66,
+    /// Ownership percentages in a cap table do not sum to 100.
+    InvalidShareTotal = 67,
+    /// The commitment has been archived and can no longer be revealed.
+    CommitmentArchived = 68,
+    /// Write-once notarization: the IP already has a notary signature.
+    AlreadyNotarized = 60,
+    /// #1150: Access level must be 1, 2 or 3.
+    InvalidAccessLevel = 61,
+    /// #1151: The owner cannot grant access to themselves.
+    SelfGrantNotAllowed = 62,
+    /// Upgrade timelock is enabled and no matching upgrade has been proposed.
+    UpgradeNotProposed = 64,
+    /// #1154: `accept_admin` called with no pending nomination.
+    NoPendingAdmin = 65,
 }
-
 // ── TTL ───────────────────────────────────────────────────────────────────────
 
 /// Minimum ledger TTL bump applied to every persistent storage write.
@@ -534,9 +547,9 @@ const CURRENT_STORAGE_KEYS: &[&str] = &[
 /// Used as the compatibility baseline in `validate_upgrade`.
 const CURRENT_ERROR_CODES: &[(&str, u32)] = &[
     ("IpNotFound", 1),
-    ("BatchTooLarge", 60),
-    ("AnonRateLimitExceeded", 61),
-    ("InvalidStakeAmount", 62),
+    ("BatchTooLarge", 69),
+    ("AnonRateLimitExceeded", 70),
+    ("InvalidStakeAmount", 71),
     ("ZeroCommitmentHash", 2),
     ("CommitmentAlreadyRegistered", 3),
     ("IpAlreadyRevoked", 4),

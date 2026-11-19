@@ -54,7 +54,7 @@ const DEDUCTIBLE_RATIO   = 0.05;
  * @param {object} swapMeta
  * @param {number} [swapMeta.sellerReputationScore]  - 0–1000 reputation score
  * @param {number} [swapMeta.previousClaimsCount]    - number of past insurance claims
- * @param {number} [swapMeta.transactionValue]       - nominal swap value
+ * @param {number} [swapMeta.swapValue]              - nominal swap value
  * @param {string} [swapMeta.assetCategory]          - e.g. "high_risk", "software"
  * @returns {number} risk factor ≥ 0.5 (applied as a premium multiplier)
  */
