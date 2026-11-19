@@ -2,11 +2,13 @@
 
 use ip_registry::{IpRegistry, IpRegistryClient};
 use soroban_sdk::{
-    testutils::Address as _, token, token::StellarAssetClient, Address, Bytes, BytesN, Env, Error,
-    Vec,
+    testutils::{Address as _, Ledger},
+    token,
+    token::StellarAssetClient,
+    Address, Bytes, BytesN, Env, Error, Vec,
 };
 
-use crate::{AtomicSwap, AtomicSwapClient, ContractError, SwapStatus};
+use crate::{AtomicSwap, AtomicSwapClient, ContractError, SwapCondition, SwapStatus};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -120,4 +122,123 @@ fn test_batch_reveal_keys_duplicate_id_panics_without_state_change() {
     assert_eq!(token.balance(&seller), seller_before);
     assert_eq!(token.balance(&contract_id), contract_before);
     assert_eq!(client.get_swap(&id0).unwrap().status, SwapStatus::Accepted);
+}
+
+// ── #1340: batch_reveal_keys enforces multi-signer and buyer conditions ───────
+
+/// A swap that requires co-signers must not be releasable through the batch path
+/// until every signer has signed, matching `reveal_key`.
+#[test]
+fn test_batch_reveal_keys_requires_all_signatures() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let seller = Address::generate(&env);
+    let co_signer = Address::generate(&env);
+    let buyer = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    let registry_id = setup_registry(&env);
+    let token_id = setup_token(&env, &admin, &buyer, 10_000_000);
+    let contract_id = setup_contract(&env, &registry_id);
+    let client = AtomicSwapClient::new(&env, &contract_id);
+    let token = token::Client::new(&env, &token_id);
+
+    let (ip_id, secret, blinding) = commit_ip(&env, &registry_id, &seller, 0x01);
+
+    let mut signers = Vec::new(&env);
+    signers.push_back(seller.clone());
+    signers.push_back(co_signer.clone());
+    let swap_id =
+        client.initiate_swap_with_signers(&token_id, &ip_id, &seller, &1000i128, &buyer, &signers);
+    client.accept_swap(&swap_id);
+
+    let mut ids = Vec::new(&env);
+    ids.push_back(swap_id);
+    let mut secrets = Vec::new(&env);
+    secrets.push_back(secret.clone());
+    let mut blindings = Vec::new(&env);
+    blindings.push_back(blinding.clone());
+
+    // Only one of two signatures collected: batch reveal must be refused.
+    client.sign_swap_reveal(&swap_id, &seller);
+    let seller_before = token.balance(&seller);
+    let contract_before = token.balance(&contract_id);
+    let result = client.try_batch_reveal_keys(&ids, &secrets, &blindings, &seller);
+    assert_eq!(
+        result.unwrap_err(),
+        contract_error(ContractError::NotAllSigned)
+    );
+    assert_eq!(token.balance(&seller), seller_before);
+    assert_eq!(token.balance(&contract_id), contract_before);
+    assert_eq!(
+        client.get_swap(&swap_id).unwrap().status,
+        SwapStatus::Accepted
+    );
+
+    // Final signature collected: batch reveal now succeeds.
+    client.sign_swap_reveal(&swap_id, &co_signer);
+    client.batch_reveal_keys(&ids, &secrets, &blindings, &seller);
+    assert_eq!(
+        client.get_swap(&swap_id).unwrap().status,
+        SwapStatus::Completed
+    );
+}
+
+/// Buyer conditions must be re-evaluated at reveal time in the batch path, as
+/// `reveal_key` does. A `TimeAfter` condition that is not yet met must block the batch.
+#[test]
+fn test_batch_reveal_keys_enforces_buyer_conditions() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let seller = Address::generate(&env);
+    let buyer = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    let registry_id = setup_registry(&env);
+    let token_id = setup_token(&env, &admin, &buyer, 10_000_000);
+    let contract_id = setup_contract(&env, &registry_id);
+    let client = AtomicSwapClient::new(&env, &contract_id);
+    let token = token::Client::new(&env, &token_id);
+
+    let (ip_id, secret, blinding) = commit_ip(&env, &registry_id, &seller, 0x02);
+
+    let mut ip_ids = Vec::new(&env);
+    ip_ids.push_back(ip_id);
+    let mut prices = Vec::new(&env);
+    prices.push_back(1000i128);
+    let swap_ids =
+        client.batch_initiate_swap(&token_id, &ip_ids, &seller, &prices, &buyer, &0u32, &None);
+    let swap_id = swap_ids.get(0).unwrap();
+
+    let mut conditions = Vec::new(&env);
+    conditions.push_back(SwapCondition::TimeAfter(1_000u64));
+    client.accept_swap_conditional(&swap_id, &conditions);
+
+    let mut ids = Vec::new(&env);
+    ids.push_back(swap_id);
+    let mut secrets = Vec::new(&env);
+    secrets.push_back(secret);
+    let mut blindings = Vec::new(&env);
+    blindings.push_back(blinding);
+
+    // Ledger time is 0, before the TimeAfter(1000) condition: batch must be refused.
+    let seller_before = token.balance(&seller);
+    let contract_before = token.balance(&contract_id);
+    let result = client.try_batch_reveal_keys(&ids, &secrets, &blindings, &seller);
+    assert_eq!(
+        result.unwrap_err(),
+        contract_error(ContractError::ConditionNotMet)
+    );
+    assert_eq!(token.balance(&seller), seller_before);
+    assert_eq!(token.balance(&contract_id), contract_before);
+
+    // Once the condition holds, the same batch completes.
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    client.batch_reveal_keys(&ids, &secrets, &blindings, &seller);
+    assert_eq!(
+        client.get_swap(&swap_id).unwrap().status,
+        SwapStatus::Completed
+    );
 }

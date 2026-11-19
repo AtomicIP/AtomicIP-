@@ -723,6 +723,33 @@ impl AtomicSwap {
         }
     }
 
+    /// #1340: Panics with `NotAllSigned` unless every required co-signer of the swap has
+    /// signed. Shared by `reveal_key` and `batch_reveal_keys` so neither path can release
+    /// payment for a multi-signer swap that is still missing signatures.
+    fn require_all_signed(env: &Env, swap_id: u64) {
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::SwapSigners(swap_id))
+        {
+            let signers: Vec<Address> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::SwapSigners(swap_id))
+                .unwrap_or(Vec::new(env));
+            let signed: Vec<Address> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::SwapSignatures(swap_id))
+                .unwrap_or(Vec::new(env));
+            if signed.len() < signers.len() {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::NotAllSigned as u32,
+                ));
+            }
+        }
+    }
+
     fn validate_contingencies(env: &Env, swap_id: u64) {
         let contingencies: Vec<SwapContingencyRecord> = env
             .storage()
@@ -1031,30 +1058,10 @@ impl AtomicSwap {
         );
         Self::validate_contingencies(&env, swap_id);
 
-        // Verify commitment via IP registry
         // Guard: if this swap has required signers, all must have signed before reveal.
-        if env
-            .storage()
-            .persistent()
-            .has(&DataKey::SwapSigners(swap_id))
-        {
-            let signers: Vec<Address> = env
-                .storage()
-                .persistent()
-                .get(&DataKey::SwapSigners(swap_id))
-                .unwrap_or(Vec::new(&env));
-            let signed: Vec<Address> = env
-                .storage()
-                .persistent()
-                .get(&DataKey::SwapSignatures(swap_id))
-                .unwrap_or(Vec::new(&env));
-            if signed.len() < signers.len() {
-                env.panic_with_error(Error::from_contract_error(
-                    ContractError::NotAllSigned as u32,
-                ));
-            }
-        }
+        Self::require_all_signed(&env, swap_id);
 
+        // Verify commitment via IP registry
         let valid = registry::verify_commitment(&env, swap.ip_id, &secret, &blinding_factor);
         if !valid {
             // #1171: Soroban rolls back all state changes in a failed invocation, so a
@@ -4473,6 +4480,11 @@ impl AtomicSwap {
                 ContractError::NotAccepted,
             );
             Self::validate_contingencies(&env, swap_id);
+            // #1340: same multi-signer gate and buyer-condition re-check as reveal_key.
+            Self::require_all_signed(&env, swap_id);
+            if !swap.conditions.is_empty() {
+                Self::evaluate_conditions(&env, &swap, true);
+            }
             let valid = registry::verify_commitment(
                 &env,
                 swap.ip_id,
