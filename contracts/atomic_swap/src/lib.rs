@@ -1029,6 +1029,9 @@ impl AtomicSwap {
         );
         Self::validate_contingencies(&env, swap_id);
 
+        // #1381: the seller must still own the IP at reveal time.
+        registry::ensure_seller_owns_active_ip(&env, swap.ip_id, &swap.seller);
+
         // Verify commitment via IP registry
         // Guard: if this swap has required signers, all must have signed before reveal.
         if env
@@ -2915,6 +2918,12 @@ impl AtomicSwap {
     }
 
     /// Read a swap record. Returns `None` if the swap_id does not exist.
+    /// #1381: Whether an active swap or auction currently references `ip_id`.
+    /// Consulted by the IP registry before allowing a transfer.
+    pub fn has_active_swap(env: Env, ip_id: u64) -> bool {
+        env.storage().persistent().has(&DataKey::ActiveSwap(ip_id))
+    }
+
     pub fn get_swap(env: Env, swap_id: u64) -> Option<SwapRecord> {
         env.storage().persistent().get(&DataKey::Swap(swap_id))
     }
