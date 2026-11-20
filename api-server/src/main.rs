@@ -486,6 +486,8 @@ async fn main() {
         .route("/v1/admin/commitments/lifecycle", get(commitment_monitoring::lifecycle_handler))
         .route("/v1/admin/alerts", get(commitment_monitoring::open_alerts_handler))
         .merge(incident_routes())
+        .route("/v1/ip/search", get(handlers::search_ip))
+        .merge(ip_search_routes())
         .route("/v1/admin/incidents/alertmanager", post(incidents::alertmanager_webhook_handler))
         .route("/v1/auth/recovery/initiate",      post(account_recovery::initiate_recovery))
         .route("/v1/auth/recovery/verify-token",  post(account_recovery::verify_recovery_token))
@@ -674,9 +676,7 @@ fn build_app() -> Router {
         .route("/v1/swap/marketplace/buyer/{buyer}",  get(handlers::marketplace_by_buyer))
         .route("/v1/swap/marketplace/ip/{ip_id}",     get(handlers::marketplace_by_ip))
         .route("/v1/ip/search", get(handlers::search_ip))
-        .route("/v1/ip/{ip_id}/metadata", axum::routing::put(handlers::put_ip_search_metadata))
-        .route("/v1/ip/search/saved/{owner}", get(handlers::list_ip_saved_searches).post(handlers::save_ip_search))
-        .route("/v1/ip/search/saved/{owner}/{id}", axum::routing::delete(handlers::delete_ip_saved_search))
+        .merge(ip_search_routes())
         .route("/v1/ip/owner/{owner}/cursor", get(handlers::list_ip_by_owner_cursor))
         .route("/v1/swap/initiate", post(handlers::initiate_swap).layer(signed.clone()))
         .route("/v1/swap/batch-initiate", post(handlers::batch_initiate_swap).layer(signed.clone()))
@@ -721,6 +721,17 @@ fn build_app() -> Router {
         .layer(middleware::from_fn(compression::compression_middleware))
         .layer(middleware::from_fn(validation_middleware::validation_logging_middleware))
         .layer(middleware::from_fn(require_json_content_type))
+}
+
+/// Marketplace search routes that write or expose per-owner data. They take
+/// the caller's identity from the bearer token (#1387, #1388), so every one
+/// sits behind `require_auth`; the owner is never read from the path.
+fn ip_search_routes() -> Router {
+    Router::new()
+        .route("/v1/ip/{ip_id}/metadata", axum::routing::put(handlers::put_ip_search_metadata))
+        .route("/v1/ip/search/saved", get(handlers::list_ip_saved_searches).post(handlers::save_ip_search))
+        .route("/v1/ip/search/saved/{id}", axum::routing::delete(handlers::delete_ip_saved_search))
+        .route_layer(middleware::from_fn(auth::require_auth))
 }
 
 fn incident_routes() -> Router {

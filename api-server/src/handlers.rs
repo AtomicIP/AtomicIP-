@@ -1996,12 +1996,20 @@ pub async fn marketplace_by_ip(
     params(IpSearchFilters),
     responses((status = 200, description = "Matching IP listings with facet counts", body = IpSearchResponse))
 )]
-pub async fn search_ip(Query(filters): Query<IpSearchFilters>) -> impl IntoResponse {
+pub async fn search_ip(Query(mut filters): Query<IpSearchFilters>) -> impl IntoResponse {
+    // #1389: revoked IPs are hidden from public search; the admin-only
+    // `include_revoked` flag cannot be set from this route.
+    filters.include_revoked = None;
     Json(crate::ip_search::search(&crate::ip_search::listings(), &filters))
 }
 
+fn ip_search_error(status: StatusCode, error: &str) -> Response {
+    (status, Json(ErrorResponse { error: error.to_string() })).into_response()
+}
+
 /// Index an IP for marketplace search, or replace the metadata of an already
-/// indexed IP. The IP record must be known to the cache.
+/// indexed IP. Requires a bearer token; only the IP's current owner may write
+/// its listing (#1387).
 #[utoipa::path(
     put,
     path = "/v1/ip/{ip_id}/metadata",
@@ -2011,72 +2019,98 @@ pub async fn search_ip(Query(filters): Query<IpSearchFilters>) -> impl IntoRespo
     responses(
         (status = 200, description = "Metadata indexed", body = IpSearchMetadata),
         (status = 400, description = "Invalid metadata", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Caller does not own this IP", body = ErrorResponse),
         (status = 404, description = "IP not found", body = ErrorResponse)
     )
 )]
 pub async fn put_ip_search_metadata(
+    crate::auth::AuthExtension(claims): crate::auth::AuthExtension,
     Path(ip_id): Path<u64>,
     Json(metadata): Json<IpSearchMetadata>,
 ) -> impl IntoResponse {
     let Some(record) = cache::get::<IpRecord>(&cache::ip_key(ip_id)) else {
-        return (StatusCode::NOT_FOUND, Json(ErrorResponse { error: "IP not found".to_string() })).into_response();
+        return ip_search_error(StatusCode::NOT_FOUND, "IP not found");
     };
+    // #1387: ownership is checked against the registry record, never the body.
+    if record.owner != claims.sub {
+        return ip_search_error(StatusCode::FORBIDDEN, "only the IP owner may update its listing");
+    }
+    if record.revoked {
+        return ip_search_error(StatusCode::BAD_REQUEST, "revoked IPs cannot be listed");
+    }
     match crate::ip_search::index_listing(record, metadata) {
         Ok(stored) => (StatusCode::OK, Json(stored)).into_response(),
         Err(error) => (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response(),
     }
 }
 
-/// Save a named search for an owner (at most 20 per owner, names unique).
+/// Save a named search for the authenticated caller (at most 20, names unique).
+/// The owner is the bearer token's subject (#1388).
 #[utoipa::path(
     post,
-    path = "/v1/ip/search/saved/{owner}",
+    path = "/v1/ip/search/saved",
     tag = "Marketplace",
-    params(("owner" = String, Path, description = "Owner address")),
     request_body = SaveSearchRequest,
     responses(
         (status = 201, description = "Saved search created", body = SavedSearch),
-        (status = 400, description = "Invalid name or limit reached", body = ErrorResponse)
+        (status = 400, description = "Invalid name or limit reached", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse)
     )
 )]
 pub async fn save_ip_search(
-    Path(owner): Path<String>,
-    Json(request): Json<SaveSearchRequest>,
+    crate::auth::AuthExtension(claims): crate::auth::AuthExtension,
+    Json(mut request): Json<SaveSearchRequest>,
 ) -> impl IntoResponse {
-    match crate::ip_search::save_search(&owner, &request.name, request.filters) {
+    // Saved searches replay through the public search route, so never persist
+    // the admin-only revoked flag.
+    request.filters.include_revoked = None;
+    match crate::ip_search::save_search(&claims.sub, &request.name, request.filters) {
         Ok(saved) => (StatusCode::CREATED, Json(saved)).into_response(),
         Err(error) => (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response(),
     }
 }
 
-/// List an owner's saved searches.
+/// List the authenticated caller's saved searches (#1388).
 #[utoipa::path(
     get,
-    path = "/v1/ip/search/saved/{owner}",
+    path = "/v1/ip/search/saved",
     tag = "Marketplace",
-    params(("owner" = String, Path, description = "Owner address")),
-    responses((status = 200, description = "Saved searches", body = Vec<SavedSearch>))
+    responses(
+        (status = 200, description = "Saved searches", body = Vec<SavedSearch>),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse)
+    )
 )]
-pub async fn list_ip_saved_searches(Path(owner): Path<String>) -> impl IntoResponse {
-    Json(crate::ip_search::list_saved_searches(&owner))
+pub async fn list_ip_saved_searches(
+    crate::auth::AuthExtension(claims): crate::auth::AuthExtension,
+) -> impl IntoResponse {
+    Json(crate::ip_search::list_saved_searches(&claims.sub))
 }
 
-/// Delete one of an owner's saved searches.
+/// Delete one of the authenticated caller's saved searches (#1388). A search
+/// that belongs to someone else returns 403.
 #[utoipa::path(
     delete,
-    path = "/v1/ip/search/saved/{owner}/{id}",
+    path = "/v1/ip/search/saved/{id}",
     tag = "Marketplace",
-    params(("owner" = String, Path, description = "Owner address"), ("id" = u64, Path, description = "Saved search identifier")),
+    params(("id" = u64, Path, description = "Saved search identifier")),
     responses(
         (status = 204, description = "Saved search deleted"),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Saved search belongs to another owner", body = ErrorResponse),
         (status = 404, description = "No saved search with that id", body = ErrorResponse)
     )
 )]
-pub async fn delete_ip_saved_search(Path((owner, id)): Path<(String, u64)>) -> impl IntoResponse {
-    if crate::ip_search::delete_saved_search(&owner, id) {
-        StatusCode::NO_CONTENT.into_response()
-    } else {
-        (StatusCode::NOT_FOUND, Json(ErrorResponse { error: "saved search not found".to_string() })).into_response()
+pub async fn delete_ip_saved_search(
+    crate::auth::AuthExtension(claims): crate::auth::AuthExtension,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    if crate::ip_search::delete_saved_search(&claims.sub, id) {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+    match crate::ip_search::saved_search_owner(id) {
+        Some(_) => ip_search_error(StatusCode::FORBIDDEN, "saved search belongs to another owner"),
+        None => ip_search_error(StatusCode::NOT_FOUND, "saved search not found"),
     }
 }
 
