@@ -3913,7 +3913,8 @@ mod batch_escrow_tests {
         let commitment = BytesN::from_array(&env, &[0xA1u8; 32]);
         let ip_id = client.commit_ip(&owner, &commitment, &0u32);
 
-        // Set a very short TTL: 100 seconds
+        // Set a very short TTL: 100 seconds (requires an initialized admin, #1385)
+        client.initialize(&<Address as TestAddress>::generate(&env));
         client.set_challenge_ttl(&100u64);
 
         let challenger = <Address as TestAddress>::generate(&env);
@@ -3946,8 +3947,9 @@ mod batch_escrow_tests {
         let commitment = BytesN::from_array(&env, &[0xA2u8; 32]);
         let ip_id = client.commit_ip(&owner, &commitment, &0u32);
 
-        // Short TTL
-        client.set_challenge_ttl(&50u64);
+        // Short TTL (minimum allowed is 60 seconds, #1385)
+        client.initialize(&<Address as TestAddress>::generate(&env));
+        client.set_challenge_ttl(&60u64);
 
         let challenger = <Address as TestAddress>::generate(&env);
         let nonce = BytesN::from_array(&env, &[0x55u8; 32]);
