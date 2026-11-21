@@ -211,16 +211,30 @@ pub fn require_pow(env: &Env, commitment_hash: &BytesN<32>, difficulty: u32) {
     }
 }
 
-/// Calculate commitment strength (0-100 scale) based on secret length and PoW difficulty.
-/// Strength = min(100, (secret_length * 2) + (pow_difficulty * 3))
-#[allow(dead_code)]
-pub fn calculate_commitment_strength(secret_length: u32, pow_difficulty: u32) -> u8 {
-    let strength = (secret_length * 2).saturating_add(pow_difficulty * 3);
-    if strength > 100 {
-        100u8
-    } else {
-        strength as u8
+/// Strength score (0–100) of an IP commitment. This is the single formula
+/// behind `IpRegistry::get_ip_strength`.
+///
+/// ```text
+/// entropy_score = unique_bytes(commitment_hash) * 50 / 32      // 0–50
+/// pow_score     = min(pow_difficulty, 32) * 50 / 32            // 0–50
+/// strength      = min(100, entropy_score + pow_score)
+/// ```
+///
+/// `unique_bytes` is the number of distinct byte values among the 32 bytes of
+/// the commitment hash, used as a proxy for byte-level entropy.
+/// `pow_difficulty` is the number of leading zero bits proven at commit time.
+/// Both divisions are integer (truncating) divisions.
+pub fn commitment_strength(commitment_hash: &[u8; 32], pow_difficulty: u32) -> u32 {
+    let mut seen = [false; 256];
+    for b in commitment_hash.iter() {
+        seen[*b as usize] = true;
     }
+    let unique_bytes = seen.iter().filter(|&&v| v).count() as u32;
+
+    let entropy_score = (unique_bytes * 50) / 32;
+    let pow_score = (pow_difficulty.min(32) * 50) / 32;
+
+    (entropy_score + pow_score).min(100)
 }
 
 /// Validates that a set of `OwnershipShare` percentages sums to exactly 100.
@@ -401,5 +415,41 @@ mod tests {
         let env = Env::default();
         let shares = shares_summing_to(&env, 101);
         require_valid_share_total(&env, &shares);
+    }
+    // ── #1378: pin the get_ip_strength formula ────────────────────────────────
+
+    #[test]
+    fn test_commitment_strength_single_byte_no_pow() {
+        // 1 unique byte -> 50/32 = 1; pow 0 -> 0
+        assert_eq!(commitment_strength(&[7u8; 32], 0), 1);
+    }
+
+    #[test]
+    fn test_commitment_strength_all_unique_bytes_max_pow() {
+        let mut hash = [0u8; 32];
+        for (i, b) in hash.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        // 32 unique -> 50; pow 32 -> 50
+        assert_eq!(commitment_strength(&hash, 32), 100);
+    }
+
+    #[test]
+    fn test_commitment_strength_partial_values() {
+        let mut hash = [0u8; 32];
+        for (i, b) in hash.iter_mut().enumerate() {
+            *b = (i % 16) as u8;
+        }
+        // 16 unique -> 800/32 = 25; pow 8 -> 400/32 = 12
+        assert_eq!(commitment_strength(&hash, 8), 37);
+        // pow 4 -> 200/32 = 6
+        assert_eq!(commitment_strength(&hash, 4), 31);
+    }
+
+    #[test]
+    fn test_commitment_strength_pow_capped_at_32_bits() {
+        assert_eq!(commitment_strength(&[7u8; 32], 32), 51);
+        assert_eq!(commitment_strength(&[7u8; 32], 200), 51);
+        assert_eq!(commitment_strength(&[7u8; 32], u32::MAX), 51);
     }
 }
