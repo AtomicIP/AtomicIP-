@@ -75,6 +75,10 @@ mod validator_network_tests;
 #[cfg(test)]
 mod revocation_property_tests;
 
+// #1367 / #1368 / #1369 / #1370: arbitration voting, finalization and stake ownership
+#[cfg(test)]
+mod arbitration_stake_tests;
+
 // ── Error Codes ────────────────────────────────────────────────────────────
 
 #[contracterror]
@@ -201,6 +205,10 @@ pub enum ContractError {
     MetadataKeyAlreadyRegistered = 65,
     /// Issue #1105: The metadata key has been retired and cannot be used for writes.
     MetadataKeyRetired = 66,
+    /// #1368: The arbitrator has already voted on this arbitration case.
+    AlreadyVoted = 67,
+    /// #1370: Not enough arbitrators have voted to finalize the case.
+    ArbitrationQuorumNotMet = 68,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -353,6 +361,8 @@ pub enum DataKey {
     ArbitrationCase(u64),   // Issue #449: stores ArbitrationRecord for a given arbitration_id
     NextArbitrationId,      // Issue #449: monotonic arbitration ID counter
     ArbitratorPool,         // Issue #449: stores Vec<Address> of registered arbitrators
+    /// #1368: (arbitration_id, voter) -> bool vote (true = for owner). Presence means the voter has voted.
+    ArbitrationVote(u64, Address),
     CompressedCommitment(u64), // Issue #438: stores compressed commitment bytes for a given ip_id
     // Issue #458: Batch verification result cache
     BatchVerifyResult(BytesN<32>), // maps batch_proof_id -> BatchVerifyResult
@@ -2436,6 +2446,22 @@ impl IpRegistry {
         // The new owner starts with a single-owner cap table and no grants.
         validation::clear_owner_scoped_state(&env, ip_id);
         record.co_owners = Vec::new(&env);
+
+        // #1367: the stake follows the IP. Migrate it so the former owner can
+        // no longer unstake it and slashing penalises the current owner.
+        if let Some(mut stake) = env
+            .storage()
+            .persistent()
+            .get::<_, StakeRecord>(&DataKey::IpStake(ip_id))
+        {
+            stake.owner = new_owner.clone();
+            env.storage()
+                .persistent()
+                .set(&DataKey::IpStake(ip_id), &stake);
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::IpStake(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+        }
 
         record.owner = new_owner.clone();
         env.storage()
@@ -5786,24 +5812,31 @@ impl IpRegistry {
             .get(&DataKey::IpDisputes(dispute_id))
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::DisputeNotFound));
 
+        Self::apply_dispute_resolution(&env, &mut record, winner);
+    }
+
+    /// #1369: Single resolution path shared by `resolve_dispute` and
+    /// `finalize_arbitration`. Rejects a dispute that is already resolved so
+    /// one dispute can never end up with two different stored outcomes.
+    fn apply_dispute_resolution(env: &Env, record: &mut DisputeRecord, winner: Address) {
         if record.resolved {
-            panic_with_error!(&env, ContractError::DisputeAlreadyResolved);
+            panic_with_error!(env, ContractError::DisputeAlreadyResolved);
         }
 
         record.resolved = true;
         record.winner = Some(winner.clone());
         env.storage()
             .persistent()
-            .set(&DataKey::IpDisputes(dispute_id), &record);
+            .set(&DataKey::IpDisputes(record.dispute_id), &*record);
         env.storage().persistent().extend_ttl(
-            &DataKey::IpDisputes(dispute_id),
+            &DataKey::IpDisputes(record.dispute_id),
             LEDGER_BUMP,
             LEDGER_BUMP,
         );
 
         env.events().publish(
-            (symbol_short!("disp_res"), winner.clone()),
-            (dispute_id, record.ip_id),
+            (symbol_short!("disp_res"), winner),
+            (record.dispute_id, record.ip_id),
         );
     }
 
@@ -5945,7 +5978,9 @@ impl IpRegistry {
             .publish((symbol_short!("slashed"), stake.owner), ip_id);
     }
 
-    /// Unstake: remove an active (non-slashed) stake. Owner-only.
+    /// Unstake: remove an active (non-slashed) stake. Only the current IP
+    /// owner may unstake (#1367): authorisation is checked against the IP
+    /// record, not the address stored when the stake was created.
     pub fn unstake(env: Env, ip_id: u64) {
         let stake: StakeRecord = env
             .storage()
@@ -5953,7 +5988,8 @@ impl IpRegistry {
             .get(&DataKey::IpStake(ip_id))
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::StakeNotFound));
 
-        stake.owner.require_auth();
+        let current_owner = require_ip_exists(&env, ip_id).owner;
+        current_owner.require_auth();
 
         if stake.slashed {
             panic_with_error!(&env, ContractError::StakeAlreadySlashed);
@@ -5961,7 +5997,7 @@ impl IpRegistry {
 
         env.storage().persistent().remove(&DataKey::IpStake(ip_id));
         env.events()
-            .publish((symbol_short!("unstaked"), stake.owner), ip_id);
+            .publish((symbol_short!("unstaked"), current_owner), ip_id);
     }
 
     /// Get the stake record for an IP.
@@ -6105,12 +6141,15 @@ impl IpRegistry {
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::Unauthorized));
         admin.require_auth();
 
-        // Ensure dispute exists
-        let _dispute: DisputeRecord = env
+        // Ensure dispute exists and is still open (#1369)
+        let dispute: DisputeRecord = env
             .storage()
             .persistent()
             .get(&DataKey::IpDisputes(dispute_id))
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::DisputeNotFound));
+        if dispute.resolved {
+            panic_with_error!(&env, ContractError::DisputeAlreadyResolved);
+        }
 
         let arb_id: u64 = env
             .storage()
@@ -6156,6 +6195,7 @@ impl IpRegistry {
 
     /// Cast a vote on an arbitration case. `vote_for_owner = true` votes for the
     /// IP owner; `false` votes for the challenger. Caller must be a nominated arbitrator.
+    /// Each arbitrator may vote exactly once per case (#1368).
     pub fn vote_on_dispute(env: Env, arbitration_id: u64, voter: Address, vote_for_owner: bool) {
         voter.require_auth();
 
@@ -6181,6 +6221,16 @@ impl IpRegistry {
             panic_with_error!(&env, ContractError::NotAnArbitrator);
         }
 
+        // #1368: one vote per arbitrator per case.
+        let vote_key = DataKey::ArbitrationVote(arbitration_id, voter.clone());
+        if env.storage().persistent().has(&vote_key) {
+            panic_with_error!(&env, ContractError::AlreadyVoted);
+        }
+        env.storage().persistent().set(&vote_key, &vote_for_owner);
+        env.storage()
+            .persistent()
+            .extend_ttl(&vote_key, LEDGER_BUMP, LEDGER_BUMP);
+
         if vote_for_owner {
             case.votes_owner += 1;
         } else {
@@ -6204,6 +6254,19 @@ impl IpRegistry {
 
     /// Finalize an arbitration case. Admin-only. Determines winner by majority vote
     /// and resolves the underlying dispute.
+    ///
+    /// Outcome rules (#1370):
+    /// * **Quorum**: a strict majority of the case's arbitrators must have voted
+    ///   (`votes_owner + votes_challenger >= arbitrators.len() / 2 + 1`).
+    ///   Below quorum — including a case with zero votes or zero arbitrators —
+    ///   finalization panics with `ArbitrationQuorumNotMet`.
+    /// * **Majority**: once quorum is met, the side with more votes wins.
+    /// * **Tie**: a tie at or above quorum goes to the current IP owner. The
+    ///   challenger carries the burden of proof, so failing to win a majority
+    ///   leaves ownership unchanged.
+    ///
+    /// Panics with `DisputeAlreadyResolved` if the dispute was already resolved,
+    /// e.g. by `resolve_dispute` (#1369).
     pub fn finalize_arbitration(env: Env, arbitration_id: u64) {
         let admin: Address = env
             .storage()
@@ -6228,9 +6291,21 @@ impl IpRegistry {
             .get(&DataKey::IpDisputes(case.dispute_id))
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::DisputeNotFound));
 
+        // #1369: never overwrite a dispute that has already been resolved.
+        if dispute.resolved {
+            panic_with_error!(&env, ContractError::DisputeAlreadyResolved);
+        }
+
+        // #1370: require a quorum (strict majority of arbitrators) to have voted.
+        let total_votes = case.votes_owner + case.votes_challenger;
+        let quorum = case.arbitrators.len() / 2 + 1;
+        if total_votes < quorum {
+            panic_with_error!(&env, ContractError::ArbitrationQuorumNotMet);
+        }
+
         let ip_record = require_ip_exists(&env, dispute.ip_id);
 
-        // Majority vote determines winner; ties go to the IP owner
+        // Majority vote determines winner; ties (at quorum) go to the IP owner.
         let winner = if case.votes_challenger > case.votes_owner {
             dispute.challenger.clone()
         } else {
@@ -6239,8 +6314,6 @@ impl IpRegistry {
 
         case.finalized = true;
         case.winner = Some(winner.clone());
-        dispute.resolved = true;
-        dispute.winner = Some(winner.clone());
 
         env.storage()
             .persistent()
@@ -6250,14 +6323,8 @@ impl IpRegistry {
             LEDGER_BUMP,
             LEDGER_BUMP,
         );
-        env.storage()
-            .persistent()
-            .set(&DataKey::IpDisputes(case.dispute_id), &dispute);
-        env.storage().persistent().extend_ttl(
-            &DataKey::IpDisputes(case.dispute_id),
-            LEDGER_BUMP,
-            LEDGER_BUMP,
-        );
+
+        Self::apply_dispute_resolution(&env, &mut dispute, winner.clone());
 
         env.events()
             .publish((symbol_short!("arb_fin"), winner.clone()), arbitration_id);
