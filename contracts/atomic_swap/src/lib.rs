@@ -161,6 +161,8 @@ pub enum ContractError {
     DuplicateSwapId = 81,
     /// #1342: `collateral_amount` must be zero or positive.
     InvalidCollateralAmount = 82,
+    /// Seller reputation penalty for expired swaps must be at most 100.
+    InvalidReputationPenalty = 83,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -1223,7 +1225,7 @@ impl AtomicSwap {
     /// panicking, so a genuinely invalid reveal attempt can be recorded on-chain.
     /// Returns `true` if the claimable flag was set, `false` if the commitment was
     /// actually valid (nothing to claim) or insurance was not enabled.
-    pub fn mark_invalid_key_insurance_claimable(
+    pub fn mark_invalid_key_claimable(
         env: Env,
         swap_id: u64,
         caller: Address,
@@ -6135,7 +6137,7 @@ impl AtomicSwap {
     // ── Reputation ────────────────────────────────────────────────────────────
 
     /// Returns the configured seller reputation penalty for expired swaps. Defaults to 10.
-    pub fn get_expired_swap_reputation_penalty(env: Env) -> u32 {
+    pub fn get_expired_penalty(env: Env) -> u32 {
         env.storage()
             .persistent()
             .get(&DataKey::ExpiredSwapReputationPenalty)
@@ -6143,7 +6145,7 @@ impl AtomicSwap {
     }
 
     /// Set the seller reputation penalty for expired swaps. Only the admin may call this.
-    pub fn set_expired_swap_reputation_penalty(env: Env, caller: Address, penalty: u32) {
+    pub fn set_expired_penalty(env: Env, caller: Address, penalty: u32) {
         caller.require_auth();
         require_admin(&env, &caller);
         if penalty > 100 {

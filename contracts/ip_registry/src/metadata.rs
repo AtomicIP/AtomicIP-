@@ -8,6 +8,7 @@ use crate::types::{
     DataKey, EncryptedField, EncryptedMetadataInfo, EncryptedMetadataRecord, IpMetadata,
     MetadataSearchResult,
 };
+use crate::types::LEDGER_BUMP;
 use soroban_sdk::{Bytes, BytesN, Env, Map, Symbol, Vec};
 
 /// Maximum number of results per search page
