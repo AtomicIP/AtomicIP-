@@ -138,6 +138,12 @@ function scoreMatch(buyer, seller) {
   return { score, breakdown };
 }
 
+function compareIds(a, b) {
+  const ka = String(a);
+  const kb = String(b);
+  return ka < kb ? -1 : ka > kb ? 1 : 0;
+}
+
 /**
  * Find and rank all sellers that are a good match for a single buyer listing.
  *
@@ -164,7 +170,9 @@ function findMatchesForBuyer(buyer, sellers, options = {}) {
       return { sellerId: seller.id, sellerListing: seller, score, breakdown, matchedAt };
     })
     .filter((r) => r.score >= minScore)
-    .sort((a, b) => b.score - a.score)
+    // Deterministic order: highest score first; equal scores are ordered by
+    // sellerId (ascending, code-unit order) so input order never changes the result.
+    .sort((a, b) => b.score - a.score || compareIds(a.sellerId, b.sellerId))
     .slice(0, maxResults);
 }
 

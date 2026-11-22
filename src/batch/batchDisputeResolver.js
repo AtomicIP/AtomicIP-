@@ -29,8 +29,49 @@ const RESOLUTION_TYPES = Object.freeze({
 });
 
 const MAX_BATCH_SIZE       = 50;
-const DEFAULT_SPLIT_RATIO  = 0.5; // 50/50 if not specified
-const VALID_SPLIT_RANGE    = [0.01, 0.99];
+
+// Split shares are carried internally as integer basis points (1 bp = 0.01%).
+// Integers avoid float artefacts such as 0.1 + 0.2 !== 0.3 when validating
+// bounds. `splitBps` is the canonical field; `splitRatio` is accepted as a
+// legacy alias but must still map onto a whole number of basis points.
+const BPS_DENOMINATOR      = 10000;
+const DEFAULT_SPLIT_BPS    = 5000; // 50/50 if not specified
+const VALID_SPLIT_BPS      = [100, 9900]; // 1% .. 99%, inclusive
+const RATIO_TOLERANCE_BPS  = 1e-6;
+
+/**
+ * Resolve a SPLIT resolution to integer basis points.
+ * Throws RangeError / TypeError when the requested split is not representable.
+ */
+function resolveSplitBps(resolution, dispute) {
+  const { splitBps, splitRatio } = resolution;
+  const range = `${VALID_SPLIT_BPS[0]} and ${VALID_SPLIT_BPS[1]} basis points`;
+
+  if (splitBps !== undefined) {
+    if (!Number.isInteger(splitBps) || splitBps < VALID_SPLIT_BPS[0] || splitBps > VALID_SPLIT_BPS[1])
+      throw new RangeError(
+        `Dispute ${dispute.swapId}: splitBps must be an integer between ${range}.`
+      );
+    return splitBps;
+  }
+
+  if (splitRatio === undefined) return DEFAULT_SPLIT_BPS;
+
+  if (typeof splitRatio !== "number" || !Number.isFinite(splitRatio))
+    throw new RangeError(`Dispute ${dispute.swapId}: splitRatio must be a finite number.`);
+
+  const scaled = splitRatio * BPS_DENOMINATOR;
+  const bps    = Math.round(scaled);
+  if (Math.abs(scaled - bps) > RATIO_TOLERANCE_BPS)
+    throw new RangeError(
+      `Dispute ${dispute.swapId}: splitRatio must correspond to a whole number of basis points (e.g. 0.3000 = 3000 bps).`
+    );
+  if (bps < VALID_SPLIT_BPS[0] || bps > VALID_SPLIT_BPS[1])
+    throw new RangeError(
+      `Dispute ${dispute.swapId}: splitRatio must be between ${range}.`
+    );
+  return bps;
+}
 
 // ── Validators ────────────────────────────────────────────────────────────────
 
@@ -53,12 +94,7 @@ function validateResolution(resolution, dispute) {
   if (!Object.values(RESOLUTION_TYPES).includes(resolution.type))
     throw new TypeError(`Resolution for swap ${dispute.swapId}: invalid type '${resolution.type}'.`);
   if (resolution.type === RESOLUTION_TYPES.SPLIT) {
-    const ratio = resolution.splitRatio ?? DEFAULT_SPLIT_RATIO;
-    if (typeof ratio !== "number" || !Number.isFinite(ratio) ||
-        ratio < VALID_SPLIT_RANGE[0] || ratio > VALID_SPLIT_RANGE[1])
-      throw new RangeError(
-        `Dispute ${dispute.swapId}: splitRatio must be between ${VALID_SPLIT_RANGE[0]} and ${VALID_SPLIT_RANGE[1]}.`
-      );
+    resolveSplitBps(resolution, dispute); // throws on invalid input
   }
   if (resolution.type === RESOLUTION_TYPES.MULTI_PARTY) {
     const allocations = resolution.allocations;
@@ -83,7 +119,7 @@ function validateResolution(resolution, dispute) {
 // ── Resolution logic ──────────────────────────────────────────────────────────
 
 function resolveOne(dispute, resolution) {
-  const { type, splitRatio = DEFAULT_SPLIT_RATIO, reason = "" } = resolution;
+  const { type, reason = "" } = resolution;
 
   switch (type) {
     case RESOLUTION_TYPES.REFUND:
@@ -111,14 +147,16 @@ function resolveOne(dispute, resolution) {
       };
 
     case RESOLUTION_TYPES.SPLIT: {
-      const initiatorShare    = +(dispute.amount * splitRatio).toFixed(8);
+      const splitBps          = resolveSplitBps(resolution, dispute);
+      const initiatorShare    = +((dispute.amount * splitBps) / BPS_DENOMINATOR).toFixed(8);
       const counterpartyShare = +(dispute.amount - initiatorShare).toFixed(8);
       return {
         swapId:             dispute.swapId,
         originalState:      dispute.state,
         newState:           DISPUTE_STATES.RESOLVED,
         resolutionType:     type,
-        splitRatio,
+        splitBps,
+        splitRatio:         splitBps / BPS_DENOMINATOR,
         initiatorAmount:    initiatorShare,
         counterpartyAmount: counterpartyShare,
         reason,
@@ -174,7 +212,8 @@ function resolveOne(dispute, resolution) {
  * @returns {BatchDisputeResult}
  *
  * @typedef {{ swapId: string, state: string, amount: number }} DisputeEntry
- * @typedef {{ type: string, splitRatio?: number, reason?: string }} ResolutionEntry
+ * @typedef {{ type: string, splitBps?: number, splitRatio?: number, reason?: string }} ResolutionEntry
+ *   splitBps: integer in [100, 9900] (preferred). splitRatio: legacy, must equal a whole bps value.
  *
  * @typedef {Object} BatchDisputeResult
  * @property {number} batchSize
