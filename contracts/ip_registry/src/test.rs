@@ -1323,6 +1323,7 @@ mod tests {
         let client = IpRegistryClient::new(&env, &contract_id);
 
         let owner = <Address as TestAddress>::generate(&env);
+        client.commit_ip(&owner, &BytesN::from_array(&env, &[0xD1u8; 32]), &0u32);
         let delegate = <Address as TestAddress>::generate(&env);
 
         client.delegate_commitment_authority(&owner, &owner, &delegate);
@@ -1340,6 +1341,7 @@ mod tests {
         let client = IpRegistryClient::new(&env, &contract_id);
 
         let owner = <Address as TestAddress>::generate(&env);
+        client.commit_ip(&owner, &BytesN::from_array(&env, &[0xD1u8; 32]), &0u32);
         let delegate = <Address as TestAddress>::generate(&env);
 
         client.delegate_commitment_authority(&owner, &owner, &delegate);
@@ -1358,6 +1360,7 @@ mod tests {
         let client = IpRegistryClient::new(&env, &contract_id);
 
         let owner = <Address as TestAddress>::generate(&env);
+        client.commit_ip(&owner, &BytesN::from_array(&env, &[0xD1u8; 32]), &0u32);
         let delegate = <Address as TestAddress>::generate(&env);
         let hash = BytesN::from_array(&env, &[1u8; 32]);
 

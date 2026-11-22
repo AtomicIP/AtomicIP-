@@ -253,6 +253,10 @@ pub enum ContractError {
     InvalidChallengeTtl = 82,
     /// Issue #1384: An unanswered, unexpired challenge is already open for this commitment.
     ChallengeStillOpen = 83,
+    /// Issue #1371: An arbitration case is already open for this dispute.
+    DisputeAlreadyInArbitration = 84,
+    /// Issue #1373: The delegation root does not own any active IP.
+    RootOwnerHasNoIp = 85,
 }
 // ── TTL ───────────────────────────────────────────────────────────────────────
 
@@ -417,7 +421,7 @@ pub enum DataKey {
     IpAuditTrail(u64),      // Issue #436: stores Vec<AuditEntry> for a given ip_id
     RenewalCount(u64),      // stores renewal count for a given ip_id
     Delegates(Address),     // stores Vec<DelegationRecord> for a given owner
-    DelegateDepth(Address), // stores delegation depth for a given delegate
+    DelegateDepth(Address, Address), // Issue #1374: (root_owner, delegate) -> delegation depth within that root's tree
     /// #1375: (root_owner, delegate) -> address that granted the delegation,
     /// so revoking a delegate can cascade to everything it sub-delegated.
     DelegatedBy(Address, Address),
@@ -431,6 +435,7 @@ pub enum DataKey {
     ArbitrationCase(u64),   // Issue #449: stores ArbitrationRecord for a given arbitration_id
     NextArbitrationId,      // Issue #449: monotonic arbitration ID counter
     ArbitratorPool,         // Issue #449: stores Vec<Address> of registered arbitrators
+    DisputeCase(u64),       // Issue #1371: maps dispute_id -> arbitration_id (one case per dispute)
     CompressedCommitment(u64), // Issue #438: stores compressed commitment bytes for a given ip_id
     // Issue #458: Batch verification result cache
     BatchVerifyResult(BytesN<32>), // maps batch_proof_id -> BatchVerifyResult
@@ -3568,7 +3573,7 @@ impl IpRegistry {
         blinding_factor: BytesN<32>,
     ) -> bool {
         let record = require_ip_exists(&env, ip_id);
-        if !Self::is_delegate_in_chain(&env, &record.owner, &delegate, 0) {
+        if !Self::is_delegate_in_chain(&env, &record.owner, &delegate) {
             panic_with_error!(&env, ContractError::Unauthorized);
         }
         delegate.require_auth();
@@ -6568,6 +6573,77 @@ impl IpRegistry {
             .publish((symbol_short!("arb_nom"), admin), arbitrator);
     }
 
+    /// Issue #1372: Remove an address from the arbitrator pool (admin-only).
+    ///
+    /// The removed address is excluded from every case opened afterwards and
+    /// can no longer vote on cases that are still open.
+    ///
+    /// # Panics
+    ///
+    /// Panics with `NotAnArbitrator` if the address is not in the pool.
+    pub fn remove_arbitrator(env: Env, admin: Address, arbitrator: Address) {
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::Unauthorized));
+        if admin != stored_admin {
+            panic_with_error!(&env, ContractError::Unauthorized);
+        }
+        admin.require_auth();
+
+        let pool: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ArbitratorPool)
+            .unwrap_or(Vec::new(&env));
+
+        let mut updated: Vec<Address> = Vec::new(&env);
+        let mut found = false;
+        for a in pool.iter() {
+            if a == arbitrator {
+                found = true;
+            } else {
+                updated.push_back(a);
+            }
+        }
+        if !found {
+            panic_with_error!(&env, ContractError::NotAnArbitrator);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ArbitratorPool, &updated);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::ArbitratorPool, LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events()
+            .publish((symbol_short!("arb_rem"), admin), arbitrator);
+    }
+
+    /// Returns true if `addr` is currently in the arbitrator pool.
+    fn is_in_arbitrator_pool(env: &Env, addr: &Address) -> bool {
+        let pool: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ArbitratorPool)
+            .unwrap_or(Vec::new(env));
+        for a in pool.iter() {
+            if &a == addr {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Get the arbitration case ID opened for a dispute, if any.
+    pub fn get_dispute_arbitration(env: Env, dispute_id: u64) -> Option<u64> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DisputeCase(dispute_id))
+    }
+
     /// Open an arbitration case for an existing dispute. Admin-only.
     /// Returns the new arbitration_id.
     pub fn open_arbitration(env: Env, dispute_id: u64) -> u64 {
@@ -6579,11 +6655,24 @@ impl IpRegistry {
         admin.require_auth();
 
         // Ensure dispute exists
-        let _dispute: DisputeRecord = env
+        let dispute: DisputeRecord = env
             .storage()
             .persistent()
             .get(&DataKey::IpDisputes(dispute_id))
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::DisputeNotFound));
+
+        // Issue #1371: a settled dispute cannot be re-arbitrated.
+        if dispute.resolved {
+            panic_with_error!(&env, ContractError::DisputeAlreadyResolved);
+        }
+        // Issue #1371: at most one arbitration case per dispute.
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::DisputeCase(dispute_id))
+        {
+            panic_with_error!(&env, ContractError::DisputeAlreadyInArbitration);
+        }
 
         let arb_id: u64 = env
             .storage()
@@ -6597,10 +6686,31 @@ impl IpRegistry {
             .get(&DataKey::ArbitratorPool)
             .unwrap_or(Vec::new(&env));
 
+        // Issue #1372: exclude arbitrators who are parties to the dispute
+        // (the challenger, the IP owner, or any co-owner).
+        let ip_record = require_ip_exists(&env, dispute.ip_id);
+        let mut arbitrators: Vec<Address> = Vec::new(&env);
+        for a in pool.iter() {
+            if a == dispute.challenger || a == ip_record.owner {
+                continue;
+            }
+            let mut is_co_owner = false;
+            for c in ip_record.co_owners.iter() {
+                if c == a {
+                    is_co_owner = true;
+                    break;
+                }
+            }
+            if is_co_owner {
+                continue;
+            }
+            arbitrators.push_back(a);
+        }
+
         let case = ArbitrationRecord {
             arbitration_id: arb_id,
             dispute_id,
-            arbitrators: pool,
+            arbitrators,
             votes_owner: 0,
             votes_challenger: 0,
             finalized: false,
@@ -6612,6 +6722,14 @@ impl IpRegistry {
             .set(&DataKey::ArbitrationCase(arb_id), &case);
         env.storage().persistent().extend_ttl(
             &DataKey::ArbitrationCase(arb_id),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::DisputeCase(dispute_id), &arb_id);
+        env.storage().persistent().extend_ttl(
+            &DataKey::DisputeCase(dispute_id),
             LEDGER_BUMP,
             LEDGER_BUMP,
         );
@@ -6650,7 +6768,9 @@ impl IpRegistry {
                 break;
             }
         }
-        if !is_arbitrator {
+        // Issue #1372: an arbitrator removed from the pool after the case was
+        // opened can no longer vote on it.
+        if !is_arbitrator || !Self::is_in_arbitrator_pool(&env, &voter) {
             panic_with_error!(&env, ContractError::NotAnArbitrator);
         }
 
@@ -6803,13 +6923,19 @@ impl IpRegistry {
     ) {
         delegator.require_auth();
 
+        // Issue #1373: a delegation tree can only be rooted at an address that
+        // owns at least one active IP.
+        require_owns_active_ip(&env, &root_owner);
+
+        // Issue #1374: depth is scoped to (root_owner, delegate) so the same
+        // address can sit at different depths in different trees.
         let new_depth: u32 = if delegator == root_owner {
             0
         } else {
             let stored: Option<u32> = env
                 .storage()
                 .persistent()
-                .get(&DataKey::DelegateDepth(delegator.clone()));
+                .get(&DataKey::DelegateDepth(root_owner.clone(), delegator.clone()));
             match stored {
                 Some(d) => d + 1,
                 None => panic_with_error!(&env, ContractError::Unauthorized),
@@ -6845,11 +6971,11 @@ impl IpRegistry {
         Self::set_delegated_by(&env, &root_owner, &delegate_address, &delegator);
 
         env.storage().persistent().set(
-            &DataKey::DelegateDepth(delegate_address.clone()),
+            &DataKey::DelegateDepth(root_owner.clone(), delegate_address.clone()),
             &new_depth,
         );
         env.storage().persistent().extend_ttl(
-            &DataKey::DelegateDepth(delegate_address.clone()),
+            &DataKey::DelegateDepth(root_owner.clone(), delegate_address.clone()),
             LEDGER_BUMP,
             LEDGER_BUMP,
         );
@@ -6917,7 +7043,7 @@ impl IpRegistry {
         for addr in revoked.iter() {
             env.storage()
                 .persistent()
-                .remove(&DataKey::DelegateDepth(addr.clone()));
+                .remove(&DataKey::DelegateDepth(owner.clone(), addr.clone()));
             env.storage()
                 .persistent()
                 .remove(&DataKey::DelegatedBy(owner.clone(), addr.clone()));
@@ -6936,7 +7062,7 @@ impl IpRegistry {
     }
 
     pub fn is_delegate(env: Env, owner: Address, delegate_address: Address) -> bool {
-        Self::is_delegate_in_chain(&env, &owner, &delegate_address, 0)
+        Self::is_delegate_in_chain(&env, &owner, &delegate_address)
     }
 
     pub fn commit_ip_delegated(
@@ -7028,23 +7154,26 @@ impl IpRegistry {
         id
     }
 
-    fn is_delegate_in_chain(env: &Env, root: &Address, candidate: &Address, depth: u32) -> bool {
-        if depth >= MAX_DELEGATION_DEPTH {
-            return false;
+    /// Issue #1374: every delegate in `root`'s tree (direct or sub-delegated)
+    /// is recorded under `Delegates(root)` with a depth stored at the scoped
+    /// `DelegateDepth(root, delegate)` key. Membership is decided only from
+    /// `root`'s own tree, never from trees rooted at other addresses.
+    fn is_delegate_in_chain(env: &Env, root: &Address, candidate: &Address) -> bool {
+        let depth: Option<u32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DelegateDepth(root.clone(), candidate.clone()));
+        match depth {
+            Some(d) if d < MAX_DELEGATION_DEPTH => {}
+            _ => return false,
         }
-        let key = DataKey::Delegates(root.clone());
         let delegates: Vec<DelegationRecord> = env
             .storage()
             .persistent()
-            .get(&key)
+            .get(&DataKey::Delegates(root.clone()))
             .unwrap_or(Vec::new(env));
-
-        for i in 0..delegates.len() {
-            let rec = delegates.get(i).unwrap();
+        for rec in delegates.iter() {
             if &rec.delegate == candidate {
-                return true;
-            }
-            if Self::is_delegate_in_chain(env, &rec.delegate, candidate, depth + 1) {
                 return true;
             }
         }
@@ -7681,13 +7810,19 @@ impl IpRegistry {
     ) {
         delegator.require_auth();
 
+        // Issue #1373: a delegation tree can only be rooted at an address that
+        // owns at least one active IP.
+        require_owns_active_ip(&env, &root_owner);
+
+        // Issue #1374: depth is scoped to (root_owner, delegate) so the same
+        // address can sit at different depths in different trees.
         let new_depth: u32 = if delegator == root_owner {
             0
         } else {
             let stored: Option<u32> = env
                 .storage()
                 .persistent()
-                .get(&DataKey::DelegateDepth(delegator.clone()));
+                .get(&DataKey::DelegateDepth(root_owner.clone(), delegator.clone()));
             match stored {
                 Some(d) => d + 1,
                 None => panic_with_error!(&env, ContractError::Unauthorized),
@@ -7724,11 +7859,11 @@ impl IpRegistry {
             Self::set_delegated_by(&env, &root_owner, &delegate_address, &delegator);
 
             env.storage().persistent().set(
-                &DataKey::DelegateDepth(delegate_address.clone()),
+                &DataKey::DelegateDepth(root_owner.clone(), delegate_address.clone()),
                 &new_depth,
             );
             env.storage().persistent().extend_ttl(
-                &DataKey::DelegateDepth(delegate_address.clone()),
+                &DataKey::DelegateDepth(root_owner.clone(), delegate_address.clone()),
                 LEDGER_BUMP,
                 LEDGER_BUMP,
             );
@@ -10938,6 +11073,7 @@ mod tests {
         let client = IpRegistryClient::new(&env, &contract_id);
 
         let owner = Address::generate(&env);
+        client.commit_ip(&owner, &BytesN::from_array(&env, &[0x51u8; 32]), &0u32);
         let delegate1 = Address::generate(&env);
         let delegate2 = Address::generate(&env);
 
@@ -10959,6 +11095,7 @@ mod tests {
         let client = IpRegistryClient::new(&env, &contract_id);
 
         let owner = Address::generate(&env);
+        client.commit_ip(&owner, &BytesN::from_array(&env, &[0x52u8; 32]), &0u32);
         let delegate = Address::generate(&env);
 
         let mut delegates = soroban_sdk::Vec::new(&env);
@@ -10978,6 +11115,7 @@ mod tests {
         let client = IpRegistryClient::new(&env, &contract_id);
 
         let owner = Address::generate(&env);
+        client.commit_ip(&owner, &BytesN::from_array(&env, &[0x53u8; 32]), &0u32);
         let unrelated = Address::generate(&env);
 
         let delegates = soroban_sdk::Vec::new(&env);
@@ -10995,6 +11133,7 @@ mod tests {
         let client = IpRegistryClient::new(&env, &contract_id);
 
         let owner = Address::generate(&env);
+        client.commit_ip(&owner, &BytesN::from_array(&env, &[0x54u8; 32]), &0u32);
         let stranger = Address::generate(&env);
         let target = Address::generate(&env);
 
@@ -11002,6 +11141,298 @@ mod tests {
         delegates.push_back(target.clone());
 
         client.batch_delegate_commitment(&owner, &stranger, &delegates);
+    }
+
+    // ── Issue #1373: delegation root must own an IP ──────────────────────────
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #68)")]
+    fn test_delegate_root_without_ip_is_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let nobody = Address::generate(&env);
+        let delegate = Address::generate(&env);
+        client.delegate_commitment_authority(&nobody, &nobody, &delegate);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #68)")]
+    fn test_batch_delegate_root_without_ip_is_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let nobody = Address::generate(&env);
+        let mut delegates = soroban_sdk::Vec::new(&env);
+        delegates.push_back(Address::generate(&env));
+        client.batch_delegate_commitment(&nobody, &nobody, &delegates);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #68)")]
+    fn test_delegate_root_with_only_revoked_ip_is_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[0x61u8; 32]), &0u32);
+        client.revoke_ip(&ip_id);
+
+        let delegate = Address::generate(&env);
+        client.delegate_commitment_authority(&owner, &owner, &delegate);
+    }
+
+    #[test]
+    fn test_delegate_root_with_ip_is_accepted() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        client.commit_ip(&owner, &BytesN::from_array(&env, &[0x62u8; 32]), &0u32);
+        let delegate = Address::generate(&env);
+        client.delegate_commitment_authority(&owner, &owner, &delegate);
+        assert!(client.is_delegate(&owner, &delegate));
+    }
+
+    // ── Issue #1374: delegate depth is scoped per root ───────────────────────
+
+    #[test]
+    fn test_delegate_depth_scoped_per_root() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let root_a = Address::generate(&env);
+        let root_b = Address::generate(&env);
+        client.commit_ip(&root_a, &BytesN::from_array(&env, &[0x71u8; 32]), &0u32);
+        client.commit_ip(&root_b, &BytesN::from_array(&env, &[0x72u8; 32]), &0u32);
+
+        let shared = Address::generate(&env);
+
+        // Build a chain under root_a so `shared` ends up at depth MAX - 1.
+        let mut prev = root_a.clone();
+        for _ in 0..(MAX_DELEGATION_DEPTH - 1) {
+            let next = Address::generate(&env);
+            client.delegate_commitment_authority(&root_a, &prev, &next);
+            prev = next;
+        }
+        client.delegate_commitment_authority(&root_a, &prev, &shared);
+
+        // Under root_b, `shared` is a direct delegate (depth 0). This used to
+        // overwrite the root_a depth.
+        client.delegate_commitment_authority(&root_b, &root_b, &shared);
+
+        // In root_b's tree `shared` is at depth 0 and can sub-delegate.
+        let sub_b = Address::generate(&env);
+        client.delegate_commitment_authority(&root_b, &shared, &sub_b);
+        assert!(client.is_delegate(&root_b, &sub_b));
+
+        // In root_a's tree `shared` is still at depth MAX - 1, so the limit
+        // still applies there.
+        let sub_a = Address::generate(&env);
+        let res = client.try_delegate_commitment_authority(&root_a, &shared, &sub_a);
+        assert!(res.is_err());
+        assert!(!client.is_delegate(&root_a, &sub_a));
+    }
+
+    #[test]
+    fn test_revoke_delegation_only_affects_one_root() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let root_a = Address::generate(&env);
+        let root_b = Address::generate(&env);
+        client.commit_ip(&root_a, &BytesN::from_array(&env, &[0x73u8; 32]), &0u32);
+        client.commit_ip(&root_b, &BytesN::from_array(&env, &[0x74u8; 32]), &0u32);
+
+        let shared = Address::generate(&env);
+        client.delegate_commitment_authority(&root_a, &root_a, &shared);
+        client.delegate_commitment_authority(&root_b, &root_b, &shared);
+
+        client.revoke_delegation(&root_a, &shared);
+
+        assert!(!client.is_delegate(&root_a, &shared));
+        assert!(client.is_delegate(&root_b, &shared));
+
+        // `shared` can still sub-delegate under root_b.
+        let sub = Address::generate(&env);
+        client.delegate_commitment_authority(&root_b, &shared, &sub);
+        assert!(client.is_delegate(&root_b, &sub));
+    }
+
+    #[test]
+    fn test_is_delegate_does_not_cross_trees() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let root_a = Address::generate(&env);
+        let middle = Address::generate(&env);
+        client.commit_ip(&root_a, &BytesN::from_array(&env, &[0x75u8; 32]), &0u32);
+        client.commit_ip(&middle, &BytesN::from_array(&env, &[0x76u8; 32]), &0u32);
+
+        // `middle` is a delegate of root_a, and separately roots its own tree.
+        client.delegate_commitment_authority(&root_a, &root_a, &middle);
+        let outsider = Address::generate(&env);
+        client.delegate_commitment_authority(&middle, &middle, &outsider);
+
+        // A delegate in middle's own tree is not a delegate of root_a.
+        assert!(!client.is_delegate(&root_a, &outsider));
+        assert!(client.is_delegate(&middle, &outsider));
+    }
+
+    // ── Issues #1371 / #1372: arbitration guards ─────────────────────────────
+
+    fn setup_dispute(
+        env: &Env,
+        client: &IpRegistryClient,
+        seed: u8,
+    ) -> (Address, Address, u64) {
+        let owner = Address::generate(env);
+        let challenger = Address::generate(env);
+        let ip_id = client.commit_ip(&owner, &BytesN::from_array(env, &[seed; 32]), &0u32);
+        let evidence = BytesN::from_array(env, &[seed.wrapping_add(1); 32]);
+        let dispute_id = client.initiate_dispute(&ip_id, &challenger, &evidence);
+        (owner, challenger, dispute_id)
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #17)")]
+    fn test_open_arbitration_rejects_resolved_dispute() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let (owner, _challenger, dispute_id) = setup_dispute(&env, &client, 0x81);
+        client.resolve_dispute(&dispute_id, &owner);
+        client.open_arbitration(&dispute_id);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #67)")]
+    fn test_open_arbitration_rejects_second_case() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let (_owner, _challenger, dispute_id) = setup_dispute(&env, &client, 0x83);
+        let arb_id = client.open_arbitration(&dispute_id);
+        assert_eq!(client.get_dispute_arbitration(&dispute_id), Some(arb_id));
+        client.open_arbitration(&dispute_id);
+    }
+
+    #[test]
+    fn test_remove_arbitrator_excluded_from_new_cases() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let keep = Address::generate(&env);
+        let drop = Address::generate(&env);
+        client.nominate_arbitrator(&keep);
+        client.nominate_arbitrator(&drop);
+
+        client.remove_arbitrator(&admin, &drop);
+
+        let (_o, _c, dispute_id) = setup_dispute(&env, &client, 0x85);
+        let arb_id = client.open_arbitration(&dispute_id);
+        let case = client.get_arbitration(&arb_id);
+        assert_eq!(case.arbitrators.len(), 1);
+        assert_eq!(case.arbitrators.get(0).unwrap(), keep);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #23)")]
+    fn test_removed_arbitrator_cannot_vote_on_open_case() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let arb = Address::generate(&env);
+        client.nominate_arbitrator(&arb);
+        let (_o, _c, dispute_id) = setup_dispute(&env, &client, 0x87);
+        let arb_id = client.open_arbitration(&dispute_id);
+
+        client.remove_arbitrator(&admin, &arb);
+        client.vote_on_dispute(&arb_id, &arb, &true);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #23)")]
+    fn test_remove_unknown_arbitrator_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        client.remove_arbitrator(&admin, &Address::generate(&env));
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #6)")]
+    fn test_remove_arbitrator_rejects_non_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let arb = Address::generate(&env);
+        client.nominate_arbitrator(&arb);
+        client.remove_arbitrator(&Address::generate(&env), &arb);
+    }
+
+    #[test]
+    fn test_dispute_parties_excluded_from_case_arbitrators() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let owner = Address::generate(&env);
+        let challenger = Address::generate(&env);
+        let neutral = Address::generate(&env);
+        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[0x89u8; 32]), &0u32);
+        let dispute_id =
+            client.initiate_dispute(&ip_id, &challenger, &BytesN::from_array(&env, &[0x8Au8; 32]));
+
+        client.nominate_arbitrator(&owner);
+        client.nominate_arbitrator(&challenger);
+        client.nominate_arbitrator(&neutral);
+
+        let arb_id = client.open_arbitration(&dispute_id);
+        let case = client.get_arbitration(&arb_id);
+        assert_eq!(case.arbitrators.len(), 1);
+        assert_eq!(case.arbitrators.get(0).unwrap(), neutral);
     }
 
     // ── Issue #461: Batch Renewal Tests ──────────────────────────────────────

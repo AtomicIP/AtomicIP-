@@ -136,6 +136,35 @@ pub fn require_not_revoked(env: &Env, record: &IpRecord) {
     }
 }
 
+/// Issue #1373: Validates that `owner` currently owns at least one IP that has
+/// not been revoked. Used to stop delegation trees from being rooted at an
+/// address that owns nothing.
+///
+/// # Panics
+///
+/// Panics with `RootOwnerHasNoIp` if no such IP exists.
+pub fn require_owns_active_ip(env: &Env, owner: &Address) {
+    let ids: Vec<u64> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::OwnerIps(owner.clone()))
+        .unwrap_or(Vec::new(env));
+    for id in ids.iter() {
+        if let Some(record) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, IpRecord>(&DataKey::IpRecord(id))
+        {
+            if &record.owner == owner && !record.revoked {
+                return;
+            }
+        }
+    }
+    env.panic_with_error(Error::from_contract_error(
+        ContractError::RootOwnerHasNoIp as u32,
+    ));
+}
+
 /// Validates that the caller is the owner of the IP.
 ///
 /// # Arguments
