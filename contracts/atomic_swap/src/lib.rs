@@ -155,6 +155,10 @@ pub enum ContractError {
     SelfTradeNotAllowed = 79,
     /// #1170: an ID counter would overflow u64 on increment.
     IdCounterOverflow = 80,
+    /// #1339: a batch call listed the same swap ID more than once.
+    DuplicateSwapId = 81,
+    /// #1342: `collateral_amount` must be zero or positive.
+    InvalidCollateralAmount = 82,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -576,6 +580,9 @@ impl AtomicSwap {
     }
 
     /// Seller initiates a patent sale. Returns the swap ID.
+    ///
+    /// **#1342:** panics with `InvalidCollateralAmount` if `collateral_amount` is negative.
+    /// Zero means no collateral is held.
     pub fn initiate_swap(
         env: Env,
         token: Address,
@@ -595,6 +602,14 @@ impl AtomicSwap {
 
         // Guard: price must be positive.
         require_positive_price(&env, price);
+
+        // #1342: a negative collateral would be stored on the swap and later drive
+        // refund/release transfers, and accept_swap would silently skip the deposit.
+        if collateral_amount < 0 {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::InvalidCollateralAmount as u32,
+            ));
+        }
 
         // #1169: reject self-trades (buyer == seller).
         if buyer == seller {
@@ -718,6 +733,33 @@ impl AtomicSwap {
             if !ok {
                 env.panic_with_error(Error::from_contract_error(
                     ContractError::ConditionNotMet as u32,
+                ));
+            }
+        }
+    }
+
+    /// #1340: Panics with `NotAllSigned` unless every required co-signer of the swap has
+    /// signed. Shared by `reveal_key` and `batch_reveal_keys` so neither path can release
+    /// payment for a multi-signer swap that is still missing signatures.
+    fn require_all_signed(env: &Env, swap_id: u64) {
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::SwapSigners(swap_id))
+        {
+            let signers: Vec<Address> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::SwapSigners(swap_id))
+                .unwrap_or(Vec::new(env));
+            let signed: Vec<Address> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::SwapSignatures(swap_id))
+                .unwrap_or(Vec::new(env));
+            if signed.len() < signers.len() {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::NotAllSigned as u32,
                 ));
             }
         }
@@ -1031,30 +1073,10 @@ impl AtomicSwap {
         );
         Self::validate_contingencies(&env, swap_id);
 
-        // Verify commitment via IP registry
         // Guard: if this swap has required signers, all must have signed before reveal.
-        if env
-            .storage()
-            .persistent()
-            .has(&DataKey::SwapSigners(swap_id))
-        {
-            let signers: Vec<Address> = env
-                .storage()
-                .persistent()
-                .get(&DataKey::SwapSigners(swap_id))
-                .unwrap_or(Vec::new(&env));
-            let signed: Vec<Address> = env
-                .storage()
-                .persistent()
-                .get(&DataKey::SwapSignatures(swap_id))
-                .unwrap_or(Vec::new(&env));
-            if signed.len() < signers.len() {
-                env.panic_with_error(Error::from_contract_error(
-                    ContractError::NotAllSigned as u32,
-                ));
-            }
-        }
+        Self::require_all_signed(&env, swap_id);
 
+        // Verify commitment via IP registry
         let valid = registry::verify_commitment(&env, swap.ip_id, &secret, &blinding_factor);
         if !valid {
             // #1171: Soroban rolls back all state changes in a failed invocation, so a
@@ -1433,8 +1455,12 @@ impl AtomicSwap {
 
     /// Admin batch rollback: cancel multiple swaps and refund all parties in one call.
     /// Pre-validates all swap IDs before making any state changes (#521).
+    ///
+    /// **#1341:** duplicate IDs in the batch are rejected with `DuplicateSwapId`
+    /// before any state is changed, so a repeated entry can never apply twice.
     pub fn batch_rollback_swaps(env: Env, swap_ids: Vec<u64>, caller: Address, reason: Bytes) {
         caller.require_auth();
+        require_unique_ids(&env, &swap_ids);
         require_admin(&env, &caller);
 
         let len = swap_ids.len();
@@ -4472,6 +4498,9 @@ impl AtomicSwap {
             ));
         }
 
+        // #1339: a repeated ID would release the same payout twice.
+        require_unique_ids(&env, &swap_ids);
+
         let mut fee_breakdowns: Vec<SwapFeeBreakdown> = Vec::new(&env);
 
         for i in 0..swap_ids.len() {
@@ -4485,6 +4514,11 @@ impl AtomicSwap {
                 ContractError::NotAccepted,
             );
             Self::validate_contingencies(&env, swap_id);
+            // #1340: same multi-signer gate and buyer-condition re-check as reveal_key.
+            Self::require_all_signed(&env, swap_id);
+            if !swap.conditions.is_empty() {
+                Self::evaluate_conditions(&env, &swap, true);
+            }
             let valid = registry::verify_commitment(
                 &env,
                 swap.ip_id,
@@ -4500,6 +4534,14 @@ impl AtomicSwap {
         for i in 0..swap_ids.len() {
             let swap_id = swap_ids.get(i).unwrap();
             let mut swap = require_swap_exists(&env, swap_id);
+            // #1339: re-check status here too so the payout never depends on the
+            // validation pass having seen this swap in its current state.
+            require_swap_status(
+                &env,
+                &swap,
+                SwapStatus::Accepted,
+                ContractError::NotAccepted,
+            );
 
             swap.status = SwapStatus::Completed;
             swap::save_swap(&env, swap_id, &swap);
@@ -4697,6 +4739,9 @@ impl AtomicSwap {
     /// Seller initiates multiple patent sales with optional insurance. Returns a Vec of swap IDs.
     /// When `insurance_enabled` is true, each swap's premium is set to 2% of its price and
     /// collected from the buyer at `batch_accept_swaps` time.
+    ///
+    /// **#1341:** duplicate IDs in the batch are rejected with `DuplicateSwapId`
+    /// before any state is changed, so a repeated entry can never apply twice.
     pub fn batch_initiate_swap_insured(
         env: Env,
         token: Address,
@@ -4710,6 +4755,7 @@ impl AtomicSwap {
     ) -> Vec<u64> {
         require_not_paused(&env);
         seller.require_auth();
+        require_unique_ids(&env, &ip_ids);
 
         let len = ip_ids.len();
         let mut swap_ids: Vec<u64> = Vec::new(&env);
@@ -4822,12 +4868,17 @@ impl AtomicSwap {
     /// the `ArbitratorCommittee` model, at which point it can call
     /// `arbitrate_dispute`/`execute_ruling` per swap instead of moving funds
     /// directly.
+    ///
+    /// **#1341:** duplicate IDs in the batch are rejected with `DuplicateSwapId`
+    /// before any state is changed, so a repeated entry can never apply twice.
     pub fn batch_arbitrate_swaps(
         env: Env,
         _swap_ids: Vec<u64>,
         _arbitrator: Address,
         _refund: bool,
     ) {
+        // #1341: reject duplicate IDs before the disabled-batch error.
+        require_unique_ids(&env, &_swap_ids);
         env.panic_with_error(Error::from_contract_error(
             ContractError::BatchArbitrationDisabled as u32,
         ));
@@ -4927,6 +4978,9 @@ impl AtomicSwap {
     ///
     /// Each `ip_ids[i]` is paired with `prices[i]` and `timeouts[i]` (expiry).
     /// Returns a vector of assigned swap IDs.
+    ///
+    /// **#1341:** duplicate IDs in the batch are rejected with `DuplicateSwapId`
+    /// before any state is changed, so a repeated entry can never apply twice.
     pub fn batch_initiate_escrow(
         env: Env,
         token: Address,
@@ -4938,6 +4992,7 @@ impl AtomicSwap {
     ) -> Vec<u64> {
         require_not_paused(&env);
         seller.require_auth();
+        require_unique_ids(&env, &ip_ids);
 
         let len = ip_ids.len();
         if len == 0 || prices.len() != len || timeouts.len() != len {
@@ -5038,8 +5093,12 @@ impl AtomicSwap {
 
     /// Buyer deposits funds into multiple escrow-mode swaps in one call.
     /// Each swap must be in `Pending` status with `SwapMode::Escrow`.
+    ///
+    /// **#1341:** duplicate IDs in the batch are rejected with `DuplicateSwapId`
+    /// before any state is changed, so a repeated entry can never apply twice.
     pub fn batch_escrow_deposit(env: Env, swap_ids: Vec<u64>, buyer: Address) {
         buyer.require_auth();
+        require_unique_ids(&env, &swap_ids);
 
         for swap_id in swap_ids.iter() {
             let mut swap = require_swap_exists(&env, swap_id);
@@ -5987,8 +6046,12 @@ impl AtomicSwap {
     /// required co-signer on every swap in `swap_ids`. Each swap must be in
     /// `Accepted` state and the signer must not have already signed it.
     /// Equivalent to calling `sign_swap_reveal` for each swap_id individually.
+    ///
+    /// **#1341:** duplicate IDs in the batch are rejected with `DuplicateSwapId`
+    /// before any state is changed, so a repeated entry can never apply twice.
     pub fn batch_sign_swap_reveal(env: Env, swap_ids: Vec<u64>, signer: Address) {
         signer.require_auth();
+        require_unique_ids(&env, &swap_ids);
 
         for i in 0..swap_ids.len() {
             let swap_id = swap_ids.get(i).unwrap();
@@ -6132,6 +6195,9 @@ impl AtomicSwap {
     ///
     /// A single `evidence_hash` is shared across all swaps in the batch.
     /// Emits `BatchEscrowArbitrationEvent` after processing all swaps.
+    ///
+    /// **#1341:** duplicate IDs in the batch are rejected with `DuplicateSwapId`
+    /// before any state is changed, so a repeated entry can never apply twice.
     pub fn batch_escrow_arbitration(
         env: Env,
         swap_ids: Vec<u64>,
@@ -6139,6 +6205,7 @@ impl AtomicSwap {
         evidence_hash: BytesN<32>,
     ) {
         requester.require_auth();
+        require_unique_ids(&env, &swap_ids);
 
         let len = swap_ids.len();
         if len == 0 {
@@ -6218,7 +6285,11 @@ impl AtomicSwap {
     /// On success, each swap is cancelled and the buyer is refunded the escrowed
     /// amount (from `EscrowDeposit` if present, otherwise `swap.price`).
     /// Emits `BatchTimeoutAutoResolvedEvent` after processing all swaps.
+    ///
+    /// **#1341:** duplicate IDs in the batch are rejected with `DuplicateSwapId`
+    /// before any state is changed, so a repeated entry can never apply twice.
     pub fn batch_timeout_auto_resolve(env: Env, swap_ids: Vec<u64>) {
+        require_unique_ids(&env, &swap_ids);
         let len = swap_ids.len();
         if len == 0 {
             env.panic_with_error(Error::from_contract_error(ContractError::BatchEmpty as u32));
@@ -6343,17 +6414,25 @@ impl AtomicSwap {
     /// - `BatchEmpty`: Empty swap_ids vector provided
     /// - `BatchTooLarge`: More than MAX_BATCH_SIZE swaps
     /// - Various swap-specific errors if atomic mode is enabled and any swap fails
+    ///
+    /// **#1341:** duplicate IDs in the batch are rejected with `DuplicateSwapId`
+    /// before any state is changed, so a repeated entry can never apply twice.
     pub fn execute_batch_swaps(env: Env, swap_ids: Vec<u64>, atomic: bool) -> Vec<bool> {
+        require_unique_ids(&env, &swap_ids);
         Self::execute_batch_swaps_ordered(&env, swap_ids, atomic)
     }
 
     /// Execute swaps in descending priority order.
+    ///
+    /// **#1341:** duplicate IDs in the batch are rejected with `DuplicateSwapId`
+    /// before any state is changed, so a repeated entry can never apply twice.
     pub fn execute_batch_swaps_prioritized(
         env: Env,
         swap_ids: Vec<u64>,
         atomic: bool,
         priorities: Vec<u32>,
     ) -> Vec<bool> {
+        require_unique_ids(&env, &swap_ids);
         if priorities.len() != swap_ids.len() {
             env.panic_with_error(Error::from_contract_error(
                 ContractError::BatchSizeMismatch as u32,
@@ -6385,12 +6464,16 @@ impl AtomicSwap {
     /// Execute a batch while enforcing per-swap prerequisites. Dependencies
     /// included in the batch are ordered first; external dependencies must
     /// already be completed.
+    ///
+    /// **#1341:** duplicate IDs in the batch are rejected with `DuplicateSwapId`
+    /// before any state is changed, so a repeated entry can never apply twice.
     pub fn execute_batch_with_deps(
         env: Env,
         swap_ids: Vec<u64>,
         atomic: bool,
         dependencies: Vec<Vec<u64>>,
     ) -> Vec<bool> {
+        require_unique_ids(&env, &swap_ids);
         if dependencies.len() != swap_ids.len() {
             env.panic_with_error(Error::from_contract_error(
                 ContractError::BatchSizeMismatch as u32,
@@ -6627,6 +6710,10 @@ mod batch_swap_features_tests;
 // #832: compile errors fixed — re-enabled
 #[cfg(test)]
 mod batch_history_tests;
+
+// #1339, #1340, #1341, #1342: regression tests for batch and input validation fixes
+#[cfg(test)]
+mod batch_security_tests;
 
 // #828: compile errors fixed — re-enabled
 // Temporarily disabled: does not compile yet (pre-existing errors). Re-enable after fixing.
