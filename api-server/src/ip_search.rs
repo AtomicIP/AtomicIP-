@@ -51,6 +51,10 @@ pub struct IpSearchFilters {
     pub limit: Option<usize>,
     /// Number of matches to skip.
     pub offset: Option<usize>,
+    /// Include revoked IPs in results and facets (#1389). Admin-only: the
+    /// public search route always clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_revoked: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema, PartialEq)]
@@ -123,14 +127,34 @@ pub fn index_listing(
 }
 
 /// Every indexed listing, in no particular order. Feed this to [`search`].
+///
+/// #1390: the stored record snapshot is refreshed from the IP record cache
+/// (the server's view of the on-chain registry) on every read, so owner,
+/// revocation state and timestamp follow transfers and revocations instead of
+/// freezing at index time. When the cache has no entry the last known snapshot
+/// is used.
 pub fn listings() -> Vec<(IpRecord, Option<IpSearchMetadata>)> {
-    LISTINGS
-        .iter()
-        .map(|entry| {
-            let (record, metadata) = entry.value().clone();
-            (record, Some(metadata))
+    let ids: Vec<u64> = LISTINGS.iter().map(|entry| *entry.key()).collect();
+    ids.into_iter()
+        .filter_map(|ip_id| {
+            if let Some(fresh) = crate::cache::get::<IpRecord>(&crate::cache::ip_key(ip_id)) {
+                refresh_record(fresh);
+            }
+            LISTINGS.get(&ip_id).map(|entry| {
+                let (record, metadata) = entry.value().clone();
+                (record, Some(metadata))
+            })
         })
         .collect()
+}
+
+/// Replaces the record snapshot of an indexed listing with `record` (#1390).
+/// Call this whenever the registry reports a new owner, a revocation or any
+/// other change to an IP. Does nothing if the IP is not indexed.
+pub fn refresh_record(record: IpRecord) {
+    if let Some(mut entry) = LISTINGS.get_mut(&record.ip_id) {
+        entry.value_mut().0 = record;
+    }
 }
 
 pub fn get_metadata(ip_id: u64) -> Option<IpSearchMetadata> {
@@ -153,9 +177,16 @@ pub fn search(
     let category = filters.category.as_ref().map(|c| c.trim().to_ascii_lowercase());
     let jurisdiction = filters.jurisdiction.as_ref().map(|j| j.trim().to_ascii_lowercase());
 
+    let include_revoked = filters.include_revoked.unwrap_or(false);
+
     let mut matches: Vec<&(IpRecord, Option<IpSearchMetadata>)> = records
         .iter()
         .filter(|(record, metadata)| {
+            // #1389: revoked IPs are withdrawn on-chain and must not show up
+            // in results, totals or facets unless explicitly requested.
+            if record.revoked && !include_revoked {
+                return false;
+            }
             if let Some(after) = filters.registered_after {
                 if record.timestamp < after {
                     return false;
@@ -284,6 +315,14 @@ pub fn delete_saved_search(owner: &str, id: u64) -> bool {
     let before = entry.len();
     entry.retain(|s| s.id != id);
     entry.len() != before
+}
+
+/// Owner of the saved search with `id`, if it exists. Lets callers tell a
+/// missing search (404) from someone else's (403).
+pub fn saved_search_owner(id: u64) -> Option<String> {
+    SAVED_SEARCHES
+        .iter()
+        .find_map(|entry| entry.value().iter().find(|s| s.id == id).map(|s| s.owner.clone()))
 }
 
 #[cfg(test)]
