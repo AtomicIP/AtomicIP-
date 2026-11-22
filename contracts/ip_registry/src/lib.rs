@@ -240,6 +240,12 @@ pub enum ContractError {
     UpgradeNotProposed = 64,
     /// #1154: `accept_admin` called with no pending nomination.
     NoPendingAdmin = 65,
+    /// #1382: The same IP ID appears more than once in a batch.
+    DuplicateIpId = 78,
+    /// #1379: Grace period exceeds `MAX_GRACE_PERIOD_SECONDS`.
+    GracePeriodTooLong = 79,
+    /// #1381: IP is referenced by an active swap or auction.
+    IpInActiveSwap = 80,
 }
 // ── TTL ───────────────────────────────────────────────────────────────────────
 
@@ -253,6 +259,13 @@ pub const DEFAULT_CHALLENGE_TTL_SECONDS: u64 = 86_400;
 
 /// Maximum metadata size: 1 KB
 pub const MAX_METADATA_BYTES: u32 = 1024;
+
+/// #1379: Maximum grace period accepted by `set_ip_expiry` (365 days).
+pub const MAX_GRACE_PERIOD_SECONDS: u64 = 31_536_000;
+
+/// #1382: Reputation score range, matching the atomic-swap contract (0..=100).
+pub const MIN_REPUTATION_SCORE: i64 = 0;
+pub const MAX_REPUTATION_SCORE: i64 = 100;
 
 /// Issue #1105: Minimum `grant_ip_access` level that may read an encrypted metadata field.
 pub const METADATA_FIELD_ACCESS_LEVEL: u32 = 1;
@@ -402,6 +415,8 @@ pub enum DataKey {
     BatchVerifyResult(BytesN<32>), // maps batch_proof_id -> BatchVerifyResult
     // #1100: ZK proof verification cache
     ZkCacheEntry(BytesN<32>), // maps cache key -> cached verdict (bool)
+    /// #1381: Address of the atomic swap contract consulted before transfers.
+    SwapContract,
     ZkCacheEpoch(BytesN<32>), // maps commitment -> invalidation epoch (u32)
     ZkCacheSlot(u32),         // maps FIFO slot -> cache key occupying it
     ZkCacheCursor,            // next slot to evict once the cache is full (u32)
@@ -2612,6 +2627,11 @@ impl IpRegistry {
         let record = require_ip_exists(&env, ip_id);
 
         record.owner.require_auth();
+
+        // #1381: block transfers while an active swap or auction references the IP.
+        if Self::has_active_swap(&env, ip_id) {
+            panic_with_error!(&env, ContractError::IpInActiveSwap);
+        }
 
         Self::transfer_ip_unchecked(env, ip_id, new_owner);
     }
@@ -6402,6 +6422,16 @@ impl IpRegistry {
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::Unauthorized));
         admin.require_auth();
 
+        // #1382: reject duplicate IP IDs so the same delta is not applied twice.
+        for i in 0..ip_ids.len() {
+            let id = ip_ids.get(i).unwrap();
+            for j in (i + 1)..ip_ids.len() {
+                if ip_ids.get(j).unwrap() == id {
+                    panic_with_error!(&env, ContractError::DuplicateIpId);
+                }
+            }
+        }
+
         for i in 0..ip_ids.len() {
             let ip_id = ip_ids.get(i).unwrap();
             let score_delta = score_deltas.get(i).unwrap();
@@ -6418,7 +6448,10 @@ impl IpRegistry {
                     commitments: 0,
                     disputes_lost: 0,
                 });
-            rep.score = rep.score.saturating_add(score_delta);
+            rep.score = rep
+                .score
+                .saturating_add(score_delta)
+                .clamp(MIN_REPUTATION_SCORE, MAX_REPUTATION_SCORE);
             env.storage()
                 .persistent()
                 .set(&DataKey::OwnerReputation(owner.clone()), &rep);
@@ -7702,6 +7735,15 @@ impl IpRegistry {
         let mut record = require_ip_exists(&env, ip_id);
         record.owner.require_auth();
 
+        // #1379: revoked IPs keep their expiry as-is.
+        if record.revoked {
+            panic_with_error!(&env, ContractError::IpAlreadyRevoked);
+        }
+        // #1379: cap the grace period so a commitment always becomes unverifiable.
+        if grace_period_seconds > MAX_GRACE_PERIOD_SECONDS {
+            panic_with_error!(&env, ContractError::GracePeriodTooLong);
+        }
+
         if expiry_timestamp != 0 && expiry_timestamp <= env.ledger().timestamp() {
             env.panic_with_error(Error::from_contract_error(
                 ContractError::InvalidExpiry as u32,
@@ -7787,8 +7829,94 @@ impl IpRegistry {
         true
     }
 
+    /// #1381: Set the atomic swap contract consulted before transfers and cleanup. Admin-only.
+    pub fn set_swap_contract(env: Env, swap_contract: Address) {
+        Self::require_admin(&env).require_auth();
+        env.storage()
+            .persistent()
+            .set(&DataKey::SwapContract, &swap_contract);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::SwapContract, LEDGER_BUMP, LEDGER_BUMP);
+    }
+
+    /// #1380: Report why an IP cannot be cleaned up, or `None` if nothing blocks it.
+    /// Possible reasons: `swap`, `dispute`, `arbitrate`, `stake`, `licence`.
+    pub fn get_cleanup_blocker(env: Env, ip_id: u64) -> Option<Symbol> {
+        Self::cleanup_blocker_reason(&env, ip_id)
+    }
+
+    fn has_active_swap(env: &Env, ip_id: u64) -> bool {
+        let swap_contract: Option<Address> =
+            env.storage().persistent().get(&DataKey::SwapContract);
+        match swap_contract {
+            Some(addr) => {
+                let args: Vec<soroban_sdk::Val> =
+                    soroban_sdk::vec![env, soroban_sdk::IntoVal::into_val(&ip_id, env)];
+                env.invoke_contract::<bool>(&addr, &Symbol::new(env, "has_active_swap"), args)
+            }
+            None => false,
+        }
+    }
+
+    fn cleanup_blocker_reason(env: &Env, ip_id: u64) -> Option<Symbol> {
+        if Self::has_active_swap(env, ip_id) {
+            return Some(symbol_short!("swap"));
+        }
+
+        let next_dispute: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NextDisputeId)
+            .unwrap_or(1);
+        for dispute_id in 1..next_dispute {
+            let dispute: Option<DisputeRecord> =
+                env.storage().persistent().get(&DataKey::IpDisputes(dispute_id));
+            if let Some(d) = dispute {
+                if d.ip_id == ip_id && !d.resolved {
+                    return Some(symbol_short!("dispute"));
+                }
+            }
+        }
+
+        let next_arb: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NextArbitrationId)
+            .unwrap_or(1);
+        for arb_id in 1..next_arb {
+            let case: Option<ArbitrationRecord> =
+                env.storage().persistent().get(&DataKey::ArbitrationCase(arb_id));
+            if let Some(c) = case {
+                if c.finalized {
+                    continue;
+                }
+                let dispute: Option<DisputeRecord> =
+                    env.storage().persistent().get(&DataKey::IpDisputes(c.dispute_id));
+                if dispute.map(|d| d.ip_id == ip_id).unwrap_or(false) {
+                    return Some(symbol_short!("arbitrate"));
+                }
+            }
+        }
+
+        let stake: Option<StakeRecord> = env.storage().persistent().get(&DataKey::IpStake(ip_id));
+        if stake.map(|s| !s.slashed).unwrap_or(false) {
+            return Some(symbol_short!("stake"));
+        }
+
+        let licenses: Option<Vec<LicenseEntry>> =
+            env.storage().persistent().get(&DataKey::IpLicenses(ip_id));
+        if licenses.map(|l| !l.is_empty()).unwrap_or(false) {
+            return Some(symbol_short!("licence"));
+        }
+
+        None
+    }
+
     /// Remove expired IPs that are past their grace period. Admin-only.
     /// Skips IPs with expiry_timestamp == 0 (no expiry set).
+    /// #1380: Also skips IPs blocked by a swap, dispute, arbitration, stake or licence
+    /// (see `get_cleanup_blocker`).
     /// Removes the record plus its `OwnerIps` and `CommitmentOwner` index entries.
     pub fn cleanup_expired_ips(env: Env, ip_ids: Vec<u64>) {
         // Admin-only: deleting records must not be open to arbitrary callers.
@@ -7806,6 +7934,7 @@ impl IpRegistry {
                     >= rec
                         .expiry_timestamp
                         .saturating_add(rec.grace_period_seconds)
+                    && Self::cleanup_blocker_reason(&env, ip_id).is_none()
                 {
                     // Drop index entries in the same call so no dangling references remain.
                     let owner_ids: Option<Vec<u64>> = env
