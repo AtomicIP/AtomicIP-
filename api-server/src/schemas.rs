@@ -10,6 +10,10 @@ pub struct CommitIpRequest {
     /// Optional labels used to organize the commitment.
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Plaintext feature keywords describing the IP. Used for prior-art
+    /// similarity comparison instead of hash-based Hamming distance.
+    #[serde(default)]
+    pub feature_fingerprints: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -26,6 +30,10 @@ pub struct IpRecord {
     pub timestamp: u64,
     /// Whether the IP record has been revoked
     pub revoked: bool,
+    /// Plaintext feature keywords describing the IP, supplied by the owner at
+    /// registration time. Used for prior-art similarity comparison.
+    #[serde(default)]
+    pub feature_fingerprints: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]

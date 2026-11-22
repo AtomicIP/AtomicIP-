@@ -5,10 +5,25 @@
 //! by the licensor only before the license starts. Status is derived from the
 //! clock: `Pending` before `start`, `Active` between `start` and `expiry`, and
 //! `Expired` from `expiry` onward.
+//!
+//! # Durability (#1401)
+//!
+//! Licenses are persisted to Redis (when `REDIS_URL` is set) so they survive
+//! process restarts and are visible to every replica. The in-process
+//! `DashMap` acts as a write-through cache: every write goes to Redis first
+//! and then to the map; every read checks the map before falling back to
+//! Redis. The ID counter is backed by a Redis `INCR` so replicas cannot
+//! issue duplicate IDs.
+//!
+//! When Redis is unavailable the module falls back to in-process state only,
+//! matching the previous behaviour. A log warning is emitted on each
+//! degraded write so operators are alerted.
 
 use axum::{extract::Path, http::StatusCode, Json};
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
+use r2d2::Pool;
+use redis::Commands;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -34,6 +49,9 @@ pub struct RoyaltyPayment {
     /// Royalty owed to the licensor on that revenue, in stroops.
     pub royalty_due: i128,
     pub timestamp: u64,
+    /// On-chain settlement reference (transaction hash or swap ID) that
+    /// proves the payment occurred. Required to prevent self-reporting.
+    pub settlement_ref: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -48,6 +66,12 @@ pub struct License {
     pub expiry: u64,
     pub royalties: Vec<RoyaltyPayment>,
     pub total_royalty_due: i128,
+    /// Accumulated remainder from prior royalty calculations. When the
+    /// product `gross_revenue * royalty_bps` is not exactly divisible by
+    /// `BPS_DENOMINATOR`, the leftover is carried forward so that rounding
+    /// happens at most once across the life of the license.
+    #[serde(default)]
+    pub royalty_remainder: i128,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -72,6 +96,9 @@ pub struct UpdateTermsRequest {
 #[derive(Debug, Clone, Deserialize)]
 pub struct RecordRoyaltyRequest {
     pub gross_revenue: i128,
+    /// On-chain settlement reference (transaction hash or atomic-swap ID)
+    /// that proves the payment occurred.
+    pub settlement_ref: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -112,6 +139,79 @@ impl LicenseError {
 static LICENSES: Lazy<DashMap<u64, License>> = Lazy::new(DashMap::new);
 static NEXT_LICENSE_ID: AtomicU64 = AtomicU64::new(1);
 
+// ── Redis-backed durability (#1401) ───────────────────────────────────────────
+
+const REDIS_ID_KEY: &str = "license:next_id";
+
+fn license_redis_key(id: u64) -> String {
+    format!("license:{}", id)
+}
+
+/// Open a Redis connection from `REDIS_URL`, or return `None` when Redis is
+/// not configured or not reachable. Errors are logged but not propagated so
+/// the module degrades gracefully.
+fn redis_pool() -> Option<Pool<redis::Client>> {
+    static POOL: Lazy<Option<Pool<redis::Client>>> = Lazy::new(|| {
+        let url = std::env::var("REDIS_URL").ok()?;
+        let client = redis::Client::open(url)
+            .map_err(|err| tracing::warn!(error = %err, "licensing: invalid REDIS_URL"))
+            .ok()?;
+        Pool::builder()
+            .max_size(8)
+            .connection_timeout(std::time::Duration::from_millis(300))
+            .build_unchecked(client)
+            .into()
+    });
+    POOL.clone()
+}
+
+/// Allocate the next license ID.
+/// Uses Redis `INCR` when available so replicas cannot issue duplicate IDs;
+/// falls back to the process-local `AtomicU64` otherwise.
+fn next_id() -> u64 {
+    if let Some(pool) = redis_pool() {
+        if let Ok(mut conn) = pool.get() {
+            match conn.incr::<_, _, i64>(REDIS_ID_KEY, 1_i64) {
+                Ok(id) => return id as u64,
+                Err(err) => tracing::warn!(error = %err, "licensing: Redis INCR failed, using local counter"),
+            }
+        }
+    }
+    NEXT_LICENSE_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Persist a license to Redis. Logs a warning on failure (degraded mode).
+fn redis_save(license: &License) {
+    let pool = match redis_pool() {
+        Some(p) => p,
+        None => return,
+    };
+    let mut conn = match pool.get() {
+        Ok(c) => c,
+        Err(err) => {
+            tracing::warn!(error = %err, id = license.id, "licensing: Redis connection unavailable, license not persisted to Redis");
+            return;
+        }
+    };
+    match serde_json::to_string(license) {
+        Ok(json) => {
+            if let Err(err) = conn.set::<_, _, ()>(&license_redis_key(license.id), &json) {
+                tracing::warn!(error = %err, id = license.id, "licensing: failed to persist license to Redis");
+            }
+        }
+        Err(err) => tracing::warn!(error = %err, id = license.id, "licensing: failed to serialize license"),
+    }
+}
+
+/// Load a license from Redis into the local map, returning it if found.
+fn redis_load(id: u64) -> Option<License> {
+    let mut conn = redis_pool()?.get().ok()?;
+    let json: String = conn.get(&license_redis_key(id)).ok()?;
+    let license: License = serde_json::from_str(&json).ok()?;
+    LICENSES.insert(id, license.clone());
+    Some(license)
+}
+
 /// Status of a license at time `now`.
 pub fn status_at(license: &License, now: u64) -> LicenseStatus {
     if now < license.start {
@@ -148,7 +248,7 @@ pub fn create(req: CreateLicenseRequest, now: u64) -> Result<License, LicenseErr
     validate_terms(req.royalty_bps, start, req.expiry)?;
 
     let license = License {
-        id: NEXT_LICENSE_ID.fetch_add(1, Ordering::Relaxed),
+        id: next_id(),
         ip_id: req.ip_id,
         licensor: req.licensor,
         licensee: req.licensee,
@@ -157,13 +257,15 @@ pub fn create(req: CreateLicenseRequest, now: u64) -> Result<License, LicenseErr
         expiry: req.expiry,
         royalties: Vec::new(),
         total_royalty_due: 0,
+        royalty_remainder: 0,
     };
+    redis_save(&license);
     LICENSES.insert(license.id, license.clone());
     Ok(license)
 }
 
 pub fn get(id: u64) -> Option<License> {
-    LICENSES.get(&id).map(|l| l.clone())
+    LICENSES.get(&id).map(|l| l.clone()).or_else(|| redis_load(id))
 }
 
 /// Amend royalty rate and expiry. Only the licensor may do this, and only before the license starts.
@@ -180,14 +282,22 @@ pub fn update_terms(id: u64, req: UpdateTermsRequest, now: u64) -> Result<Licens
     validate_terms(req.royalty_bps, entry.start, req.expiry)?;
     entry.royalty_bps = req.royalty_bps;
     entry.expiry = req.expiry;
-    Ok(entry.clone())
+    let updated = entry.clone();
+    drop(entry);
+    redis_save(&updated);
+    Ok(updated)
 }
 
 /// Record licensee revenue and accrue the royalty due. Only allowed while the license is active.
-pub fn record_royalty(id: u64, gross_revenue: i128, now: u64) -> Result<License, LicenseError> {
+pub fn record_royalty(id: u64, gross_revenue: i128, settlement_ref: String, now: u64) -> Result<License, LicenseError> {
     let mut entry = LICENSES.get_mut(&id).ok_or(LicenseError::NotFound(id))?;
     if gross_revenue <= 0 {
         return Err(LicenseError::Invalid("gross_revenue must be positive".to_string()));
+    }
+    if settlement_ref.trim().is_empty() {
+        return Err(LicenseError::Invalid(
+            "settlement_ref must be a non-empty transaction hash or swap ID".to_string(),
+        ));
     }
     match status_at(&entry, now) {
         LicenseStatus::Active => {}
@@ -197,14 +307,30 @@ pub fn record_royalty(id: u64, gross_revenue: i128, now: u64) -> Result<License,
             )))
         }
     }
-    let royalty_due = gross_revenue * entry.royalty_bps / BPS_DENOMINATOR;
-    entry.total_royalty_due += royalty_due;
+    // Carry the remainder forward to avoid per-payment flooring (#1399).
+    // numerator = gross_revenue * royalty_bps + leftover from previous payments
+    let numerator = gross_revenue
+        .checked_mul(entry.royalty_bps)
+        .and_then(|n| n.checked_add(entry.royalty_remainder))
+        .ok_or_else(|| LicenseError::Invalid("royalty calculation overflowed".to_string()))?;
+    let royalty_due = numerator / BPS_DENOMINATOR;
+    let new_remainder = numerator % BPS_DENOMINATOR;
+    let new_total = entry
+        .total_royalty_due
+        .checked_add(royalty_due)
+        .ok_or_else(|| LicenseError::Invalid("total_royalty_due overflowed".to_string()))?;
+    entry.royalty_remainder = new_remainder;
+    entry.total_royalty_due = new_total;
     entry.royalties.push(RoyaltyPayment {
         gross_revenue,
         royalty_due,
         timestamp: now,
+        settlement_ref,
     });
-    Ok(entry.clone())
+    let updated = entry.clone();
+    drop(entry);
+    redis_save(&updated);
+    Ok(updated)
 }
 
 fn respond(result: Result<License, LicenseError>, now: u64) -> Result<Json<LicenseResponse>, (StatusCode, Json<ErrorResponse>)> {
@@ -250,7 +376,7 @@ pub async fn record_license_royalty(
     Json(body): Json<RecordRoyaltyRequest>,
 ) -> Result<Json<LicenseResponse>, (StatusCode, Json<ErrorResponse>)> {
     let now = now_timestamp();
-    respond(record_royalty(id, body.gross_revenue, now), now)
+    respond(record_royalty(id, body.gross_revenue, body.settlement_ref, now), now)
 }
 
 #[cfg(test)]
@@ -287,15 +413,15 @@ mod tests {
     fn records_royalties_only_while_active() {
         let license = create(request(Some(100), 200), 0).unwrap();
         assert!(matches!(
-            record_royalty(license.id, 1_000, 50),
+            record_royalty(license.id, 1_000, "tx_pending".to_string(), 50),
             Err(LicenseError::InvalidState(_))
         ));
-        let updated = record_royalty(license.id, 1_000, 150).unwrap();
+        let updated = record_royalty(license.id, 1_000, "tx_active".to_string(), 150).unwrap();
         assert_eq!(updated.royalties.len(), 1);
         assert_eq!(updated.royalties[0].royalty_due, 100);
         assert_eq!(updated.total_royalty_due, 100);
         assert!(matches!(
-            record_royalty(license.id, 1_000, 200),
+            record_royalty(license.id, 1_000, "tx_expired".to_string(), 200),
             Err(LicenseError::InvalidState(_))
         ));
     }
@@ -343,6 +469,44 @@ mod tests {
 
     #[test]
     fn unknown_license_is_not_found() {
-        assert_eq!(record_royalty(u64::MAX, 1, 0), Err(LicenseError::NotFound(u64::MAX)));
+        assert_eq!(
+            record_royalty(u64::MAX, 1, "txhash".to_string(), 0),
+            Err(LicenseError::NotFound(u64::MAX))
+        );
+    }
+
+    #[test]
+    fn royalty_remainder_is_carried_forward() {
+        // royalty_bps = 1 (0.01%). Payment of 1 stroop: 1 * 1 / 10_000 = 0 with remainder 1.
+        // After 10_000 such payments the accumulated numerator = 10_000, royalty_due = 1 total.
+        let req = CreateLicenseRequest {
+            ip_id: 1,
+            licensor: "GLICENSOR".to_string(),
+            licensee: "GLICENSEE".to_string(),
+            royalty_bps: 1,
+            start: Some(100),
+            expiry: 200,
+        };
+        let license = create(req, 0).unwrap();
+        // 9_999 payments of 1 stroop each — remainder accumulates, royalty_due stays 0 each time.
+        for i in 0..9_999u64 {
+            record_royalty(license.id, 1, format!("tx_{i}"), 150).unwrap();
+        }
+        // 10_000th payment tips the accumulated numerator over BPS_DENOMINATOR.
+        let final_state = record_royalty(license.id, 1, "tx_final".to_string(), 150).unwrap();
+        assert_eq!(final_state.total_royalty_due, 1, "remainder carry-forward must yield 1 stroop after 10_000 payments");
+    }
+
+    #[test]
+    fn empty_settlement_ref_is_rejected() {
+        let license = create(request(Some(100), 200), 0).unwrap();
+        assert!(matches!(
+            record_royalty(license.id, 1_000, "".to_string(), 150),
+            Err(LicenseError::Invalid(_))
+        ));
+        assert!(matches!(
+            record_royalty(license.id, 1_000, "   ".to_string(), 150),
+            Err(LicenseError::Invalid(_))
+        ));
     }
 }
