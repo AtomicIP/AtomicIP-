@@ -246,3 +246,45 @@ describe("cancelBatchSwaps — MAX_REASON_LENGTH boundary", () => {
     expect(result.results[0].reason).toBe("");
   });
 });
+
+describe("cancelBatchSwaps — feePaid validation (issue #1319)", () => {
+  test("rejects negative feePaid instead of over-refunding", () => {
+    const result = cancelBatchSwaps(
+      [pendingSwap("neg", 100)],
+      [{ refundPolicy: REFUND_POLICIES.PARTIAL, feePaid: -500 }]
+    );
+    expect(result.cancelledCount).toBe(0);
+    expect(result.errors[0].swapId).toBe("neg");
+    expect(result.totalRefunded).toBe(0);
+  });
+  test("rejects feePaid greater than swap amount", () => {
+    const result = cancelBatchSwaps(
+      [pendingSwap("big", 100)],
+      [{ refundPolicy: REFUND_POLICIES.PARTIAL, feePaid: 101 }]
+    );
+    expect(result.failedCount).toBe(1);
+    expect(result.errors[0].error).toMatch(/must not exceed swap amount/);
+  });
+  test("rejects non-numeric and non-finite feePaid", () => {
+    const result = cancelBatchSwaps(
+      [pendingSwap("a", 100), pendingSwap("b", 100), pendingSwap("c", 100)],
+      [
+        { feePaid: "10" },
+        { feePaid: NaN },
+        { feePaid: Infinity },
+      ]
+    );
+    expect(result.failedCount).toBe(3);
+  });
+  test("accepts feePaid of 0 and equal to amount", () => {
+    const result = cancelBatchSwaps(
+      [pendingSwap("zero", 100), pendingSwap("full", 100)],
+      [
+        { refundPolicy: REFUND_POLICIES.PARTIAL, feePaid: 0 },
+        { refundPolicy: REFUND_POLICIES.PARTIAL, feePaid: 100 },
+      ]
+    );
+    expect(result.failedCount).toBe(0);
+    expect(result.totalRefunded).toBe(100);
+  });
+});
