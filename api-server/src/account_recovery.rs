@@ -109,6 +109,7 @@ struct RecoveryStore {
     tokens: HashMap<String, RecoveryToken>,
     lockouts: HashMap<String, i64>,  // email -> lockout_until_timestamp
     security_answers: HashMap<String, HashMap<u32, String>>, // email -> (question_id -> answer_hash)
+    failed_answer_attempts: HashMap<String, usize>, // email -> consecutive wrong security answers
 }
 
 static RECOVERY_STORE: Lazy<RwLock<RecoveryStore>> = Lazy::new(|| {
@@ -116,8 +117,70 @@ static RECOVERY_STORE: Lazy<RwLock<RecoveryStore>> = Lazy::new(|| {
         tokens: HashMap::new(),
         lockouts: HashMap::new(),
         security_answers: HashMap::new(),
+        failed_answer_attempts: HashMap::new(),
     })
 });
+
+/// Why a security-question answer was not accepted.
+#[derive(Debug, PartialEq, Eq)]
+enum SecurityAnswerError {
+    /// The email is currently locked out (too many wrong answers).
+    LockedOut,
+    /// No security answers are registered for this email.
+    NoSecurityQuestions,
+    /// The requested question is not registered for this email.
+    QuestionNotConfigured,
+    /// The answer does not match the stored hash.
+    Incorrect,
+}
+
+/// Check a submitted answer against the stored SHA256 hash for `(email, question_id)`.
+///
+/// Mirrors the email-recovery lockout: lockout is checked first, wrong answers are
+/// counted per email, and reaching `max_recovery_attempts` locks the email for
+/// `lockout_duration_minutes`. A correct answer clears the failure counter.
+fn check_security_answer(
+    store: &mut RecoveryStore,
+    email: &str,
+    question_id: u32,
+    answer: &str,
+    now: i64,
+    config: &RecoveryConfig,
+) -> Result<(), SecurityAnswerError> {
+    if let Some(lockout_until) = store.lockouts.get(email) {
+        if now < *lockout_until {
+            return Err(SecurityAnswerError::LockedOut);
+        }
+    }
+
+    let answers = store
+        .security_answers
+        .get(email)
+        .ok_or(SecurityAnswerError::NoSecurityQuestions)?;
+    let expected_hash = answers
+        .get(&question_id)
+        .ok_or(SecurityAnswerError::QuestionNotConfigured)?;
+
+    if hash_string(answer) == *expected_hash {
+        store.failed_answer_attempts.remove(email);
+        return Ok(());
+    }
+
+    let attempts = store
+        .failed_answer_attempts
+        .entry(email.to_string())
+        .or_insert(0);
+    *attempts += 1;
+    if *attempts >= config.max_recovery_attempts {
+        store.failed_answer_attempts.remove(email);
+        store.lockouts.insert(
+            email.to_string(),
+            now + config.lockout_duration_minutes * 60,
+        );
+        return Err(SecurityAnswerError::LockedOut);
+    }
+    Err(SecurityAnswerError::Incorrect)
+}
 
 /// Hash a string using SHA256
 fn hash_string(input: &str) -> String {
@@ -276,31 +339,51 @@ pub async fn get_security_questions(
 pub async fn verify_security_question(
     axum::Json(req): axum::Json<SecurityQuestionAnswerRequest>,
 ) -> Result<axum::Json<SecurityQuestionAnswerResponse>, (axum::http::StatusCode, axum::Json<crate::schemas::ErrorResponse>)> {
-    let store = RECOVERY_STORE.read().await;
+    let config = RecoveryConfig::default();
+    let now = Utc::now();
+    let mut store = RECOVERY_STORE.write().await;
 
-    // Check if user has security questions set up
-    if !store.security_answers.contains_key(&req.email) {
-        return Err((
+    check_security_answer(
+        &mut store,
+        &req.email,
+        req.question_id,
+        &req.answer,
+        now.timestamp(),
+        &config,
+    )
+    .map_err(|err| match err {
+        SecurityAnswerError::LockedOut => (
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            axum::Json(crate::schemas::ErrorResponse {
+                error: "Too many recovery attempts. Please try again later.".to_string(),
+            }),
+        ),
+        SecurityAnswerError::NoSecurityQuestions => (
             axum::http::StatusCode::BAD_REQUEST,
             axum::Json(crate::schemas::ErrorResponse {
                 error: "No security questions found for this email. Use email recovery instead.".to_string(),
             }),
-        ));
-    }
-
-    // TODO: In production, verify the answer against the hashed stored answer
-    // For now, accept any answer longer than 3 characters
-    if req.answer.len() < 3 {
-        return Err((
+        ),
+        SecurityAnswerError::QuestionNotConfigured | SecurityAnswerError::Incorrect => (
             axum::http::StatusCode::BAD_REQUEST,
             axum::Json(crate::schemas::ErrorResponse {
                 error: "Incorrect answer to security question".to_string(),
             }),
-        ));
-    }
+        ),
+    })?;
 
-    // Generate a temporary recovery token
+    // Issue a recovery token that verify_recovery_token will accept.
     let recovery_token = generate_recovery_token();
+    store.tokens.insert(
+        recovery_token.clone(),
+        RecoveryToken {
+            email: req.email.clone(),
+            token: recovery_token.clone(),
+            created_at: now.timestamp(),
+            expires_at: (now + Duration::minutes(config.token_expiry_minutes)).timestamp(),
+            used: false,
+        },
+    );
 
     Ok(axum::Json(SecurityQuestionAnswerResponse {
         message: "Security question answered correctly. Use the recovery token to reset your password.".to_string(),
@@ -360,6 +443,7 @@ mod tests {
             tokens: HashMap::from([("known-token".to_string(), token.clone())]),
             lockouts: HashMap::new(),
             security_answers: HashMap::new(),
+            failed_answer_attempts: HashMap::new(),
         };
 
         assert!(is_recovery_token_valid(&store, "test@example.com", "known-token", 199));
@@ -374,6 +458,7 @@ mod tests {
             )]),
             lockouts: HashMap::new(),
             security_answers: HashMap::new(),
+            failed_answer_attempts: HashMap::new(),
         };
         assert!(!is_recovery_token_valid(
             &used_store,
@@ -388,5 +473,103 @@ mod tests {
         let questions = SecurityQuestion::default_questions();
         assert_eq!(questions.len(), 5);
         assert!(questions[0].question.contains("pet"));
+    }
+
+    fn store_with_answer(email: &str, question_id: u32, answer: &str) -> RecoveryStore {
+        RecoveryStore {
+            tokens: HashMap::new(),
+            lockouts: HashMap::new(),
+            security_answers: HashMap::from([(
+                email.to_string(),
+                HashMap::from([(question_id, hash_string(answer))]),
+            )]),
+            failed_answer_attempts: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_security_answer_correct_is_accepted() {
+        let config = RecoveryConfig::default();
+        let mut store = store_with_answer("a@example.com", 1, "Rex");
+        assert_eq!(
+            check_security_answer(&mut store, "a@example.com", 1, "Rex", 1_000, &config),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn test_security_answer_long_wrong_answer_is_rejected() {
+        // Previously any answer of 4+ characters was accepted; it must now match the stored hash.
+        let config = RecoveryConfig::default();
+        let mut store = store_with_answer("a@example.com", 1, "Rex");
+        assert_eq!(
+            check_security_answer(&mut store, "a@example.com", 1, "Long but wrong", 1_000, &config),
+            Err(SecurityAnswerError::Incorrect)
+        );
+    }
+
+    #[test]
+    fn test_security_answer_wrong_question_id_is_rejected() {
+        let config = RecoveryConfig::default();
+        let mut store = store_with_answer("a@example.com", 1, "Rex");
+        assert_eq!(
+            check_security_answer(&mut store, "a@example.com", 2, "Rex", 1_000, &config),
+            Err(SecurityAnswerError::QuestionNotConfigured)
+        );
+    }
+
+    #[test]
+    fn test_security_answer_unknown_email_is_rejected() {
+        let config = RecoveryConfig::default();
+        let mut store = store_with_answer("a@example.com", 1, "Rex");
+        assert_eq!(
+            check_security_answer(&mut store, "b@example.com", 1, "Rex", 1_000, &config),
+            Err(SecurityAnswerError::NoSecurityQuestions)
+        );
+    }
+
+    #[test]
+    fn test_security_answer_locks_out_after_max_wrong_attempts() {
+        let config = RecoveryConfig::default();
+        let mut store = store_with_answer("a@example.com", 1, "Rex");
+        let now = 1_000;
+        for _ in 0..(config.max_recovery_attempts - 1) {
+            assert_eq!(
+                check_security_answer(&mut store, "a@example.com", 1, "nope", now, &config),
+                Err(SecurityAnswerError::Incorrect)
+            );
+        }
+        assert_eq!(
+            check_security_answer(&mut store, "a@example.com", 1, "nope", now, &config),
+            Err(SecurityAnswerError::LockedOut)
+        );
+        // Even the correct answer is refused while locked out.
+        assert_eq!(
+            check_security_answer(&mut store, "a@example.com", 1, "Rex", now + 1, &config),
+            Err(SecurityAnswerError::LockedOut)
+        );
+        // Lockout expires after the configured duration.
+        let after = now + config.lockout_duration_minutes * 60;
+        assert_eq!(
+            check_security_answer(&mut store, "a@example.com", 1, "Rex", after, &config),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn test_security_answer_success_resets_failure_counter() {
+        let config = RecoveryConfig::default();
+        let mut store = store_with_answer("a@example.com", 1, "Rex");
+        for _ in 0..(config.max_recovery_attempts - 1) {
+            let _ = check_security_answer(&mut store, "a@example.com", 1, "nope", 1_000, &config);
+        }
+        assert_eq!(
+            check_security_answer(&mut store, "a@example.com", 1, "Rex", 1_000, &config),
+            Ok(())
+        );
+        assert_eq!(
+            check_security_answer(&mut store, "a@example.com", 1, "nope", 1_000, &config),
+            Err(SecurityAnswerError::Incorrect)
+        );
     }
 }

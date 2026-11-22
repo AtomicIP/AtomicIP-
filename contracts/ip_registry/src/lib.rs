@@ -78,6 +78,26 @@ mod revocation_property_tests;
 #[cfg(test)]
 mod merge_shares_tests;
 
+// #1307: these test modules existed in src/ but were never declared, so
+// `cargo test` silently skipped them.
+#[cfg(test)]
+mod commitment_sybil_resistance_tests;
+
+#[cfg(test)]
+mod commitment_property_tests;
+
+#[cfg(test)]
+mod lifecycle_tests;
+
+#[cfg(test)]
+mod notary_access_tests;
+
+#[cfg(test)]
+mod per_ip_auth_tests;
+
+#[cfg(test)]
+mod admin_handover_tests;
+
 // ── Error Codes ────────────────────────────────────────────────────────────
 
 #[contracterror]

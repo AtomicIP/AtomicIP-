@@ -10,7 +10,7 @@
 
 use axum::{
     extract::Path,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     Json,
 };
 use serde::Serialize;
@@ -191,15 +191,26 @@ async fn count_remaining_references(
         (status = 500, description = "Erasure failed", body = ErrorResponse),
     )
 )]
-#[instrument]
+#[instrument(skip(headers))]
 pub async fn delete_user_handler(
     Path(user_id): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Json<UserErasureReport>, (StatusCode, Json<ErrorResponse>)> {
     let user_id = user_id.trim();
     if user_id.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse { error: "user_id must not be empty".to_string() }),
+        ));
+    }
+
+    // Only the account holder may erase its data: the request-signing layer proves
+    // possession of X-Public-Key, and that key must be the user being erased.
+    let signer = headers.get("X-Public-Key").and_then(|v| v.to_str().ok());
+    if signer != Some(user_id) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse { error: "signer does not match user_id".to_string() }),
         ));
     }
 

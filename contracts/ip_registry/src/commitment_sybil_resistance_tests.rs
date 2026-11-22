@@ -11,7 +11,7 @@ mod commitment_sybil_resistance_tests {
         IpRegistryClient::new(env, &registry_id)
     }
 
-    fn create_valid_commitment_hash(env: &Env) -> crate::CommitmentHash {
+    fn create_valid_commitment_hash(env: &Env) -> soroban_sdk::BytesN<32> {
         let commitment_data = soroban_sdk::Bytes::from_slice(env, b"test_commitment");
         env.crypto().sha256(&commitment_data).into()
     }
@@ -83,11 +83,11 @@ mod commitment_sybil_resistance_tests {
         let registry = setup_contract(&env);
         let suspicious_user = Address::generate(&env);
 
-        let mut commitment_hashes = Vec::new(&env);
+        let mut commitment_hashes = soroban_sdk::Vec::new(&env);
         for i in 0..10 {
             let data = soroban_sdk::Bytes::from_slice(
                 &env,
-                format!("commitment_{}", i).as_bytes(),
+                std::format!("commitment_{}", i).as_bytes(),
             );
             let hash = env.crypto().sha256(&data).into();
             commitment_hashes.push(hash);
@@ -184,7 +184,7 @@ mod commitment_sybil_resistance_tests {
         for i in 0..5 {
             let data = soroban_sdk::Bytes::from_slice(
                 &env,
-                format!("commitment_{}", i).as_bytes(),
+                std::format!("commitment_{}", i).as_bytes(),
             );
             let hash = env.crypto().sha256(&data).into();
 

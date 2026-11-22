@@ -86,6 +86,7 @@ mod rate_limit;
 mod validation;
 mod validation_middleware;
 mod docs;
+mod user_data;
 #[cfg(test)]
 mod validation_fuzz_tests;
 #[cfg(test)]
@@ -493,6 +494,8 @@ async fn main() {
         .route("/v1/auth/recovery/verify-token",  post(account_recovery::verify_recovery_token))
         .route("/v1/auth/recovery/questions",     get(account_recovery::get_security_questions))
         .route("/v1/auth/recovery/verify-question", post(account_recovery::verify_security_question))
+        // #1309: GDPR/CCPA erasure. Signed, and bound to the erased user in the handler.
+        .route("/users/{user_id}", axum::routing::delete(user_data::delete_user_handler).layer(signed.clone()))
         .route("/auth/2fa/enable", post(handlers::enable_2fa))
         .route("/auth/2fa/verify", post(handlers::verify_2fa))
         .route("/auth/2fa/backup-code", post(handlers::use_backup_code))
@@ -663,6 +666,8 @@ fn build_app() -> Router {
         .route("/v1/auth/recovery/verify-token", post(account_recovery::verify_recovery_token))
         .route("/v1/auth/recovery/questions", get(account_recovery::get_security_questions))
         .route("/v1/auth/recovery/verify-question", post(account_recovery::verify_security_question))
+        // #1309: GDPR/CCPA erasure. Signed, and bound to the erased user in the handler.
+        .route("/users/{user_id}", axum::routing::delete(user_data::delete_user_handler).layer(signed.clone()))
         .route("/v1/graphql", post(graphql_handler))
         .route("/v1/ip/commit", post(handlers::commit_ip).layer(signed.clone()))
         .route("/v1/ip/transfer", post(handlers::transfer_ip).layer(signed.clone()))
@@ -702,10 +707,11 @@ fn build_app() -> Router {
         .route("/v1/transfers/{id}/validate", post(transfers::validate_transfer))
         .route("/v1/transfers/{id}/escrow", post(transfers::fund_transfer_escrow))
         .route("/v1/transfers/{id}/cancel", post(transfers::cancel_transfer))
-        .route("/v1/licenses", post(licensing::create_license))
+        // #1310: mutating license routes require the same request signature as swaps/transfers.
+        .route("/v1/licenses", post(licensing::create_license).layer(signed.clone()))
         .route("/v1/licenses/{id}", get(licensing::get_license))
-        .route("/v1/licenses/{id}/terms", post(licensing::update_license_terms))
-        .route("/v1/licenses/{id}/royalties", post(licensing::record_license_royalty))
+        .route("/v1/licenses/{id}/terms", post(licensing::update_license_terms).layer(signed.clone()))
+        .route("/v1/licenses/{id}/royalties", post(licensing::record_license_royalty).layer(signed.clone()))
         .route("/auth/2fa/enable", post(handlers::enable_2fa))
         .route("/auth/2fa/verify", post(handlers::verify_2fa))
         .route("/auth/2fa/backup-code", post(handlers::use_backup_code))
