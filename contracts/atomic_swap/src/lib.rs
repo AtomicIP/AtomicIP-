@@ -6686,6 +6686,8 @@ mod escrow_release_tests;
 mod liquidity_pool_tests;
 #[cfg(test)]
 mod finality_tests;
+#[cfg(test)]
+mod reputation_sync_tests;
 
 // #1347: self-trade guard coverage across every swap-creation path.
 #[cfg(test)]
