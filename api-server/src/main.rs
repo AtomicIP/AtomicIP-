@@ -702,10 +702,7 @@ fn build_app() -> Router {
         .route("/v1/transfers/{id}/validate", post(transfers::validate_transfer))
         .route("/v1/transfers/{id}/escrow", post(transfers::fund_transfer_escrow))
         .route("/v1/transfers/{id}/cancel", post(transfers::cancel_transfer))
-        .route("/v1/licenses", post(licensing::create_license))
-        .route("/v1/licenses/{id}", get(licensing::get_license))
-        .route("/v1/licenses/{id}/terms", post(licensing::update_license_terms))
-        .route("/v1/licenses/{id}/royalties", post(licensing::record_license_royalty))
+        .merge(license_routes())
         .route("/auth/2fa/enable", post(handlers::enable_2fa))
         .route("/auth/2fa/verify", post(handlers::verify_2fa))
         .route("/auth/2fa/backup-code", post(handlers::use_backup_code))
@@ -734,8 +731,15 @@ fn incident_routes() -> Router {
         .route("/v1/admin/incidents/{id}/postmortem", post(incidents::postmortem_handler))
         .route_layer(middleware::from_fn(auth::require_auth))
 }
+fn license_routes() -> Router {
+    Router::new()
+        .route("/v1/licenses", post(licensing::create_license))
+        .route("/v1/licenses/{id}", get(licensing::get_license))
+        .route("/v1/licenses/{id}/terms", post(licensing::update_license_terms))
+        .route("/v1/licenses/{id}/royalties", post(licensing::record_license_royalty))
+        .route_layer(middleware::from_fn(auth::require_auth))
+}
 
-#[cfg(test)]
 mod tests {
     use super::*;
     use axum::{

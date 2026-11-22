@@ -46,6 +46,7 @@ pub struct License {
     pub royalty_bps: i128,
     pub start: u64,
     pub expiry: u64,
+    pub exclusive: bool,
     pub royalties: Vec<RoyaltyPayment>,
     pub total_royalty_due: i128,
 }
@@ -59,12 +60,13 @@ pub struct CreateLicenseRequest {
     /// Defaults to the creation time when omitted.
     pub start: Option<u64>,
     pub expiry: u64,
+    /// When true, no other license may overlap on (ip_id, term) for any licensee.
+    #[serde(default)]
+    pub exclusive: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct UpdateTermsRequest {
-    /// Must match the license's licensor.
-    pub licensor: String,
     pub royalty_bps: i128,
     pub expiry: u64,
 }
@@ -147,6 +149,37 @@ pub fn create(req: CreateLicenseRequest, now: u64) -> Result<License, LicenseErr
     let start = req.start.unwrap_or(now);
     validate_terms(req.royalty_bps, start, req.expiry)?;
 
+    // #1395: Exclusivity overlap check on (ip_id, term).
+    // Reject if the new license overlaps with any existing license for the same ip_id where
+    // either the existing or the new license is exclusive.
+    for entry in LICENSES.iter() {
+        let l = entry.value();
+        if l.ip_id != req.ip_id {
+            continue;
+        }
+        // Intervals [l.start, l.expiry) and [start, req.expiry) overlap when start < l.expiry && l.start < req.expiry.
+        let overlaps = start < l.expiry && l.start < req.expiry;
+        if !overlaps {
+            continue;
+        }
+        if l.exclusive {
+            return Err(LicenseError::InvalidState(
+                "an exclusive license already exists for this IP during the requested term".to_string(),
+            ));
+        }
+        if req.exclusive {
+            return Err(LicenseError::InvalidState(
+                "an exclusive license cannot be granted when other licenses overlap the same term".to_string(),
+            ));
+        }
+        // Non-exclusive duplicate licensee check.
+        if l.licensee == req.licensee {
+            return Err(LicenseError::InvalidState(
+                "a license for this IP and licensee already exists during the requested term".to_string(),
+            ));
+        }
+    }
+
     let license = License {
         id: NEXT_LICENSE_ID.fetch_add(1, Ordering::Relaxed),
         ip_id: req.ip_id,
@@ -155,6 +188,7 @@ pub fn create(req: CreateLicenseRequest, now: u64) -> Result<License, LicenseErr
         royalty_bps: req.royalty_bps,
         start,
         expiry: req.expiry,
+        exclusive: req.exclusive,
         royalties: Vec::new(),
         total_royalty_due: 0,
     };
@@ -167,9 +201,9 @@ pub fn get(id: u64) -> Option<License> {
 }
 
 /// Amend royalty rate and expiry. Only the licensor may do this, and only before the license starts.
-pub fn update_terms(id: u64, req: UpdateTermsRequest, now: u64) -> Result<License, LicenseError> {
+pub fn update_terms(id: u64, req: UpdateTermsRequest, caller: &str, now: u64) -> Result<License, LicenseError> {
     let mut entry = LICENSES.get_mut(&id).ok_or(LicenseError::NotFound(id))?;
-    if req.licensor != entry.licensor {
+    if caller != entry.licensor {
         return Err(LicenseError::Forbidden("only the licensor may amend terms".to_string()));
     }
     if now >= entry.start {
@@ -184,8 +218,14 @@ pub fn update_terms(id: u64, req: UpdateTermsRequest, now: u64) -> Result<Licens
 }
 
 /// Record licensee revenue and accrue the royalty due. Only allowed while the license is active.
-pub fn record_royalty(id: u64, gross_revenue: i128, now: u64) -> Result<License, LicenseError> {
+/// Caller must be the licensee (reporting revenue) or the licensor (review).
+pub fn record_royalty(id: u64, gross_revenue: i128, caller: &str, now: u64) -> Result<License, LicenseError> {
     let mut entry = LICENSES.get_mut(&id).ok_or(LicenseError::NotFound(id))?;
+    if caller != entry.licensee && caller != entry.licensor {
+        return Err(LicenseError::Forbidden(
+            "only the licensee or licensor may record royalties".to_string(),
+        ));
+    }
     if gross_revenue <= 0 {
         return Err(LicenseError::Invalid("gross_revenue must be positive".to_string()));
     }
@@ -231,26 +271,41 @@ pub async fn create_license(
 }
 
 /// `GET /v1/licenses/{id}` — license terms and current status.
-pub async fn get_license(Path(id): Path<u64>) -> Result<Json<LicenseResponse>, (StatusCode, Json<ErrorResponse>)> {
-    respond(get(id).ok_or(LicenseError::NotFound(id)), now_timestamp())
+pub async fn get_license(
+    crate::auth::AuthExtension(claims): crate::auth::AuthExtension,
+    Path(id): Path<u64>,
+) -> Result<Json<LicenseResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let now = now_timestamp();
+    let license = get(id).ok_or_else(|| {
+        let err = LicenseError::NotFound(id);
+        (err.status(), Json(ErrorResponse { error: err.message() }))
+    })?;
+    if claims.sub != license.licensor && claims.sub != license.licensee {
+        let err = LicenseError::Forbidden("access restricted to licensor and licensee".to_string());
+        return Err((err.status(), Json(ErrorResponse { error: err.message() })));
+    }
+    let status = status_at(&license, now);
+    Ok(Json(LicenseResponse { license, status }))
 }
 
 /// `POST /v1/licenses/{id}/terms` — amend terms before the license starts.
 pub async fn update_license_terms(
+    crate::auth::AuthExtension(claims): crate::auth::AuthExtension,
     Path(id): Path<u64>,
     Json(body): Json<UpdateTermsRequest>,
 ) -> Result<Json<LicenseResponse>, (StatusCode, Json<ErrorResponse>)> {
     let now = now_timestamp();
-    respond(update_terms(id, body, now), now)
+    respond(update_terms(id, body, &claims.sub, now), now)
 }
 
 /// `POST /v1/licenses/{id}/royalties` — record licensee revenue and accrue royalties.
 pub async fn record_license_royalty(
+    crate::auth::AuthExtension(claims): crate::auth::AuthExtension,
     Path(id): Path<u64>,
     Json(body): Json<RecordRoyaltyRequest>,
 ) -> Result<Json<LicenseResponse>, (StatusCode, Json<ErrorResponse>)> {
     let now = now_timestamp();
-    respond(record_royalty(id, body.gross_revenue, now), now)
+    respond(record_royalty(id, body.gross_revenue, &claims.sub, now), now)
 }
 
 #[cfg(test)]
@@ -265,6 +320,7 @@ mod tests {
             royalty_bps: 1_000,
             start,
             expiry,
+            exclusive: false,
         }
     }
 
@@ -287,15 +343,15 @@ mod tests {
     fn records_royalties_only_while_active() {
         let license = create(request(Some(100), 200), 0).unwrap();
         assert!(matches!(
-            record_royalty(license.id, 1_000, 50),
+            record_royalty(license.id, 1_000, "GLICENSEE", 50),
             Err(LicenseError::InvalidState(_))
         ));
-        let updated = record_royalty(license.id, 1_000, 150).unwrap();
+        let updated = record_royalty(license.id, 1_000, "GLICENSEE", 150).unwrap();
         assert_eq!(updated.royalties.len(), 1);
         assert_eq!(updated.royalties[0].royalty_due, 100);
         assert_eq!(updated.total_royalty_due, 100);
         assert!(matches!(
-            record_royalty(license.id, 1_000, 200),
+            record_royalty(license.id, 1_000, "GLICENSEE", 200),
             Err(LicenseError::InvalidState(_))
         ));
     }
@@ -304,27 +360,25 @@ mod tests {
     fn only_licensor_can_amend_before_start() {
         let license = create(request(Some(100), 200), 0).unwrap();
         let by_licensee = UpdateTermsRequest {
-            licensor: "GLICENSEE".to_string(),
             royalty_bps: 500,
             expiry: 300,
         };
         assert!(matches!(
-            update_terms(license.id, by_licensee, 0),
+            update_terms(license.id, by_licensee, "GLICENSEE", 0),
             Err(LicenseError::Forbidden(_))
         ));
 
         let by_licensor = UpdateTermsRequest {
-            licensor: "GLICENSOR".to_string(),
             royalty_bps: 500,
             expiry: 300,
         };
-        let amended = update_terms(license.id, by_licensor.clone(), 0).unwrap();
+        let amended = update_terms(license.id, by_licensor.clone(), "GLICENSOR", 0).unwrap();
         assert_eq!(amended.royalty_bps, 500);
         assert_eq!(amended.expiry, 300);
 
         // Once the license has started, terms are frozen.
         assert!(matches!(
-            update_terms(license.id, by_licensor, 150),
+            update_terms(license.id, by_licensor, "GLICENSOR", 150),
             Err(LicenseError::InvalidState(_))
         ));
     }
@@ -343,6 +397,104 @@ mod tests {
 
     #[test]
     fn unknown_license_is_not_found() {
-        assert_eq!(record_royalty(u64::MAX, 1, 0), Err(LicenseError::NotFound(u64::MAX)));
+        assert_eq!(record_royalty(u64::MAX, 1, "GLICENSEE", 0), Err(LicenseError::NotFound(u64::MAX)));
+    }
+
+    #[test]
+    fn only_licensor_or_licensee_can_record_royalties() {
+        let license = create(request(Some(100), 200), 0).unwrap();
+        assert!(matches!(
+            record_royalty(license.id, 1_000, "THIRD_PARTY", 150),
+            Err(LicenseError::Forbidden(_))
+        ));
+        assert!(record_royalty(license.id, 1_000, "GLICENSEE", 150).is_ok());
+        assert!(record_royalty(license.id, 1_000, "GLICENSOR", 150).is_ok());
+    }
+
+    #[test]
+    fn exclusive_license_blocks_overlapping_licenses() {
+        let exclusive_req = CreateLicenseRequest {
+            ip_id: 42,
+            licensor: "LICENSOR".to_string(),
+            licensee: "LICENSEE_A".to_string(),
+            royalty_bps: 500,
+            start: Some(100),
+            expiry: 200,
+            exclusive: true,
+        };
+        create(exclusive_req, 0).unwrap();
+
+        // Any overlapping license should be rejected.
+        let overlap_req = CreateLicenseRequest {
+            ip_id: 42,
+            licensor: "LICENSOR".to_string(),
+            licensee: "LICENSEE_B".to_string(),
+            royalty_bps: 500,
+            start: Some(150),
+            expiry: 250,
+            exclusive: false,
+        };
+        assert!(matches!(
+            create(overlap_req, 0),
+            Err(LicenseError::InvalidState(_))
+        ));
+
+        // Non-overlapping license is allowed.
+        let non_overlap_req = CreateLicenseRequest {
+            ip_id: 42,
+            licensor: "LICENSOR".to_string(),
+            licensee: "LICENSEE_B".to_string(),
+            royalty_bps: 500,
+            start: Some(200),
+            expiry: 300,
+            exclusive: false,
+        };
+        assert!(create(non_overlap_req, 0).is_ok());
+    }
+
+    #[test]
+    fn non_exclusive_duplicate_licensee_is_rejected() {
+        let req = CreateLicenseRequest {
+            ip_id: 43,
+            licensor: "LICENSOR".to_string(),
+            licensee: "LICENSEE_A".to_string(),
+            royalty_bps: 500,
+            start: Some(100),
+            expiry: 200,
+            exclusive: false,
+        };
+        create(req.clone(), 0).unwrap();
+        assert!(matches!(
+            create(req, 0),
+            Err(LicenseError::InvalidState(_))
+        ));
+    }
+
+    #[test]
+    fn new_exclusive_license_blocked_by_existing_non_exclusive() {
+        let non_exclusive = CreateLicenseRequest {
+            ip_id: 44,
+            licensor: "LICENSOR".to_string(),
+            licensee: "LICENSEE_A".to_string(),
+            royalty_bps: 500,
+            start: Some(100),
+            expiry: 200,
+            exclusive: false,
+        };
+        create(non_exclusive, 0).unwrap();
+
+        let exclusive_req = CreateLicenseRequest {
+            ip_id: 44,
+            licensor: "LICENSOR".to_string(),
+            licensee: "LICENSEE_B".to_string(),
+            royalty_bps: 500,
+            start: Some(100),
+            expiry: 200,
+            exclusive: true,
+        };
+        assert!(matches!(
+            create(exclusive_req, 0),
+            Err(LicenseError::InvalidState(_))
+        ));
     }
 }
