@@ -200,4 +200,58 @@ mod tests {
             &MAX_SLIPPAGE_BPS,
         );
     }
+
+    // ── #1352: withdraw and close ─────────────────────────────────────────────
+
+    #[test]
+    fn test_withdraw_liquidity_partial_returns_tokens_and_reduces_reserve() {
+        let f = fixture_with_pool();
+        let admin_before = f.token().balance(&f.admin);
+
+        f.client().withdraw_liquidity(&f.admin, &COMMITMENT, &4_000);
+
+        let pool = f.client().get_liquidity_pool(&COMMITMENT).unwrap();
+        assert_eq!(pool.token_reserve, TOKEN_RESERVE - 4_000);
+        assert_eq!(pool.ip_reserve, IP_RESERVE);
+        assert_eq!(f.token().balance(&f.admin), admin_before + 4_000);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_withdraw_liquidity_zero_amount_panics() {
+        let f = fixture_with_pool();
+        f.client().withdraw_liquidity(&f.admin, &COMMITMENT, &0);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_withdraw_liquidity_full_reserve_panics() {
+        let f = fixture_with_pool();
+        f.client()
+            .withdraw_liquidity(&f.admin, &COMMITMENT, &TOKEN_RESERVE);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_withdraw_liquidity_by_non_admin_panics() {
+        let f = fixture_with_pool();
+        let outsider = Address::generate(&f.env);
+        f.client()
+            .withdraw_liquidity(&outsider, &COMMITMENT, &1_000);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_close_pool_with_remaining_ip_panics() {
+        let f = fixture_with_pool();
+        f.client().close_liquidity_pool(&f.admin, &COMMITMENT);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_close_pool_by_non_admin_panics() {
+        let f = fixture_with_pool();
+        let outsider = Address::generate(&f.env);
+        f.client().close_liquidity_pool(&outsider, &COMMITMENT);
+    }
 }

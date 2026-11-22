@@ -179,7 +179,18 @@ pub enum ContractError {
     ApprovalsTooHigh = 86,
     /// #1344: the referrer must not be the swap's buyer or seller (self-referral rebate).
     InvalidReferrer = 87,
+    /// #1353: auction duration is below the minimum or above the maximum.
+    InvalidAuctionDuration = 88,
+    /// #1353: start_time + duration would overflow u64.
+    AuctionTimeOverflow = 89,
+    /// #1352: pool still holds IP units and cannot be closed.
+    PoolNotEmpty = 90,
 }
+
+/// #1353: shortest auction duration accepted by `start_ip_auction` (1 hour).
+pub const MIN_AUCTION_DURATION_SECONDS: u64 = 3_600;
+/// #1353: longest auction duration accepted by `start_ip_auction` (30 days).
+pub const MAX_AUCTION_DURATION_SECONDS: u64 = 30 * 24 * 3_600;
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
 
@@ -3433,8 +3444,22 @@ impl AtomicSwap {
             .get(&DataKey::NextAuctionId)
             .unwrap_or(0);
 
+        // #1353: bound the duration so an auction cannot end immediately or lock
+        // the IP for an unbounded time.
+        if !(MIN_AUCTION_DURATION_SECONDS..=MAX_AUCTION_DURATION_SECONDS)
+            .contains(&duration_seconds)
+        {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::InvalidAuctionDuration as u32,
+            ));
+        }
+
         let start_time = env.ledger().timestamp();
-        let end_time = start_time + duration_seconds;
+        let Some(end_time) = start_time.checked_add(duration_seconds) else {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::AuctionTimeOverflow as u32,
+            ));
+        };
 
         let auction = AuctionRecord {
             auction_id,
@@ -3505,6 +3530,13 @@ impl AtomicSwap {
         if auction.finalized {
             env.panic_with_error(Error::from_contract_error(
                 ContractError::AlreadyInit as u32,
+            ));
+        }
+
+        // #1354: a seller bidding on their own auction is shill bidding.
+        if bidder == auction.seller {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::SelfTradeNotAllowed as u32,
             ));
         }
 
@@ -5768,6 +5800,80 @@ impl AtomicSwap {
         true
     }
 
+    /// #1352: Admin withdraws `amount` tokens from a pool's token reserve.
+    ///
+    /// `amount` must be positive and strictly less than the current token reserve,
+    /// so the pool keeps a non-zero reserve for pricing. Use `close_liquidity_pool`
+    /// to reclaim the full reserve once the pool has no IP left.
+    pub fn withdraw_liquidity(env: Env, admin: Address, commitment_id: u64, amount: i128) {
+        require_not_paused(&env);
+        admin.require_auth();
+        require_admin(&env, &admin);
+
+        let mut pool = Self::load_pool(&env, commitment_id);
+        if amount <= 0 || amount >= pool.token_reserve {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::InvalidPoolParams as u32,
+            ));
+        }
+
+        token::Client::new(&env, &pool.token).transfer(
+            &env.current_contract_address(),
+            &admin,
+            &amount,
+        );
+
+        pool.token_reserve -= amount;
+        Self::save_pool(&env, &pool);
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("pool_wd"),),
+            LiquidityWithdrawnEvent {
+                commitment_id,
+                admin,
+                amount,
+                token_reserve: pool.token_reserve,
+            },
+        );
+    }
+
+    /// #1352: Admin closes a pool that has no IP units left and returns the
+    /// remaining token reserve to the admin.
+    pub fn close_liquidity_pool(env: Env, admin: Address, commitment_id: u64) {
+        require_not_paused(&env);
+        admin.require_auth();
+        require_admin(&env, &admin);
+
+        let pool = Self::load_pool(&env, commitment_id);
+        if pool.ip_reserve != 0 {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::PoolNotEmpty as u32,
+            ));
+        }
+
+        let refunded = pool.token_reserve;
+        if refunded > 0 {
+            token::Client::new(&env, &pool.token).transfer(
+                &env.current_contract_address(),
+                &admin,
+                &refunded,
+            );
+        }
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::LiquidityPool(commitment_id));
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("pool_cls"),),
+            PoolClosedEvent {
+                commitment_id,
+                admin,
+                refunded,
+            },
+        );
+    }
+
     /// #1088: Current pool state, including reserves and slippage limit.
     pub fn get_liquidity_pool(env: Env, commitment_id: u64) -> Option<LiquidityPool> {
         env.storage()
@@ -6789,6 +6895,10 @@ impl AtomicSwap {
 // #830: compile errors fixed — re-enabled
 #[cfg(test)]
 mod escrow_tests;
+
+// #1353/#1354: IP auction bid and duration guard tests.
+#[cfg(test)]
+mod auction_tests;
 #[cfg(test)]
 mod escrow_release_tests;
 #[cfg(test)]
