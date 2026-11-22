@@ -62,6 +62,33 @@ mod per_ip_auth_tests {
     }
 
     #[test]
+    fn store_commitment_metadata_by_non_owner_rejected() {
+        let (env, client, _owner, contract_id) = setup();
+        let attacker = Address::generate(&env);
+        let data = Bytes::from_array(&env, &[0x11u8; 32]);
+        let nonce = BytesN::from_array(&env, &[0x22u8; 12]);
+        let tags: Vec<BytesN<32>> = Vec::new(&env);
+
+        only_authorize(
+            &env,
+            &contract_id,
+            &attacker,
+            "store_commitment_metadata",
+            soroban_sdk::vec![
+                &env,
+                1u64.into_val(&env),
+                data.clone().into_val(&env),
+                nonce.clone().into_val(&env),
+                tags.clone().into_val(&env),
+            ],
+        );
+        assert!(client
+            .try_store_commitment_metadata(&1u64, &data, &nonce, &tags)
+            .is_err());
+        assert!(client.get_commitment_metadata(&1u64).is_none());
+    }
+
+    #[test]
     fn encrypt_commitment_by_owner_accepted() {
         let (env, client, owner, contract_id) = setup();
         let encrypted = Bytes::from_array(&env, &[0xCDu8; 32]);
