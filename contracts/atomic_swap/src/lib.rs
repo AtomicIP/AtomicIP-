@@ -181,6 +181,10 @@ pub enum ContractError {
     AuctionTimeOverflow = 89,
     /// #1352: pool still holds IP units and cannot be closed.
     PoolNotEmpty = 90,
+    /// #1355: `min_increment_bps` must be at most 10_000 (100%).
+    InvalidIncrement = 91,
+    /// #1356: `withdraw_refund` called with no refund owed.
+    NoPendingRefund = 92,
 }
 
 /// #1353: shortest auction duration accepted by `start_ip_auction` (1 hour).
@@ -326,6 +330,9 @@ pub enum DataKey {
     AuctionBids(u64),
     /// #347: Next auction ID counter.
     NextAuctionId,
+    /// #1356: Maps (bidder, token) → refund amount owed, withdrawn with
+    /// `withdraw_refund`. Refunds are pulled, never pushed inside `place_bid`.
+    PendingRefunds(Address, Address),
     /// #349: Maps swap_id → Vec<PaymentSchedule> for scheduled payments.
     PaymentSchedule(u64),
     /// #349: Maps swap_id → Vec<bool> tracking which payments have been made.
@@ -3409,6 +3416,10 @@ impl AtomicSwap {
     // ── #347: IP Auction Mechanism ────────────────────────────────────────────
 
     /// Seller starts an auction for their IP. Returns the auction ID.
+    ///
+    /// `min_increment_bps` sets the minimum raise over the current highest bid
+    /// (basis points, at most 10_000). `anti_snipe_window_secs` sets the
+    /// extension window; zero disables anti-sniping extension (#1355).
     pub fn start_ip_auction(
         env: Env,
         token: Address,
@@ -3416,12 +3427,20 @@ impl AtomicSwap {
         seller: Address,
         min_bid: i128,
         duration_seconds: u64,
+        min_increment_bps: u32,
+        anti_snipe_window_secs: u64,
     ) -> u64 {
         require_not_paused(&env);
         seller.require_auth();
 
         require_positive_price(&env, min_bid);
         registry::ensure_seller_owns_active_ip(&env, ip_id, &seller);
+
+        if min_increment_bps > 10_000 {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::InvalidIncrement as u32,
+            ));
+        }
 
         // Check no active auction exists
         if env
@@ -3469,6 +3488,9 @@ impl AtomicSwap {
             start_time,
             end_time,
             finalized: false,
+            min_increment_bps,
+            anti_snipe_window_secs,
+            failed: false,
         };
 
         env.storage()
@@ -3541,25 +3563,34 @@ impl AtomicSwap {
             env.panic_with_error(Error::from_contract_error(ContractError::NotExpired as u32));
         }
 
-        if bid_amount < auction.min_bid {
+        // #1355: the bid must clear the minimum increment over the current
+        // highest bid (or `min_bid` for the first bid).
+        let min_next = Self::min_next_bid(&auction).unwrap_or_else(|| {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::PriceTooSmall as u32,
+            ));
+        });
+        if bid_amount < min_next {
             env.panic_with_error(Error::from_contract_error(
                 ContractError::PriceTooSmall as u32,
             ));
         }
 
-        if bid_amount <= auction.highest_bid {
-            env.panic_with_error(Error::from_contract_error(
-                ContractError::PriceTooSmall as u32,
-            ));
+        // #1355: anti-sniping. A bid inside the window pushes the end out to a
+        // full window from now, so a last-ledger bid cannot close the auction
+        // before others can respond.
+        let now = env.ledger().timestamp();
+        if auction.anti_snipe_window_secs > 0
+            && auction.end_time - now <= auction.anti_snipe_window_secs
+        {
+            auction.end_time = now + auction.anti_snipe_window_secs;
         }
 
-        // Refund previous highest bidder if exists
-        if let Some(ref prev_bidder) = auction.highest_bidder {
-            token::Client::new(&env, &auction.token).transfer(
-                &env.current_contract_address(),
-                prev_bidder,
-                &auction.highest_bid,
-            );
+        // #1356: pull-based refund. The outbid bidder's funds are credited to
+        // their pending balance and withdrawn with `withdraw_refund`, so a
+        // refund that cannot be paid out never blocks the new bid.
+        if let Some(prev_bidder) = auction.highest_bidder.clone() {
+            Self::credit_pending_refund(&env, &prev_bidder, &auction.token, auction.highest_bid);
         }
 
         // Transfer new bid to contract
@@ -3591,6 +3622,65 @@ impl AtomicSwap {
         );
     }
 
+    /// #1356: add `amount` to the refund balance owed to `bidder` in `token`.
+    fn credit_pending_refund(env: &Env, bidder: &Address, token: &Address, amount: i128) {
+        let key = DataKey::PendingRefunds(bidder.clone(), token.clone());
+        let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        env.storage().persistent().set(&key, &(current + amount));
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, LEDGER_BUMP, LEDGER_BUMP);
+    }
+
+    /// #1356: withdraw the caller's pending refund in `token`. Returns the
+    /// amount transferred. Panics with `NoPendingRefund` if nothing is owed.
+    pub fn withdraw_refund(env: Env, bidder: Address, token: Address) -> i128 {
+        bidder.require_auth();
+
+        let key = DataKey::PendingRefunds(bidder.clone(), token.clone());
+        let amount: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        if amount <= 0 {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::NoPendingRefund as u32,
+            ));
+        }
+
+        // Clear the balance before transferring so a re-entrant or repeated
+        // call cannot withdraw the same refund twice.
+        env.storage().persistent().remove(&key);
+
+        token::Client::new(&env, &token).transfer(
+            &env.current_contract_address(),
+            &bidder,
+            &amount,
+        );
+
+        amount
+    }
+
+    /// #1356: refund amount currently owed to `bidder` in `token` (zero if none).
+    pub fn get_pending_refund(env: Env, bidder: Address, token: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PendingRefunds(bidder, token))
+            .unwrap_or(0)
+    }
+
+    /// #1355: smallest bid currently acceptable on `auction`, or `None` if the
+    /// required amount overflows `i128` (no bid can be placed then).
+    fn min_next_bid(auction: &AuctionRecord) -> Option<i128> {
+        if auction.highest_bid == 0 {
+            return Some(auction.min_bid);
+        }
+        // The step is at least 1 unit, so every accepted bid strictly exceeds
+        // the highest bid even when `min_increment_bps` is zero.
+        let step = auction
+            .highest_bid
+            .checked_mul(auction.min_increment_bps as i128)?
+            / 10_000;
+        auction.highest_bid.checked_add(step.max(1))
+    }
+
     /// Finalize an auction after it ends. Creates a swap with the winning bid.
     pub fn finalize_auction(env: Env, auction_id: u64) {
         let mut auction: AuctionRecord = env
@@ -3613,6 +3703,14 @@ impl AtomicSwap {
             env.panic_with_error(Error::from_contract_error(ContractError::NotExpired as u32));
         }
 
+        // #1357: the IP may have been transferred or revoked while the auction
+        // ran. Re-check ownership now so the buyer is never sold an IP the
+        // seller no longer owns. The non-panicking check lets a failure refund
+        // the winner instead of reverting finalization.
+        let seller_still_owns =
+            registry::seller_owns_active_ip(&env, auction.ip_id, &auction.seller);
+        auction.failed = !seller_still_owns;
+
         auction.finalized = true;
         env.storage()
             .persistent()
@@ -3630,6 +3728,23 @@ impl AtomicSwap {
 
         let winning_bid = auction.highest_bid;
         let winner = auction.highest_bidder.clone();
+
+        // #1357: seller no longer owns the IP. Refund the winner (pull-based)
+        // and report no sale. No swap is created.
+        if !seller_still_owns {
+            if let Some(bidder) = winner {
+                Self::credit_pending_refund(&env, &bidder, &auction.token, winning_bid);
+            }
+            env.events().publish(
+                (soroban_sdk::symbol_short!("auc_fnl"),),
+                AuctionFinalizedEvent {
+                    auction_id,
+                    winner: None,
+                    winning_bid: 0,
+                },
+            );
+            return;
+        }
 
         env.events().publish(
             (soroban_sdk::symbol_short!("auc_fnl"),),
@@ -3651,7 +3766,7 @@ impl AtomicSwap {
                 price: winning_bid,
                 token: auction.token.clone(),
                 status: SwapStatus::Accepted,
-                expiry: env.ledger().timestamp() + 604800u64,
+                expiry: env.ledger().timestamp() + Self::protocol_config(&env).swap_expiry_seconds,
                 accept_timestamp: env.ledger().timestamp(),
                 required_approvals: 0,
                 dispute_timestamp: 0,
@@ -3761,7 +3876,7 @@ impl AtomicSwap {
             price: total_price,
             token: token.clone(),
             status: SwapStatus::Pending,
-            expiry: env.ledger().timestamp() + 604800u64,
+            expiry: env.ledger().timestamp() + Self::protocol_config(&env).swap_expiry_seconds,
             accept_timestamp: 0,
             required_approvals: 0,
             dispute_timestamp: 0,
@@ -3981,7 +4096,7 @@ impl AtomicSwap {
             price,
             token: token.clone(),
             status: SwapStatus::Pending,
-            expiry: env.ledger().timestamp() + 604800u64,
+            expiry: env.ledger().timestamp() + Self::protocol_config(&env).swap_expiry_seconds,
             accept_timestamp: 0,
             required_approvals: 0,
             dispute_timestamp: 0,
@@ -4976,7 +5091,7 @@ impl AtomicSwap {
                 price,
                 token: token.clone(),
                 status: SwapStatus::Pending,
-                expiry: env.ledger().timestamp() + 604800u64,
+                expiry: env.ledger().timestamp() + Self::protocol_config(&env).swap_expiry_seconds,
                 accept_timestamp: 0,
                 required_approvals,
                 dispute_timestamp: 0,
@@ -6157,7 +6272,7 @@ impl AtomicSwap {
             price,
             token: token.clone(),
             status: SwapStatus::Pending,
-            expiry: env.ledger().timestamp() + 604800u64,
+            expiry: env.ledger().timestamp() + Self::protocol_config(&env).swap_expiry_seconds,
             accept_timestamp: 0,
             required_approvals: 0,
             dispute_timestamp: 0,
@@ -6937,6 +7052,14 @@ mod liquidity_pool_ip_verification_tests;
 // calls to a since-removed function; both fixed / removed in this PR).
 #[cfg(test)]
 mod arbitration_tests;
+
+// #1355: auction minimum increment and anti-sniping extension.
+#[cfg(test)]
+mod auction_increment_tests;
+
+// #1358: swap expiry comes from ProtocolConfig on every initiation path.
+#[cfg(test)]
+mod swap_expiry_tests;
 
 // #824: compile errors fixed — re-enabled
 // Temporarily disabled: does not compile yet (pre-existing errors). Re-enable after fixing.

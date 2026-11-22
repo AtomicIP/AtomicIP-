@@ -67,7 +67,7 @@ mod tests {
 
     fn start(f: &Fixture, duration: u64) -> u64 {
         f.client()
-            .start_ip_auction(&f.token_id, &f.ip_id, &f.seller, &MIN_BID, &duration)
+            .start_ip_auction(&f.token_id, &f.ip_id, &f.seller, &MIN_BID, &duration, &0, &0)
     }
 
     #[test]
@@ -126,7 +126,7 @@ mod tests {
         let f = fixture();
         let client = f.client();
         let auction_id =
-            client.start_ip_auction(&f.token_id, &f.ip_id, &f.seller, &MIN_BID, &DURATION);
+            client.start_ip_auction(&f.token_id, &f.ip_id, &f.seller, &MIN_BID, &DURATION, &0, &0);
 
         // #1354: the seller bidding on their own auction must panic.
         client.place_bid(&auction_id, &f.seller, &(MIN_BID + 1));

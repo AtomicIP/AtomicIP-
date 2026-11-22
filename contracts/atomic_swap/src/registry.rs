@@ -25,6 +25,18 @@ pub fn ip_registry(env: &Env) -> Address {
         .unwrap_or_else(|| panic_with_error(env, ContractError::NotInitialized))
 }
 
+/// #1357: non-panicking form of `ensure_seller_owns_active_ip`. Returns
+/// whether `seller` still owns `ip_id` and it is not revoked. Used where a
+/// failed check must be handled (for example, refunding a bidder) rather
+/// than abort the whole call.
+pub fn seller_owns_active_ip(env: &Env, ip_id: u64, seller: &Address) -> bool {
+    let registry_addr = ip_registry(env);
+    let registry = ip_registry::IpRegistryClient::new(env, &registry_addr);
+    let record = registry.get_ip(&ip_id);
+
+    record.owner == *seller && !record.revoked
+}
+
 pub fn ensure_seller_owns_active_ip(env: &Env, ip_id: u64, seller: &Address) {
     let registry_addr = ip_registry(env);
     let registry = ip_registry::IpRegistryClient::new(env, &registry_addr);

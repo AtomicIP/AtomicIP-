@@ -171,7 +171,7 @@ mod self_trade_guard_tests {
         let f = setup();
         let auction_id =
             f.client()
-                .start_ip_auction(&f.token, &f.ip_id, &f.seller, &PRICE, &3_600);
+                .start_ip_auction(&f.token, &f.ip_id, &f.seller, &PRICE, &3_600, &0, &0);
         // The seller is the only bidder, so finalization would create a self-trade.
         f.client().place_bid(&auction_id, &f.seller, &PRICE);
         f.env
