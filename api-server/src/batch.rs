@@ -153,64 +153,17 @@ async fn process_single_request_with_retry(
 }
 
 async fn process_single_request(request: SingleRequest) -> SingleResponse {
-    // Route to appropriate handler based on path and method
-    let (status, body) = match (request.method.as_str(), request.path.as_str()) {
-        ("GET", path) if path.starts_with("/ip/") => {
-            // Extract IP ID from path
-            if let Some(ip_id_str) = path.strip_prefix("/ip/") {
-                if let Ok(ip_id) = ip_id_str.parse::<u64>() {
-                    // Simulate get_ip call
-                    (200, serde_json::json!({"ip_id": ip_id, "status": "retrieved"}))
-                } else {
-                    (400, serde_json::json!({"error": "Invalid IP ID"}))
-                }
-            } else {
-                (400, serde_json::json!({"error": "Invalid path"}))
-            }
-        }
-        ("GET", path) if path.starts_with("/swap/") => {
-            // Extract Swap ID from path
-            if let Some(swap_id_str) = path.strip_prefix("/swap/") {
-                if let Ok(swap_id) = swap_id_str.parse::<u64>() {
-                    (200, serde_json::json!({"swap_id": swap_id, "status": "retrieved"}))
-                } else {
-                    (400, serde_json::json!({"error": "Invalid Swap ID"}))
-                }
-            } else {
-                (400, serde_json::json!({"error": "Invalid path"}))
-            }
-        }
-        ("POST", "/ip/commit") => {
-            // Simulate commit_ip call
-            if let Some(body) = &request.body {
-                (200, serde_json::json!({"ip_id": 12345, "data": body}))
-            } else {
-                (400, serde_json::json!({"error": "Missing request body"}))
-            }
-        }
-        ("POST", "/swap/initiate") => {
-            // Simulate initiate_swap call
-            if let Some(body) = &request.body {
-                (200, serde_json::json!({"swap_id": 67890, "data": body}))
-            } else {
-                (400, serde_json::json!({"error": "Missing request body"}))
-            }
-        }
-        ("POST", "/swap/accept") => {
-            // Simulate accept_swap call
-            if let Some(body) = &request.body {
-                (200, serde_json::json!({"status": "accepted", "data": body}))
-            } else {
-                (400, serde_json::json!({"error": "Missing request body"}))
-            }
-        }
-        _ => (404, serde_json::json!({"error": "Endpoint not found"})),
-    };
-
+    // Sub-requests are not dispatched to the real handlers yet. Returning
+    // fabricated success payloads (e.g. made-up IDs) would look like committed
+    // state to clients, so every sub-request is reported as not implemented.
     SingleResponse {
         id: request.id,
-        status,
-        body,
+        status: 501,
+        body: serde_json::json!({
+            "error": "batch dispatch is not implemented for this endpoint",
+            "method": request.method,
+            "path": request.path,
+        }),
         headers: None,
     }
 }
@@ -321,6 +274,25 @@ mod tests {
         assert!(result.is_ok());
         
         let response = result.unwrap().0;
-        assert_eq!(response.responses[0].status, 200);
+        assert_eq!(response.responses[0].status, 501);
+        assert_ne!(response.responses[0].body.get("swap_id"), Some(&serde_json::json!(67890)));
+    }
+
+    #[tokio::test]
+    async fn test_batch_commit_does_not_return_fabricated_ip_id() {
+        let batch_request = BatchRequest {
+            mode: None,
+            requests: vec![SingleRequest {
+                id: "req1".to_string(),
+                method: "POST".to_string(),
+                path: "/ip/commit".to_string(),
+                body: Some(serde_json::json!({"owner": "test"})),
+                headers: None,
+            }],
+        };
+
+        let response = batch_handler(Json(batch_request)).await.unwrap().0;
+        assert_eq!(response.responses[0].status, 501);
+        assert!(response.responses[0].body.get("ip_id").is_none());
     }
 }

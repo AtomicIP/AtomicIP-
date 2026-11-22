@@ -3,7 +3,7 @@
 //! Aggregates the IPs held by one owner into key metrics, a concentration-based
 //! risk rating, and rebalancing suggestions for positions that exceed the cap.
 
-use axum::{extract::Path, http::StatusCode, Json};
+use axum::{extract::Path, http::{HeaderMap, StatusCode}, Json};
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
@@ -182,10 +182,32 @@ pub async fn get_portfolio(Path(owner): Path<String>) -> Json<Portfolio> {
 }
 
 /// `POST /v1/portfolio/{owner}/holdings` — replace the holdings for an owner.
+/// Check that the authenticated signer (`X-Public-Key`) is the portfolio owner.
+///
+/// The request-signing middleware proves the caller holds the private key for
+/// the `X-Public-Key` it presents; this binds that identity to the `owner`
+/// whose holdings would be replaced.
+pub fn authorize_owner(owner: &str, signer_key: Option<&str>) -> Result<(), String> {
+    match signer_key {
+        Some(key) if key == owner => Ok(()),
+        Some(_) => Err("signer is not the owner of this portfolio".to_string()),
+        None => Err("missing X-Public-Key header".to_string()),
+    }
+}
+
+/// `POST /v1/portfolio/{owner}/holdings` — replace the holdings for an owner.
+///
+/// Requires a valid request signature (enforced by the route layer) from the
+/// owner's own key.
 pub async fn put_holdings(
     Path(owner): Path<String>,
+    headers: HeaderMap,
     Json(holdings): Json<Vec<Holding>>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    let signer = headers.get("X-Public-Key").and_then(|v| v.to_str().ok());
+    if let Err(error) = authorize_owner(&owner, signer) {
+        return Err((StatusCode::FORBIDDEN, Json(ErrorResponse { error })));
+    }
     set_holdings(&owner, holdings)
         .map(|_| StatusCode::NO_CONTENT)
         .map_err(|error| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })))
@@ -247,6 +269,13 @@ mod tests {
         assert!(set_holdings("G-dup", vec![h(1, 1), h(1, 2)]).is_err());
         assert!(set_holdings("G-neg", vec![h(1, -1)]).is_err());
         assert!(set_holdings("", vec![]).is_err());
+    }
+
+    #[test]
+    fn authorize_owner_requires_signer_to_match_owner() {
+        assert!(authorize_owner("GOWNER", Some("GOWNER")).is_ok());
+        assert!(authorize_owner("GVICTIM", Some("GATTACKER")).is_err());
+        assert!(authorize_owner("GVICTIM", None).is_err());
     }
 
     #[test]

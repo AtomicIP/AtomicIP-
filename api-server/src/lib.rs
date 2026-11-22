@@ -85,6 +85,7 @@ pub mod response;
 pub mod schemas;
 pub mod snapshot_tests;
 pub mod soroban_rpc;
+pub mod threat_detection;
 pub mod tracing_middleware;
 pub mod validation;
 pub mod validation_fuzz_tests;
