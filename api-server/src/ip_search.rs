@@ -157,6 +157,109 @@ pub fn refresh_record(record: IpRecord) {
     }
 }
 
+/// Search indexed IP listings directly, without cloning the whole index upfront.
+/// Unlike calling `search(&listings(), filters)`, this streams over the
+/// DashMap shard-by-shard and only clones matching records.
+pub fn search_index(filters: &IpSearchFilters) -> Result<IpSearchResponse, String> {
+    // #1389: revoked IPs are withdrawn on-chain and stay hidden unless explicitly requested.
+    let include_revoked = filters.include_revoked.unwrap_or(false);
+    let terms: Vec<String> = filters
+        .q
+        .as_deref()
+        .unwrap_or("")
+        .split_whitespace()
+        .map(|t| t.to_lowercase())
+        .collect();
+    let category = filters.category.as_ref().map(|c| c.trim().to_ascii_lowercase());
+    let jurisdiction = filters.jurisdiction.as_ref().map(|j| j.trim().to_ascii_lowercase());
+
+    if let (Some(min), Some(max)) = (filters.min_price, filters.max_price) {
+        if min > max {
+            return Err("min_price must not exceed max_price".to_string());
+        }
+    }
+    if let (Some(after), Some(before)) = (filters.registered_after, filters.registered_before) {
+        if after > before {
+            return Err("registered_after must not exceed registered_before".to_string());
+        }
+    }
+
+    let mut matches: Vec<(IpRecord, IpSearchMetadata)> = LISTINGS
+        .iter()
+        .filter_map(|entry| {
+            let (record, meta) = entry.value();
+
+            if record.revoked && !include_revoked {
+                return None;
+            }
+            if let Some(after) = filters.registered_after {
+                if record.timestamp < after {
+                    return None;
+                }
+            }
+            if let Some(before) = filters.registered_before {
+                if record.timestamp > before {
+                    return None;
+                }
+            }
+            if let Some(min) = filters.min_price {
+                if meta.price.map_or(true, |p| p < min) {
+                    return None;
+                }
+            }
+            if let Some(max) = filters.max_price {
+                if meta.price.map_or(true, |p| p > max) {
+                    return None;
+                }
+            }
+            if let Some(cat) = &category {
+                if &meta.category != cat {
+                    return None;
+                }
+            }
+            if let Some(jur) = &jurisdiction {
+                if &meta.jurisdiction != jur {
+                    return None;
+                }
+            }
+            if !terms.is_empty() {
+                let haystack = format!(
+                    "{} {} {} {}",
+                    meta.title.to_lowercase(),
+                    meta.description.to_lowercase(),
+                    meta.category,
+                    meta.jurisdiction
+                );
+                if !terms.iter().all(|term| {
+                    haystack.split(|c: char| !c.is_alphanumeric()).any(|word| word == term.as_str())
+                }) {
+                    return None;
+                }
+            }
+            Some((record.clone(), meta.clone()))
+        })
+        .collect();
+
+    matches.sort_by_key(|(record, _)| record.ip_id);
+
+    let facets = SearchFacets {
+        categories: facet_counts(matches.iter().map(|(_, m)| m.category.clone())),
+        jurisdictions: facet_counts(matches.iter().map(|(_, m)| m.jurisdiction.clone())),
+    };
+
+    let total = matches.len();
+    let limit = filters.limit.unwrap_or(DEFAULT_PAGE_SIZE).clamp(1, MAX_PAGE_SIZE);
+    let offset = filters.offset.unwrap_or(0);
+    let items = matches
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|(record, _)| record)
+        .collect();
+
+    Ok(IpSearchResponse { total, items, facets })
+}
+
 pub fn get_metadata(ip_id: u64) -> Option<IpSearchMetadata> {
     LISTINGS.get(&ip_id).map(|entry| entry.value().1.clone())
 }
@@ -172,7 +275,7 @@ pub fn search(
         .as_deref()
         .unwrap_or("")
         .split_whitespace()
-        .map(|t| t.to_ascii_lowercase())
+        .map(|t| t.to_lowercase())
         .collect();
     let category = filters.category.as_ref().map(|c| c.trim().to_ascii_lowercase());
     let jurisdiction = filters.jurisdiction.as_ref().map(|j| j.trim().to_ascii_lowercase());
@@ -228,12 +331,12 @@ pub fn search(
             }
             let haystack = format!(
                 "{} {} {} {}",
-                meta.title.to_ascii_lowercase(),
-                meta.description.to_ascii_lowercase(),
+                meta.title.to_lowercase(),
+                meta.description.to_lowercase(),
                 meta.category,
                 meta.jurisdiction
             );
-            terms.iter().all(|term| haystack.contains(term.as_str()))
+            terms.iter().all(|term| haystack.split(|c: char| !c.is_alphanumeric()).any(|word| word == term.as_str()))
         })
         .collect();
 
@@ -360,6 +463,22 @@ mod tests {
 
     fn ids(resp: &IpSearchResponse) -> Vec<u64> {
         resp.items.iter().map(|r| r.ip_id).collect()
+    }
+
+    #[test]
+    fn inverted_price_range_is_rejected() {
+        let f = IpSearchFilters { min_price: Some(1000), max_price: Some(500), ..Default::default() };
+        assert!(search_index(&f).is_err());
+        let err = search_index(&f).unwrap_err();
+        assert!(err.contains("min_price"), "expected min_price in error: {err}");
+    }
+
+    #[test]
+    fn inverted_date_range_is_rejected() {
+        let f = IpSearchFilters { registered_after: Some(300), registered_before: Some(100), ..Default::default() };
+        assert!(search_index(&f).is_err());
+        let err = search_index(&f).unwrap_err();
+        assert!(err.contains("registered_after"), "expected registered_after in error: {err}");
     }
 
     #[test]

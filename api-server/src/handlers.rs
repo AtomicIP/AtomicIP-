@@ -174,6 +174,11 @@ pub(crate) fn indexed_record(ip_id: u64) -> Option<IpRecord> {
     COMMITMENT_INDEX.get(ip_id)
 }
 
+/// Insert (or refresh) a record in the commitment index.
+pub(crate) fn index_record(record: IpRecord) {
+    COMMITMENT_INDEX.insert(record.ip_id, record);
+}
+
 /// Snapshot of every indexed commitment, for read-side features (#1095, #1097).
 pub(crate) fn indexed_records() -> Vec<IpRecord> {
     COMMITMENT_INDEX.entries.iter().map(|entry| entry.value().0.clone()).collect()
@@ -1994,13 +1999,20 @@ pub async fn marketplace_by_ip(
     path = "/v1/ip/search",
     tag = "Marketplace",
     params(IpSearchFilters),
-    responses((status = 200, description = "Matching IP listings with facet counts", body = IpSearchResponse))
+    responses(
+        (status = 200, description = "Matching IP listings with facet counts", body = IpSearchResponse),
+        (status = 400, description = "Inverted price or date range", body = ErrorResponse)
+    )
 )]
-pub async fn search_ip(Query(mut filters): Query<IpSearchFilters>) -> impl IntoResponse {
+pub async fn search_ip(
+    Query(mut filters): Query<IpSearchFilters>,
+) -> Result<Json<crate::ip_search::IpSearchResponse>, (StatusCode, Json<ErrorResponse>)> {
     // #1389: revoked IPs are hidden from public search; the admin-only
     // `include_revoked` flag cannot be set from this route.
     filters.include_revoked = None;
-    Json(crate::ip_search::search(&crate::ip_search::listings(), &filters))
+    crate::ip_search::search_index(&filters)
+        .map(Json)
+        .map_err(|msg| error_response(StatusCode::BAD_REQUEST, msg))
 }
 
 fn ip_search_error(status: StatusCode, error: &str) -> Response {
