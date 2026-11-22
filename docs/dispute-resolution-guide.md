@@ -5,7 +5,7 @@
 > escalation procedures and arbitration guidelines.
 
 Related: [Atomic Swap](atomic-swap.md) · [Threat Model](threat-model.md) ·
-[Security](security.md) · [FAQ](FAQ.md#disputes)
+[Security](security.md) · [FAQ](faq.md#disputes)
 
 ---
 

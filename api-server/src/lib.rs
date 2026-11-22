@@ -130,7 +130,7 @@ impl std::error::Error for LockError {}
 ///
 /// A poisoned mutex means a thread panicked while holding the lock. Rather than
 /// propagating that panic into every later request, we log a warning and keep
-/// using the (possibly inconsistent) data. See `docs/SECURITY_HARDENING.md`.
+/// using the (possibly inconsistent) data. See `docs/security-hardening.md`.
 pub fn lock_or_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     match m.lock() {
         Ok(guard) => guard,

@@ -24,7 +24,7 @@ jobs:
           fetch-depth: 0  # Full history for diff comparison
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca  # stable
         with:
           targets: wasm32-unknown-unknown
 
