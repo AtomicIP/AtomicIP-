@@ -7,8 +7,10 @@
 //!   is plausible, and the record has not been revoked.
 //! - **Ownership**: the owner is a valid Stellar public key and, when the caller
 //!   supplies `claimed_owner`, matches it.
-//! - **Prior art**: earlier commitments with the same or a near-identical hash,
-//!   compared by Hamming distance over the 256-bit digest.
+//! - **Prior art**: earlier commitments with the same commitment hash (exact
+//!   duplicate) or with highly overlapping `feature_fingerprints` (near
+//!   duplicate). Feature sets are compared by symmetric-difference size; a
+//!   smaller value means more overlap.
 //! - **Legal risk**: a heuristic rating built from the findings above.
 //!
 //! The legal risk rating is decision support for a buyer, not legal advice.
@@ -23,8 +25,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::schemas::{ErrorResponse, IpRecord};
 
-/// Hamming distance (in bits, out of 256) at or below which two commitments
-/// count as near-duplicates.
+/// Maximum symmetric-difference size (in feature tokens) at or below which two
+/// commitments count as near-duplicates. A value of 0 is an exact feature
+/// match; larger values indicate more divergence.
 pub const NEAR_DUPLICATE_MAX_DISTANCE: u32 = 8;
 /// Upper bound on prior-art matches returned in one report.
 pub const MAX_PRIOR_ART_MATCHES: usize = 10;
@@ -58,7 +61,9 @@ pub struct PriorArtMatch {
     pub ip_id: u64,
     pub owner: String,
     pub timestamp: u64,
-    /// Hamming distance in bits between the two commitment digests.
+    /// Symmetric-difference size between the two feature-fingerprint sets.
+    /// Zero means the feature sets are identical; an exact commitment-hash
+    /// match always reports distance 0.
     pub distance: u32,
     pub kind: MatchKind,
 }
@@ -129,11 +134,15 @@ fn is_valid_owner(owner: &str) -> bool {
     stellar_strkey::ed25519::PublicKey::from_string(owner).is_ok()
 }
 
-fn hamming(left: &[u8; 32], right: &[u8; 32]) -> u32 {
-    left.iter()
-        .zip(right.iter())
-        .map(|(a, b)| (a ^ b).count_ones())
-        .sum()
+/// Symmetric difference size between two feature-fingerprint sets.
+/// Both slices are treated as sets (duplicates within a slice are ignored).
+/// Returns the number of tokens that appear in one set but not the other.
+fn feature_distance(left: &[String], right: &[String]) -> u32 {
+    use std::collections::HashSet;
+    let a: HashSet<&str> = left.iter().map(String::as_str).collect();
+    let b: HashSet<&str> = right.iter().map(String::as_str).collect();
+    let sym_diff = a.symmetric_difference(&b).count();
+    sym_diff as u32
 }
 
 /// Whether `other` was committed before `subject`. Equal timestamps break on
@@ -190,29 +199,36 @@ fn ownership_checks(record: &IpRecord, claimed_owner: Option<&str>) -> Vec<Check
 }
 
 fn find_prior_art(record: &IpRecord, index: &[IpRecord]) -> Vec<PriorArtMatch> {
-    let Some(digest) = parse_digest(&record.commitment_hash) else {
-        return Vec::new();
-    };
     let mut matches: Vec<PriorArtMatch> = index
         .iter()
         .filter(|other| other.ip_id != record.ip_id && is_earlier(other, record))
         .filter_map(|other| {
-            let other_digest = parse_digest(&other.commitment_hash)?;
-            let distance = hamming(&digest, &other_digest);
-            let kind = if distance == 0 {
-                MatchKind::ExactDuplicate
-            } else if distance <= NEAR_DUPLICATE_MAX_DISTANCE {
-                MatchKind::NearDuplicate
-            } else {
+            if other.commitment_hash == record.commitment_hash {
+                // Identical commitment hash: definite exact duplicate.
+                return Some(PriorArtMatch {
+                    ip_id: other.ip_id,
+                    owner: other.owner.clone(),
+                    timestamp: other.timestamp,
+                    distance: 0,
+                    kind: MatchKind::ExactDuplicate,
+                });
+            }
+            // Skip near-duplicate check when either record has no features.
+            if record.feature_fingerprints.is_empty() || other.feature_fingerprints.is_empty() {
                 return None;
-            };
-            Some(PriorArtMatch {
-                ip_id: other.ip_id,
-                owner: other.owner.clone(),
-                timestamp: other.timestamp,
-                distance,
-                kind,
-            })
+            }
+            let distance = feature_distance(&record.feature_fingerprints, &other.feature_fingerprints);
+            if distance <= NEAR_DUPLICATE_MAX_DISTANCE {
+                Some(PriorArtMatch {
+                    ip_id: other.ip_id,
+                    owner: other.owner.clone(),
+                    timestamp: other.timestamp,
+                    distance,
+                    kind: MatchKind::NearDuplicate,
+                })
+            } else {
+                None
+            }
         })
         .collect();
     matches.sort_by_key(|found| (found.distance, found.timestamp, found.ip_id));
@@ -328,6 +344,18 @@ mod tests {
             commitment_hash: digest(bytes),
             timestamp,
             revoked: false,
+            feature_fingerprints: Vec::new(),
+        }
+    }
+
+    fn record_with_features(ip_id: u64, bytes: [u8; 32], timestamp: u64, features: Vec<&str>) -> IpRecord {
+        IpRecord {
+            ip_id,
+            owner: stellar_key(1),
+            commitment_hash: digest(bytes),
+            timestamp,
+            revoked: false,
+            feature_fingerprints: features.into_iter().map(String::from).collect(),
         }
     }
 
@@ -368,14 +396,14 @@ mod tests {
 
     #[test]
     fn earlier_near_identical_commitment_is_medium_risk() {
-        let mut near = [0xAA; 32];
-        near[0] ^= 0b1;
-        let subject = record(2, [0xAA; 32], 100);
-        let index = vec![record(1, near, 50)];
+        let subject = record_with_features(2, [0xAA; 32], 100, vec!["a", "b", "c"]);
+        // prior art shares 2 of 3 features; symmetric difference = 2 (not in prior: "c", extra in prior: "d")
+        let prior = record_with_features(1, [0xBB; 32], 50, vec!["a", "b", "d"]);
+        let index = vec![prior];
         let report = run(&subject, None, &index, NOW);
         assert_eq!(report.prior_art.len(), 1);
         assert_eq!(report.prior_art[0].kind, MatchKind::NearDuplicate);
-        assert_eq!(report.prior_art[0].distance, 1);
+        assert_eq!(report.prior_art[0].distance, 2);
         assert_eq!(report.legal_risk.level, RiskLevel::Medium);
     }
 
@@ -398,11 +426,11 @@ mod tests {
 
     #[test]
     fn distance_beyond_threshold_is_ignored() {
-        let mut far = [0xAA; 32];
-        far[0] ^= 0xFF; // 8 bits
-        far[1] ^= 0b10; // 9 bits total, past NEAR_DUPLICATE_MAX_DISTANCE
-        let subject = record(2, [0xAA; 32], 100);
-        let index = vec![record(1, far, 50)];
+        // 9 features differ — past NEAR_DUPLICATE_MAX_DISTANCE (8), different hash.
+        let subject = record_with_features(2, [0xAA; 32], 100, vec!["a", "b", "c"]);
+        let prior = record_with_features(1, [0xBB; 32], 50,
+            vec!["d", "e", "f", "g", "h", "i", "j", "k", "l"]);
+        let index = vec![prior];
         let report = run(&subject, None, &index, NOW);
         assert!(report.prior_art.is_empty());
     }
