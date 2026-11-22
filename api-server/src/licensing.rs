@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::handlers::now_timestamp;
+use crate::handlers::indexed_record;
 use crate::schemas::ErrorResponse;
 
 const BPS_DENOMINATOR: i128 = 10_000;
@@ -144,6 +145,11 @@ pub fn create(req: CreateLicenseRequest, now: u64) -> Result<License, LicenseErr
     if req.licensor == req.licensee {
         return Err(LicenseError::Invalid("licensor and licensee must be different parties".to_string()));
     }
+    let record = indexed_record(req.ip_id)
+        .ok_or_else(|| LicenseError::Invalid(format!("IP {} does not exist", req.ip_id)))?;
+    if record.owner != req.licensor {
+        return Err(LicenseError::Forbidden("licensor does not own this IP".to_string()));
+    }
     let start = req.start.unwrap_or(now);
     validate_terms(req.royalty_bps, start, req.expiry)?;
 
@@ -256,6 +262,18 @@ pub async fn record_license_royalty(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handlers::index_record;
+    use crate::schemas::IpRecord;
+
+    fn register_test_ip() {
+        index_record(IpRecord {
+            ip_id: 7,
+            owner: "GLICENSOR".to_string(),
+            commitment_hash: "hash-7".to_string(),
+            timestamp: 0,
+            revoked: false,
+        });
+    }
 
     fn request(start: Option<u64>, expiry: u64) -> CreateLicenseRequest {
         CreateLicenseRequest {
@@ -270,6 +288,7 @@ mod tests {
 
     #[test]
     fn status_follows_the_clock() {
+        register_test_ip();
         let license = create(request(Some(100), 200), 0).unwrap();
         assert_eq!(status_at(&license, 99), LicenseStatus::Pending);
         assert_eq!(status_at(&license, 100), LicenseStatus::Active);
@@ -279,12 +298,14 @@ mod tests {
 
     #[test]
     fn start_defaults_to_creation_time() {
+        register_test_ip();
         let license = create(request(None, 500), 50).unwrap();
         assert_eq!(license.start, 50);
     }
 
     #[test]
     fn records_royalties_only_while_active() {
+        register_test_ip();
         let license = create(request(Some(100), 200), 0).unwrap();
         assert!(matches!(
             record_royalty(license.id, 1_000, 50),
@@ -302,6 +323,7 @@ mod tests {
 
     #[test]
     fn only_licensor_can_amend_before_start() {
+        register_test_ip();
         let license = create(request(Some(100), 200), 0).unwrap();
         let by_licensee = UpdateTermsRequest {
             licensor: "GLICENSEE".to_string(),
@@ -331,6 +353,7 @@ mod tests {
 
     #[test]
     fn rejects_invalid_terms() {
+        register_test_ip();
         let mut bad_rate = request(Some(1), 10);
         bad_rate.royalty_bps = 10_001;
         assert!(matches!(create(bad_rate, 0), Err(LicenseError::Invalid(_))));
@@ -339,6 +362,22 @@ mod tests {
             create(request(Some(1), 1 + MAX_TERM_SECS + 1), 0),
             Err(LicenseError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn rejects_nonexistent_ip() {
+        let mut req = request(Some(1), 100);
+        req.ip_id = 99999;
+        assert!(matches!(create(req, 0), Err(LicenseError::Invalid(_))));
+    }
+
+    #[test]
+    fn rejects_non_owner_licensor() {
+        register_test_ip();
+        let mut req = request(Some(1), 100);
+        req.licensor = "GNOTOWNER".to_string();
+        req.licensee = "GLICENSEE".to_string();
+        assert!(matches!(create(req, 0), Err(LicenseError::Forbidden(_))));
     }
 
     #[test]
