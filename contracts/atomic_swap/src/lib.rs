@@ -31,6 +31,7 @@ pub mod cross_contract;
 mod contingency_tests;
 #[cfg(test)]
 mod auction_swap_lock_tests;
+mod swap_acceptance_guard_tests;
 
 use soroban_sdk::xdr::{FromXdr, ToXdr};
 use soroban_sdk::{
@@ -163,6 +164,10 @@ pub enum ContractError {
     InvalidCollateralAmount = 82,
     /// Seller reputation penalty for expired swaps must be at most 100.
     InvalidReputationPenalty = 83,
+    /// #1335/#1336: The swap's expiry has passed, so it can no longer be accepted or funded.
+    SwapExpired = 84,
+    /// #1337: The same swap ID appears more than once in a batch.
+    DuplicateBatchId = 85,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -716,6 +721,40 @@ impl AtomicSwap {
         id
     }
 
+    /// Panics with SwapExpired once the ledger timestamp has reached `swap.expiry`.
+    /// Matches the boundary used by `cancel_pending_swap`: a swap is live while `now < expiry`.
+    fn require_not_expired(env: &Env, swap: &SwapRecord) {
+        if env.ledger().timestamp() >= swap.expiry {
+            env.panic_with_error(Error::from_contract_error(ContractError::SwapExpired as u32));
+        }
+    }
+
+    /// Buyer-side acceptance gates shared by `accept_swap` and `batch_accept_swaps`:
+    /// the buyer-set conditions (#351) and the seller's minimum reputation for this swap.
+    /// Keeping them in one place stops the batch path from skipping either check (#1338).
+    fn require_buyer_gates(env: &Env, swap_id: u64, swap: &SwapRecord) {
+        if !swap.conditions.is_empty() {
+            Self::evaluate_conditions(env, swap, false);
+        }
+
+        if let Some(min_rep) = env
+            .storage()
+            .persistent()
+            .get::<_, u32>(&DataKey::ReputationMultiplier(swap_id))
+        {
+            let buyer_rep = env
+                .storage()
+                .persistent()
+                .get::<_, u32>(&DataKey::UserReputation(swap.buyer.clone()))
+                .unwrap_or(50u32);
+            if buyer_rep < min_rep {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::InsufficientReputation as u32,
+                ));
+            }
+        }
+    }
+
     /// Evaluate all conditions on a swap. Panics with ConditionNotMet if any fail.
     /// `check_key_valid` controls whether KeyValid is enforced (true at reveal_key time).
     fn evaluate_conditions(env: &Env, swap: &SwapRecord, check_key_valid: bool) {
@@ -929,6 +968,7 @@ impl AtomicSwap {
 
         swap.buyer.require_auth();
         require_swap_status(&env, &swap, SwapStatus::Pending, ContractError::NotPending);
+        Self::require_not_expired(&env, &swap);
         Self::validate_contingencies(&env, swap_id);
 
         // #254: Ensure all required approvals have been collected.
@@ -945,28 +985,8 @@ impl AtomicSwap {
             }
         }
 
-        // #351: Evaluate any buyer-set conditions.
-        if !swap.conditions.is_empty() {
-            Self::evaluate_conditions(&env, &swap, false);
-        }
-
-        // Check minimum reputation requirement set by seller
-        if let Some(min_rep) = env
-            .storage()
-            .persistent()
-            .get::<_, u32>(&DataKey::ReputationMultiplier(swap_id))
-        {
-            let buyer_rep = env
-                .storage()
-                .persistent()
-                .get::<_, u32>(&DataKey::UserReputation(swap.buyer.clone()))
-                .unwrap_or(50u32);
-            if buyer_rep < min_rep {
-                env.panic_with_error(Error::from_contract_error(
-                    ContractError::InsufficientReputation as u32,
-                ));
-            }
-        }
+        // #351 / seller reputation gate: shared with batch_accept_swaps.
+        Self::require_buyer_gates(&env, swap_id, &swap);
 
         // #350: Deposit collateral if required
         if swap.collateral_amount > 0 {
@@ -4401,6 +4421,17 @@ impl AtomicSwap {
             ));
         }
 
+        // #1337: A repeated ID would be charged twice but accepted once.
+        for i in 0..swap_ids.len() {
+            for j in (i + 1)..swap_ids.len() {
+                if swap_ids.get(i) == swap_ids.get(j) {
+                    env.panic_with_error(Error::from_contract_error(
+                        ContractError::DuplicateBatchId as u32,
+                    ));
+                }
+            }
+        }
+
         // #522: Pre-validation pass — no mutations; ensures full atomicity
         for swap_id in swap_ids.iter() {
             let swap = require_swap_exists(&env, swap_id);
@@ -4412,6 +4443,7 @@ impl AtomicSwap {
             }
 
             require_swap_status(&env, &swap, SwapStatus::Pending, ContractError::NotPending);
+            Self::require_not_expired(&env, &swap);
 
             if swap.required_approvals > 0 {
                 let approvals: Vec<Address> = env
@@ -4426,11 +4458,15 @@ impl AtomicSwap {
                 }
             }
             Self::validate_contingencies(&env, swap_id);
+            // #1338: Same buyer-side gates as accept_swap (conditions + seller reputation).
+            Self::require_buyer_gates(&env, swap_id, &swap);
         }
 
         // Execution pass — all validations passed, safe to mutate
         for swap_id in swap_ids.iter() {
             let mut swap = require_swap_exists(&env, swap_id);
+            // #1337: Defence in depth — never move tokens for a swap that is no longer Pending.
+            require_swap_status(&env, &swap, SwapStatus::Pending, ContractError::NotPending);
 
             if swap.collateral_amount > 0 {
                 if !env
@@ -5191,6 +5227,7 @@ impl AtomicSwap {
         }
 
         require_swap_status(&env, &swap, SwapStatus::Pending, ContractError::NotPending);
+        Self::require_not_expired(&env, &swap);
         Self::validate_contingencies(&env, swap_id);
 
         // Transfer payment from buyer into contract escrow
