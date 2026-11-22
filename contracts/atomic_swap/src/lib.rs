@@ -32,6 +32,13 @@ mod contingency_tests;
 #[cfg(test)]
 mod auction_swap_lock_tests;
 mod swap_acceptance_guard_tests;
+mod required_approvals_bound_tests;
+#[cfg(test)]
+mod referrer_validation_tests;
+#[cfg(test)]
+mod ip_swaps_index_tests;
+#[cfg(test)]
+mod auto_refund_timeout_tests;
 
 use soroban_sdk::xdr::{FromXdr, ToXdr};
 use soroban_sdk::{
@@ -168,6 +175,10 @@ pub enum ContractError {
     SwapExpired = 84,
     /// #1337: The same swap ID appears more than once in a batch.
     DuplicateBatchId = 85,
+    /// #1343: `required_approvals` exceeds `MAX_REQUIRED_APPROVALS`, so the swap could never be accepted.
+    ApprovalsTooHigh = 86,
+    /// #1344: the referrer must not be the swap's buyer or seller (self-referral rebate).
+    InvalidReferrer = 87,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -186,6 +197,66 @@ pub const MAX_FINALITY_CALLBACKS: u32 = 5;
 
 /// Maximum number of items allowed in a single batch operation.
 pub const MAX_BATCH_SIZE: u32 = 50;
+
+/// #1343: Upper bound on `required_approvals` for a swap. A value above this could
+/// never be satisfied by the approver set, which would lock the IP until expiry.
+pub const MAX_REQUIRED_APPROVALS: u32 = 10;
+
+/// #1345: Number of swap IDs indexed for `ip_id`, or `None` if the IP has not been
+/// migrated to the paged index yet (legacy `DataKey::IpSwaps` vector may still exist).
+fn ip_swap_count(env: &Env, ip_id: u64) -> Option<u64> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::IpSwapCount(ip_id))
+}
+
+/// #1345: Swap ID at `index` in the paged per-IP index. Caller ensures `index < count`.
+fn ip_swap_at(env: &Env, ip_id: u64, index: u64) -> u64 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::IpSwapAt(ip_id, index))
+        .unwrap()
+}
+
+/// #1345: Appends `swap_id` to the per-IP swap index with a constant number of storage
+/// writes, regardless of how many swaps the IP already has. The former `IpSwaps` vector
+/// was read and rewritten in full on every append.
+///
+/// The first append for a legacy IP copies its `IpSwaps` vector into the paged index
+/// and removes the vector, so the index stays complete across the migration.
+pub(crate) fn append_ip_swap(env: &Env, ip_id: u64, swap_id: u64) {
+    let count = match ip_swap_count(env, ip_id) {
+        Some(count) => count,
+        None => {
+            let legacy: Option<Vec<u64>> =
+                env.storage().persistent().get(&DataKey::IpSwaps(ip_id));
+            match legacy {
+                Some(ids) => {
+                    for index in 0..ids.len() {
+                        let key = DataKey::IpSwapAt(ip_id, index as u64);
+                        env.storage().persistent().set(&key, &ids.get(index).unwrap());
+                        env.storage().persistent().extend_ttl(&key, LEDGER_BUMP, LEDGER_BUMP);
+                    }
+                    env.storage().persistent().remove(&DataKey::IpSwaps(ip_id));
+                    ids.len() as u64
+                }
+                None => 0,
+            }
+        }
+    };
+
+    let entry_key = DataKey::IpSwapAt(ip_id, count);
+    env.storage().persistent().set(&entry_key, &swap_id);
+    env.storage()
+        .persistent()
+        .extend_ttl(&entry_key, LEDGER_BUMP, LEDGER_BUMP);
+
+    let count_key = DataKey::IpSwapCount(ip_id);
+    env.storage().persistent().set(&count_key, &(count + 1));
+    env.storage()
+        .persistent()
+        .extend_ttl(&count_key, LEDGER_BUMP, LEDGER_BUMP);
+}
 
 /// #781: Minimum non-refundable dispute bond, in the swap token's smallest
 /// unit — 1 XLM in stroops, per docs/threat-model.md's stated minimum. The
@@ -222,6 +293,10 @@ pub enum DataKey {
     ProtocolConfig,
     Paused,
     IpSwaps(u64),
+    /// #1345: number of swap IDs in the paged per-IP index for `ip_id`.
+    IpSwapCount(u64),
+    /// #1345: `(ip_id, index)` → swap ID entry of the paged per-IP index.
+    IpSwapAt(u64, u64),
     /// #253: Maps swap_id → Vec<SwapHistoryEntry> audit trail.
     SwapHistory(u64),
     /// #254: Maps swap_id → Vec<Address> of collected approvals.
@@ -624,6 +699,11 @@ impl AtomicSwap {
             ));
         }
 
+        // #1343: reject approval thresholds that the approver set could never meet.
+        require_valid_approvals(&env, required_approvals);
+        // #1344: a referrer must be a third party, not the buyer or seller.
+        require_valid_referrer(&env, &referrer, &seller, &buyer);
+
         // Verify seller owns the IP and it's not revoked
         registry::ensure_seller_owns_active_ip(&env, ip_id, &seller);
 
@@ -689,18 +769,7 @@ impl AtomicSwap {
         swap::append_swap_for_party(&env, &seller, &buyer, id);
 
         // Append to ip-swaps index
-        let mut ip_ids: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::IpSwaps(ip_id))
-            .unwrap_or(Vec::new(&env));
-        ip_ids.push_back(id);
-        env.storage()
-            .persistent()
-            .set(&DataKey::IpSwaps(ip_id), &ip_ids);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::IpSwaps(ip_id), 50000, 50000);
+        append_ip_swap(&env, ip_id, id);
 
         // #253: Log initial history entry
         Self::append_history(&env, id, SwapStatus::Pending);
@@ -2823,8 +2892,48 @@ impl AtomicSwap {
     }
 
     /// List all swap IDs ever created for a given IP. Returns `None` if none exist.
+    ///
+    /// Reads every entry of the per-IP index. For bounded reads on busy IPs, use
+    /// `get_swaps_by_ip_page`.
     pub fn get_swaps_by_ip(env: Env, ip_id: u64) -> Option<Vec<u64>> {
-        env.storage().persistent().get(&DataKey::IpSwaps(ip_id))
+        match ip_swap_count(&env, ip_id) {
+            None => env.storage().persistent().get(&DataKey::IpSwaps(ip_id)),
+            Some(0) => None,
+            Some(count) => {
+                let mut ids = Vec::new(&env);
+                for index in 0..count {
+                    ids.push_back(ip_swap_at(&env, ip_id, index));
+                }
+                Some(ids)
+            }
+        }
+    }
+
+    /// #1345: Returns up to `limit` swap IDs for `ip_id`, starting at position `start`
+    /// in creation order. `limit` is capped at `MAX_BATCH_SIZE`. Returns an empty
+    /// vector when `start` is past the end of the index.
+    pub fn get_swaps_by_ip_page(env: Env, ip_id: u64, start: u64, limit: u32) -> Vec<u64> {
+        let mut page = Vec::new(&env);
+        // IPs not yet migrated to the paged index still hold the legacy vector.
+        let (count, legacy) = match ip_swap_count(&env, ip_id) {
+            Some(count) => (count, None),
+            None => {
+                let legacy: Option<Vec<u64>> =
+                    env.storage().persistent().get(&DataKey::IpSwaps(ip_id));
+                let count = legacy.as_ref().map(|ids| ids.len() as u64).unwrap_or(0);
+                (count, legacy)
+            }
+        };
+        let capped = limit.min(MAX_BATCH_SIZE) as u64;
+        let end = start.saturating_add(capped).min(count);
+        for index in start..end {
+            let swap_id = match &legacy {
+                Some(ids) => ids.get(index as u32).unwrap(),
+                None => ip_swap_at(&env, ip_id, index),
+            };
+            page.push_back(swap_id);
+        }
+        page
     }
 
     /// Set the admin address. Can only be called once (bootstraps the admin).
@@ -3169,6 +3278,11 @@ impl AtomicSwap {
             ));
         }
 
+        // #1343: reject approval thresholds that the approver set could never meet.
+        require_valid_approvals(&env, required_approvals);
+        // #1344: a referrer must be a third party, not the buyer or seller.
+        require_valid_referrer(&env, &referrer, &seller, &buyer);
+
         let config = Self::protocol_config(&env);
         let len = ip_ids.len();
 
@@ -3251,18 +3365,7 @@ impl AtomicSwap {
 
             swap::append_swap_for_party(&env, &seller, &buyer, id);
 
-            let mut ip_swap_ids: Vec<u64> = env
-                .storage()
-                .persistent()
-                .get(&DataKey::IpSwaps(ip_id))
-                .unwrap_or(Vec::new(&env));
-            ip_swap_ids.push_back(id);
-            env.storage()
-                .persistent()
-                .set(&DataKey::IpSwaps(ip_id), &ip_swap_ids);
-            env.storage()
-                .persistent()
-                .extend_ttl(&DataKey::IpSwaps(ip_id), 50000, 50000);
+            append_ip_swap(&env, ip_id, id);
 
             Self::append_history(&env, id, SwapStatus::Pending);
             env.storage().instance().set(&DataKey::NextId, &Self::checked_next_id(&env, id));
@@ -3558,20 +3661,7 @@ impl AtomicSwap {
 
             swap::append_swap_for_party(&env, &auction.seller, &buyer, swap_id);
 
-            let mut ip_swap_ids: Vec<u64> = env
-                .storage()
-                .persistent()
-                .get(&DataKey::IpSwaps(auction.ip_id))
-                .unwrap_or(Vec::new(&env));
-            ip_swap_ids.push_back(swap_id);
-            env.storage()
-                .persistent()
-                .set(&DataKey::IpSwaps(auction.ip_id), &ip_swap_ids);
-            env.storage().persistent().extend_ttl(
-                &DataKey::IpSwaps(auction.ip_id),
-                LEDGER_BUMP,
-                LEDGER_BUMP,
-            );
+            append_ip_swap(&env, auction.ip_id, swap_id);
 
             Self::append_history(&env, swap_id, SwapStatus::Accepted);
             env.storage()
@@ -3696,18 +3786,7 @@ impl AtomicSwap {
 
         swap::append_swap_for_party(&env, &seller, &buyer, id);
 
-        let mut ip_ids: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::IpSwaps(ip_id))
-            .unwrap_or(Vec::new(&env));
-        ip_ids.push_back(id);
-        env.storage()
-            .persistent()
-            .set(&DataKey::IpSwaps(ip_id), &ip_ids);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::IpSwaps(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+        append_ip_swap(&env, ip_id, id);
 
         Self::append_history(&env, id, SwapStatus::Pending);
         env.storage().instance().set(&DataKey::NextId, &Self::checked_next_id(&env, id));
@@ -3904,18 +3983,7 @@ impl AtomicSwap {
 
         swap::append_swap_for_party(&env, &seller, &buyer, id);
 
-        let mut ip_ids: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::IpSwaps(ip_id))
-            .unwrap_or(Vec::new(&env));
-        ip_ids.push_back(id);
-        env.storage()
-            .persistent()
-            .set(&DataKey::IpSwaps(ip_id), &ip_ids);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::IpSwaps(ip_id), 50000, 50000);
+        append_ip_swap(&env, ip_id, id);
 
         Self::append_history(&env, id, SwapStatus::Pending);
         env.storage().instance().set(&DataKey::NextId, &Self::checked_next_id(&env, id));
@@ -4118,12 +4186,42 @@ impl AtomicSwap {
         // since no committee ruling occurred here.
         Self::release_dispute_bonds_uncontested(&env, swap_id, &swap);
 
-        // Refund buyer
-        token::Client::new(&env, &swap.token).transfer(
-            &env.current_contract_address(),
-            &swap.buyer,
-            &swap.price,
-        );
+        let token_client = token::Client::new(&env, &swap.token);
+
+        // #1346: refund only what the buyer deposited. An installment swap may have
+        // paid less than the full price, and refunding `price` would draw on other
+        // swaps' funds. Same rule as `cancel_expired_swap` (#1175).
+        let refund_amount = if swap.is_installment && swap.paid_amount < swap.price {
+            swap.paid_amount
+        } else {
+            swap.price
+        };
+        if refund_amount > 0 {
+            token_client.transfer(&env.current_contract_address(), &swap.buyer, &refund_amount);
+        }
+
+        // #1346: return collateral, which this path previously kept from the buyer.
+        if swap.collateral_amount > 0 {
+            if let Some(collateral) = env
+                .storage()
+                .persistent()
+                .get::<_, i128>(&DataKey::SwapCollateral(swap_id))
+            {
+                token_client.transfer(&env.current_contract_address(), &swap.buyer, &collateral);
+                env.storage()
+                    .persistent()
+                    .remove(&DataKey::SwapCollateral(swap_id));
+
+                env.events().publish(
+                    (soroban_sdk::symbol_short!("coll_ref"),),
+                    CollateralRefundedEvent {
+                        swap_id,
+                        buyer: swap.buyer.clone(),
+                        collateral_amount: collateral,
+                    },
+                );
+            }
+        }
 
         env.storage().persistent().set(
             &DataKey::CancelReason(swap_id),
@@ -4810,6 +4908,11 @@ impl AtomicSwap {
         seller.require_auth();
         require_unique_ids(&env, &ip_ids);
 
+        // #1343: reject approval thresholds that the approver set could never meet.
+        require_valid_approvals(&env, required_approvals);
+        // #1344: a referrer must be a third party, not the buyer or seller.
+        require_valid_referrer(&env, &referrer, &seller, &buyer);
+
         let len = ip_ids.len();
         let mut swap_ids: Vec<u64> = Vec::new(&env);
         // #1168: configurable insurance premium rate (was hardcoded 2%).
@@ -4879,18 +4982,7 @@ impl AtomicSwap {
 
             swap::append_swap_for_party(&env, &seller, &buyer, id);
 
-            let mut ip_swap_ids: Vec<u64> = env
-                .storage()
-                .persistent()
-                .get(&DataKey::IpSwaps(ip_id))
-                .unwrap_or(Vec::new(&env));
-            ip_swap_ids.push_back(id);
-            env.storage()
-                .persistent()
-                .set(&DataKey::IpSwaps(ip_id), &ip_swap_ids);
-            env.storage()
-                .persistent()
-                .extend_ttl(&DataKey::IpSwaps(ip_id), 50000, 50000);
+            append_ip_swap(&env, ip_id, id);
 
             Self::append_history(&env, id, SwapStatus::Pending);
             env.storage().instance().set(&DataKey::NextId, &Self::checked_next_id(&env, id));
@@ -5111,18 +5203,7 @@ impl AtomicSwap {
 
             swap::append_swap_for_party(&env, &seller, &buyer, id);
 
-            let mut ip_swap_ids: Vec<u64> = env
-                .storage()
-                .persistent()
-                .get(&DataKey::IpSwaps(ip_id))
-                .unwrap_or(Vec::new(&env));
-            ip_swap_ids.push_back(id);
-            env.storage()
-                .persistent()
-                .set(&DataKey::IpSwaps(ip_id), &ip_swap_ids);
-            env.storage()
-                .persistent()
-                .extend_ttl(&DataKey::IpSwaps(ip_id), 50000, 50000);
+            append_ip_swap(&env, ip_id, id);
 
             Self::append_history(&env, id, SwapStatus::Pending);
             env.storage().instance().set(&DataKey::NextId, &Self::checked_next_id(&env, id));
@@ -6003,18 +6084,7 @@ impl AtomicSwap {
 
         swap::append_swap_for_party(&env, &seller, &buyer, id);
 
-        let mut ip_ids: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::IpSwaps(ip_id))
-            .unwrap_or(Vec::new(&env));
-        ip_ids.push_back(id);
-        env.storage()
-            .persistent()
-            .set(&DataKey::IpSwaps(ip_id), &ip_ids);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::IpSwaps(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+        append_ip_swap(&env, ip_id, id);
 
         Self::append_history(&env, id, SwapStatus::Pending);
         env.storage().instance().set(&DataKey::NextId, &Self::checked_next_id(&env, id));
