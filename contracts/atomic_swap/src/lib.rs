@@ -1560,6 +1560,7 @@ impl AtomicSwap {
     /// **#1341:** duplicate IDs in the batch are rejected with `DuplicateSwapId`
     /// before any state is changed, so a repeated entry can never apply twice.
     pub fn batch_rollback_swaps(env: Env, swap_ids: Vec<u64>, caller: Address, reason: Bytes) {
+        require_unique_ids(&env, &swap_ids);
         caller.require_auth();
         require_unique_ids(&env, &swap_ids);
         require_admin(&env, &caller);
@@ -4537,7 +4538,10 @@ impl AtomicSwap {
     // ── #357: Batch Processing ────────────────────────────────────────────────
 
     /// Batch accept multiple swaps. Buyer-only.
+    /// #1341: a repeated ID in `swap_ids` is rejected with `DuplicateSwapId`
+    /// before any state is read or written.
     pub fn batch_accept_swaps(env: Env, swap_ids: Vec<u64>, buyer: Address) {
+        require_unique_ids(&env, &swap_ids);
         require_not_paused(&env);
         buyer.require_auth();
 
@@ -4853,12 +4857,15 @@ impl AtomicSwap {
     /// Cancel multiple pending swaps in a batch. Only the seller or buyer may cancel.
     /// Each swap must be in Pending status. Tracks cancellation reasons for each swap.
     /// Returns the list of swap IDs that were successfully cancelled.
+    /// #1341: a repeated ID in `swap_ids` is rejected with `DuplicateSwapId`
+    /// before any state is read or written.
     pub fn batch_cancel_swaps(
         env: Env,
         swap_ids: Vec<u64>,
         canceller: Address,
         reasons: Vec<Bytes>,
     ) -> Vec<u64> {
+        require_unique_ids(&env, &swap_ids);
         canceller.require_auth();
 
         let len = swap_ids.len();
@@ -4936,6 +4943,7 @@ impl AtomicSwap {
         referrer: Option<Address>,
         insurance_enabled: bool,
     ) -> Vec<u64> {
+        require_unique_ids(&env, &ip_ids);
         require_not_paused(&env);
         seller.require_auth();
         require_unique_ids(&env, &ip_ids);
@@ -5167,6 +5175,7 @@ impl AtomicSwap {
         buyer: Address,
         timeouts: Vec<u64>,
     ) -> Vec<u64> {
+        require_unique_ids(&env, &ip_ids);
         require_not_paused(&env);
         seller.require_auth();
         require_unique_ids(&env, &ip_ids);
@@ -5263,6 +5272,7 @@ impl AtomicSwap {
     /// **#1341:** duplicate IDs in the batch are rejected with `DuplicateSwapId`
     /// before any state is changed, so a repeated entry can never apply twice.
     pub fn batch_escrow_deposit(env: Env, swap_ids: Vec<u64>, buyer: Address) {
+        require_unique_ids(&env, &swap_ids);
         buyer.require_auth();
         require_unique_ids(&env, &swap_ids);
 
@@ -6280,6 +6290,7 @@ impl AtomicSwap {
     /// **#1341:** duplicate IDs in the batch are rejected with `DuplicateSwapId`
     /// before any state is changed, so a repeated entry can never apply twice.
     pub fn batch_sign_swap_reveal(env: Env, swap_ids: Vec<u64>, signer: Address) {
+        require_unique_ids(&env, &swap_ids);
         signer.require_auth();
         require_unique_ids(&env, &swap_ids);
 
@@ -6434,6 +6445,7 @@ impl AtomicSwap {
         requester: Address,
         evidence_hash: BytesN<32>,
     ) {
+        require_unique_ids(&env, &swap_ids);
         requester.require_auth();
         require_unique_ids(&env, &swap_ids);
 
