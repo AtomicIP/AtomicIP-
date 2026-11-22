@@ -246,6 +246,13 @@ pub enum ContractError {
     GracePeriodTooLong = 79,
     /// #1381: IP is referenced by an active swap or auction.
     IpInActiveSwap = 80,
+    /// Issue #1386: The IP already has `MAX_LICENSEES_PER_IP` licensees.
+    LicenseeCapReached = 81,
+    /// Issue #1385: Challenge TTL is outside
+    /// `[MIN_CHALLENGE_TTL_SECONDS, MAX_CHALLENGE_TTL_SECONDS]`.
+    InvalidChallengeTtl = 82,
+    /// Issue #1384: An unanswered, unexpired challenge is already open for this commitment.
+    ChallengeStillOpen = 83,
 }
 // ── TTL ───────────────────────────────────────────────────────────────────────
 
@@ -256,6 +263,20 @@ pub const LEDGER_BUMP: u32 = 6_307_200;
 /// Issue #811: Default TTL for ownership challenges, in seconds (24 hours).
 /// Can be overridden via `set_challenge_ttl`.
 pub const DEFAULT_CHALLENGE_TTL_SECONDS: u64 = 86_400;
+
+/// Issue #1385: Smallest TTL `set_challenge_ttl` accepts, in seconds (1 minute).
+pub const MIN_CHALLENGE_TTL_SECONDS: u64 = 60;
+
+/// Issue #1385: Largest TTL `set_challenge_ttl` accepts, in seconds (7 days).
+pub const MAX_CHALLENGE_TTL_SECONDS: u64 = 7 * 86_400;
+
+/// Issue #1386: Maximum number of distinct licensees a single IP can hold.
+/// Bounds the size of the `IpLicenses(ip_id)` vector loaded on every read.
+pub const MAX_LICENSEES_PER_IP: u32 = 100;
+
+/// Issue #1383: Period, in seconds, that `batch_renew_ip` adds to an IP's
+/// `expiry_timestamp` (365 days).
+pub const RENEWAL_PERIOD_SECONDS: u64 = 365 * 86_400;
 
 /// Maximum metadata size: 1 KB
 pub const MAX_METADATA_BYTES: u32 = 1024;
@@ -3692,6 +3713,15 @@ impl IpRegistry {
     // set_ip_metadata removed - metadata field not in IpRecord
 
     /// Grant a license for an IP to a licensee. Owner-only.
+    ///
+    /// If `licensee` already holds a license, its terms are replaced and a
+    /// `lic_repl` event is published with `(ip_id, old_terms_hash, new_terms_hash)`
+    /// so the previous terms remain visible in the chain's history.
+    ///
+    /// # Panics
+    ///
+    /// Panics with `LicenseeCapReached` if adding a new licensee would exceed
+    /// `MAX_LICENSEES_PER_IP`.
     pub fn grant_license(env: Env, ip_id: u64, licensee: Address, terms_hash: BytesN<32>) {
         let record = require_ip_exists(&env, ip_id);
         record.owner.require_auth();
@@ -3705,7 +3735,9 @@ impl IpRegistry {
         // Replace existing entry for this licensee, or append
         let mut found = false;
         for i in 0..licenses.len() {
-            if licenses.get(i).unwrap().licensee == licensee {
+            let existing = licenses.get(i).unwrap();
+            if existing.licensee == licensee {
+                let old_terms_hash = existing.terms_hash;
                 licenses.set(
                     i,
                     LicenseEntry {
@@ -3713,11 +3745,22 @@ impl IpRegistry {
                         terms_hash: terms_hash.clone(),
                     },
                 );
+                // Issue #1386: record the replaced terms on-chain.
+                env.events().publish(
+                    (symbol_short!("lic_repl"), licensee.clone()),
+                    (ip_id, old_terms_hash, terms_hash.clone()),
+                );
                 found = true;
                 break;
             }
         }
         if !found {
+            // Issue #1386: cap the licensee list so reads stay bounded.
+            if licenses.len() >= MAX_LICENSEES_PER_IP {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::LicenseeCapReached as u32,
+                ));
+            }
             licenses.push_back(LicenseEntry {
                 licensee,
                 terms_hash,
@@ -5630,14 +5673,21 @@ impl IpRegistry {
     ///
     /// # Arguments
     ///
-    /// * `ttl_seconds` - New TTL in seconds; must be > 0.
+    /// * `ttl_seconds` - New TTL in seconds; must lie within
+    ///   `[MIN_CHALLENGE_TTL_SECONDS, MAX_CHALLENGE_TTL_SECONDS]` (60 s to 7 days).
+    ///
+    /// # Panics
+    ///
+    /// Panics with `NotInitialized` if no admin is configured (fails closed, see #790),
+    /// or `InvalidChallengeTtl` if `ttl_seconds` is out of range.
     pub fn set_challenge_ttl(env: Env, ttl_seconds: u64) {
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .unwrap_or_else(|| env.current_contract_address());
-        admin.require_auth();
+        Self::require_admin(&env).require_auth();
+
+        if ttl_seconds < MIN_CHALLENGE_TTL_SECONDS || ttl_seconds > MAX_CHALLENGE_TTL_SECONDS {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::InvalidChallengeTtl as u32,
+            ));
+        }
 
         env.storage()
             .persistent()
@@ -5687,15 +5737,19 @@ impl IpRegistry {
     /// Issue a random ownership challenge for a commitment.
     ///
     /// Generates 32 random bytes on-chain and stores them as the open challenge
-    /// for `commitment_id`. Issuing a new challenge replaces any earlier challenge
-    /// that is still unanswered. The holder proves control by calling
+    /// for `commitment_id`. Requires the commitment owner's authorisation, so a
+    /// third party cannot reissue challenges or inflate `ChallengeStats.issued`.
+    /// A new challenge can only be issued once the previous one has been
+    /// answered or has expired. The holder proves control by calling
     /// `respond_to_commitment_challenge` before the challenge expires.
     ///
     /// Returns the challenge bytes.
     ///
     /// # Panics
     ///
-    /// Panics if the commitment does not exist or has been revoked.
+    /// Panics if the commitment does not exist or has been revoked, the caller
+    /// is not the owner, or `ChallengeStillOpen` if an unanswered, unexpired
+    /// challenge already exists.
     pub fn challenge_ownership(env: Env, commitment_id: u64) -> Bytes {
         let record = require_ip_exists(&env, commitment_id);
         if record.revoked {
@@ -5703,16 +5757,32 @@ impl IpRegistry {
                 ContractError::IpAlreadyRevoked as u32,
             ));
         }
+        // Issue #1384: only the owner may open a challenge for their commitment.
+        record.owner.require_auth();
+
+        let now = env.ledger().timestamp();
+        let record_key = DataKey::CommitmentChallenge(commitment_id);
+
+        // Issue #1384: never overwrite a challenge that is still pending.
+        if let Some(existing) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, CommitmentChallenge>(&record_key)
+        {
+            if !existing.answered && now <= existing.expires_at {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::ChallengeStillOpen as u32,
+                ));
+            }
+        }
 
         let challenge: Bytes = env.prng().gen_len(32);
-        let now = env.ledger().timestamp();
         let ttl_seconds: u64 = env
             .storage()
             .persistent()
             .get(&DataKey::ChallengeTtl)
             .unwrap_or(DEFAULT_CHALLENGE_TTL_SECONDS);
 
-        let record_key = DataKey::CommitmentChallenge(commitment_id);
         let open = CommitmentChallenge {
             challenge: challenge.clone(),
             issued_at: now,
@@ -7680,24 +7750,61 @@ impl IpRegistry {
     /// Renew multiple IP commitments in a single transaction.
     ///
     /// Requires auth from `owner`. Each IP must exist, belong to `owner`, and
-    /// not be revoked. Extends storage TTL for every IP and increments each
-    /// IP's renewal counter.
+    /// not be revoked. For every IP this call:
+    ///
+    /// * extends `expiry_timestamp` by `RENEWAL_PERIOD_SECONDS`, counted from
+    ///   the later of the current expiry and the current ledger time (so an IP
+    ///   already past expiry gets a full period from now). IPs with
+    ///   `expiry_timestamp == 0` never expire and keep that value;
+    /// * clears any pending expiry notification;
+    /// * extends the storage TTL of the record;
+    /// * increments the IP's renewal counter once.
+    ///
+    /// Publishes `renewed` with `(ip_id, renewal_count, new_expiry)` per IP.
     ///
     /// # Panics
     ///
-    /// Panics with `IpNotFound` if any ID does not exist, `Unauthorized` if
-    /// any IP is not owned by `owner`, or `IpAlreadyRevoked` if any IP is revoked.
+    /// Panics with `DuplicateIpId` if an ID appears more than once,
+    /// `IpNotFound` if any ID does not exist, `Unauthorized` if any IP is not
+    /// owned by `owner`, or `IpAlreadyRevoked` if any IP is revoked.
     pub fn batch_renew_ip(env: Env, owner: Address, ip_ids: Vec<u64>) {
         owner.require_auth();
 
+        // Issue #1383: reject duplicates so each IP is renewed and counted once.
+        for i in 0..ip_ids.len() {
+            let id = ip_ids.get(i).unwrap();
+            for j in (i + 1)..ip_ids.len() {
+                if ip_ids.get(j).unwrap() == id {
+                    panic_with_error!(&env, ContractError::DuplicateIpId);
+                }
+            }
+        }
+
+        let now = env.ledger().timestamp();
         for ip_id in ip_ids.iter() {
-            let record = require_ip_exists(&env, ip_id);
+            let mut record = require_ip_exists(&env, ip_id);
 
             if record.owner != owner {
                 panic_with_error!(&env, ContractError::Unauthorized);
             }
 
             require_not_revoked(&env, &record);
+
+            // Issue #1383: renewal must actually move the expiry forward.
+            if record.expiry_timestamp != 0 {
+                let base = if record.expiry_timestamp > now {
+                    record.expiry_timestamp
+                } else {
+                    now
+                };
+                record.expiry_timestamp = base.saturating_add(RENEWAL_PERIOD_SECONDS);
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::IpRecord(ip_id), &record);
+                env.storage()
+                    .persistent()
+                    .remove(&DataKey::ExpiryNotified(ip_id));
+            }
 
             env.storage().persistent().extend_ttl(
                 &DataKey::IpRecord(ip_id),
@@ -7722,7 +7829,7 @@ impl IpRegistry {
 
             env.events().publish(
                 (symbol_short!("renewed"), owner.clone()),
-                (ip_id, new_count),
+                (ip_id, new_count, record.expiry_timestamp),
             );
         }
     }
@@ -10992,6 +11099,226 @@ mod tests {
         let ids = soroban_sdk::Vec::new(&env);
 
         client.batch_renew_ip(&owner, &ids);
+    }
+
+    // ── Issue #1383: batch_renew_ip extends expiry and rejects duplicates ────
+
+    #[test]
+    fn test_batch_renew_ip_extends_expiry() {
+        use soroban_sdk::testutils::Ledger as _;
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 1_000);
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let id = client.commit_ip(&owner, &BytesN::from_array(&env, &[0xE1u8; 32]), &0u32);
+        client.set_ip_expiry(&id, &5_000u64, &0u64);
+
+        let mut ids = soroban_sdk::Vec::new(&env);
+        ids.push_back(id);
+        client.batch_renew_ip(&owner, &ids);
+
+        assert_eq!(
+            client.get_ip(&id).expiry_timestamp,
+            5_000 + RENEWAL_PERIOD_SECONDS
+        );
+    }
+
+    #[test]
+    fn test_batch_renew_ip_lapsed_expiry_counts_from_now() {
+        use soroban_sdk::testutils::Ledger as _;
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 1_000);
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let id = client.commit_ip(&owner, &BytesN::from_array(&env, &[0xE2u8; 32]), &0u32);
+        client.set_ip_expiry(&id, &2_000u64, &0u64);
+
+        env.ledger().with_mut(|l| l.timestamp = 10_000);
+        let mut ids = soroban_sdk::Vec::new(&env);
+        ids.push_back(id);
+        client.batch_renew_ip(&owner, &ids);
+
+        assert_eq!(
+            client.get_ip(&id).expiry_timestamp,
+            10_000 + RENEWAL_PERIOD_SECONDS
+        );
+    }
+
+    #[test]
+    fn test_batch_renew_ip_no_expiry_stays_unset() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let id = client.commit_ip(&owner, &BytesN::from_array(&env, &[0xE3u8; 32]), &0u32);
+
+        let mut ids = soroban_sdk::Vec::new(&env);
+        ids.push_back(id);
+        client.batch_renew_ip(&owner, &ids);
+
+        assert_eq!(client.get_ip(&id).expiry_timestamp, 0);
+        assert_eq!(client.get_renewal_count(&id), 1);
+    }
+
+    #[test]
+    fn test_batch_renew_ip_rejects_duplicates() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let id = client.commit_ip(&owner, &BytesN::from_array(&env, &[0xE4u8; 32]), &0u32);
+
+        let mut ids = soroban_sdk::Vec::new(&env);
+        ids.push_back(id);
+        ids.push_back(id);
+
+        assert_eq!(
+            client.try_batch_renew_ip(&owner, &ids),
+            Err(Ok(Error::from_contract_error(ContractError::DuplicateIpId as u32)))
+        );
+        // The rejected batch must not have touched the counter.
+        assert_eq!(client.get_renewal_count(&id), 0);
+    }
+
+    // ── Issue #1386: grant_license cap and replacement event ─────────────────
+
+    #[test]
+    fn test_grant_license_cap_reached() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let id = client.commit_ip(&owner, &BytesN::from_array(&env, &[0xF1u8; 32]), &0u32);
+        let terms = BytesN::from_array(&env, &[0x01u8; 32]);
+
+        for _ in 0..MAX_LICENSEES_PER_IP {
+            client.grant_license(&id, &Address::generate(&env), &terms);
+        }
+        assert_eq!(client.get_licenses(&id).len(), MAX_LICENSEES_PER_IP);
+
+        let extra = Address::generate(&env);
+        assert_eq!(
+            client.try_grant_license(&id, &extra, &terms),
+            Err(Ok(Error::from_contract_error(ContractError::LicenseeCapReached as u32)))
+        );
+        assert_eq!(client.get_licenses(&id).len(), MAX_LICENSEES_PER_IP);
+    }
+
+    #[test]
+    fn test_grant_license_replacement_allowed_at_cap() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let id = client.commit_ip(&owner, &BytesN::from_array(&env, &[0xF2u8; 32]), &0u32);
+        let terms = BytesN::from_array(&env, &[0x01u8; 32]);
+        let first = Address::generate(&env);
+        client.grant_license(&id, &first, &terms);
+        for _ in 1..MAX_LICENSEES_PER_IP {
+            client.grant_license(&id, &Address::generate(&env), &terms);
+        }
+
+        // Updating an existing licensee's terms does not grow the list.
+        let new_terms = BytesN::from_array(&env, &[0x02u8; 32]);
+        client.grant_license(&id, &first, &new_terms);
+        let licenses = client.get_licenses(&id);
+        assert_eq!(licenses.len(), MAX_LICENSEES_PER_IP);
+        assert_eq!(licenses.get(0).unwrap().terms_hash, new_terms);
+    }
+
+    #[test]
+    fn test_grant_license_replacement_emits_event_with_old_hash() {
+        use soroban_sdk::xdr::{ContractEventBody, ScSymbol, ScVal};
+        use soroban_sdk::TryFromVal;
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let licensee = Address::generate(&env);
+        let id = client.commit_ip(&owner, &BytesN::from_array(&env, &[0xF3u8; 32]), &0u32);
+        let old_terms = BytesN::from_array(&env, &[0x0Au8; 32]);
+        let new_terms = BytesN::from_array(&env, &[0x0Bu8; 32]);
+
+        client.grant_license(&id, &licensee, &old_terms);
+        client.grant_license(&id, &licensee, &new_terms);
+
+        let topic = ScVal::Symbol(ScSymbol("lic_repl".try_into().unwrap()));
+        let expected_data = ScVal::try_from_val(
+            &env,
+            &(id, old_terms.clone(), new_terms.clone()).into_val(&env),
+        )
+        .unwrap();
+        let found = env.events().all().events().iter().any(|ev| {
+            let ContractEventBody::V0(v0) = &ev.body;
+            v0.topics.first() == Some(&topic) && v0.data == expected_data
+        });
+        assert!(found, "replacing terms must emit lic_repl with the old hash");
+    }
+
+    // ── Issue #1385: set_challenge_ttl bounds and fail-closed admin ──────────
+
+    #[test]
+    fn test_set_challenge_ttl_accepts_bounds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        client.initialize(&Address::generate(&env));
+
+        client.set_challenge_ttl(&MIN_CHALLENGE_TTL_SECONDS);
+        client.set_challenge_ttl(&MAX_CHALLENGE_TTL_SECONDS);
+    }
+
+    #[test]
+    fn test_set_challenge_ttl_rejects_out_of_range() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        client.initialize(&Address::generate(&env));
+
+        let err = Err(Ok(Error::from_contract_error(
+            ContractError::InvalidChallengeTtl as u32,
+        )));
+        assert_eq!(client.try_set_challenge_ttl(&0u64), err);
+        assert_eq!(
+            client.try_set_challenge_ttl(&(MIN_CHALLENGE_TTL_SECONDS - 1)),
+            err
+        );
+        assert_eq!(
+            client.try_set_challenge_ttl(&(MAX_CHALLENGE_TTL_SECONDS + 1)),
+            err
+        );
+        assert_eq!(client.try_set_challenge_ttl(&u64::MAX), err);
+    }
+
+    #[test]
+    fn test_set_challenge_ttl_without_admin_fails_closed() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        assert_eq!(
+            client.try_set_challenge_ttl(&3_600u64),
+            Err(Ok(Error::from_contract_error(ContractError::NotInitialized as u32)))
+        );
     }
 
     // ── Issue #815: CommitmentHashes pruning tests ────────────────────────────
