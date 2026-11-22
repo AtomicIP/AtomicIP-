@@ -15,6 +15,11 @@
 #   --skip-init     Skip initialization
 #   --dry-run       Simulate deployment without executing
 #   --verbose       Enable verbose output
+#   --confirm-network NAME
+#                   Required for mainnet: must be typed as "mainnet"
+#   --allow-mainnet-fresh
+#                   Required with --fresh on mainnet. --fresh deletes the
+#                   deployer key, which administers live contracts (#1258)
 ################################################################################
 
 set -e
@@ -26,6 +31,8 @@ SKIP_BUILD=false
 SKIP_INIT=false
 DRY_RUN=false
 NETWORK="testnet"
+CONFIRM_NETWORK=""
+ALLOW_MAINNET_FRESH=false
 
 # Color output
 RED='\033[0;31m'
@@ -79,6 +86,14 @@ parse_args() {
                 VERBOSE=true
                 shift
                 ;;
+            --confirm-network)
+                CONFIRM_NETWORK="${2:-}"
+                shift 2
+                ;;
+            --allow-mainnet-fresh)
+                ALLOW_MAINNET_FRESH=true
+                shift
+                ;;
             *)
                 log_error "Unknown option: $1"
                 print_usage
@@ -90,6 +105,26 @@ parse_args() {
     # Set network-specific files
     DEPLOY_STATE_FILE=".$NETWORK-state.json"
     LOG_FILE="$NETWORK-deploy-$(date +%Y%m%d-%H%M%S).log"
+}
+
+# #1258: Mainnet guard. Runs before any tool or key operation.
+#  - Any mainnet deployment must type the network name: --confirm-network mainnet
+#  - --fresh on mainnet deletes the deployer key, so it also needs
+#    --allow-mainnet-fresh
+guard_mainnet() {
+    if [[ "$NETWORK" != "mainnet" ]]; then
+        return 0
+    fi
+
+    if [[ "$CONFIRM_NETWORK" != "mainnet" ]]; then
+        log_error "Refusing mainnet deployment: pass --confirm-network mainnet to confirm the target"
+        exit 1
+    fi
+
+    if [[ "$FRESH_DEPLOY" == true && "$ALLOW_MAINNET_FRESH" != true ]]; then
+        log_error "Refusing --fresh on mainnet: it deletes the live deployer key. Pass --allow-mainnet-fresh to proceed"
+        exit 1
+    fi
 }
 
 print_usage() {
@@ -286,12 +321,33 @@ deploy_atomic_swap() {
     log_success "Atomic Swap deployed: $CONTRACT_ATOMIC_SWAP"
 }
 
+# #1259: Set the IP Registry admin. Without this, every admin-gated function
+# on a fresh deployment is unusable, because the admin is never stored.
+initialize_ip_registry() {
+    log "Initializing IP Registry with deployer admin..."
+    local admin_address="deployer"
+    if [[ "$DRY_RUN" == true ]]; then
+        log "[DRY-RUN] stellar contract invoke --id $CONTRACT_IP_REGISTRY --source deployer --network $NETWORK -- initialize --admin <deployer address>"
+    else
+        admin_address="$(stellar keys address deployer)"
+        stellar contract invoke \
+            --id "$CONTRACT_IP_REGISTRY" \
+            --source deployer \
+            --network "$NETWORK" \
+            -- initialize \
+            --admin "$admin_address"
+    fi
+    log_success "IP Registry initialized"
+}
+
 # Initialize contracts
 initialize_contracts() {
     if [[ "$SKIP_INIT" == true ]]; then
         log_warning "Skipping contract initialization (--skip-init)"
         return
     fi
+
+    initialize_ip_registry
 
     log "Initializing Atomic Swap with IP Registry address..."
     if [[ "$DRY_RUN" == true ]]; then
@@ -314,6 +370,12 @@ validate_deployment() {
     if [[ "$DRY_RUN" == true ]]; then
         log "[DRY-RUN] Skipping live validation"
         return
+    fi
+
+    # #1259: Confirm the IP Registry admin is set.
+    if [[ "$SKIP_INIT" != true ]]; then
+        "$(dirname "$0")/verify_deployment.sh" "$CONTRACT_IP_REGISTRY" "$NETWORK" \
+            || { log_error "IP Registry admin check failed"; return 1; }
     fi
 
     # Verify IP Registry is callable
@@ -368,6 +430,7 @@ main() {
     trap cleanup EXIT
 
     parse_args "$@"
+    guard_mainnet
 
     log "=== Atomic Patent Deployment ==="
     log "Network: $NETWORK"
