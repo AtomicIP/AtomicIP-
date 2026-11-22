@@ -351,6 +351,9 @@ pub enum DataKey {
     RenewalCount(u64),      // stores renewal count for a given ip_id
     Delegates(Address),     // stores Vec<DelegationRecord> for a given owner
     DelegateDepth(Address), // stores delegation depth for a given delegate
+    /// #1375: (root_owner, delegate) -> address that granted the delegation,
+    /// so revoking a delegate can cascade to everything it sub-delegated.
+    DelegatedBy(Address, Address),
     IpDisputes(u64),        // stores DisputeRecord for a given dispute_id
     NextDisputeId,          // monotonic dispute ID counter
     OpenDispute(Address, u64), // (challenger, ip_id) -> dispute_id of their open dispute on that IP
@@ -1425,10 +1428,43 @@ impl IpRegistry {
     /// # Auth Model
     ///
     /// `owner.require_auth()` is called once for the batch operation.
+    ///
+    /// # Stored metadata
+    ///
+    /// Like `commit_ip`, each record gets `IpPowDifficulty` (0, as no PoW is
+    /// required) and `CommitmentAlgorithm::Pedersen`. Use
+    /// [`Self::batch_commit_ip_with_algorithm`] to choose either.
     pub fn batch_commit_ip(
         env: Env,
         owner: Address,
         commitment_hashes: Vec<BytesN<32>>,
+    ) -> Vec<u64> {
+        Self::batch_commit_ip_with_algorithm(
+            env,
+            owner,
+            commitment_hashes,
+            0,
+            CommitmentAlgorithm::Pedersen,
+        )
+    }
+
+    /// Batch counterpart of [`Self::commit_ip_with_algorithm`] (#1377).
+    ///
+    /// Every hash must satisfy `pow_difficulty` leading zero bits. Each new
+    /// record stores `IpPowDifficulty` and `CommitmentAlgorithm` exactly as a
+    /// single commit does, so `get_ip_strength` and `verify_commitment` treat
+    /// batch-committed and single-committed IPs the same way.
+    ///
+    /// # Panics
+    ///
+    /// Same as [`Self::batch_commit_ip`], plus `InsufficientPoW` if any hash
+    /// does not meet `pow_difficulty`.
+    pub fn batch_commit_ip_with_algorithm(
+        env: Env,
+        owner: Address,
+        commitment_hashes: Vec<BytesN<32>>,
+        pow_difficulty: u32,
+        algorithm: CommitmentAlgorithm,
     ) -> Vec<u64> {
         owner.require_auth();
 
@@ -1446,6 +1482,9 @@ impl IpRegistry {
 
             // Reject duplicate commitment hash globally
             require_unique_commitment(&env, &commitment_hash);
+
+            // Validate proof-of-work, as in `commit_ip_with_algorithm`
+            require_pow(&env, &commitment_hash, pow_difficulty);
 
             // NextId lives in persistent storage so it survives contract upgrades.
             let id: u64 = env
@@ -1475,6 +1514,24 @@ impl IpRegistry {
             env.storage()
                 .persistent()
                 .extend_ttl(&DataKey::IpRecord(id), LEDGER_BUMP, LEDGER_BUMP);
+
+            // #1377: record the same strength/verification metadata as a single commit
+            env.storage()
+                .persistent()
+                .set(&DataKey::IpPowDifficulty(id), &pow_difficulty);
+            env.storage().persistent().extend_ttl(
+                &DataKey::IpPowDifficulty(id),
+                LEDGER_BUMP,
+                LEDGER_BUMP,
+            );
+            env.storage()
+                .persistent()
+                .set(&DataKey::CommitmentAlgorithm(id), &algorithm);
+            env.storage().persistent().extend_ttl(
+                &DataKey::CommitmentAlgorithm(id),
+                LEDGER_BUMP,
+                LEDGER_BUMP,
+            );
 
             // Append to owner index
             let mut owner_ids: Vec<u64> = env
@@ -1529,8 +1586,10 @@ impl IpRegistry {
     /// # Arguments
     ///
     /// * `env` - The Soroban environment
-    /// * `blinded_owner` - A 32-byte blinded owner identifier (e.g. `sha256(owner || nonce)`).
-    ///   Stored on-chain per commitment so ownership can be proved or revealed later.
+    /// * `blinded_owner` - A 32-byte blinded owner identifier. Stored on-chain per
+    ///   commitment so ownership can be proved or revealed later. To be able to
+    ///   manage the IPs later, use `compute_blinded_owner(owner, nonce)`
+    ///   (`sha256(owner.to_xdr() || nonce)`).
     /// * `commitment_hashes` - Non-empty vector of 32-byte commitment hashes to register.
     ///   Each must not be all zeros and must be globally unique.
     ///
@@ -1550,6 +1609,13 @@ impl IpRegistry {
     ///
     /// No caller authorization is required. The submitter's identity is intentionally
     /// not recorded on-chain; only the `blinded_owner` identifier is stored.
+    ///
+    /// # Management (#1376)
+    ///
+    /// Until claimed, an anonymous IP is verification-only: its placeholder owner
+    /// (the contract address) cannot authorize `revoke_ip`, `transfer_ip`,
+    /// `renew_ip`, `set_ip_expiry` or `grant_ip_access`. The holder of the
+    /// blinded owner takes control with `claim_anonymous_ip`.
     ///
     /// # Events
     ///
@@ -1733,6 +1799,113 @@ impl IpRegistry {
             results.push_back(Self::get_anonymous_owner(env.clone(), hash));
         }
         results
+    }
+
+    // ── Issue #1376: Claiming anonymous commitments ───────────────────────────
+
+    /// Compute the blinded owner identifier for `owner` and `nonce`:
+    /// `sha256(owner.to_xdr() || nonce)`.
+    ///
+    /// Pass the result as `blinded_owner` to `batch_commit_ip_anonymous` if
+    /// you want to be able to take control of those IPs later with
+    /// [`Self::claim_anonymous_ip`]. Keep `nonce` secret until then: anyone who
+    /// knows both `owner` and `nonce` can link the batch to `owner`.
+    ///
+    /// This is a pure helper; it reads and writes no storage. Clients may
+    /// compute the same value off-chain.
+    pub fn compute_blinded_owner(env: Env, owner: Address, nonce: BytesN<32>) -> BytesN<32> {
+        let mut preimage = owner.to_xdr(&env);
+        preimage.append(&nonce.into());
+        env.crypto().sha256(&preimage).into()
+    }
+
+    /// Take control of an IP committed through `batch_commit_ip_anonymous`.
+    ///
+    /// An anonymous IP is stored with the contract address as a placeholder
+    /// owner, which cannot authorize anything, so `revoke_ip`, `transfer_ip`,
+    /// `renew_ip`, `set_ip_expiry` and `grant_ip_access` cannot run on it.
+    /// Claiming replaces the placeholder with `claimant`, after which all of
+    /// those operations work as for any other IP.
+    ///
+    /// The claimant proves control of the blinded owner by revealing `nonce`
+    /// such that `sha256(claimant.to_xdr() || nonce)` equals the stored
+    /// blinded owner (see [`Self::compute_blinded_owner`]). Because the
+    /// claimant's address is part of the preimage, a third party who sees the
+    /// nonce in a pending transaction cannot reuse it for their own address.
+    ///
+    /// Claiming is irreversible and gives up anonymity for this IP: it links
+    /// `claimant` to the blinded owner, and therefore to every other IP in
+    /// the same anonymous batch. Each IP in a batch is claimed separately.
+    ///
+    /// # Panics
+    ///
+    /// - `IpNotFound` if the IP does not exist.
+    /// - `Unauthorized` if the IP was not committed anonymously, has already
+    ///   been claimed, or `nonce` does not open the blinded owner for `claimant`.
+    /// - Auth error if `claimant` does not authorize the call.
+    ///
+    /// # Events
+    ///
+    /// Emits `("ip_claim", claimant)` with data `ip_id`.
+    pub fn claim_anonymous_ip(env: Env, ip_id: u64, claimant: Address, nonce: BytesN<32>) {
+        claimant.require_auth();
+
+        let mut record = require_ip_exists(&env, ip_id);
+
+        // Only unclaimed anonymous records still carry the placeholder owner.
+        if record.owner != env.current_contract_address() {
+            panic_with_error!(&env, ContractError::Unauthorized);
+        }
+
+        let blinded_owner: BytesN<32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AnonymousOwner(record.commitment_hash.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::Unauthorized));
+
+        let expected = Self::compute_blinded_owner(env.clone(), claimant.clone(), nonce);
+        if !constant_time_bytes_32_eq(&blinded_owner, &expected) {
+            panic_with_error!(&env, ContractError::Unauthorized);
+        }
+
+        record.owner = claimant.clone();
+        env.storage()
+            .persistent()
+            .set(&DataKey::IpRecord(ip_id), &record);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::IpRecord(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        let mut ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OwnerIps(claimant.clone()))
+            .unwrap_or(Vec::new(&env));
+        ids.push_back(ip_id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::OwnerIps(claimant.clone()), &ids);
+        env.storage().persistent().extend_ttl(
+            &DataKey::OwnerIps(claimant.clone()),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        env.storage().persistent().set(
+            &DataKey::CommitmentOwner(record.commitment_hash.clone()),
+            &claimant,
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey::CommitmentOwner(record.commitment_hash.clone()),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        env.events()
+            .publish((symbol_short!("ip_claim"), claimant.clone()), ip_id);
+
+        Self::append_audit_entry(&env, ip_id, symbol_short!("claimed"), claimant.clone());
+        Self::mark_merkle_root_stale(&env, &claimant);
     }
 
     // ── Issue #974: Merkle Tree Batch Commitments ──────────────────────────
@@ -3175,11 +3348,20 @@ impl IpRegistry {
 
     /// Returns the entropy-and-complexity strength score (0–100) for an IP commitment.
     ///
-    /// The score combines:
-    /// - **Byte entropy**: number of unique bytes in the 32-byte commitment hash,
-    ///   scaled to 0–50 (max 32 unique bytes → 50 points).
-    /// - **PoW difficulty**: the `pow_difficulty` used at commit time, scaled to 0–50
-    ///   (each difficulty bit contributes ~1.5625 points, capped at 50).
+    /// This is the only strength formula in the contract; it is implemented in
+    /// [`validation::commitment_strength`]:
+    ///
+    /// ```text
+    /// entropy_score = unique_bytes(commitment_hash) * 50 / 32      // 0–50
+    /// pow_score     = min(pow_difficulty, 32) * 50 / 32            // 0–50
+    /// strength      = min(100, entropy_score + pow_score)
+    /// ```
+    ///
+    /// - `unique_bytes` is the number of distinct byte values in the 32-byte
+    ///   commitment hash, a proxy for byte-level entropy.
+    /// - `pow_difficulty` is the leading-zero-bit difficulty recorded for the IP
+    ///   at commit time (`DataKey::IpPowDifficulty`), or 0 if none was recorded.
+    /// - Both divisions truncate.
     ///
     /// Weak commitments (e.g. all-same-byte hashes or zero PoW) score low; strong,
     /// high-entropy commitments with meaningful PoW score near 100.
@@ -3195,26 +3377,7 @@ impl IpRegistry {
             .get(&DataKey::IpPowDifficulty(ip_id))
             .unwrap_or(0u32);
 
-        let hash_bytes = record.commitment_hash.to_array();
-
-        // Count unique bytes as a proxy for byte-level entropy (0–32 unique values)
-        let mut seen = [false; 256];
-        for b in hash_bytes.iter() {
-            seen[*b as usize] = true;
-        }
-        let unique_bytes = seen.iter().filter(|&&v| v).count() as u32;
-
-        // Scale unique_bytes (0–32) to 0–50
-        let entropy_score = (unique_bytes * 50) / 32;
-
-        // Scale pow_difficulty to 0–50 (32 bits max → 50 points)
-        let pow_score = if pow_difficulty >= 32 {
-            50u32
-        } else {
-            (pow_difficulty * 50) / 32
-        };
-
-        (entropy_score + pow_score).min(100)
+        commitment_strength(&record.commitment_hash.to_array(), pow_difficulty)
     }
 
     // Returns the current protocol configuration.
@@ -6543,6 +6706,8 @@ impl IpRegistry {
             .persistent()
             .extend_ttl(&key, LEDGER_BUMP, LEDGER_BUMP);
 
+        Self::set_delegated_by(&env, &root_owner, &delegate_address, &delegator);
+
         env.storage().persistent().set(
             &DataKey::DelegateDepth(delegate_address.clone()),
             &new_depth,
@@ -6559,6 +6724,12 @@ impl IpRegistry {
         );
     }
 
+    /// Revoke `delegate_address`'s commitment authority under `owner`.
+    ///
+    /// #1375: the revocation cascades. Every delegate that was granted
+    /// authority by `delegate_address`, directly or further down the chain,
+    /// is revoked too, so no sub-delegate outlives its parent. One `revoke`
+    /// event is emitted per removed delegate.
     pub fn revoke_delegation(env: Env, owner: Address, delegate_address: Address) {
         owner.require_auth();
 
@@ -6569,10 +6740,35 @@ impl IpRegistry {
             .get(&key)
             .unwrap_or(Vec::new(&env));
 
+        // Collect the revoked delegate and all of its descendants. A record is
+        // a descendant if the address that granted it has already been revoked.
+        // Repeat until no new descendant is found; the chain depth is bounded
+        // by MAX_DELEGATION_DEPTH, so this terminates quickly.
+        let mut revoked: Vec<Address> = Vec::new(&env);
+        revoked.push_back(delegate_address.clone());
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for rec in delegates.iter() {
+                if revoked.contains(&rec.delegate) {
+                    continue;
+                }
+                let parent: Option<Address> = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::DelegatedBy(owner.clone(), rec.delegate.clone()));
+                if let Some(parent) = parent {
+                    if revoked.contains(&parent) {
+                        revoked.push_back(rec.delegate.clone());
+                        changed = true;
+                    }
+                }
+            }
+        }
+
         let mut updated = Vec::new(&env);
-        for i in 0..delegates.len() {
-            let rec = delegates.get(i).unwrap();
-            if rec.delegate != delegate_address {
+        for rec in delegates.iter() {
+            if !revoked.contains(&rec.delegate) {
                 updated.push_back(rec);
             }
         }
@@ -6582,12 +6778,25 @@ impl IpRegistry {
             .persistent()
             .extend_ttl(&key, LEDGER_BUMP, LEDGER_BUMP);
 
+        for addr in revoked.iter() {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::DelegateDepth(addr.clone()));
+            env.storage()
+                .persistent()
+                .remove(&DataKey::DelegatedBy(owner.clone(), addr.clone()));
+            env.events()
+                .publish((symbol_short!("revoke"), owner.clone()), addr);
+        }
+    }
+
+    /// #1375: Record which address granted `delegate` its authority under `root_owner`.
+    fn set_delegated_by(env: &Env, root_owner: &Address, delegate: &Address, delegator: &Address) {
+        let key = DataKey::DelegatedBy(root_owner.clone(), delegate.clone());
+        env.storage().persistent().set(&key, delegator);
         env.storage()
             .persistent()
-            .remove(&DataKey::DelegateDepth(delegate_address.clone()));
-
-        env.events()
-            .publish((symbol_short!("revoke"), owner), delegate_address);
+            .extend_ttl(&key, LEDGER_BUMP, LEDGER_BUMP);
     }
 
     pub fn is_delegate(env: Env, owner: Address, delegate_address: Address) -> bool {
@@ -7376,6 +7585,7 @@ impl IpRegistry {
                 delegate: delegate_address.clone(),
                 depth: new_depth,
             });
+            Self::set_delegated_by(&env, &root_owner, &delegate_address, &delegator);
 
             env.storage().persistent().set(
                 &DataKey::DelegateDepth(delegate_address.clone()),
@@ -10848,6 +11058,352 @@ mod tests {
 
         // id2 must appear in cat_into.
         assert!(in_into.contains(&id2));
+    }
+
+    // ── Issue #1375: revoke_delegation cascades to sub-delegates ─────────────
+
+    fn setup_delegation_chain(
+        env: &Env,
+    ) -> (IpRegistryClient<'_>, Address, Address, Address, Address) {
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(env, &contract_id);
+
+        let owner = Address::generate(env);
+        let top = Address::generate(env);
+        let middle = Address::generate(env);
+        let leaf = Address::generate(env);
+
+        // owner -> top -> middle -> leaf
+        client.delegate_commitment_authority(&owner, &owner, &top);
+        client.delegate_commitment_authority(&owner, &top, &middle);
+        client.delegate_commitment_authority(&owner, &middle, &leaf);
+        assert!(client.is_delegate(&owner, &top));
+        assert!(client.is_delegate(&owner, &middle));
+        assert!(client.is_delegate(&owner, &leaf));
+
+        (client, owner, top, middle, leaf)
+    }
+
+    #[test]
+    fn test_revoke_middle_delegate_revokes_leaf() {
+        let env = Env::default();
+        let (client, owner, top, middle, leaf) = setup_delegation_chain(&env);
+
+        client.revoke_delegation(&owner, &middle);
+
+        assert!(client.is_delegate(&owner, &top), "parent of revoked delegate is unaffected");
+        assert!(!client.is_delegate(&owner, &middle));
+        assert!(!client.is_delegate(&owner, &leaf), "leaf must be revoked with its parent");
+    }
+
+    #[test]
+    fn test_revoke_top_delegate_revokes_whole_chain() {
+        let env = Env::default();
+        let (client, owner, top, middle, leaf) = setup_delegation_chain(&env);
+
+        client.revoke_delegation(&owner, &top);
+
+        assert!(!client.is_delegate(&owner, &top));
+        assert!(!client.is_delegate(&owner, &middle));
+        assert!(!client.is_delegate(&owner, &leaf));
+    }
+
+    #[test]
+    fn test_revoke_delegation_leaves_sibling_branch_intact() {
+        let env = Env::default();
+        let (client, owner, top, middle, leaf) = setup_delegation_chain(&env);
+        let sibling = Address::generate(&env);
+        let sibling_child = Address::generate(&env);
+        client.delegate_commitment_authority(&owner, &owner, &sibling);
+        client.delegate_commitment_authority(&owner, &sibling, &sibling_child);
+
+        client.revoke_delegation(&owner, &top);
+
+        assert!(!client.is_delegate(&owner, &middle));
+        assert!(!client.is_delegate(&owner, &leaf));
+        assert!(client.is_delegate(&owner, &sibling));
+        assert!(client.is_delegate(&owner, &sibling_child));
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_cascaded_revoked_delegate_cannot_sub_delegate() {
+        let env = Env::default();
+        let (client, owner, _top, middle, leaf) = setup_delegation_chain(&env);
+
+        client.revoke_delegation(&owner, &middle);
+
+        // `leaf` lost its authority with `middle`, so it cannot grant any.
+        let other = Address::generate(&env);
+        client.delegate_commitment_authority(&owner, &leaf, &other);
+    }
+
+    // ── Issue #1376: anonymous IPs can be claimed and managed ─────────────────
+
+    fn commit_anonymous(
+        env: &Env,
+        client: &IpRegistryClient,
+        holder: &Address,
+        nonce: &BytesN<32>,
+        hash_byte: u8,
+    ) -> u64 {
+        let blinded = client.compute_blinded_owner(holder, nonce);
+        let hash = BytesN::from_array(env, &[hash_byte; 32]);
+        client
+            .batch_commit_ip_anonymous(&blinded, &Vec::from_array(env, [hash]))
+            .get(0)
+            .unwrap()
+    }
+
+    #[test]
+    fn test_anonymous_ip_can_be_claimed_then_revoked_by_holder() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let holder = Address::generate(&env);
+        let nonce = BytesN::from_array(&env, &[42u8; 32]);
+        let ip_id = commit_anonymous(&env, &client, &holder, &nonce, 0x11);
+        assert_eq!(client.get_ip(&ip_id).owner, contract_id);
+
+        client.claim_anonymous_ip(&ip_id, &holder, &nonce);
+
+        let record = client.get_ip(&ip_id);
+        assert_eq!(record.owner, holder);
+        assert!(client.list_ip_by_owner(&holder).contains(&ip_id));
+
+        client.revoke_ip(&ip_id);
+        assert!(client.get_ip(&ip_id).revoked);
+    }
+
+    #[test]
+    fn test_claimed_anonymous_ip_can_be_transferred() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let holder = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let nonce = BytesN::from_array(&env, &[7u8; 32]);
+        let ip_id = commit_anonymous(&env, &client, &holder, &nonce, 0x22);
+
+        client.claim_anonymous_ip(&ip_id, &holder, &nonce);
+        client.transfer_ip(&ip_id, &buyer);
+
+        assert_eq!(client.get_ip(&ip_id).owner, buyer);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #")]
+    fn test_claim_anonymous_ip_rejects_other_address_with_same_nonce() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let holder = Address::generate(&env);
+        let attacker = Address::generate(&env);
+        let nonce = BytesN::from_array(&env, &[9u8; 32]);
+        let ip_id = commit_anonymous(&env, &client, &holder, &nonce, 0x33);
+
+        client.claim_anonymous_ip(&ip_id, &attacker, &nonce);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #")]
+    fn test_claim_anonymous_ip_rejects_wrong_nonce() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let holder = Address::generate(&env);
+        let nonce = BytesN::from_array(&env, &[9u8; 32]);
+        let ip_id = commit_anonymous(&env, &client, &holder, &nonce, 0x44);
+
+        client.claim_anonymous_ip(&ip_id, &holder, &BytesN::from_array(&env, &[8u8; 32]));
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #")]
+    fn test_claim_anonymous_ip_cannot_be_claimed_twice() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let holder = Address::generate(&env);
+        let nonce = BytesN::from_array(&env, &[5u8; 32]);
+        let ip_id = commit_anonymous(&env, &client, &holder, &nonce, 0x55);
+
+        client.claim_anonymous_ip(&ip_id, &holder, &nonce);
+        client.claim_anonymous_ip(&ip_id, &holder, &nonce);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #")]
+    fn test_claim_anonymous_ip_rejects_non_anonymous_ip() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let nonce = BytesN::from_array(&env, &[1u8; 32]);
+        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[0x66; 32]), &0u32);
+
+        client.claim_anonymous_ip(&ip_id, &owner, &nonce);
+    }
+
+    // ── Issue #1377: batch commits record PoW difficulty and algorithm ───────
+
+    #[test]
+    fn test_batch_commit_sha256_commitment_verifies_with_sha256() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let secret = BytesN::from_array(&env, &[3u8; 32]);
+        let blinding = BytesN::from_array(&env, &[4u8; 32]);
+        let hash = commitment_hash(&env, &secret, &blinding, CommitmentAlgorithm::Sha256);
+
+        let ids = client.batch_commit_ip_with_algorithm(
+            &owner,
+            &Vec::from_array(&env, [hash]),
+            &0u32,
+            &CommitmentAlgorithm::Sha256,
+        );
+        let ip_id = ids.get(0).unwrap();
+
+        let stored: Option<CommitmentAlgorithm> = env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .get(&DataKey::CommitmentAlgorithm(ip_id))
+        });
+        assert_eq!(stored, Some(CommitmentAlgorithm::Sha256));
+        assert!(client.verify_commitment(&ip_id, &secret, &blinding));
+    }
+
+    #[test]
+    fn test_batch_commit_blake3_commitment_verifies_with_blake3() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let secret = BytesN::from_array(&env, &[5u8; 32]);
+        let blinding = BytesN::from_array(&env, &[6u8; 32]);
+        let hash = commitment_hash(&env, &secret, &blinding, CommitmentAlgorithm::Blake3);
+
+        let ids = client.batch_commit_ip_with_algorithm(
+            &owner,
+            &Vec::from_array(&env, [hash]),
+            &0u32,
+            &CommitmentAlgorithm::Blake3,
+        );
+
+        // Would be false if the batch path fell back to the default algorithm.
+        assert!(client.verify_commitment(&ids.get(0).unwrap(), &secret, &blinding));
+    }
+
+    #[test]
+    fn test_batch_commit_ip_records_default_metadata_like_commit_ip() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[0x77; 32]);
+        let ip_id = client
+            .batch_commit_ip(&owner, &Vec::from_array(&env, [hash]))
+            .get(0)
+            .unwrap();
+
+        let (pow, algo): (Option<u32>, Option<CommitmentAlgorithm>) =
+            env.as_contract(&contract_id, || {
+                (
+                    env.storage().persistent().get(&DataKey::IpPowDifficulty(ip_id)),
+                    env.storage().persistent().get(&DataKey::CommitmentAlgorithm(ip_id)),
+                )
+            });
+        assert_eq!(pow, Some(0));
+        assert_eq!(algo, Some(CommitmentAlgorithm::Pedersen));
+    }
+
+    #[test]
+    fn test_batch_and_single_commit_report_same_strength() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        // Two hashes with 16 leading zero bits and the same number of unique bytes.
+        let mut single_bytes = [0u8; 32];
+        let mut batch_bytes = [0u8; 32];
+        for i in 2..32 {
+            single_bytes[i] = i as u8;
+            batch_bytes[i] = (i + 100) as u8;
+        }
+        let single_id = client.commit_ip(&owner, &BytesN::from_array(&env, &single_bytes), &16u32);
+        let batch_id = client
+            .batch_commit_ip_with_algorithm(
+                &owner,
+                &Vec::from_array(&env, [BytesN::from_array(&env, &batch_bytes)]),
+                &16u32,
+                &CommitmentAlgorithm::Pedersen,
+            )
+            .get(0)
+            .unwrap();
+
+        assert_eq!(client.get_ip_strength(&single_id), client.get_ip_strength(&batch_id));
+        assert_eq!(client.get_ip_strength(&batch_id), commitment_strength(&batch_bytes, 16));
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #")]
+    fn test_batch_commit_with_algorithm_enforces_pow() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        client.batch_commit_ip_with_algorithm(
+            &owner,
+            &Vec::from_array(&env, [BytesN::from_array(&env, &[0xff; 32])]),
+            &8u32,
+            &CommitmentAlgorithm::Pedersen,
+        );
+    }
+
+    // ── Issue #1378: get_ip_strength uses the single documented formula ──────
+
+    #[test]
+    fn test_get_ip_strength_pins_formula() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        // bytes = 0,1,..,15,0,1,..,15 -> 16 unique bytes, 15 leading zero bits.
+        let mut bytes = [0u8; 32];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = (i % 16) as u8;
+        }
+        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &bytes), &8u32);
+
+        // entropy = 16 * 50 / 32 = 25; pow = 8 * 50 / 32 = 12
+        assert_eq!(client.get_ip_strength(&ip_id), 37);
+        assert_eq!(client.get_ip_strength(&ip_id), commitment_strength(&bytes, 8));
     }
 }
 
