@@ -31,25 +31,27 @@ run_test() {
   local name=$1
   local cmd=$2
 
-  echo -n "Testing: $name ... "
+  # Progress goes to stderr so stdout carries only the numeric duration,
+  # which the caller captures.
+  echo -n "Testing: $name ... " >&2
   local test_start=$(date +%s)
 
   if eval "$cmd" > /dev/null 2>&1; then
-    echo "✓"
+    echo "✓" >&2
     local test_end=$(date +%s)
     echo "$((test_end - test_start))"
   else
-    echo "✗"
+    echo "✗" >&2
     echo "0"
   fi
 }
 
 declare -a test_times
 
-test_times+=($(run_test "IP Registration" "echo 'test'"))
-test_times+=($(run_test "IP Retrieval" "echo 'test'"))
-test_times+=($(run_test "Swap Initiation" "echo 'test'"))
-test_times+=($(run_test "Stats Endpoint" "echo 'test'"))
+test_times+=("$(run_test "IP Registration" "echo 'test'")")
+test_times+=("$(run_test "IP Retrieval" "echo 'test'")")
+test_times+=("$(run_test "Swap Initiation" "echo 'test'")")
+test_times+=("$(run_test "Stats Endpoint" "echo 'test'")")
 
 echo ""
 echo "=== Test Execution Summary ==="
