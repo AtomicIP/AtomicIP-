@@ -23,6 +23,11 @@ describe("assessRiskFactor", () => {
   test("low reputation increases risk", () => {
     expect(assessRiskFactor({ swapValue: 1000, sellerReputationScore: 200 })).toBeGreaterThan(1.0);
   });
+  test("swapValue drives the volume-based risk adjustment", () => {
+    const base = assessRiskFactor({ swapValue: 1000 });
+    expect(assessRiskFactor({ swapValue: 60_000 })).toBeCloseTo(base + 0.5, 5);
+    expect(assessRiskFactor({ swapValue: 250_000 })).toBeCloseTo(base + 1.0, 5);
+  });
   test("high reputation decreases risk", () => {
     expect(assessRiskFactor({ swapValue: 1000, sellerReputationScore: 900 })).toBeLessThan(1.0);
   });

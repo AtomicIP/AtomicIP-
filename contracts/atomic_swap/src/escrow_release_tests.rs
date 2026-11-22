@@ -69,7 +69,7 @@ mod tests {
 
         let contract_id = env.register(AtomicSwap, ());
         let client = AtomicSwapClient::new(&env, &contract_id);
-        client.initialize(&registry_id);
+        client.initialize(&<soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env), &registry_id);
         client.set_admin(&admin);
 
         let timeout = env.ledger().timestamp() + 100;
@@ -263,7 +263,7 @@ mod tests {
 
         let contract_id = env.register(AtomicSwap, ());
         let client = AtomicSwapClient::new(&env, &contract_id);
-        client.initialize(&registry_id);
+        client.initialize(&<soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env), &registry_id);
         let swap_id = client.initiate_swap(
             &token_id, &ip_id, &seller, &PRICE, &buyer, &0u32, &None, &0i128, &false,
         );

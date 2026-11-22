@@ -1,6 +1,8 @@
 // Design rationale: docs/adr/0003-stellar-soroban-for-settlement.md
 #![no_std]
 #![allow(deprecated)]
+#[cfg(test)]
+extern crate std;
 mod registry;
 mod swap;
 mod upgrade;
@@ -9,24 +11,18 @@ mod price_oracle;
 mod types;
 mod utils;
 pub mod cross_contract;
-// Temporarily disabled: does not compile yet (pre-existing errors). Re-enable after fixing.
-// #[cfg(test)]
-// mod cross_contract_tests;
-// Temporarily disabled: does not compile yet (pre-existing errors). Re-enable after fixing.
-// #[cfg(test)]
-// mod oracle_tests;
-// Temporarily disabled: does not compile yet (pre-existing errors). Re-enable after fixing.
-// #[cfg(test)]
-// mod treasury_validation_tests;
-// Temporarily disabled: does not compile yet (pre-existing errors). Re-enable after fixing.
-// #[cfg(test)]
-// mod swap_fuzz_tests;
-// Temporarily disabled: does not compile yet (pre-existing errors). Re-enable after fixing.
-// #[cfg(test)]
-// mod swap_multisig_requirement_tests;
-// Temporarily disabled: does not compile yet (pre-existing errors). Re-enable after fixing.
-// #[cfg(test)]
-// mod swap_collateral_tests;
+#[cfg(test)]
+mod cross_contract_tests;
+#[cfg(test)]
+mod oracle_tests;
+#[cfg(test)]
+mod treasury_validation_tests;
+#[cfg(test)]
+mod swap_fuzz_tests;
+#[cfg(test)]
+mod swap_multisig_requirement_tests;
+#[cfg(test)]
+mod swap_collateral_tests;
 #[cfg(test)]
 mod contingency_tests;
 #[cfg(test)]
@@ -7172,7 +7168,7 @@ mod installment_tests {
 
         let contract_id = env.register(AtomicSwap, ());
         let client = AtomicSwapClient::new(&env, &contract_id);
-        client.initialize(&registry_id);
+        client.initialize(&<soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env), &registry_id);
 
         let swap_id =
             client.initiate_swap_installment(&token_id, &ip_id, &seller, &600_i128, &buyer, &3_u32);
@@ -7214,7 +7210,7 @@ mod installment_tests {
 
         let contract_id = env.register(AtomicSwap, ());
         let client = AtomicSwapClient::new(&env, &contract_id);
-        client.initialize(&registry_id);
+        client.initialize(&<soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env), &registry_id);
 
         let swap_id =
             client.initiate_swap_installment(&token_id, &ip_id, &seller, &300_i128, &buyer, &3_u32);
@@ -7269,7 +7265,7 @@ mod installment_tests {
 
         let contract_id = env.register(AtomicSwap, ());
         let client = AtomicSwapClient::new(&env, &contract_id);
-        client.initialize(&registry_id);
+        client.initialize(&<soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env), &registry_id);
 
         // num_installments = 0 should panic
         client.initiate_swap_installment(&token_id, &ip_id, &seller, &300_i128, &buyer, &0_u32);
@@ -7667,7 +7663,7 @@ mod insurance_reserve_tests {
 
         let contract_id = env.register(AtomicSwap, ());
         let client = AtomicSwapClient::new(env, &contract_id);
-        client.initialize(&registry_id);
+        client.initialize(&<soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env), &registry_id);
 
         let swap_a = client.initiate_swap(
             &token, &ip_a, &seller, &PRICE, &buyer_a, &0u32, &None, &0i128, &true,
