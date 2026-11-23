@@ -738,6 +738,16 @@ pub enum AlertmanagerStatus {
     Resolved,
 }
 
+impl AlertmanagerStatus {
+    /// Lowercase wire representation used by Alertmanager.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AlertmanagerStatus::Firing => "firing",
+            AlertmanagerStatus::Resolved => "resolved",
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct AlertmanagerAlert {
     pub status: AlertmanagerStatus,

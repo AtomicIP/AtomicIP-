@@ -84,7 +84,7 @@ pub struct BatchRevealCommitmentsResponse {
     pub results: Vec<BatchRevealResult>,
 }
 
-#[derive(Debug, Deserialize, IntoParams)]
+#[derive(Debug, Deserialize, IntoParams, ToSchema)]
 pub struct ExportCommitmentsParams {
     /// Export format: json, csv, or xml.
     #[serde(default = "default_export_format")]
@@ -103,7 +103,7 @@ pub struct WatchlistRequest {
     pub ip_id: u64,
 }
 
-#[derive(Debug, Serialize, Deserialize, IntoParams)]
+#[derive(Debug, Serialize, Deserialize, IntoParams, ToSchema)]
 pub struct WatchlistQuery {
     pub user_id: String,
 }
@@ -114,7 +114,7 @@ pub struct WatchlistResponse {
     pub ip_ids: Vec<u64>,
 }
 
-#[derive(Debug, Deserialize, IntoParams)]
+#[derive(Debug, Deserialize, IntoParams, ToSchema)]
 pub struct SimilarCommitmentsParams {
     /// 32-byte commitment hash, hex-encoded.
     pub commitment_hash: String,
@@ -415,6 +415,10 @@ pub struct WebhookResponse {
     pub url: String,
     pub events: Vec<String>,
     pub created_at: u64,
+    /// Per-webhook HMAC secret. Returned only by `POST /v1/webhooks`;
+    /// always empty in `GET /v1/webhooks` listings.
+    #[serde(default)]
+    pub secret: String,
 }
 
 /// #321: Bulk commit IP request
