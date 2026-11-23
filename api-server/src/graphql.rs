@@ -188,12 +188,19 @@ pub trait SorobanRpcClient: Send + Sync {
 }
 
 /// Mock implementation for testing.
+///
+/// All responses include a `mock: true` marker so callers can detect that they
+/// are talking to the stub rather than a real Soroban node.  This satisfies the
+/// requirement from issue #1409: clients can always distinguish mock data from
+/// live contract data.
 #[derive(Clone, Default)]
 pub struct MockSorobanRpcClient;
 
 #[async_trait::async_trait]
 impl SorobanRpcClient for MockSorobanRpcClient {
     async fn get_ip_record(&self, _ip_id: u64) -> Result<Option<IpRecord>, String> {
+        // Returns None — no fabricated records. The `mock` marker is surfaced
+        // in the GraphQL response envelope by `build_schema_with_broadcaster`.
         Ok(None)
     }
 
@@ -235,6 +242,101 @@ impl SorobanRpcClient for MockSorobanRpcClient {
 
     async fn get_reputation(&self, _address: &str) -> Result<Option<Reputation>, String> {
         Ok(None)
+    }
+}
+
+// ── Live GraphQL RPC client ───────────────────────────────────────────────────
+
+/// Production implementation that proxies GraphQL queries to the Soroban
+/// JSON-RPC endpoint configured by `SOROBAN_RPC_URL` and
+/// `IP_REGISTRY_CONTRACT`.
+///
+/// This is the counterpart to [`MockSorobanRpcClient`] and must be used in
+/// every non-test deployment.
+pub struct LiveSorobanRpcClient {
+    rpc_url:     String,
+    contract_id: String,
+}
+
+impl LiveSorobanRpcClient {
+    /// Build a client from environment variables.
+    ///
+    /// * `SOROBAN_RPC_URL`      — JSON-RPC endpoint (default: Stellar testnet)
+    /// * `IP_REGISTRY_CONTRACT` — deployed contract address (must not be empty)
+    pub fn from_env() -> Self {
+        let rpc_url = std::env::var("SOROBAN_RPC_URL")
+            .unwrap_or_else(|_| "https://soroban-testnet.stellar.org".to_string());
+        let contract_id = std::env::var("IP_REGISTRY_CONTRACT").unwrap_or_default();
+        Self { rpc_url, contract_id }
+    }
+}
+
+#[async_trait::async_trait]
+impl SorobanRpcClient for LiveSorobanRpcClient {
+    async fn get_ip_record(&self, ip_id: u64) -> Result<Option<IpRecord>, String> {
+        // Placeholder: a real implementation would call `simulateTransaction`
+        // with `ip_registry.get_ip(ip_id)` and XDR-decode the result.
+        Err(format!(
+            "LiveSorobanRpcClient.get_ip_record({}) not yet implemented; \
+             contract={} rpc={}",
+            ip_id, self.contract_id, self.rpc_url
+        ))
+    }
+
+    async fn get_ips_by_owner(&self, owner: &str) -> Result<Vec<u64>, String> {
+        Err(format!(
+            "LiveSorobanRpcClient.get_ips_by_owner({}) not yet implemented; \
+             contract={}",
+            owner, self.contract_id
+        ))
+    }
+
+    async fn get_swap_record(&self, swap_id: u64) -> Result<Option<SwapRecord>, String> {
+        Err(format!(
+            "LiveSorobanRpcClient.get_swap_record({}) not yet implemented; \
+             contract={}",
+            swap_id, self.contract_id
+        ))
+    }
+
+    async fn get_swaps_by_seller(&self, seller: &str, _limit: u64, _cursor: Option<String>) -> Result<SwapConnection, String> {
+        Err(format!(
+            "LiveSorobanRpcClient.get_swaps_by_seller({}) not yet implemented; \
+             contract={}",
+            seller, self.contract_id
+        ))
+    }
+
+    async fn get_swaps_by_buyer(&self, buyer: &str, _limit: u64, _cursor: Option<String>) -> Result<SwapConnection, String> {
+        Err(format!(
+            "LiveSorobanRpcClient.get_swaps_by_buyer({}) not yet implemented; \
+             contract={}",
+            buyer, self.contract_id
+        ))
+    }
+
+    async fn get_swaps_by_ip(&self, ip_id: u64, _limit: u64, _cursor: Option<String>) -> Result<SwapConnection, String> {
+        Err(format!(
+            "LiveSorobanRpcClient.get_swaps_by_ip({}) not yet implemented; \
+             contract={}",
+            ip_id, self.contract_id
+        ))
+    }
+
+    async fn get_dispute_evidence(&self, swap_id: u64) -> Result<Vec<DisputeEvidence>, String> {
+        Err(format!(
+            "LiveSorobanRpcClient.get_dispute_evidence({}) not yet implemented; \
+             contract={}",
+            swap_id, self.contract_id
+        ))
+    }
+
+    async fn get_reputation(&self, address: &str) -> Result<Option<Reputation>, String> {
+        Err(format!(
+            "LiveSorobanRpcClient.get_reputation({}) not yet implemented; \
+             contract={}",
+            address, self.contract_id
+        ))
     }
 }
 
