@@ -131,7 +131,10 @@ pub fn register(url: String, events: Vec<String>) -> WebhookConfig {
             .as_secs(),
     };
     REGISTRY.insert(config.id, config.clone());
-    info!(webhook_id = %config.id, url = %config.url, "Webhook registered");
+    // Paths, queries, and userinfo can contain webhook credentials.
+    let parsed_url = reqwest::Url::parse(&config.url).ok();
+    let host = parsed_url.as_ref().and_then(|url| url.host_str());
+    info!(webhook_id = %config.id, host, "Webhook registered");
     config
 }
 
@@ -199,7 +202,7 @@ async fn deliver_with_retry(config: &WebhookConfig, payload: &WebhookPayload) {
         }
 
         match deliver(&config.url, payload).await {
-            Ok(status) if status.is_redirect() => {
+            Ok(status) if status.is_redirection() => {
                 warn!(
                     webhook_id = %config.id,
                     url = %config.url,
@@ -263,6 +266,71 @@ async fn deliver(url: &str, payload: &WebhookPayload) -> Result<StatusCode, reqw
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone)]
+    struct LogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn registration_logs_host_without_url_secrets() {
+        for (url, host) in [
+            (
+                "https://private-user:private-password@hooks.example.com:8443/secret-path?token=secret-query#secret-fragment",
+                Some("hooks.example.com"),
+            ),
+            (
+                "http://8.8.8.8/secret-path?token=secret-query#secret-fragment",
+                Some("8.8.8.8"),
+            ),
+            ("invalid-url-secret", None),
+        ] {
+            let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let writer = LogWriter(buffer.clone());
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .with_writer(move || writer.clone())
+                .finish();
+            let events = vec![SWAP_STATUS_CHANGED_EVENT.to_string()];
+            let config = tracing::subscriber::with_default(subscriber, || {
+                register(url.to_string(), events.clone())
+            });
+            // Registration must still retain the original delivery configuration.
+            assert_eq!(config.url, url);
+            assert_eq!(config.events, events);
+            assert!(unregister(config.id));
+
+            let logs = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+            assert!(logs.contains("Webhook registered"));
+            assert!(logs.contains(&config.id.to_string()));
+            assert!(!logs.contains(url), "registration log leaked the full URL");
+            if let Some(host) = host {
+                assert!(logs.contains(&format!("host=\"{host}\"")));
+            }
+            for secret in [
+                "private-user",
+                "private-password",
+                ":8443",
+                "secret-path",
+                "secret-query",
+                "secret-fragment",
+                "invalid-url-secret",
+            ] {
+                assert!(!logs.contains(secret), "registration log leaked {secret}");
+            }
+        }
+    }
 
     fn blocked(s: &str) -> bool {
         is_blocked_ip(s.parse().unwrap())
@@ -348,7 +416,7 @@ mod tests {
         let status = deliver(&format!("http://{addr}/hook"), &payload)
             .await
             .unwrap();
-        assert!(status.is_redirect());
+        assert!(status.is_redirection());
         assert_eq!(status.as_u16(), 302);
     }
 }
