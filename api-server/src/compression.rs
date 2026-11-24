@@ -201,7 +201,7 @@ mod tests {
 
     #[test]
     fn test_invalid_content_encoding_header_returns_error() {
-        assert!(parse_content_encoding("gzip\\ninvalid").is_err());
+        assert!(parse_content_encoding("gzip\ninvalid").is_err());
     }
 
     #[test]
