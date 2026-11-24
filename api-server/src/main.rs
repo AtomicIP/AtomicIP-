@@ -441,8 +441,8 @@ async fn main() {
         .route("/swap/{swap_id}/reveal",          post(handlers::reveal_key))
         .route("/swap/{swap_id}/cancel",          post(handlers::cancel_swap))
         .route("/swap/{swap_id}/cancel-expired",  post(handlers::cancel_expired_swap))
-        // #1098: collections identify the caller by the verified X-Public-Key header,
-        // so every collection route, reads included, must be signed.
+        // #1098/#1405: collection identity comes from the signing middleware,
+        // so every collection route, reads included, must require a signature.
         .route("/collections",                          post(collections::create_collection).get(collections::list_collections))
         .route("/collections/{id}",                     get(collections::get_collection).delete(collections::delete_collection))
         .route("/collections/{id}/ips",                 post(collections::add_collection_ips))
