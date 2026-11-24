@@ -1,7 +1,7 @@
 use axum::{
     body::Body,
     extract::Request,
-    http::HeaderMap,
+    http::{HeaderMap, HeaderValue},
     middleware::Next,
     response::Response,
 };
@@ -49,6 +49,11 @@ pub fn compress_deflate(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
     encoder.finish()
 }
 
+/// Parse a Content-Encoding header value without panicking on invalid input.
+fn parse_content_encoding(name: &str) -> Result<HeaderValue, axum::http::header::InvalidHeaderValue> {
+    HeaderValue::from_bytes(name.as_bytes())
+}
+
 /// Middleware to handle Accept-Encoding header and apply compression
 pub async fn compression_middleware(
     headers: HeaderMap,
@@ -62,9 +67,11 @@ pub async fn compression_middleware(
 
     let response = next.run(req).await;
 
-    // Add Vary header to indicate response varies by Accept-Encoding
+    // Add Vary header to indicate response varies by Accept-Encoding.
     let (mut parts, body) = response.into_parts();
-    parts.headers.insert("Vary", "Accept-Encoding".parse().unwrap());
+    parts
+        .headers
+        .insert("Vary", HeaderValue::from_static("Accept-Encoding"));
 
     let encoding = if accept_encoding.contains("br") {
         Some(("br", compress_brotli as fn(&[u8]) -> Result<Vec<u8>, std::io::Error>))
@@ -104,9 +111,21 @@ pub async fn compression_middleware(
         return Response::from_parts(parts, Body::from(bytes));
     }
 
+    let content_encoding = match parse_content_encoding(name) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                encoding = name,
+                "invalid Content-Encoding header; returning uncompressed response"
+            );
+            return Response::from_parts(parts, Body::from(bytes));
+        }
+    };
+
     match compress(&bytes) {
         Ok(compressed) => {
-            parts.headers.insert("Content-Encoding", name.parse().unwrap());
+            parts.headers.insert("Content-Encoding", content_encoding);
             parts.headers.remove("Content-Length");
             Response::from_parts(parts, Body::from(compressed))
         }
@@ -170,6 +189,19 @@ mod tests {
     #[test]
     fn test_is_compression_unsupported() {
         assert!(!is_compression_supported("unknown"));
+    }
+
+    #[test]
+    fn test_content_encoding_header_for_each_supported_encoding() {
+        for encoding in ["gzip", "br", "deflate"] {
+            let header = parse_content_encoding(encoding).expect("supported encoding is valid");
+            assert_eq!(header.to_str().expect("header is valid text"), encoding);
+        }
+    }
+
+    #[test]
+    fn test_invalid_content_encoding_header_returns_error() {
+        assert!(parse_content_encoding("gzip\\ninvalid").is_err());
     }
 
     #[test]
