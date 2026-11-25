@@ -55,8 +55,8 @@ pub async fn erase_user_data(user_id: &str) -> Result<UserErasureReport, String>
     // Collect owned IPs first so the cascade has a fixed set to work from.
     let owned_ids: BTreeSet<u64> = COMMITMENT_INDEX
         .iter()
-        .filter(|entry| entry.value().owner == user_id)
-        .map(|entry| *entry.key())
+        .filter(|(_, record)| record.owner == user_id)
+        .map(|(ip_id, _)| ip_id)
         .collect();
 
     for ip_id in &owned_ids {
@@ -144,7 +144,7 @@ async fn count_remaining_references(
 
     remaining += COMMITMENT_INDEX
         .iter()
-        .filter(|entry| entry.value().owner == user_id)
+        .filter(|(_, record)| record.owner == user_id)
         .count();
 
     remaining += owned_ids

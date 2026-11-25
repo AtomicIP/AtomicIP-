@@ -982,7 +982,11 @@ impl RateLimitMiddleware {
         if self.config.trust_proxy_headers {
             if let Some(peer) = peer {
                 if self.is_trusted_proxy(peer) {
-                    return parse_forwarded_ip(req).or(Some(peer));
+                    return match parse_forwarded_ip(req) {
+                        ForwardedIp::Valid(ip) => Some(ip),
+                        // No usable forwarding header: fall back to the peer.
+                        ForwardedIp::Absent | ForwardedIp::Malformed => Some(peer),
+                    };
                 }
             }
         }
