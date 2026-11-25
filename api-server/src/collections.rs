@@ -157,16 +157,43 @@ fn readable<'a>(store: &'a Store, id: &str, who: &str) -> Result<&'a StoredColle
         .ok_or(CollectionError::NotFound)
 }
 
+/// Verifies that every IP ID in `ip_ids` is owned by `owner`.
+/// `lookup` returns `Some(owner_key)` for a known IP, `None` for an unknown one.
+fn validate_ip_ownership(
+    owner: &str,
+    ip_ids: &BTreeSet<u64>,
+    lookup: &dyn Fn(u64) -> Option<String>,
+) -> Result<(), CollectionError> {
+    for &ip_id in ip_ids {
+        match lookup(ip_id) {
+            None => {
+                return Err(CollectionError::Invalid(format!(
+                    "IP {ip_id} does not exist"
+                )))
+            }
+            Some(ref actual_owner) if actual_owner != owner => {
+                return Err(CollectionError::Invalid(format!(
+                    "IP {ip_id} is not owned by the caller"
+                )))
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn create(
     store: &mut Store,
     owner: &str,
     name: &str,
     ip_ids: &[u64],
     created_at: u64,
+    lookup: &dyn Fn(u64) -> Option<String>,
 ) -> Result<Collection, CollectionError> {
     let name = validate_name(name)?;
     let ip_ids: BTreeSet<u64> = ip_ids.iter().copied().collect();
     check_capacity(ip_ids.len())?;
+    validate_ip_ownership(owner, &ip_ids, lookup)?;
     let id = uuid::Uuid::new_v4().to_string();
     let stored = StoredCollection {
         id: id.clone(),
@@ -195,9 +222,17 @@ fn list_for(store: &Store, who: &str) -> Vec<Collection> {
     visible.into_iter().map(Collection::from).collect()
 }
 
-fn add_ips(store: &mut Store, id: &str, who: &str, ip_ids: &[u64]) -> Result<Collection, CollectionError> {
+fn add_ips(
+    store: &mut Store,
+    id: &str,
+    who: &str,
+    ip_ids: &[u64],
+    lookup: &dyn Fn(u64) -> Option<String>,
+) -> Result<Collection, CollectionError> {
+    let new_ids: BTreeSet<u64> = ip_ids.iter().copied().collect();
+    validate_ip_ownership(who, &new_ids, lookup)?;
     let collection = owned_mut(store, id, who)?;
-    let merged: BTreeSet<u64> = collection.ip_ids.iter().copied().chain(ip_ids.iter().copied()).collect();
+    let merged: BTreeSet<u64> = collection.ip_ids.iter().copied().chain(new_ids).collect();
     check_capacity(merged.len())?;
     collection.ip_ids = merged;
     Ok(Collection::from(&*collection))
@@ -503,7 +538,7 @@ mod tests {
     #[test]
     fn owner_can_read_their_collection() {
         let mut store = Store::new();
-        let created = create(&mut store, &key(1), "  Patents  ", &[], 10).unwrap();
+        let created = create(&mut store, &key(1), "  Patents  ", &[], 10, &owner_lookup(1)).unwrap();
         assert_eq!(created.name, "Patents");
         assert_eq!(get(&store, &created.id, &key(1)).unwrap(), created);
     }
@@ -511,18 +546,18 @@ mod tests {
     #[test]
     fn stranger_gets_not_found() {
         let mut store = Store::new();
-        let created = create(&mut store, &key(1), "Patents", &[], 10).unwrap();
+        let created = create(&mut store, &key(1), "Patents", &[], 10, &owner_lookup(1)).unwrap();
         assert_eq!(get(&store, &created.id, &key(2)), Err(CollectionError::NotFound));
     }
 
     #[test]
     fn shared_user_can_read_but_not_change() {
         let mut store = Store::new();
-        let created = create(&mut store, &key(1), "Patents", &[1], 10).unwrap();
+        let created = create(&mut store, &key(1), "Patents", &[1], 10, &owner_lookup(1)).unwrap();
         share(&mut store, &created.id, &key(1), &key(2)).unwrap();
         assert!(get(&store, &created.id, &key(2)).is_ok());
         assert_eq!(
-            add_ips(&mut store, &created.id, &key(2), &[9]),
+            add_ips(&mut store, &created.id, &key(2), &[9], &owner_lookup(2)),
             Err(CollectionError::Forbidden)
         );
         assert_eq!(
@@ -534,7 +569,7 @@ mod tests {
     #[test]
     fn unsharing_revokes_read_access() {
         let mut store = Store::new();
-        let created = create(&mut store, &key(1), "Patents", &[], 10).unwrap();
+        let created = create(&mut store, &key(1), "Patents", &[], 10, &owner_lookup(1)).unwrap();
         share(&mut store, &created.id, &key(1), &key(2)).unwrap();
         unshare(&mut store, &created.id, &key(1), &key(2)).unwrap();
         assert_eq!(get(&store, &created.id, &key(2)), Err(CollectionError::NotFound));
@@ -543,7 +578,7 @@ mod tests {
     #[test]
     fn only_owner_can_share() {
         let mut store = Store::new();
-        let created = create(&mut store, &key(1), "Patents", &[], 10).unwrap();
+        let created = create(&mut store, &key(1), "Patents", &[], 10, &owner_lookup(1)).unwrap();
         share(&mut store, &created.id, &key(1), &key(2)).unwrap();
         assert_eq!(
             share(&mut store, &created.id, &key(2), &key(3)),
@@ -554,15 +589,21 @@ mod tests {
     #[test]
     fn create_rejects_blank_and_overlong_names() {
         let mut store = Store::new();
-        assert!(matches!(create(&mut store, &key(1), "   ", &[], 0), Err(CollectionError::Invalid(_))));
+        assert!(matches!(
+            create(&mut store, &key(1), "   ", &[], 0, &owner_lookup(1)),
+            Err(CollectionError::Invalid(_))
+        ));
         let long = "x".repeat(MAX_NAME_LENGTH + 1);
-        assert!(matches!(create(&mut store, &key(1), &long, &[], 0), Err(CollectionError::Invalid(_))));
+        assert!(matches!(
+            create(&mut store, &key(1), &long, &[], 0, &owner_lookup(1)),
+            Err(CollectionError::Invalid(_))
+        ));
     }
 
     #[test]
     fn ip_ids_are_deduplicated_and_sorted() {
         let mut store = Store::new();
-        let created = create(&mut store, &key(1), "Patents", &[3, 1, 3], 0).unwrap();
+        let created = create(&mut store, &key(1), "Patents", &[3, 1, 3], 0, &owner_lookup(1)).unwrap();
         assert_eq!(created.ip_ids, vec![1, 3]);
     }
 
@@ -571,7 +612,7 @@ mod tests {
         let mut store = Store::new();
         let too_many: Vec<u64> = (0..=MAX_IPS_PER_COLLECTION as u64).collect();
         assert!(matches!(
-            create(&mut store, &key(1), "Big", &too_many, 0),
+            create(&mut store, &key(1), "Big", &too_many, 0, &owner_lookup(1)),
             Err(CollectionError::Invalid(_))
         ));
     }
@@ -579,8 +620,8 @@ mod tests {
     #[test]
     fn bulk_add_and_remove_members() {
         let mut store = Store::new();
-        let created = create(&mut store, &key(1), "Patents", &[1, 2], 0).unwrap();
-        let added = add_ips(&mut store, &created.id, &key(1), &[5]).unwrap();
+        let created = create(&mut store, &key(1), "Patents", &[1, 2], 0, &owner_lookup(1)).unwrap();
+        let added = add_ips(&mut store, &created.id, &key(1), &[5], &owner_lookup(1)).unwrap();
         assert_eq!(added.ip_ids, vec![1, 2, 5]);
         let removed = remove_ip(&mut store, &created.id, &key(1), 1).unwrap();
         assert_eq!(removed.ip_ids, vec![2, 5]);
@@ -591,7 +632,7 @@ mod tests {
     #[test]
     fn delete_removes_the_collection() {
         let mut store = Store::new();
-        let created = create(&mut store, &key(1), "Patents", &[], 0).unwrap();
+        let created = create(&mut store, &key(1), "Patents", &[], 0, &owner_lookup(1)).unwrap();
         delete(&mut store, &created.id, &key(1)).unwrap();
         assert_eq!(get(&store, &created.id, &key(1)), Err(CollectionError::NotFound));
     }
@@ -599,9 +640,9 @@ mod tests {
     #[test]
     fn list_includes_owned_and_shared_only() {
         let mut store = Store::new();
-        let owned = create(&mut store, &key(1), "Mine", &[], 1).unwrap();
-        let shared = create(&mut store, &key(2), "Theirs", &[], 2).unwrap();
-        create(&mut store, &key(3), "Private", &[], 3).unwrap();
+        let owned = create(&mut store, &key(1), "Mine", &[], 1, &owner_lookup(1)).unwrap();
+        let shared = create(&mut store, &key(2), "Theirs", &[], 2, &owner_lookup(2)).unwrap();
+        create(&mut store, &key(3), "Private", &[], 3, &owner_lookup(3)).unwrap();
         share(&mut store, &shared.id, &key(2), &key(1)).unwrap();
         let visible: Vec<String> = list_for(&store, &key(1)).into_iter().map(|c| c.id).collect();
         assert_eq!(visible, vec![owned.id, shared.id]);
@@ -610,7 +651,7 @@ mod tests {
     #[test]
     fn share_rejects_invalid_and_self_targets() {
         let mut store = Store::new();
-        let created = create(&mut store, &key(1), "Patents", &[], 0).unwrap();
+        let created = create(&mut store, &key(1), "Patents", &[], 0, &owner_lookup(1)).unwrap();
         assert!(matches!(
             share(&mut store, &created.id, &key(1), "not-a-key"),
             Err(CollectionError::Invalid(_))
@@ -624,7 +665,7 @@ mod tests {
     #[test]
     fn summary_counts_members_revocations_and_tags() {
         let mut store = Store::new();
-        let created = create(&mut store, &key(1), "Patents", &[1, 2, 9], 0).unwrap();
+        let created = create(&mut store, &key(1), "Patents", &[1, 2, 9], 0, &owner_lookup(1)).unwrap();
         let index = vec![ip(1, false), ip(2, true)];
         let tags = |id: u64| match id {
             1 => vec!["art".to_string()],
@@ -647,10 +688,52 @@ mod tests {
     #[test]
     fn summary_requires_read_access() {
         let mut store = Store::new();
-        let created = create(&mut store, &key(1), "Patents", &[1], 0).unwrap();
+        let created = create(&mut store, &key(1), "Patents", &[1], 0, &owner_lookup(1)).unwrap();
         assert_eq!(
             summary(&store, &created.id, &key(2), &[], &no_tags),
             Err(CollectionError::NotFound)
         );
+    }
+
+    #[test]
+    fn create_rejects_ip_owned_by_another() {
+        let mut store = Store::new();
+        // lookup says IP 7 belongs to key(2), not key(1)
+        let lookup = |ip_id: u64| if ip_id == 7 { Some(key(2)) } else { Some(key(1)) };
+        assert!(matches!(
+            create(&mut store, &key(1), "Patents", &[7], 0, &lookup),
+            Err(CollectionError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn create_rejects_nonexistent_ip() {
+        let mut store = Store::new();
+        assert!(matches!(
+            create(&mut store, &key(1), "Patents", &[42], 0, &empty_lookup),
+            Err(CollectionError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn add_ips_rejects_ip_owned_by_another() {
+        let mut store = Store::new();
+        let created = create(&mut store, &key(1), "Patents", &[], 0, &owner_lookup(1)).unwrap();
+        // key(2) owns IP 5, key(1) is the caller
+        let lookup = |ip_id: u64| if ip_id == 5 { Some(key(2)) } else { Some(key(1)) };
+        assert!(matches!(
+            add_ips(&mut store, &created.id, &key(1), &[5], &lookup),
+            Err(CollectionError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn add_ips_rejects_nonexistent_ip() {
+        let mut store = Store::new();
+        let created = create(&mut store, &key(1), "Patents", &[], 0, &owner_lookup(1)).unwrap();
+        assert!(matches!(
+            add_ips(&mut store, &created.id, &key(1), &[99], &empty_lookup),
+            Err(CollectionError::Invalid(_))
+        ));
     }
 }
