@@ -295,11 +295,38 @@ fn assess_legal_risk(
     LegalRiskAssessment { level, score, reasons }
 }
 
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+/// The system clock could not be read, so no due-diligence report can be
+/// produced for a request. This must never be silently replaced by a value:
+/// a zero would make every commitment look like it is dated in the future.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClockError;
+
+/// Current Unix time in seconds, from an explicit `SystemTime`.
+fn now_secs_at(now: SystemTime) -> Result<u64, ClockError> {
+    now.duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
-        .unwrap_or(0)
+        .map_err(|_| ClockError)
+}
+
+fn now_secs() -> Result<u64, ClockError> {
+    now_secs_at(SystemTime::now())
+}
+
+fn clock_error_response() -> (StatusCode, Json<ErrorResponse>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorResponse {
+            error: "system clock is unavailable; due-diligence report cannot be produced"
+                .to_string(),
+        }),
+    )
+}
+
+/// Resolve the clock for a request, turning a failed read into a 500.
+fn checked_now(
+    clock: impl FnOnce() -> Result<u64, ClockError>,
+) -> Result<u64, (StatusCode, Json<ErrorResponse>)> {
+    clock().map_err(|_| clock_error_response())
 }
 
 /// Due-diligence report for one indexed IP commitment.
@@ -320,7 +347,8 @@ pub async fn get_due_diligence(
         .as_deref()
         .filter(|owner| !owner.trim().is_empty());
     let index = crate::handlers::indexed_records();
-    Ok(Json(run(&record, claimed_owner, &index, now_secs())))
+    let now = checked_now(now_secs)?;
+    Ok(Json(run(&record, claimed_owner, &index, now)))
 }
 
 #[cfg(test)]
@@ -460,5 +488,21 @@ mod tests {
         assert!(has_failed(&report.provenance, "commitment_hash_format"));
         assert!(has_failed(&report.provenance, "timestamp_not_in_future"));
         assert_eq!(report.legal_risk.level, RiskLevel::Medium);
+    }
+
+    #[test]
+    fn clock_read_before_the_epoch_is_an_error() {
+        let before_epoch = UNIX_EPOCH
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("one second before the epoch is representable");
+        assert_eq!(now_secs_at(before_epoch), Err(ClockError));
+    }
+
+    #[test]
+    fn injected_clock_failure_returns_internal_server_error() {
+        let result = checked_now(|| Err(ClockError));
+        let (status, body) = result.expect_err("a failed clock read must not produce a report");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body.0.error.contains("clock"));
     }
 }
