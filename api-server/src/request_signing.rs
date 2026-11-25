@@ -25,6 +25,16 @@ pub struct SignaturePayload {
 /// of the server's clock, overridable via `REQUEST_SIGNATURE_SKEW_SECS`.
 const DEFAULT_TIMESTAMP_SKEW_SECS: u64 = 300;
 
+/// Public key whose ownership was proven by request-signature verification.
+#[derive(Clone, Debug)]
+pub(crate) struct VerifiedPublicKey(String);
+
+impl VerifiedPublicKey {
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 fn timestamp_skew_secs() -> u64 {
     std::env::var("REQUEST_SIGNATURE_SKEW_SECS")
         .ok()
@@ -171,7 +181,7 @@ pub async fn verify_request_signature(
     let path = req.uri().path().to_string();
 
     // Extract and hash body
-    let (parts, body) = req.into_parts();
+    let (mut parts, body) = req.into_parts();
     let body_bytes = axum::body::to_bytes(body, usize::MAX).await
         .map_err(|_| axum::http::StatusCode::BAD_REQUEST)?;
     let body_hash = hash_body(&body_bytes);
@@ -186,7 +196,10 @@ pub async fn verify_request_signature(
         return Err(axum::http::StatusCode::UNAUTHORIZED);
     }
 
-    // Reconstruct request with body
+    // Attach the authenticated identity before forwarding the reconstructed request.
+    parts
+        .extensions
+        .insert(VerifiedPublicKey(public_key.to_string()));
     let req = Request::from_parts(parts, axum::body::Body::from(body_bytes));
     Ok(next.run(req).await)
 }

@@ -5,13 +5,14 @@
 //! add/remove and a summary of the members.
 //!
 //! Every endpoint sits behind the request-signature middleware, and the caller
-//! is identified by the verified `X-Public-Key` header, never by a body field.
+//! is identified by the key attached by signature verification, never by an
+//! unverified header or body field.
 //! A caller can read a collection only if they own it or it has been shared
 //! with them. Only the owner can change, share, or delete it.
 
 use axum::{
-    extract::Path,
-    http::{HeaderMap, StatusCode},
+    extract::{Extension, Path},
+    http::StatusCode,
     Json,
 };
 use once_cell::sync::Lazy;
@@ -20,6 +21,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::request_signing::VerifiedPublicKey;
 use crate::schemas::{ErrorResponse, IpRecord};
 
 pub const MAX_NAME_LENGTH: usize = 100;
@@ -293,22 +295,18 @@ pub struct ShareRequest {
 
 type HttpError = (StatusCode, Json<ErrorResponse>);
 
-/// The caller's Stellar key, from the `X-Public-Key` header. Routes using this are signed,
-/// so the signature middleware has already proven control of the key.
-fn requester(headers: &HeaderMap) -> Result<String, HttpError> {
-    let key = headers
-        .get("X-Public-Key")
-        .and_then(|value| value.to_str().ok())
+/// Return the caller identity established by request-signature middleware.
+fn requester(identity: Option<Extension<VerifiedPublicKey>>) -> Result<String, HttpError> {
+    identity
+        .map(|Extension(key)| key.as_str().to_string())
         .ok_or_else(|| {
             (
                 StatusCode::UNAUTHORIZED,
                 Json(ErrorResponse {
-                    error: "X-Public-Key header is required".to_string(),
+                    error: "a verified request signature is required".to_string(),
                 }),
             )
-        })?;
-    validate_public_key(key, "X-Public-Key").map_err(HttpError::from)?;
-    Ok(key.to_string())
+        })
 }
 
 fn now_secs() -> u64 {
@@ -319,84 +317,89 @@ fn now_secs() -> u64 {
 }
 
 pub async fn create_collection(
-    headers: HeaderMap,
+    identity: Option<Extension<VerifiedPublicKey>>,
     Json(body): Json<CreateCollectionRequest>,
 ) -> Result<Json<Collection>, HttpError> {
-    let who = requester(&headers)?;
+    let who = requester(identity)?;
     with_store(|store| create(store, &who, &body.name, &body.ip_ids, now_secs()))
         .map(Json)
         .map_err(HttpError::from)
 }
 
-pub async fn list_collections(headers: HeaderMap) -> Result<Json<Vec<Collection>>, HttpError> {
-    let who = requester(&headers)?;
+pub async fn list_collections(
+    identity: Option<Extension<VerifiedPublicKey>>,
+) -> Result<Json<Vec<Collection>>, HttpError> {
+    let who = requester(identity)?;
     let collections = with_store(|store| Ok(list_for(store, &who))).map_err(HttpError::from)?;
     Ok(Json(collections))
 }
 
 pub async fn get_collection(
-    headers: HeaderMap,
+    identity: Option<Extension<VerifiedPublicKey>>,
     Path(id): Path<String>,
 ) -> Result<Json<Collection>, HttpError> {
-    let who = requester(&headers)?;
+    let who = requester(identity)?;
     with_store(|store| get(store, &id, &who))
         .map(Json)
         .map_err(HttpError::from)
 }
 
-pub async fn delete_collection(headers: HeaderMap, Path(id): Path<String>) -> Result<StatusCode, HttpError> {
-    let who = requester(&headers)?;
+pub async fn delete_collection(
+    identity: Option<Extension<VerifiedPublicKey>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, HttpError> {
+    let who = requester(identity)?;
     with_store(|store| delete(store, &id, &who)).map_err(HttpError::from)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn add_collection_ips(
-    headers: HeaderMap,
+    identity: Option<Extension<VerifiedPublicKey>>,
     Path(id): Path<String>,
     Json(body): Json<IpIdsRequest>,
 ) -> Result<Json<Collection>, HttpError> {
-    let who = requester(&headers)?;
+    let who = requester(identity)?;
     with_store(|store| add_ips(store, &id, &who, &body.ip_ids))
         .map(Json)
         .map_err(HttpError::from)
 }
 
 pub async fn remove_collection_ip(
-    headers: HeaderMap,
+    identity: Option<Extension<VerifiedPublicKey>>,
     Path((id, ip_id)): Path<(String, u64)>,
 ) -> Result<Json<Collection>, HttpError> {
-    let who = requester(&headers)?;
+    let who = requester(identity)?;
     with_store(|store| remove_ip(store, &id, &who, ip_id))
         .map(Json)
         .map_err(HttpError::from)
 }
 
 pub async fn share_collection(
-    headers: HeaderMap,
+    identity: Option<Extension<VerifiedPublicKey>>,
     Path(id): Path<String>,
     Json(body): Json<ShareRequest>,
 ) -> Result<Json<Collection>, HttpError> {
-    let who = requester(&headers)?;
+    let who = requester(identity)?;
     with_store(|store| share(store, &id, &who, &body.user))
         .map(Json)
         .map_err(HttpError::from)
 }
 
 pub async fn unshare_collection(
-    headers: HeaderMap,
+    identity: Option<Extension<VerifiedPublicKey>>,
     Path((id, user)): Path<(String, String)>,
 ) -> Result<Json<Collection>, HttpError> {
-    let who = requester(&headers)?;
+    let who = requester(identity)?;
     with_store(|store| unshare(store, &id, &who, &user))
         .map(Json)
         .map_err(HttpError::from)
 }
 
 pub async fn collection_summary(
-    headers: HeaderMap,
+    identity: Option<Extension<VerifiedPublicKey>>,
     Path(id): Path<String>,
 ) -> Result<Json<CollectionSummary>, HttpError> {
-    let who = requester(&headers)?;
+    let who = requester(identity)?;
     let index = crate::handlers::indexed_records();
     let result = with_store(|store| summary(store, &id, &who, &index, &crate::commitments::get_tags))
         .map_err(HttpError::from)?;
@@ -406,6 +409,14 @@ pub async fn collection_summary(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+        middleware,
+        routing::post,
+        Router,
+    };
+    use tower::ServiceExt;
 
     fn key(seed: u8) -> String {
         stellar_strkey::ed25519::PublicKey([seed; 32]).to_string()
@@ -423,6 +434,70 @@ mod tests {
 
     fn no_tags(_: u64) -> Vec<String> {
         Vec::new()
+    }
+
+    #[tokio::test]
+    async fn copied_public_key_without_verified_signature_is_rejected() {
+        let app = Router::new().route("/collections", post(create_collection));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/collections")
+                    .header("content-type", "application/json")
+                    .header("X-Public-Key", key(1))
+                    .body(Body::from(r#"{"name":"private"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn valid_signed_request_uses_verified_collection_identity() {
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[15; 32]);
+        let public_key =
+            stellar_strkey::ed25519::PublicKey(signing_key.verifying_key().to_bytes()).to_string();
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let path = "/collections";
+        let body = r#"{"name":"signed collection"}"#;
+        let nonce = format!("collections-valid-{timestamp}");
+        let signature = crate::request_signing::generate_signature(
+            "POST",
+            path,
+            timestamp,
+            &crate::request_signing::hash_body(body.as_bytes()),
+            &nonce,
+            &signing_key,
+        );
+        let app = Router::new()
+            .route(path, post(create_collection))
+            .layer(middleware::from_fn(
+                crate::request_signing::verify_request_signature,
+            ));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .header("X-Public-Key", public_key)
+                    .header("X-Timestamp", timestamp.to_string())
+                    .header("X-Nonce", nonce)
+                    .header("X-Signature", signature)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[test]
