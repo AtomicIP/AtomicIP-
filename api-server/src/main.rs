@@ -420,7 +420,36 @@ async fn main() {
     handlers::spawn_session_cleanup_task();
 
     let subscription_broadcaster = init_subscription_broadcaster().await;
-    let rpc_client: Arc<dyn graphql::SorobanRpcClient> = Arc::new(graphql::MockSorobanRpcClient::default());
+
+    // Resolve the GraphQL RPC client using the same MODE=test guard applied to
+    // the REST SOROBAN_CLIENT.  A missing IP_REGISTRY_CONTRACT outside test
+    // mode is a fatal misconfiguration — fail here rather than serving mock
+    // data silently.
+    let rpc_client: Arc<dyn graphql::SorobanRpcClient> = {
+        let contract = std::env::var("IP_REGISTRY_CONTRACT").unwrap_or_default();
+        let is_test_mode = std::env::var("MODE")
+            .map(|v| v.eq_ignore_ascii_case("test"))
+            .unwrap_or(false);
+
+        if contract.is_empty() {
+            if is_test_mode {
+                tracing::warn!(
+                    "IP_REGISTRY_CONTRACT is unset and MODE=test: GraphQL layer using \
+                     MockSorobanRpcClient. Mock responses are marked with `\"mock\": true`."
+                );
+                Arc::new(graphql::MockSorobanRpcClient::default())
+            } else {
+                eprintln!(
+                    "FATAL: IP_REGISTRY_CONTRACT is not set. \
+                     Set it to the deployed ip_registry contract address, \
+                     or set MODE=test to use the mock client for local testing."
+                );
+                std::process::exit(1);
+            }
+        } else {
+            Arc::new(graphql::LiveSorobanRpcClient::from_env())
+        }
+    };
     let query_client = Arc::new(graphql::SorobanQueryClient::new(rpc_client.clone()));
 
     // #1205/#1206: depth/complexity limits and explicit introspection setting.

@@ -33,18 +33,38 @@ use crate::soroban_rpc::{
 // ── Shared Soroban RPC client ─────────────────────────────────────────────────
 //
 // In production (`SOROBAN_RPC_URL` and `IP_REGISTRY_CONTRACT` are set) this
-// uses the live reqwest-backed client.  In test environments where those env
-// vars are absent the mock client is substituted automatically so unit tests
-// never require a live network.
+// uses the live reqwest-backed client.
+//
+// The mock client is ONLY permitted when `MODE=test` is explicitly set in the
+// environment.  Any other combination — missing contract address outside test
+// mode — is a misconfiguration and causes an immediate startup failure so a
+// broken production deployment fails loudly rather than silently returning
+// fabricated IDs.
 static SOROBAN_CLIENT: Lazy<Arc<dyn SorobanRpcClient>> = Lazy::new(|| {
-    let use_mock = std::env::var("IP_REGISTRY_CONTRACT")
-        .map(|v| v.is_empty())
-        .unwrap_or(true);
-    if use_mock {
-        Arc::new(MockSorobanRpcClient::default()) as Arc<dyn SorobanRpcClient>
-    } else {
-        Arc::new(LiveSorobanRpcClient::from_env()) as Arc<dyn SorobanRpcClient>
+    let contract = std::env::var("IP_REGISTRY_CONTRACT")
+        .unwrap_or_default();
+    let is_test_mode = std::env::var("MODE")
+        .map(|v| v.eq_ignore_ascii_case("test"))
+        .unwrap_or(false);
+
+    if contract.is_empty() {
+        if is_test_mode {
+            tracing::warn!(
+                "IP_REGISTRY_CONTRACT is unset and MODE=test: using MockSorobanRpcClient. \
+                 Mock responses are marked with `\"mock\": true`."
+            );
+            return Arc::new(MockSorobanRpcClient::default()) as Arc<dyn SorobanRpcClient>;
+        }
+        // Not in test mode — a missing contract address is a fatal misconfiguration.
+        eprintln!(
+            "FATAL: IP_REGISTRY_CONTRACT is not set. \
+             Set it to the deployed ip_registry contract address, \
+             or set MODE=test to use the mock client for local testing."
+        );
+        std::process::exit(1);
     }
+
+    Arc::new(LiveSorobanRpcClient::from_env()) as Arc<dyn SorobanRpcClient>
 });
 
 // #523/#800: Per-handler idempotency store for batch swap operations. Uses a
@@ -297,7 +317,7 @@ fn json_response<T: serde::Serialize>(
     tag = "IP Registry",
     request_body = CommitIpRequest,
     responses(
-        (status = 200, description = "IP committed successfully, returns ip_id", body = u64),
+        (status = 200, description = "IP committed successfully", body = CommitIpResponse),
         (status = 400, description = "Invalid request (zero hash, duplicate hash)", body = ErrorResponse),
         (status = 429, description = "User commitment rate limit exceeded (10 commits/minute)", body = ErrorResponse),
         (status = 503, description = "Soroban RPC node unavailable", body = ErrorResponse),
@@ -307,7 +327,7 @@ fn json_response<T: serde::Serialize>(
 pub async fn commit_ip(
     State(rate_limiter): State<Arc<crate::rate_limit::RateLimitMiddleware>>,
     Json(body): Json<CommitIpRequest>,
-) -> Result<Json<u64>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<CommitIpResponse>, (StatusCode, Json<ErrorResponse>)> {
     // Delegate to the Soroban RPC client.  The client validates inputs before
     // making the network call, so validation errors are surfaced as 400 without
     // a round-trip to the RPC node.
@@ -353,7 +373,13 @@ pub async fn commit_ip(
     // #1064: track the new commitment entering the Active lifecycle state.
     crate::commitment_monitoring::COMMITMENT_MONITOR.record_commit(1);
 
-    Ok(Json(ip_id))
+    // #1409: mark the response when the mock RPC client is active so callers
+    // can distinguish test data from live contract data.
+    let is_mock = std::env::var("MODE")
+        .map(|v| v.eq_ignore_ascii_case("test"))
+        .unwrap_or(false);
+
+    Ok(Json(CommitIpResponse { ip_id, mock: is_mock }))
 }
 
 /// Return aggregate commitment and swap usage statistics.
