@@ -172,6 +172,7 @@ pub fn lock_or_recover<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, 
         handlers::use_backup_code,
         handlers::check_session,
         handlers::extend_session,
+        due_diligence::get_due_diligence,
         batch::batch_handler,
         events::events_handler,
     ),
@@ -234,6 +235,12 @@ pub fn lock_or_recover<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, 
         schemas::CheckSessionResponse,
         schemas::ExtendSessionRequest,
         schemas::ExtendSessionResponse,
+        due_diligence::Check,
+        due_diligence::MatchKind,
+        due_diligence::PriorArtMatch,
+        due_diligence::RiskLevel,
+        due_diligence::LegalRiskAssessment,
+        due_diligence::DueDiligenceReport,
     )),
     tags(
         (name = "IP Registry", description = "Commit and query intellectual property records"),
@@ -243,6 +250,7 @@ pub fn lock_or_recover<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, 
         (name = "Events", description = "Server-Sent Events stream"),
         (name = "Admin", description = "Administrative endpoints for monitoring and audit"),
         (name = "Auth", description = "Authentication and account recovery"),
+        (name = "Due Diligence", description = "Technical checks and risk summaries for IP commitments"),
     )
 )]
 pub struct ApiDoc;
@@ -934,6 +942,34 @@ mod tests {
         assert_eq!(spec["info"]["title"], "Atomic Patent API");
         assert!(spec["paths"].is_object());
         assert!(spec["components"]["schemas"].is_object());
+        let due_diligence = &spec["paths"]["/ip/{ip_id}/due-diligence"]["get"];
+        assert!(due_diligence["responses"]["200"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("not a legal opinion"));
+        assert!(spec["components"]["schemas"]["DueDiligenceReport"]["properties"]
+            ["disclaimer"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("legal"));
+        let report_properties =
+            &spec["components"]["schemas"]["DueDiligenceReport"]["properties"];
+        assert!(report_properties["provenance"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("timestamp"));
+        assert!(report_properties["ownership"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("claimed-owner"));
+        assert!(report_properties["prior_art"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("feature fingerprints"));
+        assert!(spec["components"]["schemas"]["LegalRiskAssessment"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("not a legal analysis"));
     }
 
     // ── #317: Pagination tests ────────────────────────────────────────────────

@@ -22,8 +22,11 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
+use utoipa::ToSchema;
 
 use crate::schemas::{ErrorResponse, IpRecord};
+
+const RISK_SUMMARY_DISCLAIMER: &str = "This technical risk summary is not a legal opinion or legal advice. It does not assess patentability, infringement, enforceability, freedom to operate, or legal ownership.";
 
 /// Maximum symmetric-difference size (in feature tokens) at or below which two
 /// commitments count as near-duplicates. A value of 0 is an exact feature
@@ -42,21 +45,25 @@ const RISK_NEAR_DUPLICATE_CAP: u32 = 40;
 const RISK_HIGH_THRESHOLD: u32 = 40;
 const RISK_MEDIUM_THRESHOLD: u32 = 20;
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+/// A technical check performed against the indexed commitment data.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, ToSchema)]
 pub struct Check {
+    /// Identifier for the check, such as `commitment_hash_format`.
     pub name: &'static str,
+    /// Whether the technical check passed.
     pub passed: bool,
+    /// Human-readable result of the check.
     pub detail: String,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MatchKind {
     ExactDuplicate,
     NearDuplicate,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, ToSchema)]
 pub struct PriorArtMatch {
     pub ip_id: u64,
     pub owner: String,
@@ -68,7 +75,7 @@ pub struct PriorArtMatch {
     pub kind: MatchKind,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RiskLevel {
     Low,
@@ -76,20 +83,35 @@ pub enum RiskLevel {
     High,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+/// A heuristic risk score based only on the technical checks in this report.
+///
+/// The score is not a legal analysis or opinion. It does not determine
+/// patentability, infringement, enforceability, freedom to operate, or legal
+/// ownership.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, ToSchema)]
 pub struct LegalRiskAssessment {
+    /// Severity derived from the heuristic score thresholds.
     pub level: RiskLevel,
+    /// Sum of fixed weights for failed technical checks and prior-art matches.
     pub score: u32,
+    /// Technical findings that contributed to the score.
     pub reasons: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+/// Technical due-diligence findings for one indexed IP commitment.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, ToSchema)]
 pub struct DueDiligenceReport {
     pub ip_id: u64,
+    /// Commitment hash format, timestamp presence/future-date, and revocation checks.
     pub provenance: Vec<Check>,
+    /// Stellar public-key validity and, when supplied, claimed-owner match.
     pub ownership: Vec<Check>,
+    /// Earlier exact-hash duplicates and near-duplicates based on feature fingerprints.
     pub prior_art: Vec<PriorArtMatch>,
+    /// Weighted technical risk heuristic; not a legal assessment.
     pub legal_risk: LegalRiskAssessment,
+    /// Explains the legal and technical limits of this report.
+    pub disclaimer: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -113,6 +135,7 @@ pub fn run(record: &IpRecord, claimed_owner: Option<&str>, index: &[IpRecord], n
         ownership,
         prior_art,
         legal_risk,
+        disclaimer: RISK_SUMMARY_DISCLAIMER.to_string(),
     }
 }
 
@@ -330,6 +353,19 @@ fn checked_now(
 }
 
 /// Due-diligence report for one indexed IP commitment.
+#[utoipa::path(
+    get,
+    path = "/ip/{ip_id}/due-diligence",
+    tag = "Due Diligence",
+    params(
+        ("ip_id" = u64, Path, description = "IP commitment identifier"),
+        ("claimed_owner" = Option<String>, Query, description = "Optional expected Stellar owner address")
+    ),
+    responses(
+        (status = 200, description = "Checks commitment-hash format, timestamps, revocation, owner validity and optional claimed-owner match, plus earlier exact-hash or feature-fingerprint duplicates. The heuristic risk summary does not assess patentability, infringement, enforceability, freedom to operate, or legal ownership and is not a legal opinion.", body = DueDiligenceReport),
+        (status = 404, description = "IP record not found", body = ErrorResponse)
+    )
+)]
 pub async fn get_due_diligence(
     Path(ip_id): Path<u64>,
     Query(query): Query<DueDiligenceQuery>,
@@ -397,6 +433,11 @@ mod tests {
         let report = run(&subject, Some(&stellar_key(1)), &[], NOW);
         assert_eq!(report.legal_risk.level, RiskLevel::Low);
         assert_eq!(report.legal_risk.score, 0);
+        assert!(report.disclaimer.contains("not a legal opinion"));
+        let response = serde_json::to_value(&report).unwrap();
+        assert!(response.get("legal_risk").is_some());
+        assert!(response.get("risk_summary").is_none());
+        assert_eq!(response["disclaimer"], RISK_SUMMARY_DISCLAIMER);
         assert!(report.provenance.iter().all(|item| item.passed));
         assert!(report.ownership.iter().all(|item| item.passed));
         assert!(report.prior_art.is_empty());
