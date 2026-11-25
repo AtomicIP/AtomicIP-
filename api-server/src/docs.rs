@@ -1175,3 +1175,19 @@ mod tests {
     }
 }
 
+
+/// `GET /docs` – machine-readable API documentation as JSON.
+pub async fn docs_handler() -> axum::Json<serde_json::Value> {
+    axum::Json(
+        serde_json::to_value(ApiDocGenerator::generate_full_documentation())
+            .unwrap_or_else(|_| serde_json::json!({})),
+    )
+}
+
+/// `GET /docs/markdown` – human-readable API documentation as Markdown.
+pub async fn docs_markdown_handler() -> impl axum::response::IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
+        ApiDocGenerator::export_markdown(),
+    )
+}

@@ -102,7 +102,7 @@ fn commitment_index_capacity() -> usize {
 ///
 /// Access order is tracked with a monotonically increasing tick; the entry with
 /// the smallest tick is the least-recently-used and is evicted first.
-struct CommitmentIndex {
+pub(crate) struct CommitmentIndex {
     entries: DashMap<u64, (IpRecord, u64)>,
     capacity: usize,
     tick: AtomicU64,
@@ -141,6 +141,18 @@ impl CommitmentIndex {
         Some(entry.0.clone())
     }
 
+    /// Iterate over `(ip_id, record)` pairs currently held in the index.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (u64, IpRecord)> + '_ {
+        self.entries
+            .iter()
+            .map(|entry| (*entry.key(), entry.value().0.clone()))
+    }
+
+    /// Remove a record by IP ID. Returns true when an entry was removed.
+    pub(crate) fn remove(&self, ip_id: &u64) -> bool {
+        self.entries.remove(ip_id).is_some()
+    }
+
     fn evict_to_capacity(&self) {
         while self.entries.len() > self.capacity {
             let lru_key = self
@@ -158,7 +170,7 @@ impl CommitmentIndex {
     }
 }
 
-static COMMITMENT_INDEX: Lazy<CommitmentIndex> =
+pub(crate) static COMMITMENT_INDEX: Lazy<CommitmentIndex> =
     Lazy::new(|| CommitmentIndex::new(commitment_index_capacity()));
 
 /// Look up one indexed commitment by ID, for read-side features (#1095).
@@ -237,7 +249,7 @@ fn init_audit_log_store() -> (Arc<AuditLogStore>, bool) {
 }
 
 /// Audit log store for tracking all API access and sensitive operations
-static AUDIT_LOG_STORE: Lazy<Arc<AuditLogStore>> = Lazy::new(|| init_audit_log_store().0);
+pub(crate) static AUDIT_LOG_STORE: Lazy<Arc<AuditLogStore>> = Lazy::new(|| init_audit_log_store().0);
 
 /// Current Unix timestamp in seconds (substitute for the ledger timestamp).
 pub(crate) fn now_timestamp() -> u64 {
@@ -2115,17 +2127,187 @@ pub async fn delete_ip_saved_search(
 // ── Webhooks ──────────────────────────────────────────────────────────────────
 
 /// Register a webhook URL to receive swap event notifications.
+/// A webhook subscription as returned by the registration and listing APIs.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RegisteredWebhook {
+    pub id: String,
+    pub url: String,
+    pub events: Vec<String>,
+    pub created_at: u64,
+    /// Per-webhook HMAC secret. Populated only in the registration response;
+    /// always empty in listings.
+    #[serde(default)]
+    pub secret: String,
+}
+
+/// Re-export the webhook guard's structured error and helpers so callers and
+/// integration tests can use them without reaching into the module.
+pub use crate::webhook::{is_blocked_ip, validate_webhook_url, WebhookError};
+
+fn registered_from_config(config: &webhook::WebhookConfig, include_secret: bool) -> RegisteredWebhook {
+    RegisteredWebhook {
+        id: config.id.to_string(),
+        url: redact_webhook_url(&config.url),
+        events: config.events.clone(),
+        created_at: config.created_at,
+        secret: if include_secret {
+            config.secret.clone()
+        } else {
+            String::new()
+        },
+    }
+}
+
+fn host_is_literal_ip(host: &str) -> bool {
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .is_ok()
+}
+
+fn check_literal_host_blocked(parsed: &reqwest::Url) -> Result<(), WebhookError> {
+    let host = parsed.host_str().unwrap_or("");
+    let candidate = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = candidate.parse::<std::net::IpAddr>() {
+        if webhook::is_blocked_ip(ip) {
+            return Err(WebhookError::BlockedAddress {
+                host: host.to_string(),
+                ip,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Synchronous registration helper used by tests and internal callers.
+///
+/// Performs the URL/scheme and literal-address SSRF checks without blocking on
+/// DNS; hostnames are resolved by the async registration path.
+pub fn register_webhook_for_tests(
+    owner: &str,
+    url: &str,
+) -> Result<RegisteredWebhook, WebhookError> {
+    let parsed = reqwest::Url::parse(url).map_err(|e| WebhookError::InvalidUrl(e.to_string()))?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        other => return Err(WebhookError::InvalidScheme(other.to_string())),
+    }
+    check_literal_host_blocked(&parsed)?;
+    let config = webhook::register(url.to_string(), vec!["*".to_string()], owner.to_string());
+    Ok(registered_from_config(&config, true))
+}
+
+/// Registration helper with an injected resolver, used to simulate DNS
+/// rebinding at registration time.
+pub fn register_webhook_with_resolver_for_tests<F>(
+    owner: &str,
+    url: &str,
+    resolver: F,
+) -> Result<RegisteredWebhook, WebhookError>
+where
+    F: Fn(&str) -> Result<Vec<std::net::IpAddr>, WebhookError> + Send + Sync + 'static,
+{
+    let parsed = reqwest::Url::parse(url).map_err(|e| WebhookError::InvalidUrl(e.to_string()))?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        other => return Err(WebhookError::InvalidScheme(other.to_string())),
+    }
+    let host = parsed.host_str().unwrap_or("").to_string();
+    if host_is_literal_ip(&host) {
+        check_literal_host_blocked(&parsed)?;
+    } else {
+        for ip in resolver(&host)? {
+            if webhook::is_blocked_ip(ip) {
+                return Err(WebhookError::BlockedAddress {
+                    host: host.clone(),
+                    ip,
+                });
+            }
+        }
+    }
+    let config = webhook::register(url.to_string(), vec!["*".to_string()], owner.to_string());
+    Ok(registered_from_config(&config, true))
+}
+
+/// Delivery helper with an injected resolver, used to simulate DNS rebinding
+/// between registration and delivery.
+pub async fn deliver_webhook_with_resolver_for_tests<F>(
+    hook: &RegisteredWebhook,
+    resolver: F,
+) -> Result<(), WebhookError>
+where
+    F: Fn(&str) -> Result<Vec<std::net::IpAddr>, WebhookError> + Send + Sync + 'static,
+{
+    let parsed = reqwest::Url::parse(&hook.url).map_err(|e| WebhookError::InvalidUrl(e.to_string()))?;
+    let host = parsed.host_str().unwrap_or("").to_string();
+    let addrs = if host_is_literal_ip(&host) {
+        vec![host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .map_err(|e| WebhookError::InvalidUrl(e.to_string()))?]
+    } else {
+        resolver(&host)?
+    };
+    for ip in addrs {
+        if webhook::is_blocked_ip(ip) {
+            return Err(WebhookError::BlockedAddress {
+                host: host.clone(),
+                ip,
+            });
+        }
+    }
+
+    let config = webhook::WebhookConfig {
+        id: uuid::Uuid::parse_str(&hook.id).unwrap_or_else(|_| uuid::Uuid::new_v4()),
+        url: hook.url.clone(),
+        events: hook.events.clone(),
+        created_at: hook.created_at,
+        owner: String::new(),
+        secret: hook.secret.clone(),
+    };
+    let payload = webhook::WebhookPayload {
+        event: webhook::SWAP_STATUS_CHANGED_EVENT.to_string(),
+        swap_id: 0,
+        old_status: None,
+        new_status: String::new(),
+        timestamp: webhook::now_secs(),
+    };
+    match webhook::WebhookClient::new().deliver(&config, &payload).await {
+        webhook::DeliveryOutcome::Success { .. } => Ok(()),
+        webhook::DeliveryOutcome::Failure { reason } => Err(WebhookError::Delivery(reason)),
+    }
+}
+
+/// List the caller's registered webhooks (test helper mirroring the handler).
+pub fn list_webhooks_for_tests(owner: &str) -> Vec<RegisteredWebhook> {
+    webhook::list_all()
+        .into_iter()
+        .filter(|config| config.owner == owner)
+        .map(|config| registered_from_config(&config, false))
+        .collect()
+}
+
+/// Clear the webhook registry (test helper).
+pub fn webhooks_clear_for_tests() {
+    webhook::clear_all();
+}
+
+/// Register a webhook URL to receive signed swap event notifications.
 #[utoipa::path(
     post,
     path = "/v1/webhooks",
     tag = "Webhooks",
     request_body = RegisterWebhookRequest,
     responses(
-        (status = 200, description = "Webhook registered", body = WebhookResponse),
+        (status = 200, description = "Webhook registered (secret returned once)", body = WebhookResponse),
         (status = 400, description = "Invalid request", body = ErrorResponse),
     )
 )]
-pub async fn register_webhook(Json(body): Json<RegisterWebhookRequest>) -> Result<Json<WebhookResponse>, (StatusCode, Json<ErrorResponse>)> {
+pub async fn register_webhook(
+    crate::auth::AuthExtension(auth): crate::auth::AuthExtension,
+    Json(body): Json<RegisterWebhookRequest>,
+) -> Result<Json<WebhookResponse>, (StatusCode, Json<ErrorResponse>)> {
     let parsed_url = reqwest::Url::parse(&body.url);
     if parsed_url.as_ref().map(|url| !matches!(url.scheme(), "http" | "https")).unwrap_or(true)
         || body.events.is_empty()
@@ -2163,19 +2345,21 @@ pub async fn register_webhook(Json(body): Json<RegisterWebhookRequest>) -> Resul
         ));
     }
 
-    let config = webhook::register(url.to_string(), body.events);
+    let config = webhook::register(url.to_string(), body.events, auth.address);
 
     Ok(Json(WebhookResponse {
         id: config.id.to_string(),
         url: config.url,
         events: config.events,
         created_at: config.created_at,
+        // Returned exactly once, at registration time.
+        secret: config.secret,
     }))
 }
 
 /// Strip query strings and userinfo from a webhook URL so tokens embedded in
 /// it are never returned to a caller (#1201).
-fn redact_webhook_url(raw: &str) -> String {
+pub fn redact_webhook_url(raw: &str) -> String {
     match reqwest::Url::parse(raw) {
         Ok(mut url) => {
             let _ = url.set_username("");
@@ -2207,6 +2391,8 @@ pub async fn list_webhooks(
             url: redact_webhook_url(&config.url),
             events: config.events,
             created_at: config.created_at,
+            // The secret is never included in listings.
+            secret: String::new(),
         })
         .collect::<Vec<_>>();
     Json(webhooks)

@@ -174,7 +174,7 @@ impl ResponseFormatter {
             data: None,
             error: Some(ErrorDetails {
                 code: "UNAUTHORIZED".to_string(),
-                message,
+                message: message.into(),
                 details: None,
             }),
             meta: Self::create_meta(),
@@ -189,7 +189,7 @@ impl ResponseFormatter {
             data: None,
             error: Some(ErrorDetails {
                 code: "FORBIDDEN".to_string(),
-                message,
+                message: message.into(),
                 details: None,
             }),
             meta: Self::create_meta(),
@@ -204,7 +204,7 @@ impl ResponseFormatter {
             data: None,
             error: Some(ErrorDetails {
                 code: "NOT_FOUND".to_string(),
-                message,
+                message: message.into(),
                 details: None,
             }),
             meta: Self::create_meta(),
@@ -219,7 +219,7 @@ impl ResponseFormatter {
             data: None,
             error: Some(ErrorDetails {
                 code: "CONFLICT".to_string(),
-                message,
+                message: message.into(),
                 details: None,
             }),
             meta: Self::create_meta(),
@@ -234,7 +234,7 @@ impl ResponseFormatter {
             data: None,
             error: Some(ErrorDetails {
                 code: "INTERNAL_ERROR".to_string(),
-                message,
+                message: message.into(),
                 details: None,
             }),
             meta: Self::create_meta(),

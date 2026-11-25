@@ -3,10 +3,9 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
-        IntoResponse,
+        IntoResponse, Response,
     },
 };
-use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
 use std::{convert::Infallible, sync::Arc, time::Duration};
 use tokio::sync::broadcast;
@@ -242,7 +241,7 @@ pub async fn events_handler(
     State(broadcaster): State<Arc<EventBroadcaster>>,
     State(limiter): State<Arc<ConnectionLimiter>>,
     headers: HeaderMap,
-) -> impl IntoResponse {
+) -> Response {
     let client_ip = client_ip_from_headers(&headers);
 
     // Acquire a connection slot before establishing the stream. The guard is
@@ -251,8 +250,8 @@ pub async fn events_handler(
         Ok(guard) => guard,
         Err(reason) => {
             let status = match reason {
-                crate::websocket::LimitError::PerIp => StatusCode::TOO_MANY_REQUESTS,
-                crate::websocket::LimitError::Global => StatusCode::SERVICE_UNAVAILABLE,
+                crate::websocket::LimitError::PerIpLimit => StatusCode::TOO_MANY_REQUESTS,
+                crate::websocket::LimitError::GlobalLimit => StatusCode::SERVICE_UNAVAILABLE,
             };
             return (status, "connection limit reached").into_response();
         }
@@ -264,18 +263,20 @@ pub async fn events_handler(
         .filter_map(|result| match result {
             Ok(event) => Some(Ok::<axum::response::sse::Event, std::convert::Infallible>(Event::default().json_data(event).unwrap())),
             Err(_) => None, // Skip lagged messages
-        })
-        // Close the connection after the idle timeout so stale streams are
-        // not kept open indefinitely.
-        .take_until(tokio::time::sleep(SSE_IDLE_TIMEOUT))
-        // Hold the guard for the lifetime of the stream so the slot is
-        // released when the client disconnects.
-        .map(move |item| {
-            let _guard = &guard;
-            item
         });
+    // Close the connection after the idle timeout so stale streams are
+    // not kept open indefinitely.
+    let stream = futures::StreamExt::take_until(stream, tokio::time::sleep(SSE_IDLE_TIMEOUT));
+    // Hold the guard for the lifetime of the stream so the slot is
+    // released when the client disconnects.
+    let stream = stream.map(move |item| {
+        let _guard = &guard;
+        item
+    });
 
-    Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(30)))
+    Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(30)))
+        .into_response()
 }
 
 pub async fn broadcast_event(broadcaster: &EventBroadcaster, event: ContractEvent) {
