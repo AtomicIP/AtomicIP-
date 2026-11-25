@@ -2,7 +2,7 @@ use chrono::Utc;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -721,6 +721,16 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
         .zip(right.iter())
         .fold(0u8, |accumulator, (left, right)| accumulator | (left ^ right))
         == 0
+}
+
+fn sha256_digest(input: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(input);
+    hasher.finalize().into()
+}
+
+pub fn constant_time_hash_eq(left: &[u8], right: &[u8]) -> bool {
+    constant_time_eq(&sha256_digest(left), &sha256_digest(right))
 }
 
 /// #1106: Admin check for the audit log endpoints.

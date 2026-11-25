@@ -1,3 +1,4 @@
+use crate::audit::constant_time_hash_eq;
 use axum::{
     extract::ConnectInfo,
     http::{HeaderMap, StatusCode},
@@ -638,17 +639,7 @@ fn has_valid_bearer_token(headers: &HeaderMap) -> bool {
     let Some(token) = value.strip_prefix("Bearer ") else {
         return false;
     };
-    // Constant-time-ish comparison to avoid trivial timing leaks.
-    let token = token.as_bytes();
-    let expected = expected.as_bytes();
-    if token.len() != expected.len() {
-        return false;
-    }
-    token
-        .iter()
-        .zip(expected.iter())
-        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-        == 0
+    constant_time_hash_eq(token.as_bytes(), expected.as_bytes())
 }
 
 /// Returns `true` when the caller may access `/health/detailed`.
@@ -1035,6 +1026,32 @@ mod tests {
 
         std::env::remove_var("HEALTH_DETAILED_TOKEN");
         std::env::remove_var("HEALTH_DETAILED_ALLOWED_CIDRS");
+    }
+
+    #[test]
+    fn test_detailed_health_rejects_wrong_length_bearer_tokens() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("HEALTH_DETAILED_TOKEN", "secret-token");
+
+        for token in [
+            "",
+            "s",
+            "secret-toke",
+            "secret-tokenx",
+            "secret-token-extra",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {token}").parse().unwrap(),
+            );
+            assert!(
+                !has_valid_bearer_token(&headers),
+                "accepted token: {token:?}"
+            );
+        }
+
+        std::env::remove_var("HEALTH_DETAILED_TOKEN");
     }
 
     #[tokio::test]
