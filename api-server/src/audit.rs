@@ -413,6 +413,26 @@ impl AuditLogStore {
         })
     }
 
+    /// Builds a degraded, non-durable store used when the durable audit log
+    /// cannot be opened. Events are kept in process memory; the backing path
+    /// is a throwaway temp file so the append path still works without
+    /// persisting history across restarts.
+    pub fn in_memory(key: Vec<u8>) -> Self {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!(
+            "atomicip-audit-inmemory-{}-{nonce}.log",
+            std::process::id()
+        ));
+        Self {
+            key,
+            path,
+            events: RwLock::new(Vec::new()),
+        }
+    }
+
     /// Builds the store from durable configuration: `AUDIT_HMAC_KEY` must be
     /// set and non-empty. Startup fails loudly instead of silently
     /// substituting a random key, since a random key can never be

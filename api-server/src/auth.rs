@@ -16,6 +16,11 @@ use sha2::{Digest, Sha256};
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Claims {
     pub sub: String, // public key
+    /// Stellar address (public key) of the caller. Kept in sync with `sub`;
+    /// present so owner-scoped resources (e.g. webhooks) can key on a stable
+    /// identity field. Defaults to `sub` when decoding older tokens.
+    #[serde(default)]
+    pub address: String,
     pub exp: i64,
     pub iat: i64,
     pub token_type: String, // "access" or "refresh"
@@ -49,6 +54,7 @@ pub fn issue_tokens(public_key: &str) -> Result<(String, String), AuthError> {
 
     let access_claims = Claims {
         sub: public_key.to_string(),
+        address: public_key.to_string(),
         iat: now.timestamp(),
         exp: (now + Duration::minutes(15)).timestamp(),
         token_type: "access".to_string(),
@@ -56,6 +62,7 @@ pub fn issue_tokens(public_key: &str) -> Result<(String, String), AuthError> {
 
     let refresh_claims = Claims {
         sub: public_key.to_string(),
+        address: public_key.to_string(),
         iat: now.timestamp(),
         exp: (now + Duration::days(7)).timestamp(),
         token_type: "refresh".to_string(),
@@ -85,7 +92,8 @@ pub fn refresh_access_token(refresh_token: &str) -> Result<String, AuthError> {
 
     let now = Utc::now();
     let new_claims = Claims {
-        sub: token_data.claims.sub,
+        sub: token_data.claims.sub.clone(),
+        address: token_data.claims.address,
         iat: now.timestamp(),
         exp: (now + Duration::minutes(15)).timestamp(),
         token_type: "access".to_string(),
@@ -152,7 +160,11 @@ pub async fn require_auth(mut req: Request, next: Next) -> Result<Response, Auth
         return Err(AuthError::InvalidToken);
     }
 
-    req.extensions_mut().insert(AuthExtension(token_data.claims));
+    let mut claims = token_data.claims;
+    if claims.address.is_empty() {
+        claims.address = claims.sub.clone();
+    }
+    req.extensions_mut().insert(AuthExtension(claims));
     Ok(next.run(req).await)
 }
 

@@ -698,9 +698,9 @@ pub async fn health_handler(
 pub async fn detailed_health_handler(
     axum::extract::State(checker): axum::extract::State<Arc<HealthChecker>>,
     headers: HeaderMap,
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Response {
-    let client_ip = connect_info.map(|ConnectInfo(addr)| addr.ip());
+    let client_ip = Some(addr.ip());
     if !detailed_health_access_allowed(&headers, client_ip) {
         // Do not leak dependency details to unauthorized callers.
         return (
@@ -1047,7 +1047,7 @@ mod tests {
         let response = detailed_health_handler(
             axum::extract::State(checker),
             HeaderMap::new(),
-            Some(ConnectInfo(SocketAddr::from(([203, 0, 113, 5], 12345)))),
+            ConnectInfo(SocketAddr::from(([203, 0, 113, 5], 12345))),
         )
         .await;
 

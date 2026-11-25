@@ -49,6 +49,25 @@ impl MiddlewareConfig {
     }
 }
 
+/// CORS configuration derived from the environment.
+///
+/// Kept separate from [`MiddlewareConfig`] so the CORS layer can be wired
+/// independently of the full middleware pipeline.
+#[derive(Debug, Clone)]
+pub struct CorsConfig {
+    /// Allowlist of origins permitted to receive CORS headers.
+    pub allowed_origins: Vec<String>,
+}
+
+impl CorsConfig {
+    /// Read the CORS origin allowlist from `CORS_ALLOWED_ORIGINS`.
+    pub fn from_env() -> Self {
+        Self {
+            allowed_origins: MiddlewareConfig::allowed_origins_from_env(),
+        }
+    }
+}
+
 pub struct MiddlewarePipeline {
     config: Arc<MiddlewareConfig>,
 }

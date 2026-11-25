@@ -357,6 +357,7 @@ pub async fn handle_socket_limited(
     let mut subscribed_swap_ids: HashSet<u64> = HashSet::new();
 
     loop {
+        // `true` signals that the client connection should be closed.
         let next = tokio::time::timeout(idle_timeout, async {
             tokio::select! {
             msg = receiver.next() => {
@@ -409,11 +410,12 @@ pub async fn handle_socket_limited(
                                 _ => {}
                             }
                         }
+                        false
                     }
-                    Some(Ok(axum::extract::ws::Message::Close(_))) => break,
-                    Some(Err(_)) => break,
-                    None => break,
-                    _ => {}
+                    Some(Ok(axum::extract::ws::Message::Close(_))) => true,
+                    Some(Err(_)) => true,
+                    None => true,
+                    _ => false,
                 }
             }
             event = ip_rx.recv(), if subscribed_ip => {
@@ -422,6 +424,7 @@ pub async fn handle_socket_limited(
                         let _ = sender.send(axum::extract::ws::Message::Text(json.into())).await;
                     }
                 }
+                false
             }
             event = swap_rx.recv(), if subscribed_swap => {
                 if let Ok(event) = event {
@@ -429,6 +432,7 @@ pub async fn handle_socket_limited(
                         let _ = sender.send(axum::extract::ws::Message::Text(json.into())).await;
                     }
                 }
+                false
             }
             event = swap_status_rx.recv(), if (subscribed_all_swap_status || !subscribed_swap_ids.is_empty()) => {
                 if let Ok(event) = event {
@@ -438,21 +442,28 @@ pub async fn handle_socket_limited(
                         }
                     }
                 }
+                false
             }
             }
         }).await;
 
-        if next.is_err() {
+        match next {
+            // Client closed the connection or the socket errored: stop.
+            Ok(true) => break,
+            // Normal message/event: keep streaming.
+            Ok(false) => {}
             // Idle timeout elapsed: close the stale connection.
-            let _ = sender
-                .send(axum::extract::ws::Message::Close(Some(
-                    axum::extract::ws::CloseFrame {
-                        code: axum::extract::ws::close_code::AWAY,
-                        reason: "idle timeout".into(),
-                    },
-                )))
-                .await;
-            break;
+            Err(_) => {
+                let _ = sender
+                    .send(axum::extract::ws::Message::Close(Some(
+                        axum::extract::ws::CloseFrame {
+                            code: axum::extract::ws::close_code::AWAY,
+                            reason: "idle timeout".into(),
+                        },
+                    )))
+                    .await;
+                break;
+            }
         }
     }
 

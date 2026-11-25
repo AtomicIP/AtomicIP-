@@ -18,6 +18,7 @@ struct AppState {
     sse_broadcaster:  Arc<events::EventBroadcaster>,
     health_checker:   Arc<health::HealthChecker>,
     rate_limiter:     Arc<rate_limit::RateLimitMiddleware>,
+    sse_limiter:      Arc<websocket::ConnectionLimiter>,
 }
 
 impl FromRef<AppState> for Arc<health::HealthChecker> {
@@ -37,6 +38,12 @@ impl FromRef<AppState> for Arc<rate_limit::RateLimitMiddleware> {
         state.rate_limiter.clone()
     }
 }
+impl FromRef<AppState> for Arc<graphql::SorobanQueryClient> {
+    fn from_ref(state: &AppState) -> Self {
+        state.query_client.clone()
+    }
+}
+
 
 mod alerting;
 mod incidents;
@@ -87,10 +94,31 @@ mod validation;
 mod validation_middleware;
 mod docs;
 mod user_data;
+mod account_recovery;
+mod audit;
+mod dependency_injection;
+mod load_balancer;
+mod news_feed;
+mod response;
+mod threat_detection;
 #[cfg(test)]
 mod validation_fuzz_tests;
 #[cfg(test)]
 mod snapshot_tests;
+
+/// Acquire a lock, recovering the guard if the mutex was poisoned.
+///
+/// Mirrors `api_server::lock_or_recover`: a poisoned mutex must not panic every
+/// later request, so log and continue with the (possibly inconsistent) data.
+pub fn lock_or_recover<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match m.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            tracing::warn!("recovered poisoned mutex; continuing with possibly inconsistent data");
+            poisoned.into_inner()
+        }
+    }
+}
 
 #[derive(OpenApi)]
 #[openapi(
@@ -144,6 +172,7 @@ mod snapshot_tests;
         handlers::use_backup_code,
         handlers::check_session,
         handlers::extend_session,
+        due_diligence::get_due_diligence,
         batch::batch_handler,
         events::events_handler,
     ),
@@ -206,6 +235,12 @@ mod snapshot_tests;
         schemas::CheckSessionResponse,
         schemas::ExtendSessionRequest,
         schemas::ExtendSessionResponse,
+        due_diligence::Check,
+        due_diligence::MatchKind,
+        due_diligence::PriorArtMatch,
+        due_diligence::RiskLevel,
+        due_diligence::LegalRiskAssessment,
+        due_diligence::DueDiligenceReport,
     )),
     tags(
         (name = "IP Registry", description = "Commit and query intellectual property records"),
@@ -215,6 +250,7 @@ mod snapshot_tests;
         (name = "Events", description = "Server-Sent Events stream"),
         (name = "Admin", description = "Administrative endpoints for monitoring and audit"),
         (name = "Auth", description = "Authentication and account recovery"),
+        (name = "Due Diligence", description = "Technical checks and risk summaries for IP commitments"),
     )
 )]
 pub struct ApiDoc;
@@ -336,13 +372,14 @@ impl std::error::Error for DependencyError {}
 
 /// Resolve a required dependency from a container, returning a typed error
 /// instead of panicking when it is absent.
-fn require_dependency<T: Clone>(
+fn require_dependency<T: Clone + Send + Sync + 'static>(
     container: &dependency_injection::ServiceContainer,
     name: &'static str,
 ) -> Result<T, DependencyError> {
     container
         .resolve::<T>()
-        .ok_or(DependencyError::Missing(name))
+        .map(|service| (*service).clone())
+        .map_err(|_| DependencyError::Missing(name))
 }
 
 /// Build the shared application state, resolving every dependency through the
@@ -364,6 +401,8 @@ fn build_state(
         require_dependency::<Arc<health::HealthChecker>>(container, "health_checker")?;
     let rate_limiter =
         require_dependency::<Arc<rate_limit::RateLimitMiddleware>>(container, "rate_limiter")?;
+    let sse_limiter =
+        require_dependency::<Arc<websocket::ConnectionLimiter>>(container, "sse_limiter")?;
 
     Ok(AppState {
         schema,
@@ -373,6 +412,7 @@ fn build_state(
         sse_broadcaster,
         health_checker,
         rate_limiter,
+        sse_limiter,
     })
 }
 
@@ -388,12 +428,41 @@ async fn main() {
     handlers::spawn_session_cleanup_task();
 
     let subscription_broadcaster = init_subscription_broadcaster().await;
-    let rpc_client: Arc<dyn graphql::SorobanRpcClient> = Arc::new(graphql::MockSorobanRpcClient::default());
+
+    // Resolve the GraphQL RPC client using the same MODE=test guard applied to
+    // the REST SOROBAN_CLIENT.  A missing IP_REGISTRY_CONTRACT outside test
+    // mode is a fatal misconfiguration — fail here rather than serving mock
+    // data silently.
+    let rpc_client: Arc<dyn graphql::SorobanRpcClient> = {
+        let contract = std::env::var("IP_REGISTRY_CONTRACT").unwrap_or_default();
+        let is_test_mode = std::env::var("MODE")
+            .map(|v| v.eq_ignore_ascii_case("test"))
+            .unwrap_or(false);
+
+        if contract.is_empty() {
+            if is_test_mode {
+                tracing::warn!(
+                    "IP_REGISTRY_CONTRACT is unset and MODE=test: GraphQL layer using \
+                     MockSorobanRpcClient. Mock responses are marked with `\"mock\": true`."
+                );
+                Arc::new(graphql::MockSorobanRpcClient::default())
+            } else {
+                eprintln!(
+                    "FATAL: IP_REGISTRY_CONTRACT is not set. \
+                     Set it to the deployed ip_registry contract address, \
+                     or set MODE=test to use the mock client for local testing."
+                );
+                std::process::exit(1);
+            }
+        } else {
+            Arc::new(graphql::LiveSorobanRpcClient::from_env())
+        }
+    };
     let query_client = Arc::new(graphql::SorobanQueryClient::new(rpc_client.clone()));
 
     // #1205/#1206: depth/complexity limits and explicit introspection setting.
-    let graphql_config = graphql::GraphQLConfig::from_env();
-    let schema = graphql::build_schema_with_broadcaster_and_config(
+    let graphql_config = graphql::GraphQLSecurityConfig::from_env();
+    let schema = graphql::build_schema_with_broadcaster_and_security(
         rpc_client.clone(),
         subscription_broadcaster.clone(),
         &graphql_config,
@@ -405,13 +474,14 @@ async fn main() {
     // through it. A missing dependency yields a typed error rather than a
     // panic; log it clearly and exit non-zero.
     let mut container = dependency_injection::ServiceContainer::new();
-    container.register(schema);
-    container.register(query_client);
-    container.register(rpc_client);
-    container.register(Arc::new(websocket::EventBroadcaster::new()));
-    container.register(Arc::new(events::create_event_broadcaster().0));
-    container.register(Arc::new(health::HealthChecker::new()));
-    container.register(rate_limiter.clone());
+    let _ = container.register_singleton(schema, "graphql_schema".to_string());
+    let _ = container.register_singleton(query_client, "query_client".to_string());
+    let _ = container.register_singleton(rpc_client, "rpc_client".to_string());
+    let _ = container.register_singleton(Arc::new(websocket::EventBroadcaster::new()), "ws_broadcaster".to_string());
+    let _ = container.register_singleton(Arc::new(events::create_event_broadcaster().0), "sse_broadcaster".to_string());
+    let _ = container.register_singleton(Arc::new(health::HealthChecker::new()), "health_checker".to_string());
+    let _ = container.register_singleton(Arc::new(websocket::ConnectionLimiter::from_env()), "sse_limiter".to_string());
+    let _ = container.register_singleton(rate_limiter.clone(), "rate_limiter".to_string());
 
     let state = match build_state(&container) {
         Ok(state) => state,
@@ -424,116 +494,9 @@ async fn main() {
     let request_queue = Arc::new(request_queue::RequestQueue::new(
         request_queue::QueueConfig::default(),
     ));
-    let signed = middleware::from_fn(request_signing::verify_request_signature);
-    let signed_ip_routes = Router::new()
-        .route("/ip/commit", post(handlers::commit_ip))
-        .route("/ip/transfer", post(handlers::transfer_ip))
-        .route_layer(middleware::from_fn(request_signing::verify_request_signature));
-
-    // Mutating endpoints that move or commit IP/swap state require a signed
-    // request (see request_signing.rs) on top of the layers applied below.
-    let signed_routes = Router::new()
-        .route("/ip/commit",                      post(handlers::commit_ip))
-        .route("/ip/transfer",                    post(handlers::transfer_ip))
-        .route("/swap/initiate",                  post(handlers::initiate_swap))
-        .route("/swap/batch-initiate",            post(handlers::batch_initiate_swap))
-        .route("/swap/{swap_id}/accept",          post(handlers::accept_swap))
-        .route("/swap/{swap_id}/reveal",          post(handlers::reveal_key))
-        .route("/swap/{swap_id}/cancel",          post(handlers::cancel_swap))
-        .route("/swap/{swap_id}/cancel-expired",  post(handlers::cancel_expired_swap))
-        // #1098: collections identify the caller by the verified X-Public-Key header,
-        // so every collection route, reads included, must be signed.
-        .route("/collections",                          post(collections::create_collection).get(collections::list_collections))
-        .route("/collections/{id}",                     get(collections::get_collection).delete(collections::delete_collection))
-        .route("/collections/{id}/ips",                 post(collections::add_collection_ips))
-        .route("/collections/{id}/ips/{ip_id}",         axum::routing::delete(collections::remove_collection_ip))
-        .route("/collections/{id}/shares",              post(collections::share_collection))
-        .route("/collections/{id}/shares/{user}",       axum::routing::delete(collections::unshare_collection))
-        .route("/collections/{id}/summary",             get(collections::collection_summary))
-        .route_layer(middleware::from_fn(request_signing::verify_request_signature));
-
-    let app = Router::new()
-        .merge(signed_ip_routes)
-        .route("/health",          get(health::health_handler))
-        .route("/health/detailed", get(health::detailed_health_handler))
-        .route("/ip/{ip_id}",      get(handlers::get_ip))
-        .route("/ip/owner/{owner}", get(handlers::list_ip_by_owner))
-        .route("/ip/owner/{owner}/cursor", get(handlers::list_ip_by_owner_cursor))
-        .route("/ip/tag/{tag}",    get(handlers::list_commitments_by_tag))
-        .route("/ip/similar",      get(handlers::find_similar_commitments))
-        .route("/ip/export",       get(handlers::export_commitments))
-        .route("/analytics/commitments", get(handlers::commitment_analytics))
-        .route("/swap/marketplace/seller/{seller}", get(handlers::marketplace_by_seller))
-        .route("/swap/marketplace/buyer/{buyer}",   get(handlers::marketplace_by_buyer))
-        .route("/swap/marketplace/ip/{ip_id}",      get(handlers::marketplace_by_ip))
-        .route("/swap/{swap_id}",  get(handlers::get_swap))
-        .route("/openapi.json",    get(openapi_handler))
-        .layer(middleware::from_fn_with_state(
-            cors_config.clone(),
-            middleware_pipeline::cors_middleware,
-        ));
-
-    let app = Router::new()
-        .merge(signed_routes)
-        .merge(public_read_routes)
-        .route("/graphql",         post(graphql_handler))
-        .route("/graphql/ws",      get(graphql_ws_handler))
-        .route("/ws",              get(ws_handler))
-        .route("/events",          get(events_handler))
-        .route("/batch",           post(batch::batch_handler))
-        .route("/audit-logs",                        get(handlers::get_audit_logs))
-        .route("/v1/admin/audit/logs",               get(handlers::get_audit_logs))
-        .route("/v1/admin/audit/suspicious-patterns", get(handlers::get_suspicious_patterns))
-        .route("/v1/admin/commitments/lifecycle", get(commitment_monitoring::lifecycle_handler))
-        .route("/v1/admin/alerts", get(commitment_monitoring::open_alerts_handler))
-        .merge(incident_routes())
-        .route("/v1/ip/search", get(handlers::search_ip))
-        .merge(ip_search_routes())
-        .route("/v1/admin/incidents/alertmanager", post(incidents::alertmanager_webhook_handler))
-        .route("/v1/auth/recovery/initiate",      post(account_recovery::initiate_recovery))
-        .route("/v1/auth/recovery/verify-token",  post(account_recovery::verify_recovery_token))
-        .route("/v1/auth/recovery/questions",     get(account_recovery::get_security_questions))
-        .route("/v1/auth/recovery/verify-question", post(account_recovery::verify_security_question))
-        // #1309: GDPR/CCPA erasure. Signed, and bound to the erased user in the handler.
-        .route("/users/{user_id}", axum::routing::delete(user_data::delete_user_handler).layer(signed.clone()))
-        .route("/auth/2fa/enable", post(handlers::enable_2fa))
-        .route("/auth/2fa/verify", post(handlers::verify_2fa))
-        .route("/auth/2fa/backup-code", post(handlers::use_backup_code))
-        .route("/auth/session/status", post(handlers::check_session))
-        .route("/auth/extend-session", post(handlers::extend_session))
-        .route("/ip/{ip_id}",                     get(handlers::get_ip))
-        .route("/ip/verify",                      post(handlers::verify_commitment))
-        .route("/ip/reveal-batch",                post(handlers::batch_reveal_commitments))
-        .route("/watchlist",                    post(handlers::add_to_watchlist).get(handlers::get_watchlist))
-        .route("/watchlist/{user_id}/{ip_id}",  axum::routing::delete(handlers::remove_from_watchlist))
-        .route("/ip/similar",                  get(handlers::find_similar_commitments))
-        .route("/ip/owner/{owner}",               get(handlers::list_ip_by_owner))
-        .route("/ip/owner/{owner}/cursor",        get(handlers::list_ip_by_owner_cursor))
-        .route("/ip/tag/{tag}",                   get(handlers::list_commitments_by_tag))
-        .route("/analytics/commitments",          get(handlers::commitment_analytics))
-        .route("/analytics/marketplace",          get(marketplace_analytics::marketplace_analytics_handler))
-        .route("/ip/{ip_id}/due-diligence",       get(due_diligence::get_due_diligence))
-        .route("/recommendations",                get(recommendations::get_recommendations))
-        .route("/webhooks",                       post(handlers::register_webhook).get(handlers::list_webhooks))
-        .route("/webhooks/{id}",                  axum::routing::delete(handlers::unregister_webhook))
-        .route("/swap/marketplace/seller/{seller}", get(handlers::marketplace_by_seller))
-        .route("/swap/marketplace/buyer/{buyer}",  get(handlers::marketplace_by_buyer))
-        .route("/swap/marketplace/ip/{ip_id}",     get(handlers::marketplace_by_ip))
-        .route("/swap/{swap_id}",                 get(handlers::get_swap))
-        .route("/openapi.json", get(openapi_handler))
-        .route("/docs", get(docs::docs_handler))
-        .route("/docs/markdown", get(docs::docs_markdown_handler))
-        .with_state(state)
-        .layer(middleware::from_fn_with_state(
-            request_queue,
-            request_queue::request_queue_middleware,
-        ))
-        .layer(middleware::from_fn_with_state(rate_limiter, rate_limit::rate_limit_middleware))
-        .layer(middleware::from_fn(metrics::track))
-        .layer(middleware::from_fn(distributed_tracing::distributed_tracing_middleware))
-        .layer(middleware::from_fn(versioning::version_negotiation))
-        .layer(middleware::from_fn(compression::compression_middleware))
-        .layer(middleware::from_fn(require_json_content_type));
+    // Build the application router. `build_app` is the same router the
+    // integration tests exercise, so production and tests share one route table.
+    let app = build_app();
 
     let bind_addr = resolve_bind_addr();
     let listener = match tokio::net::TcpListener::bind(bind_addr).await {
@@ -594,28 +557,34 @@ async fn ws_handler(
 /// SSE endpoint — adapts the AppState to the handler's expected extractor.
 async fn events_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
+    headers: axum::http::HeaderMap,
 ) -> impl axum::response::IntoResponse {
-    let sender = (*state.sse_broadcaster).clone();
-    events::events_handler(axum::extract::State(Arc::new(sender))).await
+    events::events_handler(
+        axum::extract::State(state.sse_broadcaster.clone()),
+        axum::extract::State(state.sse_limiter.clone()),
+        headers,
+    )
+    .await
 }
 
 fn build_app() -> Router {
     let rpc_client: Arc<dyn graphql::SorobanRpcClient> = Arc::new(graphql::MockSorobanRpcClient::default());
     let query_client = Arc::new(graphql::SorobanQueryClient::new(rpc_client.clone()));
     // Mirror production: config-aware schema builder (#1205/#1206).
-    let graphql_config = graphql::GraphQLConfig::from_env();
-    let schema = graphql::build_schema_with_context_and_config(rpc_client.clone(), &graphql_config);
+    let graphql_config = graphql::GraphQLSecurityConfig::from_env();
+    let schema = graphql::build_schema_with_security(rpc_client.clone(), &graphql_config);
     let health_checker = Arc::new(health::HealthChecker::new());
     let rate_limiter = Arc::new(rate_limit::RateLimitMiddleware::new(rate_limit::RateLimitConfig::default()));
 
     let mut container = dependency_injection::ServiceContainer::new();
-    container.register(schema);
-    container.register(query_client);
-    container.register(rpc_client);
-    container.register(Arc::new(websocket::EventBroadcaster::new()));
-    container.register(Arc::new(events::create_event_broadcaster().0));
-    container.register(health_checker);
-    container.register(rate_limiter.clone());
+    let _ = container.register_singleton(schema, "graphql_schema".to_string());
+    let _ = container.register_singleton(query_client, "query_client".to_string());
+    let _ = container.register_singleton(rpc_client, "rpc_client".to_string());
+    let _ = container.register_singleton(Arc::new(websocket::EventBroadcaster::new()), "ws_broadcaster".to_string());
+    let _ = container.register_singleton(Arc::new(events::create_event_broadcaster().0), "sse_broadcaster".to_string());
+    let _ = container.register_singleton(health_checker, "health_checker".to_string());
+    let _ = container.register_singleton(Arc::new(websocket::ConnectionLimiter::from_env()), "sse_limiter".to_string());
+    let _ = container.register_singleton(rate_limiter.clone(), "rate_limiter".to_string());
 
     // The test router registers every dependency, so resolution cannot fail;
     // surface any regression as a panic here (tests only).
@@ -624,7 +593,7 @@ fn build_app() -> Router {
     // #1204: same CORS allowlist wiring as production, applied only to public
     // read routes.
     let cors_config = middleware_pipeline::CorsConfig::from_env();
-    let public_read_routes = Router::new()
+    let public_read_routes: Router<AppState> = Router::new()
         .route("/health", get(health::health_handler))
         .route("/health/detailed", get(health::detailed_health_handler))
         .route("/version", get(versioning::get_version_info))
@@ -648,7 +617,7 @@ fn build_app() -> Router {
     // #535: same signing enforcement as the production router, so the test
     // router exercises the identical middleware on the six write endpoints.
     let signed = middleware::from_fn(request_signing::verify_request_signature);
-    Router::new()
+    let app = Router::<AppState>::new()
         .merge(public_read_routes)
         .route("/graphql", post(graphql_handler))
         .route("/graphql/ws", get(graphql_ws_handler))
@@ -675,7 +644,7 @@ fn build_app() -> Router {
         .route("/v1/ip/reveal-batch", post(handlers::batch_reveal_commitments))
         .route("/v1/watchlist", post(handlers::add_to_watchlist).get(handlers::get_watchlist))
         .route("/v1/watchlist/{user_id}/{ip_id}", axum::routing::delete(handlers::remove_from_watchlist))
-        .route("/v1/webhooks", post(handlers::register_webhook).get(handlers::list_webhooks))
+        .route("/v1/webhooks", post(handlers::register_webhook).get(handlers::list_webhooks).layer(middleware::from_fn(auth::require_auth)))
         .route("/v1/webhooks/{id}", axum::routing::delete(handlers::unregister_webhook))
         .route("/v1/swap/marketplace/seller/{seller}", get(handlers::marketplace_by_seller))
         .route("/v1/swap/marketplace/buyer/{buyer}",  get(handlers::marketplace_by_buyer))
@@ -721,18 +690,22 @@ fn build_app() -> Router {
         .route("/docs", get(docs::docs_handler))
         .route("/docs/markdown", get(docs::docs_markdown_handler))
         .with_state(state)
-        .layer(middleware::from_fn_with_state(rate_limiter, rate_limit::rate_limit_middleware))
+        .layer(middleware::from_fn_with_state(
+            (*rate_limiter).clone(),
+            rate_limit::rate_limit_middleware,
+        ))
         .layer(middleware::from_fn(tracing_middleware::trace_requests))
         .layer(middleware::from_fn(versioning::version_negotiation))
         .layer(middleware::from_fn(compression::compression_middleware))
         .layer(middleware::from_fn(validation_middleware::validation_logging_middleware))
-        .layer(middleware::from_fn(require_json_content_type))
+        .layer(middleware::from_fn(require_json_content_type));
+    app
 }
 
 /// Marketplace search routes that write or expose per-owner data. They take
 /// the caller's identity from the bearer token (#1387, #1388), so every one
 /// sits behind `require_auth`; the owner is never read from the path.
-fn ip_search_routes() -> Router {
+fn ip_search_routes() -> Router<AppState> {
     Router::new()
         .route("/v1/ip/{ip_id}/metadata", axum::routing::put(handlers::put_ip_search_metadata))
         .route("/v1/ip/search/saved", get(handlers::list_ip_saved_searches).post(handlers::save_ip_search))
@@ -740,7 +713,7 @@ fn ip_search_routes() -> Router {
         .route_layer(middleware::from_fn(auth::require_auth))
 }
 
-fn incident_routes() -> Router {
+fn incident_routes() -> Router<AppState> {
     Router::new()
         .route("/v1/admin/incidents", get(incidents::list_handler).post(incidents::create_handler))
         .route("/v1/admin/incidents/stats", get(incidents::stats_handler))
@@ -782,13 +755,14 @@ mod tests {
         let rate_limiter = Arc::new(rate_limit::RateLimitMiddleware::new(rate_limit::RateLimitConfig::default()));
 
         let mut container = dependency_injection::ServiceContainer::new();
-        container.register(schema);
-        container.register(query_client);
-        container.register(rpc_client);
-        container.register(Arc::new(websocket::EventBroadcaster::new()));
-        container.register(Arc::new(events::create_event_broadcaster().0));
-        container.register(health_checker);
-        container.register(rate_limiter);
+        let _ = container.register_singleton(schema, "graphql_schema".to_string());
+        let _ = container.register_singleton(query_client, "query_client".to_string());
+        let _ = container.register_singleton(rpc_client, "rpc_client".to_string());
+        let _ = container.register_singleton(Arc::new(websocket::EventBroadcaster::new()), "ws_broadcaster".to_string());
+        let _ = container.register_singleton(Arc::new(events::create_event_broadcaster().0), "sse_broadcaster".to_string());
+        let _ = container.register_singleton(health_checker, "health_checker".to_string());
+        let _ = container.register_singleton(Arc::new(websocket::ConnectionLimiter::from_env()), "sse_limiter".to_string());
+        let _ = container.register_singleton(rate_limiter, "rate_limiter".to_string());
 
         let state = build_state(&container).expect("test container must resolve all dependencies");
         Router::new()
@@ -831,13 +805,14 @@ mod tests {
             Arc::new(rate_limit::RateLimitMiddleware::new(rate_limit::RateLimitConfig::default()));
 
         let mut container = dependency_injection::ServiceContainer::new();
-        container.register(schema);
-        container.register(query_client);
-        container.register(rpc_client);
-        container.register(Arc::new(websocket::EventBroadcaster::new()));
-        container.register(Arc::new(events::create_event_broadcaster().0));
-        container.register(Arc::new(health::HealthChecker::new()));
-        container.register(rate_limiter);
+        let _ = container.register_singleton(schema, "graphql_schema".to_string());
+        let _ = container.register_singleton(query_client, "query_client".to_string());
+        let _ = container.register_singleton(rpc_client, "rpc_client".to_string());
+        let _ = container.register_singleton(Arc::new(websocket::EventBroadcaster::new()), "ws_broadcaster".to_string());
+        let _ = container.register_singleton(Arc::new(events::create_event_broadcaster().0), "sse_broadcaster".to_string());
+        let _ = container.register_singleton(Arc::new(health::HealthChecker::new()), "health_checker".to_string());
+        let _ = container.register_singleton(Arc::new(websocket::ConnectionLimiter::from_env()), "sse_limiter".to_string());
+        let _ = container.register_singleton(rate_limiter, "rate_limiter".to_string());
 
         assert!(build_state(&container).is_ok());
     }
@@ -967,6 +942,34 @@ mod tests {
         assert_eq!(spec["info"]["title"], "Atomic Patent API");
         assert!(spec["paths"].is_object());
         assert!(spec["components"]["schemas"].is_object());
+        let due_diligence = &spec["paths"]["/ip/{ip_id}/due-diligence"]["get"];
+        assert!(due_diligence["responses"]["200"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("not a legal opinion"));
+        assert!(spec["components"]["schemas"]["DueDiligenceReport"]["properties"]
+            ["disclaimer"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("legal"));
+        let report_properties =
+            &spec["components"]["schemas"]["DueDiligenceReport"]["properties"];
+        assert!(report_properties["provenance"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("timestamp"));
+        assert!(report_properties["ownership"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("claimed-owner"));
+        assert!(report_properties["prior_art"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("feature fingerprints"));
+        assert!(spec["components"]["schemas"]["LegalRiskAssessment"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("not a legal analysis"));
     }
 
     // ── #317: Pagination tests ────────────────────────────────────────────────
@@ -1926,12 +1929,12 @@ mod tests {
     #[tokio::test]
     async fn test_graphql_introspection_disabled_in_production() {
         // Build a schema with introspection explicitly disabled.
-        let config = graphql::GraphQLConfig {
+        let config = graphql::GraphQLSecurityConfig {
             introspection_enabled: false,
-            ..graphql::GraphQLConfig::default()
+            ..graphql::GraphQLSecurityConfig::default()
         };
         let rpc_client: Arc<dyn graphql::SorobanRpcClient> = Arc::new(graphql::MockSorobanRpcClient::default());
-        let schema = graphql::build_schema_with_context_and_config(rpc_client, &config);
+        let schema = graphql::build_schema_with_security(rpc_client, &config);
         let resp = schema
             .execute(async_graphql::Request::new("{ __schema { queryType { name } } }"))
             .await;
