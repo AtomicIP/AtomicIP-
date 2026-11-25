@@ -43,7 +43,7 @@ pub enum LicenseStatus {
     Expired,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RoyaltyPayment {
     /// Licensee revenue reported for the period, in stroops.
     pub gross_revenue: i128,
@@ -55,7 +55,7 @@ pub struct RoyaltyPayment {
     pub settlement_ref: String,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct License {
     pub id: u64,
     pub ip_id: u64,
